@@ -34,7 +34,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Execute Windows hooks under Restricted PowerShell policy
-        run: python -m unittest plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs -v
+        run: python -m unittest plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs plugins.symphony.tests.test_runtime_retention plugins.symphony.tests.test_boost -v
 
       - name: Execute Windows hooks as a standard user
         timeout-minutes: 5
@@ -57,7 +57,7 @@ jobs:
             $stderr = Join-Path $testRoot 'stderr.log'
             $test = Start-Process -FilePath $python -WorkingDirectory $env:GITHUB_WORKSPACE `
               -Credential $credential -LoadUserProfile -PassThru `
-              -ArgumentList '-m unittest plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs -v' `
+              -ArgumentList '-m unittest plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs plugins.symphony.tests.test_runtime_retention plugins.symphony.tests.test_boost -v' `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
             if (-not $test.WaitForExit(120000)) {
               Get-Content $stdout,$stderr -ErrorAction SilentlyContinue
@@ -112,6 +112,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Codex control failed' }
           python .github/scripts/assert_heartbeat.py codex
           if ($LASTEXITCODE -ne 0) { throw 'Codex heartbeat missing' }
+          python plugins/symphony/scripts/native_effort_smoke.py --provider codex
+          if ($LASTEXITCODE -ne 0) { throw 'Native Codex ultra effort failed' }
 
       - name: Install Claude Code
         run: npm.cmd install -g @anthropic-ai/claude-code
@@ -181,6 +183,8 @@ jobs:
           print('Claude installed hook selected Opus profile')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw 'Claude runtime profile check failed' }
+          python plugins/symphony/scripts/native_effort_smoke.py --provider claude
+          if ($LASTEXITCODE -ne 0) { throw 'Native packaged Claude max assessor failed' }
 
   verify:
     runs-on: ubuntu-latest
@@ -200,6 +204,9 @@ jobs:
 
       - name: Check packaged agents and routing reference match the shipped profiles
         run: python3 plugins/symphony/scripts/generate_agents.py --check
+
+      - name: Check captured launchers match the reviewed runtime
+        run: python3 plugins/symphony/scripts/generate_hooks.py --check
 
       - name: Run installed-package smokes
         run: |
@@ -254,6 +261,7 @@ jobs:
             -C "$GITHUB_WORKSPACE" \
             '$symphony:symphony help'
           python3 .github/scripts/assert_heartbeat.py codex
+          python3 plugins/symphony/scripts/native_effort_smoke.py --provider codex
 
       - name: Run real Claude control smoke when credential is available
         env:
@@ -278,6 +286,7 @@ jobs:
             --output-format text \
             '/symphony:help' > "$RUNNER_TEMP/claude-help.txt"
           python3 .github/scripts/assert_heartbeat.py claude
+          python3 plugins/symphony/scripts/native_effort_smoke.py --provider claude
 
   release:
     needs: [verify, windows-hooks, dockur-windows]

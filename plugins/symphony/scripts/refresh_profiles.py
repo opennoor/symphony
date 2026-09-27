@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILES = ROOT / "profiles.json"
 MODEL_POLICY = ROOT / "model-policy.json"
 
-CODEX_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+CODEX_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 sys.path.insert(0, str(ROOT))
 from symphony.routing import Assessment, MATRIX as ROUTING_MATRIX, NO_PROFILE, route_for  # noqa: E402

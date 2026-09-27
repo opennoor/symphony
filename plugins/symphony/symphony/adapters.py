@@ -17,6 +17,7 @@ EVENT_KINDS = {
     "SubagentStart": "subagent_started",
     "SubagentStop": "subagent_stopped",
     "PostToolUse": "post_tool_use",
+    "PostToolUseFailure": "post_tool_failed",
     "Stop": "stop_requested",
     "Interrupt": "interrupt",
 }
@@ -73,14 +74,19 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
             for index, line in enumerate(handle):
                 if index >= 32:
                     break
-                record = json.loads(line)
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict) or not isinstance(record.get("payload", {}), dict):
+                    continue
                 record_payload = record.get("payload", {})
                 if record.get("type") == "session_meta":
-                    spawn = (
-                        record_payload.get("source", {})
-                        .get("subagent", {})
-                        .get("thread_spawn", {})
-                    )
+                    spawn = record_payload
+                    for key in ("source", "subagent", "thread_spawn"):
+                        spawn = spawn.get(key, {}) if isinstance(spawn, dict) else {}
+                    if not isinstance(spawn, dict):
+                        spawn = {}
                     agent_path = record_payload.get("agent_path") or spawn.get("agent_path")
                     if agent_path:
                         found["task_name"] = str(agent_path).rsplit("/", 1)[-1]
@@ -110,14 +116,21 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
             for line in handle:
                 if "SubagentHandback" not in line:
                     continue
-                content = (json.loads(line).get("message") or {}).get("content")
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                message = record.get("message") if isinstance(record, dict) else None
+                content = message.get("content") if isinstance(message, dict) else None
                 for item in content if isinstance(content, list) else ():
                     if (
                         isinstance(item, dict)
                         and item.get("type") == "tool_use"
                         and item.get("name") == "SubagentHandback"
                     ):
-                        report = str((item.get("input") or {}).get("message") or report)
+                        values = item.get("input")
+                        if isinstance(values, dict):
+                            report = str(values.get("message") or report)
     except (OSError, TypeError, ValueError, AttributeError):
         return report
     return report

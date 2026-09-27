@@ -84,13 +84,12 @@ class PackageSmokeTests(unittest.TestCase):
                         state["delegations"] = {payload["agent_id"]: "working"}
                     elif event == "SubagentStop":
                         state["active_children"] = []
+                        if payload.get("agent_id") == "fake-lead":
+                            state["active_run"] = None
                     elif event == "SessionStart" and state.get("active_run"):
                         state["delegations"] = {
                             key: "interrupted" for key in state.get("delegations", {})
                         }
-                        state["active_children"] = []
-                    elif event == "Stop" and payload.get("stop_hook_active"):
-                        state["active_run"] = None
                         state["active_children"] = []
                     if __HEARTBEAT__:
                         provider = os.environ["SYMPHONY_SMOKE_PROVIDER"]
@@ -156,6 +155,8 @@ class PackageSmokeTests(unittest.TestCase):
             "SubagentStart",
             "Stop",
             "Stop",
+            "Stop",
+            "SubagentStop",
             "Stop",
         ]
         # Only Claude reports a spawn before launch, and only Claude can carry

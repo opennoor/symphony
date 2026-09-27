@@ -39,6 +39,7 @@ $symphony:symphony status
 $symphony:symphony agents [--all]
 $symphony:symphony reassess
 $symphony:symphony proceed
+$symphony:symphony boost [xhigh|max|ultra|off]
 $symphony:symphony stop [--force]
 $symphony:symphony disable
 $symphony:symphony version
@@ -55,6 +56,7 @@ Claude Code exposes native slash commands:
 /symphony:agents [--all]
 /symphony:reassess
 /symphony:proceed
+/symphony:boost [xhigh|max|off]
 /symphony:stop [--force]
 /symphony:disable
 /symphony:version
@@ -62,6 +64,8 @@ Claude Code exposes native slash commands:
 ```
 
 Do not use `/symphony:*` in Codex. `$symphony:symphony start <task>` and `/symphony:start <task>` each run one managed task without changing project enablement. A leading control word counts as a control only when nothing but a documented flag follows it, so `$symphony:symphony help me fix the login bug` is treated as a task.
+
+`boost` raises only subsequent assessor effort in this project/provider/session. Codex accepts native `xhigh`, `max`, or `ultra`; Claude accepts native `xhigh` or `max`. With no argument it requests the provider’s highest level. Unsupported provider or account/model levels are rejected without changing the preference. Status reports the requested and effective native model/effort. `boost off` (or `reset`) restores normal high assessment; worker/lead routes, account restrictions, consent, and Fable opt-in remain unchanged.
 
 Symphony assumes the session root runs at the economy tier: it exists to route work to a right-sized lead, so a root that is already the strongest model pays for an assessor and a lead on top of itself. Set the root model to the cheapest capable option before enabling.
 
@@ -75,9 +79,11 @@ Symphony assumes the session root runs at the economy tier: it exists to route w
 
 A run is **guarded** only after the loaded Symphony hook has written a matching heartbeat for the current provider session. Installation, discovery, or trust alone is not proof of execution.
 
+Reviewed hooks retain their exact runtime at `~/.symphony/runtimes/<content digest>` and verify it on every launch, so future active sessions survive removal of their versioned plugin cache. They keep the reviewed build; new sessions load their separately reviewed update. Pre-1.5.0 captured commands require a one-time restart/reload while their old cache still exists. Retained snapshots are never removed automatically; delete obsolete snapshots only after their sessions exit.
+
 When the heartbeat is absent, `status` reports pending verification and gives the provider-native recovery step. A missing packaged executable or nonzero hook exit is reported as a fault, not as a trust problem. Symphony never silently labels an unverified run guarded; an unguarded one-shot route must be explicit.
 
-Normal completion is blocked while host-observed tracked work remains active. A stop is blocked at most once per turn: when the host reports that the stop hook is already active, Symphony releases the session, records the run as abandoned with the identities it never reconciled, and shows that in `status`. A prompt that never spawned an assessor opens no run and can never hold a session open.
+Normal completion is blocked while host-observed tracked work remains active. A stop is blocked at most once per turn: when the host reports that the stop hook is already active, Symphony releases the turn and preserves unfinished work in durable `status`. Only an explicit force stop archives it as abandoned with unreconciled identities. A prompt that never spawned an assessor opens no run and can never hold a session open.
 
 User interruption and host-enforced overrides remain authoritative, so interrupted work is recovered from durable lifecycle state rather than described as uninterruptible. Neither host reports which agents are still alive. A new root session never takes over another session's run or declares its agents finished; each session resumes its own durable run.
 

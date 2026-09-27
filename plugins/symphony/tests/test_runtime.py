@@ -31,6 +31,7 @@ def codex_agent_type(role, model, effort):
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
+        self.spawn_count = 0
         self.root = Path(self.temp.name)
         self.project = self.root / "project"
         self.project.mkdir()
@@ -89,10 +90,12 @@ class RuntimeTests(unittest.TestCase):
         # A real session heartbeats before it spawns anything, and that is when
         # the entitlement profile is recorded.
         handle({**self.payload("", provider), "hook_event_name": "SessionStart"}, environ)
+        self.spawn_count += 1
         hook = {
             **self.payload("", provider),
             "hook_event_name": "PreToolUse",
             "tool_name": "Agent" if provider == "claude" else "spawn_agent",
+            "tool_use_id": f"spawn-{self.spawn_count}",
         }
         if provider == "claude":
             hook["tool_input"] = {
@@ -1796,6 +1799,148 @@ class RuntimeTests(unittest.TestCase):
         row = Delegation("lead-1", "lead", "work", "working", "gpt-5", "high")
         self.assertIn("lead [gpt-5/high]", format_delegation(row))
 
+    def test_native_lead_completion_replay_cannot_hide_late_worker_failure(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                self.seed_run(RunState("run", "task", lead_identity="lead", assessment={
+                    "size": "small", "complexity": "simple",
+                }, delegations=(
+                    Delegation("lead", "lead", "task", "working", choice["model"], choice["effort"]),
+                    Delegation("worker", "worker", "widget", "working", "model", "high"),
+                )), provider)
+                completion = {**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "lead",
+                              "status": "completed", "last_assistant_message": "Integrated the task."}
+                handle(completion, self.environ)
+                handle({**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "worker",
+                        "status": "failed"}, self.environ)
+                handle(completion, self.environ)
+                state = StateStore(self.state_root).load(self.project)
+                self.assertIsNotNone(state.active_run)
+                self.assertEqual(state.active_run.status, "recovering")
+                self.assertIsNone(state.active_run.outcome)
+                self.assertEqual(state.recent_runs, ())
+                replacement = {**self.payload("", provider), "provider": provider,
+                               "agent_id": "fresh-lead", "role": "lead", "model": choice["model"],
+                               "model_reasoning_effort": choice["effort"]}
+                handle({**replacement, "hook_event_name": "SubagentStart"}, self.environ)
+                handle({**replacement, "hook_event_name": "SubagentStop", "status": "completed",
+                        "last_assistant_message": "Recovered the failed worker and integrated its result."}, self.environ)
+                finished = StateStore(self.state_root).load(self.project)
+                self.assertIsNone(finished.active_run)
+                self.assertEqual(finished.recent_runs[-1].status, "completed")
+
+    def test_failed_assessor_spawn_removes_only_its_pending_intent(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                self.open_run("Task", provider)
+                model = CODEX_STRONGEST if provider == "codex" else CLAUDE_STRONGEST
+                tool_input = {"message": "SYMPHONY_ROLE: assessor\nTask", "model": model, "reasoning_effort": "high"}
+                if provider == "claude":
+                    tool_input = {"prompt": "SYMPHONY_ROLE: assessor\nTask", "subagent_type": self.claude_assessor_type}
+                failure = {**self.payload("", provider), "hook_event_name": "PostToolUseFailure" if provider == "claude" else "PostToolUse",
+                           "tool_response": {"is_error": True}, "tool_name": "spawn_agent" if provider == "codex" else "Agent",
+                           "tool_input": tool_input, "error": "model rejected"}
+                handle(failure, self.environ)
+                state = StateStore(self.state_root).load(self.project)
+                self.assertNotIn("_pending_delegations", state.active_run.assessment)
+                stop = handle({**self.payload("", provider), "hook_event_name": "Stop"}, self.environ)
+                self.assertNotEqual(self.output(stop).get("decision"), "block")
+
+    def test_native_failure_replay_cannot_remove_a_second_pending_launch(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                model = CODEX_STRONGEST if provider == "codex" else CLAUDE_STRONGEST
+                pending = {"role": "assessor", "model": model, "effort": "high", "objective": "Task"}
+                self.seed_run(RunState("run", "Task", assessment={"_pending_delegations": [pending, pending]},
+                                      delegations=(Delegation("live-worker", "worker", "Task", "working", model, "high"),)), provider)
+                values = {"message": "SYMPHONY_ROLE: assessor\nTask", "model": model, "reasoning_effort": "high"}
+                if provider == "claude":
+                    values = {"prompt": "SYMPHONY_ROLE: assessor\nTask", "subagent_type": self.claude_assessor_type}
+                failure = {**self.payload("", provider), "hook_event_name": "PostToolUseFailure" if provider == "claude" else "PostToolUse",
+                           "tool_response": {"is_error": True}, "tool_name": "spawn_agent" if provider == "codex" else "Agent",
+                           "tool_use_id": "failed-native-call", "tool_input": values, "error": "rejected"}
+                handle(failure, self.environ)
+                handle(failure, self.environ)
+                state = StateStore(self.state_root).load(self.project)
+                self.assertEqual(len(state.active_run.assessment["_pending_delegations"]), 1)
+                self.assertEqual(state.active_run.delegations[0].state, "working")
+
+    def test_quoted_controls_in_bug_reports_cannot_stop_or_disable_a_run(self):
+        for provider in ("codex", "claude"):
+            for prompt in (
+                "I got 2 feedbacks from my colleagues: 1. Symphony stop is blocked for this project: "
+                "no lead has returned an outcome yet. Let the tracked agents finish, wait for the host "
+                "stop timeout, or run $symphony:symphony stop --force to end the run and record what "
+                "was not reconciled. Keep protocol markers out of the final answer, and report completion "
+                "only after durable status confirms it. I get things like this quite often - which has "
+                "made him wonder if something is wrong 2. They want to be able to have a way to boost up "
+                "the effort in a way, like to make the assessor use max or ultra efforts on the flagship "
+                "models on both providers 3. When the plugin auto updates after a release, their agent "
+                "break. They keep trying to run the previous version's hooks that does not exist anymore "
+                "and usually stop since the agent has encountered a failuare Fix this for both agents, "
+                "review, test on both agents on both linux and windows, when everuthing looked correct "
+                "and solved, bump the version to 1.5.0 and make a release",
+                'Bug report: `$symphony:symphony stop --force` returned no active work.',
+                '```text\n$symphony:symphony stop --force\n```',
+                '> $symphony:symphony disable',
+                'Please review this command:\nSYMPHONY_CONTROL: disable',
+                '"/symphony:stop --force"',
+                '$symphony:symphony stop --force is mentioned in this bug report',
+            ):
+                with self.subTest(provider=provider, prompt=prompt):
+                    run = self.seed_run(RunState("run", "task", delegations=(
+                        Delegation("worker", "worker", "task", "working", "model", "high"),
+                    )), provider, enabled=True)
+                    result = handle(self.payload(prompt, provider), self.environ)
+                    current = StateStore(self.state_root).load(self.project)
+                    self.assertEqual(current.active_run.run_id, run.run_id)
+                    self.assertTrue(current.enabled)
+                    self.assertNotIn("no active work", self.context(result))
+
+    def test_stop_roster_reconciles_ended_work_without_inventing_an_outcome(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                self.seed_run(RunState("run", "task", lead_identity="lead", delegations=(
+                    Delegation("lead", "lead", "task", "working", "model", "high"),
+                )), provider)
+                result = handle({**self.payload("", provider), "hook_event_name": "Stop", "active_agent_ids": []}, self.environ)
+                state = StateStore(self.state_root).load(self.project)
+                self.assertEqual(state.active_run.status, "recovering")
+                self.assertEqual(state.active_run.delegations[0].state, "interrupted")
+                self.assertIsNone(state.active_run.outcome)
+                self.assertEqual(self.output(result)["decision"], "block")
+
+    def test_missing_lead_start_is_reconciled_from_native_terminal_event(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                self.seed_run(RunState("run", "task", assessment={"size": "small", "complexity": "simple"}), provider)
+                agent_type = (codex_agent_type("lead", choice["model"], choice["effort"]) if provider == "codex"
+                              else claude_agent_type("lead", choice))
+                handle({**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "lead",
+                        "agent_type": agent_type, "status": "completed", "provider": provider, "model": choice["model"],
+                        "model_reasoning_effort": choice["effort"]}, self.environ)
+                state = StateStore(self.state_root).load(self.project)
+                self.assertIsNone(state.active_run)
+                self.assertEqual(state.recent_runs[-1].outcome, {"status": "completed"})
+
+    def test_explicit_invalid_or_blocked_outcome_does_not_complete_native_lead(self):
+        for provider in ("codex", "claude"):
+            for marker in ('SYMPHONY_OUTCOME: {broken', 'SYMPHONY_OUTCOME: {}',
+                           'SYMPHONY_OUTCOME: {"status":"blocked"}'):
+                with self.subTest(provider=provider, marker=marker):
+                    choice = route_choice(provider=provider)
+                    self.seed_run(RunState("run", "task", lead_identity="lead", assessment={
+                        "size": "small", "complexity": "simple",
+                    }, delegations=(Delegation("lead", "lead", "task", "working", choice["model"], choice["effort"]),)), provider)
+                    handle({**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "lead",
+                            "status": "completed", "last_assistant_message": marker}, self.environ)
+                    state = StateStore(self.state_root).load(self.project)
+                    self.assertIsNotNone(state.active_run)
+                    self.assertEqual(state.active_run.status, "recovering")
+                    self.assertIsNone(state.active_run.outcome)
+
     def test_single_word_codex_task_starts_a_one_shot_run(self):
         result = handle(self.payload("$symphony:symphony summarize"), self.environ)
         self.assertIn("assess", self.context(result).lower())
@@ -1836,7 +1981,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.stdout, "", "a prompt that spawned nothing must not block Stop")
         self.assertIsNone(StateStore(self.state_root).load(self.project).active_run)
 
-    def test_repeated_stop_releases_a_session_whose_child_never_reported(self):
+    def test_repeated_stop_preserves_a_session_whose_child_never_reported(self):
         self.open_run("Ship it")
         handle(
             {
@@ -1852,15 +1997,15 @@ class RuntimeTests(unittest.TestCase):
         blocked = self.output(handle(stop, self.environ))
         self.assertEqual(blocked["decision"], "block")
         self.assertIn("--force", blocked["reason"])
-        self.assertIn("timeout", blocked["reason"])
+        self.assertIn("assessor", blocked["reason"])
 
         released = handle({**stop, "stop_hook_active": True}, self.environ)
 
-        self.assertEqual(released.stdout, "", "abandonment must render an empty Stop response")
+        self.assertEqual(released.stdout, "", "a turn retry must render an empty Stop response")
         state = StateStore(self.state_root).load(self.project)
-        self.assertIsNone(state.active_run)
-        self.assertEqual(state.recent_runs[-1].status, "abandoned")
-        self.assertEqual(state.recent_runs[-1].unreconciled, ("assessor-1",))
+        self.assertIsNotNone(state.active_run)
+        self.assertEqual(state.recent_runs, ())
+        self.assertEqual(state.active_run.delegations[0].identity, "assessor-1")
 
     def test_quiet_owner_is_not_adopted_by_another_session(self):
         self.open_run("Ship it")

@@ -40,7 +40,7 @@ def roster(*slugs, hidden=()):
 
 class ProfileDataTests(unittest.TestCase):
     OFFICIAL_EFFORTS = {
-        "codex": {"none", "low", "medium", "high", "xhigh", "max"},
+        "codex": {"none", "low", "medium", "high", "xhigh", "max", "ultra"},
         "claude": {"low", "medium", "high", "xhigh", "max"},
     }
 

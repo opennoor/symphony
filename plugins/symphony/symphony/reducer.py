@@ -50,6 +50,7 @@ def _heartbeat(state: ProjectState, event: Event):
             "session_id": prior_session,
             "plugin_version": previous.get("plugin_version"),
             "plugin_root": previous.get("plugin_root"),
+            "runtime_root": previous.get("runtime_root"),
             "hook_schema_version": previous.get("hook_schema_version"),
             "observed_at": previous.get("observed_at"),
             "profile": str(previous.get("profile") or ""),
@@ -62,6 +63,7 @@ def _heartbeat(state: ProjectState, event: Event):
             "session_id": session,
             "plugin_version": event.payload.get("plugin_version"),
             "plugin_root": event.payload.get("plugin_root"),
+            "runtime_root": event.payload.get("runtime_root"),
             "hook_schema_version": event.payload.get("hook_schema_version"),
             "observed_at": event.observed_at,
             "profile": str(event.payload.get("profile") or ""),
@@ -82,6 +84,7 @@ def _heartbeat(state: ProjectState, event: Event):
         "session_id": event.payload.get("session_id"),
         "plugin_version": event.payload.get("plugin_version"),
         "plugin_root": event.payload.get("plugin_root"),
+        "runtime_root": event.payload.get("runtime_root"),
         "hook_schema_version": event.payload.get("hook_schema_version"),
         "observed_at": event.observed_at,
         # Reported once: the next heartbeat replaces this record wholesale.
@@ -193,6 +196,14 @@ def _assessment_accepted(state: ProjectState, event: Event):
     }
     assessment = dict(event.payload)
     assessment.update(lifecycle)
+    # Accepted assessment evidence supersedes unconfirmed assessor launch
+    # intents. Already observed agents retain their own lifecycle records.
+    pending = [item for item in assessment.get("_pending_delegations", ())
+               if not isinstance(item, Mapping) or item.get("role") != "assessor"]
+    if pending:
+        assessment["_pending_delegations"] = pending
+    else:
+        assessment.pop("_pending_delegations", None)
     if state.active_run.status in {"completing", "interrupted", "recovering", "stopping"}:
         status = state.active_run.status
     elif state.active_run.lead_identity:
@@ -267,7 +278,43 @@ def _delegation_updated(state: ProjectState, event: Event):
         return _archive(state, updated, "disabled", event.observed_at), (
             Action("archive_run", {"run_id": updated.run_id}),
         )
+    if (item.role != "lead" and item.state.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}
+            and (updated.status == "completing" or updated.assessment.get("_pending_lead_completion"))):
+        return _lead_failed(replace(state, active_run=updated),
+                            replace(event, payload={"identity": updated.lead_identity}))
+    if (updated.status == "completing" and item.role not in {"consultant", "lead"}
+            and _stop_block_reason(updated) is None):
+        return _archive(state, updated, "completed", event.observed_at), (
+            Action("permit_completion", {"run_id": updated.run_id}),
+        )
     return replace(state, active_run=updated), ()
+
+
+def _delegation_launch_failed(state: ProjectState, event: Event):
+    if not state.active_run:
+        return state, ()
+    assessment = dict(state.active_run.assessment)
+    pending = list(assessment.get("_pending_delegations", ()))
+    for index, item in enumerate(pending):
+        if (isinstance(item, Mapping) and item.get("role") == event.payload.get("role")
+                and item.get("model") == event.payload.get("requested_tier")
+                and item.get("effort") == event.payload.get("requested_effort")):
+            pending.pop(index)
+            if pending:
+                assessment["_pending_delegations"] = pending
+            else:
+                assessment.pop("_pending_delegations", None)
+            return replace(state, active_run=replace(state.active_run, assessment=assessment)), ()
+    return state, ()
+
+
+def _valid_outcome(outcome) -> bool:
+    if not isinstance(outcome, Mapping) or not outcome:
+        return False
+    if "status" not in outcome:
+        return True
+    status = outcome["status"]
+    return isinstance(status, str) and status.lower() in {"completed", "done", "success", "succeeded"}
 
 
 def _lead_completed(state: ProjectState, event: Event):
@@ -279,12 +326,17 @@ def _lead_completed(state: ProjectState, event: Event):
     if identity != run.lead_identity or generation != run.owner_generation:
         return state, (Action("ignore_stale_owner", {"identity": identity}),)
 
+    if run.status == "recovering":
+        return state, (Action("block_completion", {"reason": "lead_recovery_required"}),)
     outcome = event.payload.get("outcome")
-    if outcome is None:
+    if not _valid_outcome(outcome):
         return state, (Action("block_completion", {"reason": "outcome_missing"}),)
     active = [item for item in _active_identities(run) if item != identity]
-    completed = replace(run, outcome=dict(outcome or {}), updated_at=event.observed_at)
-    if active:
+    unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
+                  and (item.role != "lead" or item.identity == run.lead_identity)]
+    completed = replace(run, outcome=dict(outcome), updated_at=event.observed_at)
+    if (active or unresolved or run.assessment.get("_pending_delegations")
+            or run.assessment.get("_invalid_consultants") or run.assessment.get("_lead_route_mismatch")):
         completed = replace(completed, status="completing")
         return replace(state, active_run=completed), (Action("wait_for_delegations", {"active": active}),)
     next_state = _archive(state, completed, "completed", event.observed_at)
@@ -295,7 +347,9 @@ def _lead_failed(state: ProjectState, event: Event):
     run = state.active_run
     if not run or event.payload.get("identity") != run.lead_identity:
         return state, ()
-    recovering = replace(run, status="recovering", updated_at=event.observed_at)
+    assessment = dict(run.assessment)
+    assessment.pop("_pending_lead_completion", None)
+    recovering = replace(run, status="recovering", outcome=None, assessment=assessment, updated_at=event.observed_at)
     return replace(state, active_run=recovering), (
         Action("replace_lead", {"owner_generation": run.owner_generation + 1}),
     )
@@ -322,6 +376,13 @@ def _resume_reconciled(state: ProjectState, event: Event):
         else replace(item, state="interrupted", updated_at=event.observed_at)
         for item in run.delegations
     )
+    if run.status in {"completing", "stopping"}:
+        reconciled = replace(run, delegations=delegations, updated_at=event.observed_at)
+        if run.status == "completing" and _stop_block_reason(reconciled) is None:
+            return _archive(state, reconciled, "completed", event.observed_at), (
+                Action("permit_completion", {"run_id": run.run_id}),
+            )
+        return replace(state, active_run=reconciled), ()
     if run.lead_identity and run.lead_identity in active_ids:
         resumed = replace(run, status="active", delegations=delegations, updated_at=event.observed_at)
         return replace(state, active_run=resumed), ()
@@ -344,6 +405,14 @@ def _stop_block_reason(run: RunState) -> dict | None:
     active = _active_identities(run)
     if active:
         return {"active": active}
+    unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
+                  and (item.role != "lead" or item.identity == run.lead_identity)]
+    if unresolved:
+        return {"reason": "interrupted work still requires reconciliation: " + ", ".join(unresolved)}
+    pending = run.assessment.get("_pending_delegations", ())
+    if pending:
+        roles = [str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping)]
+        return {"reason": "waiting for host launch confirmation: " + ", ".join(roles)}
     invalid_consultants = run.assessment.get("_invalid_consultants", ())
     if invalid_consultants:
         return {
@@ -353,8 +422,8 @@ def _stop_block_reason(run: RunState) -> dict | None:
     mismatch = run.assessment.get("_lead_route_mismatch")
     if mismatch:
         return {"reason": mismatch}
-    if run.outcome is None:
-        return {"reason": "lead_outcome_missing"}
+    if not _valid_outcome(run.outcome):
+        return {"reason": "lead_outcome_missing" if run.lead_identity else "lead_not_started"}
     return None
 
 
@@ -362,7 +431,7 @@ def _stop_requested(state: ProjectState, event: Event):
     run = state.active_run
     if not run:
         return state, (Action("permit_stop"),)
-    if not run.delegations:
+    if not run.delegations and not run.assessment.get("_pending_delegations"):
         # A run that never produced tracked work cannot hold the session.
         return _archive(state, run, "abandoned", event.observed_at), (
             Action("archive_run", {"run_id": run.run_id}),
@@ -391,15 +460,9 @@ def _stop_requested(state: ProjectState, event: Event):
             Action("permit_stop"),
         )
     if event.payload.get("stop_hook_active"):
-        # The host already blocked once and is asking again. Blocking a second
-        # time cannot make the tracked work reappear, so release the session and
-        # record what was never reconciled.
-        unreconciled = tuple(_active_identities(run))
-        abandoned = replace(run, unreconciled=unreconciled)
-        return _archive(state, abandoned, "abandoned", event.observed_at), (
-            Action("run_abandoned", {"run_id": run.run_id, "unreconciled": list(unreconciled)}),
-            Action("permit_stop"),
-        )
+        # Ending a host turn is not evidence that its children died. Release
+        # the retry while keeping the run available for later host events.
+        return state, (Action("permit_stop"),)
     return state, (Action("block_stop", reason),)
 
 
@@ -427,6 +490,7 @@ _HANDLERS: dict[str, _Handler] = {
     "assessment_accepted": _assessment_accepted,
     "lead_started": _lead_started,
     "delegation_updated": _delegation_updated,
+    "delegation_launch_failed": _delegation_launch_failed,
     "lead_completed": _lead_completed,
     "lead_failed": _lead_failed,
     "interrupt": _interrupt,
