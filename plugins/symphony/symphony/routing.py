@@ -9,7 +9,7 @@ from .model import CapabilitySnapshot
 
 
 TIERS = ("economy", "balanced", "capable", "strongest")
-EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+EFFORTS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
 @dataclass(frozen=True)
@@ -158,6 +158,16 @@ def _supported_effort(requested: str, supported: tuple[str, ...]) -> str:
     target = EFFORTS.index(requested) if requested in EFFORTS else len(EFFORTS)
     lower = [effort for effort in supported if effort in EFFORTS and EFFORTS.index(effort) <= target]
     return max(lower, key=EFFORTS.index) if lower else min(supported, key=EFFORTS.index)
+
+
+def assessor_selection(snapshot: CapabilitySnapshot, requested: str = "off") -> dict[str, str]:
+    """Keep assessor boosts inside the account's already accepted entitlement."""
+    model = snapshot.tiers.get("strongest", "")
+    supported = snapshot.supported_efforts.get(model, ())
+    target = "high" if requested == "off" else requested
+    effort = target if target in supported else ""
+    return {"requested_model": model, "requested_effort": target,
+            "model": model, "effort": effort}
 
 
 def model_is_weaker(model: str, baseline: str) -> bool:

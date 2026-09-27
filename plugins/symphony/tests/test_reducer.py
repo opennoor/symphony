@@ -396,7 +396,7 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertEqual(actions, ())
 
 
-    def test_repeated_stop_releases_the_session_and_records_abandonment(self):
+    def test_repeated_stop_releases_the_turn_and_preserves_unfinished_work(self):
         state = running_state(delegations=[delegation("w1")])
 
         blocked, actions = reduce(state, event("stop_requested", event_id="stop-1"))
@@ -408,10 +408,101 @@ class LifecycleReducerTests(unittest.TestCase):
         )
 
         self.assertIn("permit_stop", [item.kind for item in retry_actions])
-        self.assertIsNone(released.active_run)
-        archived = released.recent_runs[-1]
-        self.assertEqual(archived.status, "abandoned")
-        self.assertEqual(archived.unreconciled, ("w1",))
+        self.assertEqual(released.active_run, blocked.active_run)
+        self.assertEqual(released.recent_runs, ())
+
+    def test_replayed_launch_failure_removes_only_one_pending_intent(self):
+        intent = {"role": "worker", "model": "model", "effort": "high"}
+        state = running_state()
+        state = replace(state, active_run=replace(state.active_run, assessment={"_pending_delegations": [intent, intent]}))
+        failure = event("delegation_launch_failed", role="worker", requested_tier="model", requested_effort="high")
+        failed, _ = reduce(state, failure)
+        replayed, _ = reduce(failed, failure)
+        self.assertEqual(len(replayed.active_run.assessment["_pending_delegations"]), 1)
+        self.assertEqual(replayed, failed)
+
+    def test_late_worker_failure_invalidates_earlier_lead_completion(self):
+        for status in ("failed", "interrupted", "cancelled", "error"):
+            with self.subTest(status=status):
+                state = running_state(status="completing", delegations=[delegation("worker")], outcome={"status": "completed"})
+                state = replace(state, active_run=replace(state.active_run, assessment={"_pending_lead_completion": {"outcome": {"status": "completed"}}}))
+                failed, actions = reduce(state, event("delegation_updated", identity="worker", state=status))
+                self.assertIsNotNone(failed.active_run)
+                self.assertEqual(failed.active_run.status, "recovering")
+                self.assertIsNone(failed.active_run.outcome)
+                self.assertNotIn("_pending_lead_completion", failed.active_run.assessment)
+                self.assertEqual(actions, (Action("replace_lead", {"owner_generation": 2}),))
+                self.assertEqual(failed.recent_runs, ())
+
+    def test_same_agent_terminal_recovery_allows_fresh_lead_completion(self):
+        original = replace(delegation("old", "interrupted"), objective="Build the widget")
+        state = running_state(status="recovering", delegations=[original])
+        recovered, _ = reduce(state, event("delegation_updated", identity="old", role="worker", objective="Build the widget", state="completed"))
+        self.assertEqual(recovered.active_run.delegations[0].state, "completed")
+        registered, _ = reduce(recovered, event("lead_started", identity="fresh-lead", owner_generation=2))
+        completed, _ = reduce(registered, event("lead_completed", identity="fresh-lead", owner_generation=2, outcome={"status": "completed"}))
+        self.assertIsNone(completed.active_run)
+        self.assertEqual(completed.recent_runs[-1].status, "completed")
+
+    def test_retry_does_not_supersede_uncorrelated_or_live_work(self):
+        old = replace(delegation("old", "interrupted"), objective="Build the widget")
+        for records, role, objective, status in (
+            ([old], "worker", old.objective, "completed"),
+            ([old], "worker", "Different work", "completed"),
+            ([replace(old, objective="")], "worker", "", "completed"),
+            ([old], "consultant", old.objective, "completed"),
+            ([old], "worker", old.objective, "working"),
+            ([old, replace(old, identity="another")], "worker", old.objective, "completed"),
+            ([old, replace(old, identity="live", state="working")], "worker", old.objective, "completed"),
+        ):
+            with self.subTest(records=records, role=role, objective=objective, status=status):
+                state = running_state(status="recovering", delegations=records)
+                retried, _ = reduce(state, event("delegation_updated", identity="retry", role=role, objective=objective, state=status))
+                original = next(item for item in retried.active_run.delegations if item.identity == "old")
+                self.assertEqual(original.state, "interrupted")
+                completed, _ = reduce(retried, event("lead_completed", identity="lead-1", outcome={"status": "completed"}))
+                self.assertIsNotNone(completed.active_run)
+
+    def test_empty_host_roster_cannot_complete_an_unreconciled_worker(self):
+        state = running_state(status="completing", delegations=[delegation("worker")], outcome={"status": "completed"})
+        reconciled, _ = reduce(state, event("resume_reconciled", active_ids=[]))
+        self.assertEqual(reconciled.active_run.status, "completing")
+        self.assertEqual(reconciled.active_run.delegations[0].state, "interrupted")
+        stopped, actions = reduce(reconciled, event("stop_requested"))
+        self.assertIsNotNone(stopped.active_run)
+        self.assertIn("interrupted", actions[0].payload["reason"])
+        finished, _ = reduce(stopped, event("delegation_updated", identity="worker", state="completed"))
+        self.assertIsNone(finished.active_run)
+
+    def test_pending_spawn_prevents_archiving_an_unstarted_run(self):
+        state = running_state(lead=None)
+        state = replace(state, active_run=replace(state.active_run, assessment={
+            "_pending_delegations": [{"role": "assessor"}],
+        }))
+        updated, actions = reduce(state, event("stop_requested"))
+        self.assertEqual(updated.active_run, state.active_run)
+        self.assertEqual(actions[0].kind, "block_stop")
+        self.assertIn("assessor", actions[0].payload["reason"])
+
+    def test_completion_waits_for_pending_spawns_then_last_worker_finishes(self):
+        state = running_state(delegations=[delegation("lead-1", "completed", "lead")])
+        state = replace(state, active_run=replace(state.active_run, assessment={
+            "_pending_delegations": [{"role": "worker"}],
+        }))
+        waiting, actions = reduce(state, event("lead_completed", identity="lead-1", outcome={"status": "completed"}))
+        self.assertEqual(waiting.active_run.status, "completing")
+        self.assertEqual(actions[0].kind, "wait_for_delegations")
+        waiting = replace(waiting, active_run=replace(waiting.active_run, assessment={}))
+        done, _ = reduce(waiting, event("delegation_updated", identity="worker-1", state="completed"))
+        self.assertIsNone(done.active_run)
+        self.assertEqual(done.recent_runs[-1].status, "completed")
+
+    def test_malformed_outcomes_cannot_complete_a_run(self):
+        for outcome in ({}, [], "done", False, {"status": "blocked"}, {"status": {}}):
+            with self.subTest(outcome=outcome):
+                state, actions = reduce(running_state(), event("lead_completed", identity="lead-1", outcome=outcome))
+                self.assertIsNotNone(state.active_run)
+                self.assertEqual(actions[0].kind, "block_completion")
 
     def test_run_without_delegations_never_holds_the_session(self):
         state = running_state(lead=None, delegations=[])

@@ -42,9 +42,15 @@ class PackageContractTests(unittest.TestCase):
                 command = handler["command"]
                 self.assertIn(root_name, command, provider)
                 self.assertNotIn("/cache/", command, provider)
-                match = re.search(r"scripts/symphony_hook\.py", command)
-                self.assertIsNotNone(match, provider)
-                self.assertTrue((PLUGIN / match.group(0)).is_file(), provider)
+                self.assertIn(" -I -c ", command, provider)
+                self.assertIn("base64.b64decode(", command, provider)
+                self.assertTrue((PLUGIN / "scripts/symphony_hook.py").is_file(), provider)
+
+    def test_captured_launchers_match_all_reviewed_runtime_files(self):
+        from plugins.symphony.scripts.generate_hooks import generated
+
+        for path, expected in generated().items():
+            self.assertEqual(path.read_text(), expected, "run scripts/generate_hooks.py after package changes")
 
     def test_hook_starts_when_datetime_utc_is_unavailable(self):
         """A generic python3 hook must work on Python 3.10, before UTC existed."""
@@ -200,15 +206,18 @@ class PackageContractTests(unittest.TestCase):
 
     def test_codex_windows_hooks_use_the_packaged_launcher(self):
         import base64
+        from plugins.symphony.scripts.generate_hooks import bootstrap
 
         prefix = "cmd.exe /c powershell.exe -NoProfile -NonInteractive -EncodedCommand "
         for handler in handlers("hooks/codex.json"):
             command = handler["commandWindows"]
             self.assertTrue(command.startswith(prefix))
             source = base64.b64decode(command[len(prefix):]).decode("utf-16le")
-            self.assertEqual(source, (PLUGIN / "scripts/codex_hook.ps1").read_text())
-            self.assertIn("SYMPHONY_PROVIDER", source)
-            self.assertIn("scripts/symphony_hook.py", source)
+            expected = (PLUGIN / "scripts/codex_hook.ps1").read_text().replace(
+                "$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + bootstrap().replace("'", "''") + "'")
+            self.assertEqual(source, expected)
+            self.assertIn("-I -c", source)
+            self.assertLess(len(command) + len('cmd.exe /C ""'), 8191)
             self.assertNotIn(".ps1", source)
             self.assertNotIn('"', command)
 
@@ -217,7 +226,8 @@ class PackageContractTests(unittest.TestCase):
             self.assertEqual(handler["shell"], "bash")
             self.assertIn("python3", handler["command"])
             self.assertIn("python", handler["command"])
-            self.assertIn('"${CLAUDE_PLUGIN_ROOT}/scripts/symphony_hook.py"', handler["command"])
+            self.assertIn('"${CLAUDE_PLUGIN_ROOT}"', handler["command"])
+            self.assertIn(" -I -c ", handler["command"])
 
         from plugins.symphony.symphony.store import StateStore
 
@@ -230,7 +240,7 @@ class PackageContractTests(unittest.TestCase):
             state_root = home / "state"
             handler = next(handlers("hooks/hooks.json"))
             env = {**os.environ, "CLAUDE_PLUGIN_ROOT": str(root),
-                   "SYMPHONY_STATE_DIR": str(state_root)}
+                   "SYMPHONY_STATE_DIR": str(state_root), "SYMPHONY_RUNTIME_DIR": str(home / "runtimes")}
             env.pop("SYMPHONY_PROVIDER", None)
             if os.name == "nt":
                 bash = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
@@ -285,6 +295,7 @@ class PackageContractTests(unittest.TestCase):
                                               "WindowsPowerShell" / "v1.0"))),
                 "PLUGIN_ROOT": str(root),
                 "SYMPHONY_STATE_DIR": str(state_root),
+                "SYMPHONY_RUNTIME_DIR": str(home / "runtimes"),
                 "PSExecutionPolicyPreference": "Restricted",
                 "PYTHONDONTWRITEBYTECODE": "1",
             })
@@ -356,6 +367,12 @@ class PackageContractTests(unittest.TestCase):
             self.assertNotEqual(failed.returncode, 0)
             self.assertFalse(missing_state.exists())
 
+        # The digest-pinned Dockur image invokes this exact test entrypoint.
+        # Its guest has no Git Bash; native Windows CI exercises both hosts.
+        from plugins.symphony.tests.test_runtime_retention import RuntimeRetentionTests
+
+        RuntimeRetentionTests().exercise_removed_cache(("codex",))
+
     def test_hook_manifests_contain_only_supported_events(self):
         self.assertEqual(
             set(load_json("hooks/codex.json")["hooks"]),
@@ -363,7 +380,7 @@ class PackageContractTests(unittest.TestCase):
         )
         self.assertEqual(
             set(load_json("hooks/hooks.json")["hooks"]),
-            {"SessionStart", "UserPromptSubmit", "PreToolUse", "SubagentStart", "SubagentStop", "PostToolUse", "Stop"},
+            {"SessionStart", "UserPromptSubmit", "PreToolUse", "SubagentStart", "SubagentStop", "PostToolUse", "PostToolUseFailure", "Stop"},
         )
 
     def test_provider_help_uses_only_native_command_syntax(self):

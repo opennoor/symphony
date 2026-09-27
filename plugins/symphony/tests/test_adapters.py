@@ -70,6 +70,27 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(event.payload["model"], "gpt-6-astra")
         self.assertEqual(event.payload["model_reasoning_effort"], "high")
 
+    def test_malformed_transcript_rows_do_not_hide_child_metadata_or_handback(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / "child.jsonl"
+            transcript.write_text('not json\n' + json.dumps({"type": "session_meta", "payload": {
+                "agent_path": "/root/symphony_worker_model_high", "source": {
+                    "subagent": {"thread_spawn": {"parent_thread_id": "lead-thread"}},
+                },
+            }}) + '\n' + json.dumps({"type": "turn_context", "payload": {
+                "model": "model", "effort": "high",
+            }}) + '\n{"SubagentHandback": broken}\n' + json.dumps({"message": {"content": [{
+                "type": "tool_use", "name": "SubagentHandback", "input": {
+                    "message": 'SYMPHONY_OUTCOME: {"status":"blocked"}',
+                },
+            }]}}), encoding="utf-8")
+            payload = {"hook_event_name": "SubagentStop", "agent_transcript_path": str(transcript)}
+            codex = event_from_payload("codex", payload)
+            claude = event_from_payload("claude", payload)
+            self.assertEqual(codex.payload["parent_thread_id"], "lead-thread")
+            self.assertEqual(codex.payload["model_reasoning_effort"], "high")
+            self.assertIn('"blocked"', claude.payload["last_assistant_message"])
+
     def test_event_id_is_stable_for_replayed_payload(self):
         payload = fixture("codex", "user_prompt")
         self.assertEqual(
@@ -135,6 +156,7 @@ class AdapterContractTests(unittest.TestCase):
             "SubagentStart": "subagent_started",
             "SubagentStop": "subagent_stopped",
             "PostToolUse": "post_tool_use",
+            "PostToolUseFailure": "post_tool_failed",
             "Stop": "stop_requested",
             "Interrupt": "interrupt",
         }

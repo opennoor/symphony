@@ -55,7 +55,9 @@ jobs:
         run: python3 plugins/symphony/scripts/refresh_profiles.py --agent-probe
 
       - name: Regenerate packaged agents and routing reference
-        run: python3 plugins/symphony/scripts/generate_agents.py
+        run: |
+          python3 plugins/symphony/scripts/generate_agents.py
+          python3 plugins/symphony/scripts/generate_hooks.py
 
       - name: Detect generated route changes
         id: generated
@@ -79,6 +81,7 @@ jobs:
           python3 plugins/symphony/scripts/refresh_profiles.py --check-policy
           python3 -m unittest discover -s plugins/symphony/tests
           python3 plugins/symphony/scripts/generate_agents.py --check
+          python3 plugins/symphony/scripts/generate_hooks.py --check
           for provider in codex claude; do
             for scenario in activation managed-run unmarked-spawn interrupt-resume upgrade; do
               python3 plugins/symphony/scripts/package_smoke.py \
@@ -104,6 +107,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           next=$(python3 .github/scripts/bump_version.py)
+          python3 plugins/symphony/scripts/generate_hooks.py
+          python3 plugins/symphony/scripts/generate_hooks.py --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A

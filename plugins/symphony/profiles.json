@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "generated_at": "2026-09-25",
-  "source": "Reviewed provider lifecycle and token rates in model-policy.json; provider-fetched model and effort catalogs",
+  "source": "Reviewed provider lifecycle and token rates in model-policy.json; provider-fetched model and effort catalogs; Codex ultra effort verified against native model roster and official subagent docs 2026-09-27",
   "note": "Machine-maintained provider choices for the fixed nine-cell size/complexity policy in routing.py. Each profile's matrix selects a model and effort per cell; tiers summarize those choices for agent packaging. Profiles are ordered by preference: a known roster must cover every selected model and satisfy the gates. The last profile is the conservative default for unknown entitlement. A known roster matching no profile cannot launch Symphony agents. available_models records the provider roster used for generation and offline cost comparisons, not the installed user's entitlement.",
   "providers": {
     "codex": {
@@ -66,7 +66,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ],
             "gpt-6-luna": [
               "low",
@@ -80,7 +81,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ]
           },
           "requires_all": [
@@ -141,7 +143,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ],
             "gpt-6-luna": [
               "low",
@@ -155,7 +158,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ]
           },
           "requires_all": [
@@ -215,7 +219,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ],
             "gpt-6-luna": [
               "low",
@@ -229,7 +234,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ]
           },
           "requires_all": [
@@ -288,7 +294,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ],
             "gpt-6-luna": [
               "low",
@@ -302,7 +309,8 @@
               "medium",
               "high",
               "xhigh",
-              "max"
+              "max",
+              "ultra"
             ]
           },
           "requires_all": []

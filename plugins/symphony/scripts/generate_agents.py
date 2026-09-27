@@ -139,6 +139,9 @@ def required_agents() -> dict[tuple[str, str, str], None]:
                 wanted[("worker", model, effort)] = None
         strongest = snapshot.tiers["strongest"]
         wanted[("assessor", strongest, "high")] = None
+        for effort in snapshot.supported_efforts.get(strongest, ()):
+            if effort in {"xhigh", "max"}:
+                wanted[("assessor", strongest, effort)] = None
         wanted[("consultant", strongest, "high")] = None
     return wanted
 

@@ -42,6 +42,7 @@ PERSISTED_EVENT_KEYS = frozenset(
         "stop_hook_active",
         "plugin_version",
         "plugin_root",
+        "runtime_root",
         "hook_schema_version",
         "last_fault",
         "profile",

@@ -12,7 +12,11 @@
     "https://www.anthropic.com/claude/fable",
     "https://www.anthropic.com/claude-fable-and-mythos-5-1",
     "https://docs.anthropic.com/en/docs/about-claude/model-deprecations",
-    "https://docs.anthropic.com/en/docs/about-claude/pricing"
+    "https://docs.anthropic.com/en/docs/about-claude/pricing",
+    "https://learn.chatgpt.com/docs/agent-configuration/subagents",
+    "https://learn.chatgpt.com/docs/models",
+    "https://code.claude.com/docs/en/sub-agents",
+    "https://code.claude.com/docs/en/model-config"
   ],
   "note": "Reviewed selection policy: prefer newer models once adequate capability is established; use an older model only when verified token rates justify it. Capability bands express Symphony's routing judgment from provider positioning, not prices or benchmark scores. Generation is comparable only within a family. Codex rates are Standard subscription credits per million tokens; Claude rates are standard API USD per million tokens, including 5-minute/1-hour cache writes (1.25x/2x uncached input). These billing contexts are not interchangeable and do not estimate ChatGPT or Claude plan allowances. Unknown models need a source-backed policy update; legacy, deprecated, retiring and retired models are ineligible. Actual task cost requires measured input/cache/output (including reasoning), retries and tools; effort labels have no fixed token multiplier. Price comparisons assume the same token mix and service tier, not equal task consumption.",
   "models": {

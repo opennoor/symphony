@@ -62,6 +62,9 @@ def _set_materialized_version(root: Path, version: str) -> None:
                 package.read_text(),
             )
         )
+    generator = root / "scripts" / "generate_hooks.py"
+    if generator.is_file():
+        subprocess.run([sys.executable, str(generator)], check=True, capture_output=True, text=True)
 
 
 def _hook_config(root: Path, provider: str) -> dict[str, Any]:
@@ -103,6 +106,8 @@ def _command_argv(hook: dict[str, Any], root: Path, provider: str) -> list[str]:
         argv = shlex.split(command)
         parts = argv[1:]
     scripts = [Path(value) for value in parts if value.endswith(".py")]
+    if not scripts and "base64.b64decode(" in command:
+        scripts = [root / "scripts/symphony_hook.py"]
     if not scripts or not scripts[0].is_file():
         target = scripts[0] if scripts else root / "<unknown>"
         raise SmokeFailure(f"missing hook executable: {target}")
@@ -228,6 +233,7 @@ def _run_event(
             "SYMPHONY_SMOKE_PROVIDER": provider,
             "PLUGIN_ROOT": str(root),
             "CLAUDE_PLUGIN_ROOT": str(root),
+            "SYMPHONY_RUNTIME_DIR": str(state_dir.parent / "runtimes"),
         }
     )
     completed = subprocess.run(
@@ -268,6 +274,7 @@ def _send_raw(
             "SYMPHONY_SMOKE_PROVIDER": provider,
             "PLUGIN_ROOT": str(root),
             "CLAUDE_PLUGIN_ROOT": str(root),
+            "SYMPHONY_RUNTIME_DIR": str(state_dir.parent / "runtimes"),
         }
     )
     completed = subprocess.run(
@@ -414,8 +421,13 @@ def _exercise(
             raise SmokeFailure("a second Stop without the retry flag must still block")
         if _blocks_stop(send("Stop", stop_hook_active=True)):
             raise SmokeFailure("a repeated Stop must release the session, never loop")
+        if not any(_has_active_run(document) for document in _state_documents(state_dir)):
+            raise SmokeFailure("the released turn lost its unfinished durable run")
+        send("SubagentStop")
+        if _blocks_stop(send("Stop")):
+            raise SmokeFailure("a returned native lead still blocked Stop")
         if any(_has_active_run(document) for document in _state_documents(state_dir)):
-            raise SmokeFailure("the released run was not archived")
+            raise SmokeFailure("the returned lead was not reconciled")
         activation.append("guarded")
     elif scenario == "unmarked-spawn":
         if provider != "claude":
@@ -481,23 +493,44 @@ def _exercise(
         _set_materialized_version(new_root, new_version)
         _validate_package(new_root, provider)
         old_root = root
+        pinned = "base64.b64decode(" in _event_command(_hook_config(old_root, provider), "SubagentStop")["command"]
+        if pinned:
+            send("SubagentStart", "old-session", agent_role="assessor")
+            send("SubagentStop", "old-session", agent_role="assessor")
+            send("SubagentStart", "old-session")
         stale_argv = _command_argv(
             _event_command(_hook_config(old_root, provider), "SubagentStop"), old_root, provider
         )
         stale_payload = _payload(old_root, provider, "SubagentStop", project, "old-session")
+        stale_stop = _command_argv(_event_command(_hook_config(old_root, provider), "Stop"), old_root, provider)
         before = _state_documents(state_dir)
         shutil.rmtree(old_root)
         stale_env = os.environ.copy()
-        stale_env.update({"HOME": str(home), "SYMPHONY_STATE_DIR": str(state_dir)})
+        stale_env.update({"SYMPHONY_STATE_DIR": str(state_dir), "SYMPHONY_RUNTIME_DIR": str(home / "runtimes"),
+                          "PLUGIN_ROOT": str(old_root), "CLAUDE_PLUGIN_ROOT": str(old_root),
+                          "SYMPHONY_SMOKE_PROVIDER": provider})
         stale = subprocess.run(
             stale_argv,
             input=json.dumps(stale_payload),
             capture_output=True, text=True, env=stale_env, timeout=15, check=False,
         )
-        if stale.returncode == 0 or str(old_root / "scripts" / "symphony_hook.py") not in stale.stderr:
-            raise SmokeFailure("removed old hook did not fail at its captured path")
-        if _state_documents(state_dir) != before:
-            raise SmokeFailure("failed old hook changed durable state")
+        if pinned:
+            if stale.returncode:
+                raise SmokeFailure(f"retained old hook failed after cache removal: {stale.stderr}")
+            stopped = subprocess.run(stale_stop, input=json.dumps({"hook_event_name": "Stop", "session_id": "old-session",
+                                     "cwd": str(project)}), capture_output=True, text=True, env=stale_env, timeout=15)
+            if stopped.returncode or _blocks_stop(json.loads(stopped.stdout) if stopped.stdout.strip() else None):
+                raise SmokeFailure("retained Stop failed to reconcile the returned lead")
+            if not any(run.get("session_id") == "old-session" and run.get("status") == "completed"
+                       and run.get("outcome") for doc in _state_documents(state_dir)
+                       for run in doc.get("recent_runs", [])):
+                raise SmokeFailure("old session lost its durable lead outcome after cache removal")
+        else:
+            # Pre-retention captured commands cannot be repaired retroactively.
+            if stale.returncode == 0 or str(old_root / "scripts" / "symphony_hook.py") not in stale.stderr:
+                raise SmokeFailure("removed legacy hook did not fail at its captured path")
+            if _state_documents(state_dir) != before:
+                raise SmokeFailure("failed legacy hook changed durable state")
         root = new_root
         send("UserPromptSubmit", "reloaded-session")
         documents = _state_documents(state_dir)

@@ -11,7 +11,7 @@ SYMPHONY_ROLE: worker
 SYMPHONY_ROLE: consultant
 ```
 
-Claude's Agent `PreToolUse` hook blocks unmarked spawns before launch. On Symphony's currently supported Codex collaboration path, observed events detect a mis-routed or unmarked spawn after the child starts; the cost of that spawn has already been incurred. Codex documentation also advertises `PreToolUse` for ordinary `spawn_agent`; extending Symphony's guarantee requires a real-host check of this exact collaboration path. An assessor must use high effort or above. A lead must use the matrix-selected effort, and workers and consultants cannot start until a lead is registered.
+Claude's Agent `PreToolUse` hook blocks unmarked spawns before launch. On Symphony's currently supported Codex collaboration path, observed events detect a mis-routed or unmarked spawn after the child starts; the cost of that spawn has already been incurred. Codex documentation also advertises `PreToolUse` for ordinary `spawn_agent`; extending Symphony's guarantee requires a real-host check of this exact collaboration path. An assessor normally uses high effort or above; an explicit session effort override may select low or medium and must match the reported effective route. A lead must use the matrix-selected effort, and workers and consultants cannot start until a lead is registered.
 
 Provider binding is mechanical:
 
@@ -24,7 +24,7 @@ Use the host role name `symphony_<role>_<model>_<effort>` when custom names are 
 
 ## Assessment
 
-Run substantive or uncertain work as a bounded `strongest/high` assessment. The assessor chooses needs, not provider model names, and does not become the lead implicitly.
+Run substantive or uncertain work as a bounded assessment on the strongest model in the accepted account profile, normally at `high` effort. A session assessor boost uses native levels above high: Codex xhigh/max/ultra, Claude xhigh/max. Unsupported account/model levels are rejected, never mapped to another effort. Boosts apply only to subsequent assessor spawns. The assessor chooses needs, not provider model names, and does not become the lead implicitly.
 
 Required fields:
 
@@ -86,6 +86,10 @@ Symphony's hooks enforce supported routing and lifecycle events. They do not obs
 - A large lead is an inexpensive administrator: delegate project work and reserve consultant capacity for narrow decisions.
 - Preserve active ownership across reassessment. Replace the lead only at a safe boundary or when unavailable or materially incapable.
 - When required consultation is unavailable, a large lead uses the disclosed conservative fallback instead of absorbing specialist reasoning silently.
+- Native successful `SubagentStop` events reconcile a lead even when its start event was missed. If the lead includes `SYMPHONY_OUTCOME: {"status":"completed"}`, the marker stays internal; malformed or non-success reports keep the run recoverable even when the host says the agent ended. Host termination alone cannot override an explicit blocked or failed outcome. Pending launches, active descendants, and unclassified consultant results still prevent run completion.
+- Ending the root turn permits waiting for host results. A repeated stop releases that turn while retaining the run; it never proves task completion or agent abandonment. Report completion only after durable status confirms it.
+- If a worker ends unsuccessfully after the lead reported completion, that earlier outcome is invalidated and the run returns to lead recovery. A fresh registered lead must integrate the failure and return a new outcome. Replayed native completion events cannot restore the old outcome.
+- An interrupted worker remains unresolved until its own host identity reports a terminal recovery result. Resume or follow up with that existing agent when the host supports it, then register a fresh lead to integrate the result. A new agent with the same role or objective does not prove that the interrupted agent ended; Symphony does not infer replacement from prose or objective similarity.
 
 ## Worker
 

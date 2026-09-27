@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 from typing import Mapping
@@ -19,6 +20,7 @@ from .routing import (
     Assessment,
     EFFORTS,
     NO_PROFILE,
+    assessor_selection,
     clamp_against_best,
     model_is_weaker,
     profiles_for,
@@ -31,6 +33,7 @@ from .store import StateStore
 
 CONTROLS = {
     "agents",
+    "boost",
     "bypass",
     "disable",
     "enable",
@@ -43,7 +46,7 @@ CONTROLS = {
     "version",
 }
 ROLES = {"assessor", "consultant", "lead", "worker"}
-HIGH_EFFORTS = {"high", "xhigh", "max"}
+HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
 
 
 def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
@@ -114,7 +117,7 @@ def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, 
                 return matches[0]
             if matches:
                 return None
-    if source.kind in {"pre_tool_use", "post_tool_use"} and session:
+    if source.kind in {"pre_tool_use", "post_tool_use", "post_tool_failed"} and session:
         matches = [
             (key, run.session_id) for key, run in state.active_runs.items()
             if key.startswith(f"{provider}:")
@@ -209,6 +212,7 @@ def _transition(
                 "plugin_root": environ.get(
                     "SYMPHONY_PLUGIN_ROOT", str(Path(__file__).resolve().parents[1])
                 ),
+                "runtime_root": environ.get("SYMPHONY_PINNED_RUNTIME"),
                 "hook_schema_version": HOOK_SCHEMA_VERSION,
                 "last_fault": _drain_fault(environ),
                 "profile": _entitlement_profile(
@@ -224,6 +228,21 @@ def _transition(
         )
         state, heartbeat_actions = reduce(state, heartbeat)
         actions += heartbeat_actions
+        retained = environ.get("SYMPHONY_PINNED_RUNTIME")
+        original = str(heartbeat.payload["plugin_root"])
+        if retained and (source.kind == "session_heartbeat" or not Path(original).is_dir()):
+            executable = "python.exe" if os.name == "nt" else "python3"
+            text = (
+                f"Symphony retained the reviewed runtime at {retained}. "
+                "If the loaded plugin cache disappears, use this retained root for Symphony references. "
+            )
+            bootstrap = environ.get("SYMPHONY_BOOTSTRAP_CODE")
+            if provider == "codex" and bootstrap:
+                arguments = [executable, "-I", "-c", bootstrap, original, provider, "--check-activation"]
+                command = ("& " + " ".join("'" + value.replace("'", "''") + "'" for value in arguments)
+                           if os.name == "nt" else shlex.join(arguments))
+                text += f"Check activation through the verified launcher: {command}"
+            actions += (Action("inject_context", {"text": text}),)
 
     # Every event from the owning session is evidence it is still alive, which
     # is what stops a second terminal from declaring this run abandoned.
@@ -270,10 +289,14 @@ def _transition(
             ):
                 # SubagentStart context reaches the starting agent, not the root.
                 actions += (Action("inject_context", {"text": _claude_lead_guidance(state)}),)
-    elif source.kind == "post_tool_use":
+    elif source.kind in {"post_tool_use", "post_tool_failed"}:
+        state = _discard_failed_spawn(state, source, provider)
         state, parent_actions = _consume_parent_actions(state)
         actions += parent_actions
     elif source.kind in {"stop_requested", "interrupt"}:
+        if source.kind == "stop_requested":
+            state, reconciliation_actions = _reconcile_session(state, source, payload)
+            actions += reconciliation_actions
         state, lifecycle_actions = reduce(state, source)
         actions += lifecycle_actions
 
@@ -509,9 +532,31 @@ def _handle_prompt(
         # about, at whatever model the session happened to be set to.
         if not state.enabled and not state.active_run:
             return state, ()
-        return state, (Action("inject_context", {"text": _task_guidance(state, prompt, provider)}),)
+        return state, (Action("inject_context", {"text": _task_guidance(state, prompt, provider, str(source.payload.get("session_id") or ""))}),)
 
     name, argument = control
+    if name == "boost":
+        session_id = str(source.payload.get("session_id") or "")
+        levels = ("xhigh", "max", "ultra") if provider == "codex" else ("xhigh", "max")
+        requested = argument or levels[-1]
+        if requested not in {*levels, "off", "reset"}:
+            return state, (Action("inject_context", {"text": f"Use Symphony boost [{'|'.join(levels)}|off]; reset restores high effort."}),)
+        if not session_id:
+            return state, (Action("inject_context", {"text": "Symphony boost requires an observed session identity."}),)
+        if requested not in {"off", "reset"}:
+            selected = assessor_selection(_snapshot(state, provider), requested)
+            if not selected["effort"]:
+                return state, (Action("inject_context", {"text": f"Assessor effort {requested} is unsupported for {selected['model'] or 'this account'}. Preference unchanged; choose a supported native level or off."}),)
+        configuration = dict(state.configuration)
+        preferences = dict(configuration.get("assessor_boosts", {}))
+        key = f"{provider}:{session_id}"
+        if requested in {"off", "reset"}:
+            preferences.pop(key, None)
+        else:
+            preferences[key] = requested
+        configuration["assessor_boosts"] = preferences
+        state = replace(state, configuration=configuration)
+        return state, (Action("inject_context", {"text": _boost_status(state, provider, session_id)}),)
     if name == "help":
         return state, (Action("inject_context", {"text": _help(provider)}),)
     if name == "version":
@@ -528,13 +573,13 @@ def _handle_prompt(
         next_state, actions = reduce(state, _derived(state, source, "enable"))
         if argument:
             actions += (
-                Action("inject_context", {"text": _task_guidance(next_state, argument, provider)}),
+                Action("inject_context", {"text": _task_guidance(next_state, argument, provider, str(source.payload.get("session_id") or ""))}),
             )
         return next_state, actions
     if name == "start":
         if not argument:
             return state, (Action("inject_context", {"text": "Symphony start requires a task."}),)
-        return state, (Action("inject_context", {"text": _task_guidance(state, argument, provider)}),)
+        return state, (Action("inject_context", {"text": _task_guidance(state, argument, provider, str(source.payload.get("session_id") or ""))}),)
     if name == "proceed":
         profile = _applied_profile(state, provider)
         standing = _standing_route(state, provider)
@@ -573,51 +618,50 @@ def _handle_prompt(
     return state, (Action("inject_context", {"text": f"Unknown Symphony control: {name}. Use {_native_help(provider)}."}),)
 
 
-def _task_guidance(state: ProjectState, task: str, provider: str) -> str:
+def _task_guidance(state: ProjectState, task: str, provider: str, session_id: str = "") -> str:
     """Guidance for substantive work: recover an active run, or open a new one."""
     if _applied_profile(state, provider) == NO_PROFILE:
         return "Symphony has no launchable route in this account's available model roster."
     if state.active_run:
         return _recovery_guidance(state)
-    return _assessment_guidance(task, provider, state)
+    return _assessment_guidance(task, provider, state, session_id)
 
 
 def _parse_control(prompt: str) -> tuple[str, str] | None:
-    if prompt.strip() == "enable":
+    # Controls occupy the prompt's first line. Mentions in bug reports, quoted
+    # text and fenced examples cannot issue lifecycle commands.
+    prompt = prompt.strip()
+    if prompt == "enable":
         return "enable", ""
-    if prompt.startswith("/symphony:"):
-        first_line = prompt.splitlines()[0]
-        command, _, argument = first_line.partition(" ")
-        name = command.removeprefix("/symphony:").strip()
-        return (name, argument.strip()) if name in CONTROLS else (name or "unknown", argument.strip())
     marker = "$symphony:symphony"
-    if marker in prompt:
-        before, after = prompt.split(marker, 1)
-        tail = after.strip()
+    if prompt == marker or prompt.startswith(marker + " ") or prompt.startswith(marker + "\n"):
+        tail = prompt[len(marker):].strip()
         if not tail:
             return "help", ""
         name, _, argument = tail.partition(" ")
-        if name in CONTROLS:
-            return name, argument.strip()
-        task = " ".join(part for part in (before.strip(), tail) if part).strip()
-        if task.lower().startswith("use "):
-            task = task[4:].strip()
-        if task.lower().startswith("and "):
-            task = task[4:].strip()
-        return "start", task
-    prefix = "SYMPHONY_CONTROL:"
-    lines = prompt.splitlines()
-    arguments = next(
-        (line.split(":", 1)[1].strip() for line in lines if line.strip().startswith("ARGUMENTS:")),
-        "",
-    )
-    for line in lines:
-        if line.strip().startswith(prefix):
-            value = line.strip()[len(prefix) :].strip()
-            name, _, argument = value.partition(" ")
-            argument = argument.strip() or arguments
-            return (name, argument) if name in CONTROLS else (name or "unknown", argument)
-    return None
+        argument = argument.strip()
+        if name not in CONTROLS:
+            return "start", tail
+    elif prompt.startswith("/symphony:"):
+        name, _, argument = prompt.removeprefix("/symphony:").partition(" ")
+        argument = argument.strip()
+    elif prompt.startswith("SYMPHONY_CONTROL:"):
+        lines = prompt.splitlines()
+        name, _, argument = lines[0].removeprefix("SYMPHONY_CONTROL:").strip().partition(" ")
+        argument = argument.strip()
+        if not argument and len(lines) == 2 and lines[1].startswith("ARGUMENTS:"):
+            argument = lines[1].removeprefix("ARGUMENTS:").strip()
+        elif len(lines) > 1:
+            return None
+    else:
+        return None
+    # Task controls carry prose; simple controls accept only documented flags.
+    flags = {"stop": {"", "--force"}, "agents": {"", "--all"}}
+    if name in {"disable", "help", "proceed", "status", "version"} and argument:
+        return None
+    if name in flags and argument not in flags[name]:
+        return None
+    return name or "unknown", argument
 
 
 def _derived(
@@ -634,7 +678,7 @@ def _derived(
     silently dropped as a replay, which also swallows the force-stop escape.
     """
     candidate = f"{source.event_id}:{suffix}:{kind}"
-    if any(item.event_id == candidate for item in state.event_history):
+    if source.kind == "user_prompt" and any(item.event_id == candidate for item in state.event_history):
         candidate = f"{candidate}:{source.observed_at}"
     return Event(candidate, kind, source.observed_at, payload or {})
 
@@ -657,7 +701,7 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         None,
     )
     pending: Mapping[str, object] = {}
-    if source.kind == "subagent_started" and current is None:
+    if current is None:
         state, pending = _consume_pending_delegation(state, source.payload)
     if (
         source.payload.get("provider") == "claude"
@@ -673,7 +717,7 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     terminal = source.kind == "subagent_stopped"
     status = str(source.payload.get("status") or ("completed" if terminal else "working"))
     role = str(pending.get("role") or _observed_role(source.payload) or (current.role if current else "worker"))
-    if role == "lead" and source.kind == "subagent_started":
+    if role == "lead" and (source.kind == "subagent_started" or not state.active_run.lead_identity):
         owner_generation = state.active_run.owner_generation
         if (
             state.active_run.status in {"interrupted", "recovering"}
@@ -734,6 +778,8 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                 expected = {
                     "identity": str(identity), "model": model, "effort": effort,
                 }
+                if assessment.get("_boost_assessment_pending"):
+                    expected["approval_required"] = "A valid boosted assessor result is required before selecting the lead."
                 if resolved_profile is not None and assessment.get("size"):
                     route = route_for(Assessment(
                         str(assessment["size"]), str(assessment["complexity"]),
@@ -762,16 +808,44 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         "state": status,
     }
     child_metadata = source.payload.get("_symphony_child_metadata", ())
-    model = pending.get("model") or (
+    named_model, named_effort = _agent_label_model_effort(
+        str(source.payload.get("agent_type") or source.payload.get("task_name") or ""), role
+    )
+    model = pending.get("model") or named_model or (
         source.payload.get("model")
         if "model" in child_metadata or not current or not current.requested_tier
         else current.requested_tier
     )
-    effort = pending.get("effort") or (
+    effort = pending.get("effort") or named_effort or (
         source.payload.get("model_reasoning_effort")
         if "model_reasoning_effort" in child_metadata or not current or not current.requested_effort
         else current.requested_effort
     )
+    if role == "assessor":
+        # Native child configuration outranks a requested label or queued spawn.
+        if "model" in child_metadata:
+            model = source.payload.get("model")
+        if "model_reasoning_effort" in child_metadata:
+            effort = source.payload.get("model_reasoning_effort")
+        if not current and state.active_run:
+            session = str(source.payload.get("session_id") or "")
+            provider = str(source.payload.get("provider") or detect_provider(source.payload))
+            requested = _boost_preference(state, provider, session)
+            queued = pending.get("assessor_selection")
+            remaining = [item.get("assessor_selection") for item in state.active_run.assessment.get("_pending_delegations", ())
+                         if isinstance(item, Mapping) and item.get("role") == "assessor" and item.get("assessor_selection")
+                         and item["assessor_selection"].get("requested_effort") != "high"]
+            if not queued and len(remaining) == 1:
+                queued = remaining[0]
+            if requested != "off" or queued or remaining:
+                recorded = dict(state.active_run.assessment)
+                expected = dict(recorded.get("_assessor_expected_routes", {}))
+                expected[str(identity)] = queued or ({"model": "unreconciled launch", "effort": "unknown"}
+                                                   if len(remaining) > 1 else assessor_selection(_snapshot(state, provider), requested))
+                recorded["_assessor_expected_routes"] = expected
+                if expected[str(identity)].get("requested_effort") != "high":
+                    recorded["_boost_assessment_pending"] = True
+                state = replace(state, active_run=replace(state.active_run, assessment=recorded))
     if model:
         update["requested_tier"] = str(model)
     if effort:
@@ -789,7 +863,16 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             ),
             None,
         )
-        if not observed_assessor or observed_assessor.requested_effort not in HIGH_EFFORTS:
+        expected = state.active_run.assessment.get("_assessor_expected_routes", {}).get(str(identity), {})
+        mismatch = bool(expected and observed_assessor and (
+            observed_assessor.requested_tier != expected.get("model")
+            or observed_assessor.requested_effort != expected.get("effort")
+        ))
+        if mismatch:
+            actions += (Action("inject_context", {"text":
+                f"Assessor boost was not observed at {expected['model']}/{expected['effort']}. "
+                "Retry with the effective boosted route before selecting a lead."}),)
+        elif not observed_assessor or (not expected and observed_assessor.requested_effort not in HIGH_EFFORTS):
             actions += (
                 Action(
                     "inject_context",
@@ -812,6 +895,9 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                     ),
                 )
             else:
+                recorded = dict(state.active_run.assessment)
+                recorded.pop("_boost_assessment_pending", None)
+                state = replace(state, active_run=replace(state.active_run, assessment=recorded))
                 state, assessment_actions = _accept_assessment(
                     state,
                     source,
@@ -855,6 +941,21 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         if str(identity) != state.active_run.lead_identity:
             return state, actions
         successful = status.lower() in {"completed", "done", "success", "succeeded"}
+        outcome = {"status": status}
+        report = str(source.payload.get("last_assistant_message") or "")
+        outcome_lines = [line for line in report.splitlines() if line.strip().startswith("SYMPHONY_OUTCOME:")]
+        if outcome_lines:
+            try:
+                reported = json.loads(outcome_lines[-1].strip().removeprefix("SYMPHONY_OUTCOME:").strip())
+                reported_status = reported.get("status") if isinstance(reported, Mapping) else None
+                if not isinstance(reported_status, str) or not reported_status:
+                    raise ValueError("outcome status missing")
+                outcome = {"status": reported_status}
+                successful = successful and reported_status.lower() in {"completed", "done", "success", "succeeded"}
+            except (TypeError, ValueError):
+                successful = False
+                actions += (Action("inject_context", {"text":
+                    "The lead ended with a malformed SYMPHONY_OUTCOME report. Reconcile its result or retry the lead; the run remains recoverable."}),)
         assessment = state.active_run.assessment
         if not successful and str(identity) == state.active_run.lead_identity and assessment.get("_pending_lead_completion"):
             assessment = dict(assessment)
@@ -940,7 +1041,7 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             assessment["_pending_lead_completion"] = {
                 "identity": str(identity),
                 "owner_generation": state.active_run.owner_generation,
-                "outcome": {"status": status},
+                "outcome": outcome,
             }
             state = replace(state, active_run=replace(state.active_run, assessment=assessment))
             actions += (
@@ -956,7 +1057,6 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         completion_kind = "lead_completed" if successful else "lead_failed"
         # Only the lifecycle fact is recorded. The lead's prose belongs to the
         # host transcript, not to Symphony's durable state.
-        outcome = {"status": status}
         state, completion_actions = reduce(
             state,
             _derived(
@@ -1071,12 +1171,26 @@ def _prepare_delegation(
             )
     if role == "assessor" and effort not in HIGH_EFFORTS:
         return state, (_block_tool("The Symphony assessor requires a strong model at high effort or above."),)
+    if role == "assessor":
+        session_id = str(source.payload.get("session_id") or "")
+        requested = _boost_preference(state, provider, session_id)
+        snapshot = _snapshot(state, provider)
+        selected = assessor_selection(snapshot, requested)
+        if model in snapshot.supported_efforts and effort not in snapshot.supported_efforts[model]:
+            return state, (_block_tool(f"Assessor effort {effort} is unsupported for {model} in this account profile."),)
+        if requested != "off" and (model, effort) != (selected["model"], selected["effort"]):
+            return state, (_block_tool(
+                f"Assessor boost route mismatch: requested {selected['requested_model']}/{selected['requested_effort']}; "
+                f"effective {selected['model']}/{selected['effort']}. Spawn that assessor with explicit model and effort."
+            ),)
 
     actions: tuple[Action, ...] = ()
     objective = _tool_objective(values)
     if role == "assessor" and not state.active_run:
         state, actions = _open_run(state, source, objective)
     if role == "lead":
+        if state.active_run.assessment.get("_boost_assessment_pending"):
+            return state, (_block_tool("A valid boosted assessor result is required before selecting the lead."),)
         assessment = _assessment_from_marker(values, "SYMPHONY_ROUTE:")
         if assessment is None:
             return state, (_block_tool("Add a valid SYMPHONY_ROUTE JSON line to the lead packet, then retry."),)
@@ -1130,7 +1244,12 @@ def _prepare_delegation(
     if role == "consultant" and not _decision_markers(values):
         return state, (_block_tool("Add SYMPHONY_DECISION JSON with decision-local size and complexity, then retry."),)
 
-    state = _queue_pending_delegation(state, role, objective, model, effort)
+    launch_selection = None
+    if role == "assessor":
+        # Freeze the accepted launch even when boost is off; a later control
+        # changes subsequent assessors, not an already queued native spawn.
+        launch_selection = dict(selected, model=model, effort=effort)
+    state = _queue_pending_delegation(state, role, objective, model, effort, launch_selection)
     return state, actions
 
 
@@ -1147,6 +1266,9 @@ def _version_text(environ: Mapping[str, str]) -> str:
         f"Symphony {PLUGIN_VERSION} is running this hook, hook schema "
         f"{HOOK_SCHEMA_VERSION}, loaded from {root}."
     )
+    retained = environ.get("SYMPHONY_PINNED_RUNTIME")
+    if retained:
+        text += f" Executing its verified retained runtime at {retained}."
     waiting = _newer_build_on_disk(root)
     if waiting:
         text += (
@@ -1439,7 +1561,7 @@ def _agent_label_model_effort(label: str, role: str) -> tuple[str, str]:
     model, separator, effort = setting.rpartition("-")
     return (
         (model, effort)
-        if separator and effort in {"low", "medium", "high", "xhigh", "max"}
+        if separator and effort in {"low", "medium", "high", "xhigh", "max", "ultra"}
         else ("", "")
     )
 
@@ -1457,12 +1579,31 @@ def _block_tool(reason: str) -> Action:
     return Action("block_tool", {"reason": reason})
 
 
+def _discard_failed_spawn(state: ProjectState, source: Event, provider: str) -> ProjectState:
+    if not state.active_run or "agent" not in str(source.payload.get("tool_name") or "").lower():
+        return state
+    response = source.payload.get("tool_response") or source.payload.get("tool_result") or {}
+    failed = source.kind == "post_tool_failed" or (isinstance(response, Mapping) and (
+        response.get("is_error") is True or response.get("status") in {"failed", "error", "rejected"}
+    ))
+    if not failed:
+        return state
+    values = source.payload.get("tool_input") or source.payload.get("input") or {}
+    role = _marker_value(values, "SYMPHONY_ROLE:")
+    model, effort = _requested_model_effort(values, provider, role)
+    state, _ = reduce(state, Event(source.event_id + ":delegation_launch_failed", "delegation_launch_failed", source.observed_at, {
+        "role": role, "requested_tier": model, "requested_effort": effort,
+    }))
+    return state
+
+
 def _queue_pending_delegation(
     state: ProjectState,
     role: str,
     objective: str,
     model: str,
     effort: str,
+    assessor_route: Mapping | None = None,
 ) -> ProjectState:
     if not state.active_run:
         return state
@@ -1476,6 +1617,10 @@ def _queue_pending_delegation(
             "effort": effort,
         }
     )
+    if assessor_route:
+        pending[-1]["assessor_selection"] = dict(assessor_route)
+        if assessor_route.get("requested_effort") != "high":
+            assessment["_boost_assessment_pending"] = True
     # ponytail: bound unmatched host events; add ID correlation only if a provider exposes it.
     assessment["_pending_delegations"] = pending[-32:]
     return replace(state, active_run=replace(state.active_run, assessment=assessment))
@@ -1595,11 +1740,13 @@ def _stop_block_text(
     active = ", ".join(map(str, payload.get("active", ())))
     reason = payload.get("reason") or f"active work remains: {active}"
     if reason == "lead_outcome_missing":
-        reason = "no lead has returned an outcome yet"
+        reason = "the tracked lead has no reconciled outcome; inspect its ended or interrupted result and recover or retry it"
+    elif reason == "lead_not_started":
+        reason = "assessment work has ended; reconcile its result and launch the selected lead"
     force = "/symphony:stop --force" if provider == "claude" else "$symphony:symphony stop --force"
     return (
         f"Symphony stop is blocked for {scope}: {reason}. Let the tracked agents finish, "
-        f"wait for the host stop timeout, or run `{force}` to end the run and "
+        f"return to this run on the next turn, or run `{force}` to end the run and "
         "record what was not reconciled. Keep protocol markers out of the final answer, "
         "and report completion only after durable status confirms it."
     )
@@ -1688,13 +1835,17 @@ def _render_actions(
                 "the registered lead of this run. The run is unchanged."}))
         elif action.kind == "wait_for_delegations":
             identities = ", ".join(map(str, action.payload.get("active", ())))
+            reason = f"active agents: {identities}" if identities else "pending launches or unreconciled results"
             rendered.append(Action("inject_context", {"text":
-                f"The lead reported completion while these Symphony agents are still active: {identities}. "
-                "Wait for them to finish before completing the run."}))
+                f"The lead reported completion while Symphony still tracks {reason}. "
+                "Reconcile this work before completing the run."}))
         elif action.kind == "block_completion":
-            rendered.append(Action("inject_context", {"text":
-                "Symphony refused this completion because the lead returned no outcome. Report the outcome, "
-                "then complete."}))
+            text = (
+                "Symphony invalidated the earlier lead outcome after later work failed. Register a recovered lead and integrate the result before reporting completion."
+                if action.payload.get("reason") == "lead_recovery_required"
+                else "Symphony refused this completion because the lead returned no valid outcome. Reconcile the outcome before completing."
+            )
+            rendered.append(Action("inject_context", {"text": text}))
         elif action.kind not in INTERNAL_ACTIONS:
             # A decision the reducer made must never die on the way out. Seven
             # of them did, which is how two leads ran at once with nobody told.
@@ -1730,7 +1881,7 @@ def _claude_lead_guidance(state: ProjectState) -> str:
     )
 
 
-def _claude_guidance(state: ProjectState | None) -> str:
+def _claude_guidance(state: ProjectState | None, session_id: str = "") -> str:
     """Name the exact agent types, how to wait, and where user-facing skills run.
 
     The root is the cheapest model in the session. Left to derive a packaged
@@ -1738,6 +1889,8 @@ def _claude_guidance(state: ProjectState | None) -> str:
     delivers background results it busy-polled the agent's output file.
     """
     snapshot = _snapshot(state, "claude") if state else snapshot_for("claude")
+    requested = _boost_preference(state, "claude", session_id) if state else "off"
+    assessor = assessor_selection(snapshot, requested)
     cells = _claude_cells(snapshot, "lead")
     access = ""
     if state and state.activation.get("claude", {}).get("claude_probe_attempted"):
@@ -1746,7 +1899,7 @@ def _claude_guidance(state: ProjectState | None) -> str:
                   "Claude Code could not verify both Sonnet and Opus; this task uses the Sonnet fallback. ")
     return (
         access +
-        f"On Claude Code, spawn the assessor as `symphony:symphony-assessor-{snapshot.tiers['strongest']}-high` "
+        f"On Claude Code, spawn the assessor as `symphony:symphony-assessor-{assessor['model']}-{assessor['effort']}` "
         "and the lead by its assessed cell: " + "; ".join(cells) + ". "
         "Agents run in the background: after a spawn, end your turn and Claude Code wakes you with the "
         "agent's result. Never wait by polling with Bash, sleep, Monitor, or by reading the agent's output "
@@ -1759,8 +1912,10 @@ def _claude_guidance(state: ProjectState | None) -> str:
     )
 
 
-def _assessment_guidance(task: str, provider: str = "", state: ProjectState | None = None) -> str:
-    claude = _claude_guidance(state) if provider == "claude" else ""
+def _assessment_guidance(task: str, provider: str = "", state: ProjectState | None = None, session_id: str = "") -> str:
+    if state is not None and provider:
+        session_id = session_id or str(state.activation.get(provider, {}).get("session_id") or "")
+    claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
         "On Codex, use `fork_turns=\"none\"` for assessor and lead, name them "
         "`symphony_<role>_<model>_<effort>`, and require the assessor's final response to contain one exact "
@@ -1769,8 +1924,17 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
         if provider == "codex"
         else ""
     )
+    boost = ""
+    if state is not None and provider:
+        session_id = session_id or str(state.activation.get(provider, {}).get("session_id") or "")
+        requested = _boost_preference(state, provider, session_id)
+        selected = assessor_selection(_snapshot(state, provider), requested)
+        model, effort = selected["model"], selected["effort"]
+        spawn = (f"Use agent type `symphony:symphony-assessor-{model}-{effort}`. " if provider == "claude"
+                 else f"Pass `model=\"{model}\"`, `reasoning_effort=\"{effort}\"`, and `fork_turns=\"none\"`. ")
+        boost = _boost_status(state, provider, session_id) + " " + spawn
     return (
-        "Symphony owns execution topology. Keep the root thin. Spawn a strong/high assessor with explicit model "
+        "Symphony owns execution topology. Keep the root thin. Spawn the selected assessor with explicit model "
         "and effort and put `SYMPHONY_ROLE: assessor` on its own line. Then select the lead mechanically from the "
         "nine-cell matrix; the assessor must not become the lead. Spawn the lead with explicit model and effort, "
         "put `SYMPHONY_ROLE: lead` on its own line, and include one exact line in its task: "
@@ -1780,8 +1944,27 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
         "consultants also need SYMPHONY_DECISION JSON with decision-local size and complexity. "
         "Relay the task in full: the lead cannot see this conversation, so if the request has several parts, "
         "every part goes in the packet and the acceptance check covers all of them. "
-        f"{codex}{claude}Task: {task}"
+        f"{boost}{codex}{claude}Task: {task}"
     )
+
+
+def _boost_preference(state: ProjectState, provider: str, session_id: str) -> str:
+    requested = str(state.configuration.get("assessor_boosts", {}).get(f"{provider}:{session_id}", "off"))
+    levels = {"xhigh", "max", "ultra"} if provider == "codex" else {"xhigh", "max"}
+    return requested if requested in levels else "off"
+
+
+def _boost_status(state: ProjectState, provider: str, session_id: str) -> str:
+    requested = _boost_preference(state, provider, session_id)
+    record = _session_profile_record(state, provider, session_id)
+    snapshot = snapshot_for(provider, str(record.get("profile") or "") or None)
+    selected = assessor_selection(snapshot, requested)
+    text = (f"Assessor boost: {requested}; requested {selected['requested_model'] or 'unavailable'}/{selected['requested_effort']}; "
+            f"effective {selected['model'] or 'unavailable'}/{selected['effort'] or 'unsupported'}. "
+            f"Scope: current project, {provider} session {session_id or 'unverified'}, assessors only; applies to the next spawn.")
+    if selected['effort'] != selected['requested_effort']:
+        text += " Requested effort is unsupported by the current account profile; it cannot launch."
+    return text
 
 
 def _governance(state: ProjectState) -> str:
@@ -1798,10 +1981,16 @@ def _recovery_guidance(state: ProjectState) -> str:
     run = state.active_run
     if not run:
         return "Symphony has no active run."
-    lead = f" Lead {run.lead_identity} [{_governance(state)}]." if run.lead_identity else ""
+    records = ", ".join(f"{item.role} {item.identity} ({item.state})" for item in run.delegations)
+    pending = run.assessment.get("_pending_delegations", ())
+    awaiting = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
+    lead = f" Lead {run.lead_identity} [{_governance(state)}]." if run.lead_identity else " Lead not yet observed."
     return (
-        f"Symphony run {run.run_id} remains active. Reconcile observed agents, preserve "
-        f"ownership, and wait for the lead.{lead}"
+        f"Symphony run {run.run_id} remains {run.status}.{lead} "
+        f"Observed agents: {records or 'none'}. "
+        + (f"Awaiting host launch confirmation: {awaiting}. " if awaiting else "")
+        + "Reconcile returned or interrupted results, preserve ownership, and continue unfinished work. "
+        "An ended host turn does not complete this run; report completion only when durable status confirms it."
     )
 
 
@@ -1846,6 +2035,8 @@ def _status(
         f"Symphony ({scope}): {'enabled' if state.enabled else 'disabled'}",
         f"Hooks: {'guarded' if guarded else 'pending verification'}",
     ]
+    if provider:
+        lines.append(_boost_status(state, provider, session_id))
     if provider == "claude" and activation.get("claude_probe_attempted"):
         lines.append(f"Claude model check: {activation.get('profile') or 'unverified (Sonnet fallback)'}")
     if not state.active_run:
@@ -1875,6 +2066,12 @@ def _status(
             lines.append(f"Lead route: {model}{f'/{effort}' if effort else ''}")
         if state.active_run.lead_identity:
             lines.append(f"Lead: {state.active_run.lead_identity} [{_governance(state)}]")
+        pending = assessment.get("_pending_delegations", ())
+        if pending:
+            roles = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
+            lines.append(f"Awaiting host launch confirmation: {roles}")
+        if state.active_run.outcome:
+            lines.append("Lead outcome recorded; tracked work still requires reconciliation.")
         if not state.enabled:
             control = _control_name("enable", provider) if provider else "enable"
             lines.append(
@@ -1925,8 +2122,8 @@ def _native_help(provider: str) -> str:
 
 def _help(provider: str) -> str:
     if provider == "claude":
-        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:help."
-    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|reassess|proceed|stop|version|help."
+        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:boost [max|ultra|off], /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:help."
+    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|boost [max|ultra|off]|reassess|proceed|stop|version|help."
 
 
 def _fault_log(environ: Mapping[str, str]) -> Path:
