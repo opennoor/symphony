@@ -96,7 +96,9 @@ class RuntimeRetentionTests(unittest.TestCase):
                                               str(root), "codex", "--check-activation"], cwd=directory,
                                              env={**env, "CODEX_SESSION_ID": "old-session"}, capture_output=True,
                                              text=True, check=False)
-                    self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+                    self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr + json.dumps({
+                        "expected_source": str(root.resolve()), "expected_runtime": str(retained.resolve()),
+                        "activation": document["activation"][provider]}, sort_keys=True))
                 result, _ = self.run_hook(commands["Stop"], root, provider, directory, payloads["Stop"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 document = json.loads(state_file.read_text())
