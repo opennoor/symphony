@@ -37,7 +37,7 @@ def verified(root, snapshot=False):
 def main():
     source = Path(sys.argv[1]).resolve()
     provider = sys.argv[2]
-    base = Path(os.environ.get("SYMPHONY_RUNTIME_DIR", Path.home() / ".symphony" / "runtimes"))
+    base = Path(os.environ.get("SYMPHONY_RUNTIME_DIR", Path.home() / ".symphony" / "runtimes")).resolve()
     # ponytail: retain snapshots; remove old ones only after their sessions exit.
     target = base / DIGEST
     if not verified(target, snapshot=True):
