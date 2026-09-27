@@ -39,6 +39,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                "SYMPHONY_STATE_DIR": str(directory / "state"), "SYMPHONY_PROFILE": "full",
                "PYTHONPATH": str(directory),
                "CODEX_HOME": str(directory / "empty codex home")}
+        if os.name == "nt":
+            # The VM invokes Python by absolute path and does not install it
+            # globally; provide that same interpreter to the captured hook.
+            env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
         result = subprocess.run(command, input=json.dumps(payload), capture_output=True,
                                 text=True, env=env, cwd=directory, timeout=20, check=False)
         return result, env
