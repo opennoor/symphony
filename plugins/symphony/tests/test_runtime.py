@@ -965,6 +965,77 @@ class RuntimeTests(unittest.TestCase):
         stop = {**self.payload(""), "hook_event_name": "Stop"}
         self.assertEqual(self.output(handle(stop, self.environ))["decision"], "block")
 
+    def test_same_lead_followup_recovers_without_another_start_hook(self):
+        choice = route_choice()
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(Delegation("lead", "lead", "task", "working",
+                                                       choice["model"], choice["effort"]),)))
+        stopped = {**self.payload(""), "hook_event_name": "SubagentStop",
+                   "agent_id": "lead", "agent_type": "default"}
+        # Native Codex followup_task emits another SubagentStop for the same
+        # identity, without a second SubagentStart.
+        handle({**stopped, "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"blocked"}'}, self.environ)
+        self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "recovering")
+        self.assertIn("tracked lead has no reconciled outcome",
+                      self.output(handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ))["reason"])
+
+        handle({**stopped, "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+
+        state = StateStore(self.state_root).load(self.project)
+        self.assertIsNone(state.active_run)
+        self.assertEqual(state.recent_runs[-1].outcome, {"status": "completed"})
+
+    def test_same_lead_followup_recovers_a_persisted_150_run(self):
+        choice = route_choice()
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(Delegation("lead", "lead", "task", "working",
+                                                       choice["model"], choice["effort"]),)))
+        stopped = {**self.payload(""), "hook_event_name": "SubagentStop",
+                   "agent_id": "lead", "agent_type": "default"}
+        handle({**stopped, "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"blocked"}'}, self.environ)
+        store = StateStore(self.state_root)
+        state = store.load(self.project)
+        legacy = replace(state.active_run, assessment={key: value for key, value in state.active_run.assessment.items()
+                                                       if key != "_retryable_lead"})
+        store.save(self.project, replace(state, active_run=legacy,
+                                         active_runs={"codex:codex-session": legacy},
+                                         event_history=(*state.event_history, Event(
+                                             "foreign-worker", "delegation_updated", legacy.updated_at,
+                                             {"identity": "another-session-worker", "role": "worker", "state": "failed"}
+                                         ))))
+
+        handle({**stopped, "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+
+        self.assertIsNone(store.load(self.project).active_run)
+
+    def test_worker_failure_after_blocked_lead_requires_new_lead(self):
+        choice = route_choice()
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(
+                                   Delegation("lead", "lead", "task", "working", choice["model"], choice["effort"]),
+                                   Delegation("worker", "worker", "task", "working", "model", "high"),
+                               )))
+        stopped = {**self.payload(""), "hook_event_name": "SubagentStop"}
+        handle({**stopped, "agent_id": "lead", "last_assistant_message":
+                'SYMPHONY_OUTCOME: {"status":"blocked"}'}, self.environ)
+        store = StateStore(self.state_root)
+        state = store.load(self.project)
+        legacy = replace(state.active_run, assessment={key: value for key, value in state.active_run.assessment.items()
+                                                       if key != "_retryable_lead"})
+        store.save(self.project, replace(state, active_run=legacy,
+                                         active_runs={"codex:codex-session": legacy}))
+        handle({**stopped, "agent_id": "worker", "status": "FAILED"}, self.environ)
+        handle({**stopped, "agent_id": "lead", "last_assistant_message":
+                'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+
+        state = StateStore(self.state_root).load(self.project)
+        self.assertIsNotNone(state.active_run)
+        self.assertEqual(state.active_run.status, "recovering")
+        self.assertIsNone(state.active_run.outcome)
+
     def test_unknown_payload_fields_do_not_disturb_the_guard(self):
         self.open_run("Ship it")
         started = {
@@ -1829,6 +1900,29 @@ class RuntimeTests(unittest.TestCase):
                 finished = StateStore(self.state_root).load(self.project)
                 self.assertIsNone(finished.active_run)
                 self.assertEqual(finished.recent_runs[-1].status, "completed")
+
+    def test_replayed_deferred_lead_result_cannot_hide_late_worker_failure(self):
+        choice = route_choice()
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(
+                                   Delegation("lead", "lead", "task", "working", choice["model"], choice["effort"]),
+                                   Delegation("worker", "worker", "task", "working", "model", "high"),
+                                   Delegation("consultant", "consultant", "decision", "working", "model", "high"),
+                               )))
+        stopped = {**self.payload(""), "hook_event_name": "SubagentStop"}
+        handle({**stopped, "agent_id": "consultant", "last_assistant_message": "Unclassified advice"}, self.environ)
+        lead = {**stopped, "agent_id": "lead", "last_assistant_message": "Integrated the task"}
+        handle(lead, self.environ)
+        handle({**stopped, "agent_id": "worker", "last_assistant_message": "Failed", "status": "failed"}, self.environ)
+        handle(lead, self.environ)
+        handle({**stopped, "agent_id": "consultant", "last_assistant_message":
+                'SYMPHONY_DECISION: {"size":"small","complexity":"simple"}'}, self.environ)
+
+        state = StateStore(self.state_root).load(self.project)
+        self.assertIsNotNone(state.active_run)
+        self.assertEqual(state.active_run.status, "recovering")
+        self.assertIsNone(state.active_run.outcome)
 
     def test_failed_assessor_spawn_removes_only_its_pending_intent(self):
         for provider in ("codex", "claude"):
