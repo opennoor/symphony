@@ -700,6 +700,11 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         (item for item in state.active_run.delegations if item.identity == str(identity)),
         None,
     )
+    if source.kind == "subagent_stopped" and any(
+        record.event_id == f"{source.event_id}:delegation:delegation_updated"
+        for record in state.event_history
+    ):
+        return state, opening
     pending: Mapping[str, object] = {}
     if current is None:
         state, pending = _consume_pending_delegation(state, source.payload)
@@ -1035,6 +1040,31 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             updated_assessment = dict(assessment)
             updated_assessment.pop("_lead_route_mismatch", None)
             state = replace(state, active_run=replace(state.active_run, assessment=updated_assessment))
+        # 1.5.0 persisted lead failures without the retry marker. Its latest
+        # recovery event still distinguishes a failed lead from a later failed
+        # worker, whose old lead result must stay invalid.
+        run_identities = {item.identity for item in state.active_run.delegations}
+        legacy_recovery = next((record for record in reversed(state.event_history)
+                                if record.observed_at >= state.active_run.started_at
+                                and record.payload.get("identity") in run_identities
+                                and (record.kind == "lead_failed" or
+                                     (record.kind == "delegation_updated"
+                                      and record.payload.get("role") != "lead"
+                                      and str(record.payload.get("state") or "").lower() in {
+                                          "failed", "interrupted", "cancelled", "canceled", "error", "terminated"
+                                      }))), None)
+        if (successful and state.active_run.status == "recovering"
+                and ((current and current.state == "interrupted")
+                     or assessment.get("_retryable_lead") == str(identity)
+                     or ("_retryable_lead" not in assessment and legacy_recovery
+                         and legacy_recovery.kind == "lead_failed"
+                         and legacy_recovery.payload.get("identity") == str(identity)))):
+            state, recovery_actions = reduce(
+                state, _derived(state, source, "lead_started", {
+                    "identity": str(identity), "owner_generation": state.active_run.owner_generation,
+                }, "lead-followup"),
+            )
+            actions += recovery_actions
         invalid_consultants = state.active_run.assessment.get("_invalid_consultants", ())
         if successful and invalid_consultants:
             assessment = dict(state.active_run.assessment)

@@ -250,6 +250,7 @@ def _lead_started(state: ProjectState, event: Event):
         lead_identity=str(identity),
         owner_generation=generation,
         status="active",
+        assessment={key: value for key, value in run.assessment.items() if key != "_retryable_lead"},
         updated_at=event.observed_at,
     )
     return replace(state, active_run=run), ()
@@ -278,10 +279,12 @@ def _delegation_updated(state: ProjectState, event: Event):
         return _archive(state, updated, "disabled", event.observed_at), (
             Action("archive_run", {"run_id": updated.run_id}),
         )
-    if (item.role != "lead" and item.state.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}
-            and (updated.status == "completing" or updated.assessment.get("_pending_lead_completion"))):
-        return _lead_failed(replace(state, active_run=updated),
-                            replace(event, payload={"identity": updated.lead_identity}))
+    if item.role != "lead" and item.state.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}:
+        if updated.status == "recovering" and updated.assessment.get("_retryable_lead"):
+            updated = replace(updated, assessment={**updated.assessment, "_retryable_lead": ""})
+        if updated.status == "completing" or updated.assessment.get("_pending_lead_completion"):
+            return _lead_failed(replace(state, active_run=updated),
+                                replace(event, payload={"identity": updated.lead_identity}))
     if (updated.status == "completing" and item.role not in {"consultant", "lead"}
             and _stop_block_reason(updated) is None):
         return _archive(state, updated, "completed", event.observed_at), (
@@ -349,6 +352,10 @@ def _lead_failed(state: ProjectState, event: Event):
         return state, ()
     assessment = dict(run.assessment)
     assessment.pop("_pending_lead_completion", None)
+    if event.kind == "lead_failed":
+        assessment["_retryable_lead"] = run.lead_identity
+    else:
+        assessment["_retryable_lead"] = ""
     recovering = replace(run, status="recovering", outcome=None, assessment=assessment, updated_at=event.observed_at)
     return replace(state, active_run=recovering), (
         Action("replace_lead", {"owner_generation": run.owner_generation + 1}),
