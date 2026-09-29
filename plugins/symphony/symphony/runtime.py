@@ -107,6 +107,16 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
             state = _hold_pending_batch(state, provider, session)
             if current:
+                if (expected_owner and _committed_child_terminal_replay(
+                        state, event, provider, expected_owner, allow_active=True)):
+                    # A callback retried after archive cannot complete a
+                    # newer run that reused the same child identity.
+                    continue
+                if (expected_owner and _prior_child_terminal_conflict(
+                        state, event, provider, expected_owner)):
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    unresolved = True
+                    continue
                 if (expected_owner and _run_scope(state, event, provider)
                         != (f"{provider}:{expected_owner}", expected_owner)):
                     # Retain the source before this project transaction can
@@ -291,7 +301,16 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                                                      "parent_thread_id") or ""),
                                                  include_ancestry=True,
                                              ) == (bound,))
-                            if exact_owner or native_parent:
+                            archived_replay = (alias_record["owner_session"] is None
+                                               and bool(alias_record["pending"])
+                                               and roster is not None
+                                               and all(_committed_child_terminal_replay(
+                                                   roster,
+                                                   Event(item["event_id"], item["kind"],
+                                                         item["observed_at"], item["payload"]),
+                                                   provider, session,
+                                               ) for item in alias_record["pending"]))
+                            if exact_owner or native_parent or archived_replay:
                                 records.append(alias_record)
                             else:
                                 unresolved_alias = True
@@ -312,7 +331,10 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 pending = tuple(
                     (Event(item["event_id"], item["kind"], item["observed_at"],
                            {**item["payload"], "_symphony_owner_conflict":
-                            bool(item.get("ambiguous_owner"))}),
+                            bool(item.get("ambiguous_owner")),
+                            "_symphony_verified_alias": source_record is not record
+                            and source_record["owner_session"] == session
+                            and source_record["state_name"] == bound.name}),
                      # Alias counters are local to that child session. Its
                      # verified parent/owner and active run establish the
                      # root generation; comparing raw counters drops events.
@@ -425,23 +447,20 @@ def _pending_child_disposition(
     if not identity:
         return "hold"
     run = state.active_runs.get(f"{provider}:{session}")
+    if _committed_child_terminal_replay(state, event, provider, session, allow_active=True):
+        return "stale"
+    if _prior_child_terminal_conflict(state, event, provider, session):
+        return "hold"
     if run is None:
-        archived = [item for item in state.recent_runs
-                    if item.provider == provider and item.session_id == session]
-        if archived and any(item.lead_identity == identity
-                            or any(child.identity == identity for child in item.delegations)
-                            for item in archived):
+        if event.kind == "subagent_started" and any(
+            item.provider == provider and item.session_id == session
+            and event.event_id in item.assessment.get("_start_event_ids", ())
+            for item in state.recent_runs
+        ):
             return "stale"
         return "hold"
     if run.started_at and event.observed_at < run.started_at:
         return "stale"
-    if any(item.provider == provider and item.session_id == session
-           and (item.lead_identity == identity
-                or any(child.identity == identity for child in item.delegations))
-           for item in state.recent_runs):
-        # A recycled child ID across run generations cannot establish that a
-        # delayed terminal belongs to the new run, even when it arrived later.
-        return "hold"
     if _run_scope(state, event, provider) != (f"{provider}:{session}", session):
         # One project file can contain several roots with the same child or
         # parent ID. Never ACK an event dispatch would reject or misroute.
@@ -461,6 +480,73 @@ def _pending_child_disposition(
         if any(isinstance(item, Mapping) and item.get("role") == role for item in pending):
             return "apply"
     return "hold"
+
+
+def _committed_child_terminal_replay(
+    state: ProjectState, event: Event, provider: str, session: str,
+    *, allow_active: bool = False,
+) -> bool:
+    return _prior_child_terminal_disposition(
+        state, event, provider, session, allow_active=allow_active) == "replay"
+
+
+def _prior_child_terminal_conflict(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    return _prior_child_terminal_disposition(
+        state, event, provider, session, allow_active=True) == "conflict"
+
+
+def _prior_child_terminal_disposition(
+    state: ProjectState, event: Event, provider: str, session: str,
+    *, allow_active: bool,
+) -> str:
+    """Classify old terminal evidence before it can change a newer run."""
+    if (event.kind != "subagent_stopped" or event.payload.get("_symphony_owner_conflict")
+            or (not allow_active and f"{provider}:{session}" in state.active_runs)):
+        return "unknown"
+    identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+    if not identity:
+        return "unknown"
+    parent = str(event.payload.get("parent_thread_id") or "")
+    if (not parent and str(event.payload.get("session_id") or "") != session
+            and not event.payload.get("_symphony_verified_alias")):
+        return "unknown"
+    if parent != session and parent and any(
+        item.provider == provider and item.session_id != session
+        and parent in {item.session_id, item.lead_identity,
+                       *(child.identity for child in item.delegations)}
+        for item in state.active_runs.values()
+    ):
+        return "unknown"
+    canonical = replace(event, payload={**event.payload, "session_id": session})
+    result_id = _terminal_result_id(canonical)
+    token = _child_turn_token(canonical.payload)
+    current = state.active_runs.get(f"{provider}:{session}")
+    receipts = tuple(item for item in state.terminal_receipts
+                     if item["provider"] == provider and item["session"] == session
+                     and item["agent"] in {identity, "*"}
+                     and (current is None or item["run_id"] != current.run_id)
+                     and (not parent or parent in {session, item["parent"],
+                                                   item["lead"], identity}))
+    if any(item["result"] == result_id for item in receipts):
+        return "replay"
+    owned_receipts = tuple(item for item in receipts if item["agent"] == identity)
+    if owned_receipts and (not token or any(item["turn"] == token for item in owned_receipts)):
+        return "conflict"
+    archived = tuple(run for run in state.recent_runs if
+        run.provider == provider and run.session_id == session
+        and (not parent or parent in {session, run.lead_identity,
+                                      *(item.identity for item in run.delegations)})
+        and any(item.identity == identity for item in run.delegations))
+    if any(any(item == result_id or item.endswith(f":{result_id}")
+               for item in run.assessment.get("_terminal_event_ids", ()))
+           for run in archived):
+        return "replay"
+    if archived and (not token or any(token in run.assessment.get(
+            "_terminal_turns", {}).get(identity, ()) for run in archived)):
+        return "conflict"
+    return "unknown"
 
 
 def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, str] | None:
@@ -1146,7 +1232,8 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     if source.kind == "subagent_stopped":
         seen = assessment.get("_terminal_event_ids", ())
         epoch = assessment.get("_terminal_epochs", {}).get(str(identity), 0)
-        result_id = _terminal_result_id(source)
+        base_result_id = _terminal_result_id(source)
+        result_id = base_result_id
         if not token and epoch:
             result_id = f"{epoch}:{result_id}"
         if (result_id in seen or source.event_id in seen or
@@ -1170,6 +1257,15 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         # under dozens of anonymous entries.
         return state, opening
     if source.kind == "subagent_stopped":
+        receipt = {
+            "provider": str(source.payload.get("provider") or ""),
+            "session": str(source.payload.get("session_id") or ""),
+            "agent": str(identity), "run_id": state.active_run.run_id,
+            "turn": token, "result": base_result_id,
+            "parent": str(source.payload.get("parent_thread_id") or ""),
+            "lead": str(state.active_run.lead_identity or ""),
+        }
+        state = replace(state, terminal_receipts=(*state.terminal_receipts, receipt))
         assessment = dict(state.active_run.assessment)
         assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
                                               result_id)

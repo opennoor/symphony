@@ -1461,6 +1461,263 @@ class RuntimeTests(unittest.TestCase):
                                "hook_event_name": "Stop"}, self.environ)
         self.assertNotEqual("block", self.output(foreign_stop).get("decision"))
 
+    def test_completed_lead_terminal_replay_does_not_leave_pending_child(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                session = f"{provider}-session"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                handle({**self.payload("", provider), "hook_event_name": "SessionStart"}, environ)
+                terminal = {**self.payload("", provider),
+                            "hook_event_name": "SubagentStop", "agent_id": "finished-lead",
+                            "parent_thread_id": session, "status": "completed",
+                            "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}
+                if provider == "codex":
+                    terminal["turn_id"] = "finished-turn"
+                result_id = runtime_module._terminal_result_id(
+                    event_from_payload(provider, terminal))
+                choice = route_choice(provider=provider)
+                finished = RunState(
+                    "finished-run", "task", status="completed", session_id=session,
+                    provider=provider, lead_identity="finished-lead",
+                    assessment={"_terminal_event_ids": (result_id,)},
+                    delegations=(Delegation("finished-lead", "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                    outcome={"status": "completed"},
+                )
+                store = StateStore(self.state_root)
+                store.save(self.project, ProjectState(recent_runs=(finished,)))
+                handle(terminal, environ)
+                self.assertEqual([], store.session_record(provider, session)["pending"])
+                replay = event_from_payload(provider, terminal)
+                store.queue_session_event(provider, session, replay)
+                stop = self.output(handle({**self.payload("", provider),
+                                           "hook_event_name": "Stop"}, environ))
+                self.assertNotEqual("block", stop.get("decision"), stop)
+                self.assertEqual([], store.session_record(provider, session)["pending"])
+                self.assertEqual("completed", store.load(self.project).recent_runs[-1].status)
+
+    def test_archived_lead_exemption_requires_recorded_result_and_no_new_run(self):
+        session = "codex-session"
+        handle({**self.payload(""), "hook_event_name": "SessionStart"}, self.environ)
+        terminal = {**self.payload(""), "hook_event_name": "SubagentStop",
+                    "agent_id": "same-lead", "parent_thread_id": session,
+                    "status": "completed", "turn_id": "old-turn",
+                    "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}
+        result_id = runtime_module._terminal_result_id(event_from_payload("codex", terminal))
+        model, effort = self.simple["model"], self.simple["effort"]
+        lead = Delegation("same-lead", "lead", "task", "completed", model, effort)
+        finished = RunState("old-run", "task", status="completed", session_id=session,
+                            provider="codex", lead_identity="same-lead",
+                            assessment={"_terminal_event_ids": (result_id,)},
+                            delegations=(lead,), outcome={"status": "completed"})
+        store = StateStore(self.state_root)
+        store.save(self.project, ProjectState(recent_runs=(finished,)))
+
+        changed = {**terminal, "turn_id": "new-turn"}
+        handle(changed, self.environ)
+        pending = store.session_record("codex", session)["pending"]
+        self.assertEqual(1, len(pending))
+        self.assertTrue(pending[0]["ambiguous_owner"])
+        self.assertEqual("block", self.output(handle({**self.payload(""),
+            "hook_event_name": "Stop"}, self.environ)).get("decision"))
+
+        # A later run in the same root must observe a new terminal turn.
+        store.finish_session_events(store.session_record("codex", session),
+                                    {pending[0]["event_id"]})
+        active = replace(finished, run_id="new-run", status="active", outcome=None,
+                         assessment={}, delegations=(replace(lead, state="working"),))
+        store.save(self.project, ProjectState(active_run=active,
+                   active_runs={f"codex:{session}": active}, recent_runs=(finished,)))
+        handle(changed, self.environ)
+        new_state = store.load(self.project)
+        self.assertIn(runtime_module._terminal_result_id(event_from_payload("codex", changed)),
+                      new_state.active_runs[f"codex:{session}"].assessment.get(
+                          "_terminal_event_ids", ()))
+        self.assertEqual([], store.session_record("codex", session)["pending"])
+
+    def test_late_worker_terminal_is_not_archived_lead_replay(self):
+        session = "codex-session"
+        handle({**self.payload(""), "hook_event_name": "SessionStart"}, self.environ)
+        terminal = {**self.payload(""), "hook_event_name": "SubagentStop",
+                    "agent_id": "worker", "parent_thread_id": session,
+                    "status": "failed", "turn_id": "worker-turn"}
+        committed = {**terminal, "status": "completed", "turn_id": "earlier-turn"}
+        result_id = runtime_module._terminal_result_id(event_from_payload("codex", committed))
+        run = RunState("done", "task", status="completed", session_id=session,
+                       provider="codex", lead_identity="lead",
+                       assessment={"_terminal_event_ids": (result_id,)},
+                       delegations=(Delegation("lead", "lead", "task", "completed", "m", "e"),
+                                    Delegation("worker", "worker", "task", "completed", "m", "e")),
+                       outcome={"status": "completed"})
+        store = StateStore(self.state_root)
+        store.save(self.project, ProjectState(recent_runs=(run,)))
+        handle(terminal, self.environ)
+        self.assertEqual(1, len(store.session_record("codex", session)["pending"]))
+        self.assertEqual("block", self.output(handle({**self.payload(""),
+            "hook_event_name": "Stop"}, self.environ)).get("decision"))
+
+    def test_old_terminal_retry_cannot_complete_new_run_with_same_lead(self):
+        session = "codex-session"
+        handle({**self.payload(""), "hook_event_name": "SessionStart"}, self.environ)
+        model, effort = self.simple["model"], self.simple["effort"]
+        old = {**self.payload(""), "hook_event_name": "SubagentStop",
+               "agent_id": "shared-lead", "parent_thread_id": session,
+               "status": "completed", "turn_id": "old-turn", "model": model,
+               "model_reasoning_effort": effort,
+               "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}
+        result_id = runtime_module._terminal_result_id(event_from_payload("codex", old))
+        lead = Delegation("shared-lead", "lead", "task", "completed", model, effort)
+        archived = RunState("old-run", "task", status="completed", session_id=session,
+                            provider="codex", lead_identity="shared-lead",
+                            assessment={"_terminal_event_ids": (result_id,)},
+                            delegations=(lead,), outcome={"status": "completed"})
+        middle_result = runtime_module._terminal_result_id(event_from_payload(
+            "codex", {**old, "turn_id": "middle-turn"}))
+        middle = replace(archived, run_id="middle-run",
+                         assessment={"_terminal_event_ids": (middle_result,)})
+        fresh = RunState("new-run", "new task", status="active", session_id=session,
+                         provider="codex", lead_identity="shared-lead",
+                         assessment={"size": "small", "complexity": "simple",
+                                     "route": {"lead_model": model, "lead_effort": effort},
+                                     "_lead_expected_route": {"identity": "shared-lead",
+                                                              "model": model, "effort": effort}},
+                         delegations=(replace(lead, state="working"),))
+        store = StateStore(self.state_root)
+        store.save(self.project, ProjectState(active_run=fresh,
+                   active_runs={f"codex:{session}": fresh}, recent_runs=(archived, middle)))
+
+        handle({**old, "stop_hook_active": True}, self.environ)
+        state = store.load(self.project)
+        self.assertEqual("new-run", state.active_runs[f"codex:{session}"].run_id)
+        self.assertIsNone(state.active_runs[f"codex:{session}"].outcome)
+        self.assertEqual([], store.session_record("codex", session)["pending"])
+
+        handle({**old, "turn_id": "new-turn"}, self.environ)
+        state = store.load(self.project)
+        self.assertIsNone(state.active_run)
+        self.assertEqual(["old-run", "middle-run", "new-run"],
+                         [run.run_id for run in state.recent_runs])
+
+    def test_terminal_receipt_survives_visible_archive_eviction(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                model, effort = choice["model"], choice["effort"]
+                session = f"{provider}-session"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                lead = Delegation("reused-lead", "lead", "task", "working", model, effort)
+                old_run = RunState("old-run", "task", status="active", session_id=session,
+                                   provider=provider, lead_identity="reused-lead",
+                                   assessment={"size": "small", "complexity": "simple"},
+                                   delegations=(lead,))
+                self.seed_run(old_run, provider)
+                old = {**self.payload("", provider), "hook_event_name": "SubagentStop",
+                       "agent_id": "reused-lead", "parent_thread_id": session,
+                       "status": "completed", "last_assistant_message":
+                       'SYMPHONY_OUTCOME: {"status":"completed"}'}
+                if provider == "codex":
+                    old.update({"model": model, "model_reasoning_effort": effort,
+                                "turn_id": "old-turn"})
+                else:
+                    old["prompt_id"] = "old-turn"
+                handle(old, environ)
+                store = StateStore(self.state_root)
+                done = store.load(self.project)
+                self.assertIsNone(done.active_run)
+                self.assertEqual(1, len(done.terminal_receipts))
+                fillers = tuple(RunState(f"filler-{i}", "filler", status="completed",
+                                         session_id=f"other-{i}", provider=provider)
+                                for i in range(21))
+                new_run = replace(old_run, run_id="new-run", task="new task",
+                                  assessment={"size": "small", "complexity": "simple",
+                                              "route": {"lead_model": model, "lead_effort": effort},
+                                              "_lead_expected_route": {"identity": "reused-lead",
+                                                                       "model": model, "effort": effort}})
+                store.save(self.project, replace(done, active_run=new_run,
+                           active_runs={f"{provider}:{session}": new_run},
+                           recent_runs=(*done.recent_runs, *fillers)))
+                state = store.load(self.project)
+                self.assertNotIn("old-run", {run.run_id for run in state.recent_runs})
+                self.assertEqual(1, len(state.terminal_receipts))
+
+                handle({**old, "stop_hook_active": True}, environ)
+                self.assertEqual("new-run", store.load(self.project).active_run.run_id)
+                self.assertEqual([], store.session_record(provider, session)["pending"])
+                changed = {**old, "last_assistant_message": "changed result from old turn"}
+                handle(changed, environ)
+                pending = store.session_record(provider, session)["pending"]
+                self.assertEqual(1, len(pending))
+                self.assertEqual("block", self.output(handle({**self.payload("", provider),
+                    "hook_event_name": "Stop"}, environ)).get("decision"))
+                self.assertEqual("new-run", store.load(self.project).active_run.run_id)
+                store.finish_session_events(store.session_record(provider, session),
+                                            {pending[0]["event_id"]})
+                token_field = "turn_id" if provider == "codex" else "prompt_id"
+                handle({**old, token_field: "new-turn"}, environ)
+                self.assertIsNone(store.load(self.project).active_run)
+
+    def test_upgrade_preserves_available_legacy_terminal_lineage(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                session = f"{provider}-session"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                lead = Delegation("legacy-lead", "lead", "task", "working",
+                                  choice["model"], choice["effort"])
+                old_run = RunState("legacy-run", "task", session_id=session,
+                                   provider=provider, lead_identity="legacy-lead",
+                                   assessment={"size": "small", "complexity": "simple"},
+                                   delegations=(lead,))
+                self.seed_run(old_run, provider)
+                old = {**self.payload("", provider), "hook_event_name": "SubagentStop",
+                       "agent_id": "legacy-lead", "parent_thread_id": session,
+                       "status": "completed", "last_assistant_message":
+                       'SYMPHONY_OUTCOME: {"status":"completed"}'}
+                if provider == "codex":
+                    old.update({"model": choice["model"],
+                                "model_reasoning_effort": choice["effort"],
+                                "turn_id": "legacy-turn"})
+                else:
+                    old["prompt_id"] = "legacy-turn"
+                handle(old, environ)
+                store = StateStore(self.state_root)
+                path = store._path(self.project)
+                raw = json.loads(path.read_text())
+                raw.pop("terminal_receipts")  # A 1.5.1 state still had run assessment lineage.
+                path.write_text(json.dumps(raw) + "\n")
+                migrated = store.load(self.project)
+                self.assertTrue(migrated.terminal_receipts)
+                fillers = tuple(RunState(f"filler-{i}", "task", status="completed",
+                                         session_id=f"other-{i}", provider=provider)
+                                for i in range(21))
+                current = replace(old_run, run_id="new-run", task="new task")
+                store.save(self.project, replace(migrated, active_run=current,
+                           active_runs={f"{provider}:{session}": current},
+                           recent_runs=(*migrated.recent_runs, *fillers)))
+                self.assertNotIn("legacy-run", {run.run_id for run in
+                                               store.load(self.project).recent_runs})
+                handle({**old, "stop_hook_active": True}, environ)
+                self.assertEqual("new-run", store.load(self.project).active_run.run_id)
+
+    def test_upgrade_preserves_active_legacy_terminal_evidence(self):
+        run = RunState("active-legacy", "task", session_id="codex-session",
+                       provider="codex", lead_identity="lead",
+                       assessment={"_terminal_event_ids": ("a" * 64,),
+                                   "_terminal_turns": {"lead": ("turn_id:old",)}},
+                       delegations=(Delegation("lead", "lead", "task", "working",
+                                               self.simple["model"], self.simple["effort"]),))
+        store = StateStore(self.state_root)
+        store.save(self.project, ProjectState(active_run=run,
+                   active_runs={"codex:codex-session": run}))
+        path = store._path(self.project)
+        raw = json.loads(path.read_text())
+        raw.pop("terminal_receipts")
+        path.write_text(json.dumps(raw) + "\n")
+        receipts = store.load(self.project).terminal_receipts
+        self.assertTrue(any(item["result"] == "a" * 64 for item in receipts))
+        self.assertTrue(any(item["agent"] == "lead" and item["turn"] == "turn_id:old"
+                            for item in receipts))
+
     def test_overflow_only_child_alias_blocks_completion(self):
         choice = route_choice()
         self.seed_run(RunState("root-run", "task", lead_identity="lead", status="completing",
@@ -1507,6 +1764,97 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual("block", self.output(stop).get("decision"))
         self.assertEqual(1, len(store.load(self.project).recent_runs))
         self.assertEqual([], store.session_record("codex", "codex-session")["pending"])
+
+    def test_alias_terminal_replay_after_commit_uses_root_session_hash(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                session = f"{provider}-session"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                self.seed_run(RunState("root-run", "task", lead_identity="lead", status="active",
+                                       assessment={"size": "small", "complexity": "simple"},
+                                       delegations=(Delegation("lead", "lead", "task", "working",
+                                                               choice["model"], choice["effort"]),)), provider)
+                terminal = {**self.payload("", provider), "session_id": "lead",
+                            "parent_thread_id": session, "hook_event_name": "SubagentStop",
+                            "agent_id": "lead", "last_assistant_message":
+                            'SYMPHONY_OUTCOME: {"status":"completed"}'}
+                with patch.object(StateStore, "active_owner_paths", return_value=None):
+                    handle(terminal, environ)
+                store = StateStore(self.state_root)
+                with patch.object(StateStore, "finish_session_events", side_effect=RuntimeError("after commit")):
+                    with self.assertRaisesRegex(RuntimeError, "after commit"):
+                        handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
+                self.assertIsNone(store.load(self.project).active_run)
+                self.assertEqual(1, len(store.session_record(provider, "lead")["pending"]))
+                stop = self.output(handle({**self.payload("", provider),
+                                           "hook_event_name": "Stop"}, environ))
+                self.assertNotEqual("block", stop.get("decision"), stop)
+                self.assertEqual([], store.session_record(provider, "lead")["pending"])
+
+    def test_committed_worker_and_lead_batch_replays_after_ack_crash(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                session = f"{provider}-session"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                self.seed_run(RunState("root-run", "task", lead_identity="lead", status="active",
+                                       assessment={"size": "small", "complexity": "simple"},
+                                       delegations=(
+                                           Delegation("lead", "lead", "task", "working",
+                                                      choice["model"], choice["effort"]),
+                                           Delegation("worker", "worker", "task", "working",
+                                                      choice["model"], choice["effort"]),
+                                       )), provider)
+                store = StateStore(self.state_root)
+                worker = event_from_payload(provider, {
+                    **self.payload("", provider), "hook_event_name": "SubagentStop",
+                    "agent_id": "worker", "status": "completed",
+                })
+                lead = event_from_payload(provider, {
+                    **self.payload("", provider), "hook_event_name": "SubagentStop",
+                    "agent_id": "lead", "last_assistant_message":
+                    'SYMPHONY_OUTCOME: {"status":"completed"}',
+                })
+                with store.session_lock(provider, session):
+                    store.queue_session_event(provider, session, worker)
+                    store.queue_session_event(provider, session, lead)
+                with patch.object(StateStore, "finish_session_events", side_effect=RuntimeError("after commit")):
+                    with self.assertRaisesRegex(RuntimeError, "after commit"):
+                        handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
+                self.assertIsNone(store.load(self.project).active_run)
+                self.assertEqual(2, len(store.session_record(provider, session)["pending"]))
+                stop = self.output(handle({**self.payload("", provider),
+                                           "hook_event_name": "Stop"}, environ))
+                self.assertNotEqual("block", stop.get("decision"))
+                self.assertEqual([], store.session_record(provider, session)["pending"])
+
+    def test_bound_parentless_alias_terminal_replays_after_ack_crash(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                session = f"{provider}-session"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                self.seed_run(RunState("root-run", "task", lead_identity="lead", status="active",
+                                       assessment={"size": "small", "complexity": "simple"},
+                                       delegations=(Delegation("lead", "lead", "task", "working",
+                                                               choice["model"], choice["effort"]),)), provider)
+                terminal = {**self.payload("", provider), "session_id": "lead",
+                            "hook_event_name": "SubagentStop", "agent_id": "lead",
+                            "last_assistant_message":
+                            'SYMPHONY_OUTCOME: {"status":"completed"}'}
+                handle(terminal, environ)
+                store = StateStore(self.state_root)
+                self.assertEqual(session, store.session_record(provider, "lead")["owner_session"])
+                with patch.object(StateStore, "finish_session_events", side_effect=RuntimeError("after commit")):
+                    with self.assertRaisesRegex(RuntimeError, "after commit"):
+                        handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
+                self.assertIsNone(store.load(self.project).active_run)
+                self.assertEqual(1, len(store.session_record(provider, "lead")["pending"]))
+                stop = self.output(handle({**self.payload("", provider),
+                                           "hook_event_name": "Stop"}, environ))
+                self.assertNotEqual("block", stop.get("decision"), stop)
+                self.assertEqual([], store.session_record(provider, "lead")["pending"])
 
     def test_settled_root_can_rebind_new_project_but_delayed_old_agent_cannot_complete_it(self):
         choice = route_choice()

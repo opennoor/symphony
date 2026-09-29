@@ -109,6 +109,13 @@ def _delegation_from_dict(value: Any) -> Delegation:
     )
 
 
+def _receipt_from_dict(value: Any) -> dict[str, str]:
+    receipt = _object(value, "terminal receipt")
+    return {key: _text(receipt.get(key), f"terminal receipt.{key}")
+            for key in ("provider", "session", "agent", "run_id",
+                        "turn", "result", "parent", "lead")}
+
+
 def _run_from_dict(value: Any) -> RunState:
     value = _object(value, "run")
     generation = value.get("owner_generation", 1)
@@ -139,6 +146,49 @@ def _run_from_dict(value: Any) -> RunState:
             for item in _array(value.get("unreconciled", ()), "run.unreconciled")
         ),
     )
+
+
+def _available_terminal_receipts(
+    runs: tuple[RunState, ...], existing: tuple[dict[str, str], ...],
+) -> tuple[dict[str, str], ...]:
+    """Keep lineage still present in older run records before archive trim."""
+    receipts = list(existing)
+    results = {(item["provider"], item["session"], item["run_id"], item["result"])
+               for item in receipts if item["result"]}
+    agents = {(item["provider"], item["session"], item["run_id"], item["agent"])
+              for item in receipts if item["agent"] != "*"}
+    turns = {(item["provider"], item["session"], item["run_id"],
+              item["agent"], item["turn"]) for item in receipts if item["turn"]}
+    for run in runs:
+        base = {"provider": run.provider, "session": run.session_id,
+                "run_id": run.run_id, "parent": "", "lead": run.lead_identity or ""}
+        if not run.provider or not run.session_id:
+            continue
+        terminal_ids = run.assessment.get("_terminal_event_ids", ())
+        recorded_turns = run.assessment.get("_terminal_turns", {})
+        if not terminal_ids and not recorded_turns:
+            continue
+        for raw in terminal_ids:
+            result = str(raw).rsplit(":", 1)[-1]
+            key = (run.provider, run.session_id, run.run_id, result)
+            if re.fullmatch(r"[0-9a-f]{64}", result) and key not in results:
+                receipts.append({**base, "agent": "*", "turn": "", "result": result})
+                results.add(key)
+        for child in run.delegations:
+            agent_key = (run.provider, run.session_id, run.run_id, child.identity)
+            if agent_key not in agents:
+                receipts.append({**base, "agent": child.identity,
+                                 "turn": "", "result": ""})
+                agents.add(agent_key)
+            if isinstance(recorded_turns, dict):
+                for raw in recorded_turns.get(child.identity, ()):
+                    token = str(raw)
+                    turn_key = (*agent_key, token)
+                    if token and turn_key not in turns:
+                        receipts.append({**base, "agent": child.identity,
+                                         "turn": token, "result": ""})
+                        turns.add(turn_key)
+    return tuple(receipts)
 
 
 def _legacy_run_key(run: RunState, activation: dict, history: tuple[Event, ...]) -> str:
@@ -178,6 +228,7 @@ def _state_to_dict(state: ProjectState) -> dict[str, Any]:
         "active_run": None if state.active_run is None else asdict(state.active_run),
         "active_runs": {key: asdict(run) for key, run in active_runs.items()},
         "recent_runs": [asdict(item) for item in state.recent_runs[-20:]],
+        "terminal_receipts": [dict(item) for item in state.terminal_receipts],
         "event_history": [asdict(item) for item in state.event_history],
         "needs_reassessment": state.needs_reassessment,
     }
@@ -216,6 +267,10 @@ def _state_from_dict(value: Any) -> ProjectState:
         else run
         for run in recent_runs
     )
+    receipts = tuple(_receipt_from_dict(item) for item in
+                     _array(value.get("terminal_receipts", ()), "state.terminal_receipts"))
+    receipts = _available_terminal_receipts(
+        (*recent_runs, *active_runs.values()), receipts)
     return ProjectState(
         enabled=enabled,
         configuration=_object(value.get("configuration", {}), "state.configuration"),
@@ -223,6 +278,7 @@ def _state_from_dict(value: Any) -> ProjectState:
         active_run=parsed_run,
         active_runs=active_runs,
         recent_runs=recent_runs,
+        terminal_receipts=receipts,
         event_history=history,
         needs_reassessment=needs_reassessment,
     )

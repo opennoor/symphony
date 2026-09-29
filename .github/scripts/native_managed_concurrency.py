@@ -182,14 +182,24 @@ def resume_codex(env, project, session, logs, deadline):
     command = [executable, "exec", "resume", "--dangerously-bypass-hook-trust",
                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
                "--model", "gpt-6-luna", session, "$symphony:symphony status"]
-    with (logs / "a.resume.stdout").open("w", encoding="utf-8") as stdout, \
-            (logs / "a.resume.errors").open("w", encoding="utf-8") as stderr:
-        completed = subprocess.run(command, cwd=project, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=stdout, stderr=stderr, shell=False,
-                                   timeout=max(1, min(90, deadline - time.monotonic())))
+    status_file = logs / "a.resume.status.json"
+    try:
+        with (logs / "a.resume.stdout").open("w", encoding="utf-8") as stdout, \
+                (logs / "a.resume.errors").open("w", encoding="utf-8") as stderr:
+            completed = subprocess.run(command, cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=stdout, stderr=stderr, shell=False,
+                                       timeout=max(1, min(90, deadline - time.monotonic())))
+    except subprocess.TimeoutExpired:
+        status_file.write_text(json.dumps({"timed_out": True}))
+        raise RuntimeError("Codex same-session resume timed out") from None
+    banner = re.search(r"^session id: ([0-9a-f-]+)$",
+                       (logs / "a.resume.errors").read_text(errors="replace"), re.MULTILINE)
+    status_file.write_text(json.dumps({"exit_code": completed.returncode,
+                                       "banner_present": banner is not None,
+                                       "same_session": bool(banner and banner.group(1) == session)}))
     if completed.returncode:
         raise RuntimeError(f"Codex resume for session {session} exited {completed.returncode}")
-    if codex_session(logs, "a.resume") != session:
+    if not banner or banner.group(1) != session:
         raise RuntimeError("Codex resume changed the original root session ID")
 
 
@@ -386,9 +396,30 @@ def codex_host_trace(home, session, lead_id, error_log):
     calls = {}
     outputs = set()
     activities = []
+    root_turns = {}
+    last_call = None
     for record in records(root_file):
         payload = record.get("payload") or {}
+        if record.get("type") == "event_msg" and payload.get("type") == "task_started":
+            turn_id = payload.get("turn_id")
+            if turn_id:
+                root_turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})["started"] = True
+        elif record.get("type") == "turn_context":
+            turn_id = payload.get("turn_id")
+            if turn_id:
+                turn = root_turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})
+                turn["model"] = payload.get("model")
+                turn["effort"] = payload.get("effort")
+        elif record.get("type") == "event_msg" and payload.get("type") == "task_complete":
+            turn_id = payload.get("turn_id")
+            if turn_id:
+                root_turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})["completed"] = True
         if record.get("type") == "response_item" and payload.get("type") == "function_call":
+            name = payload.get("name")
+            call_id = payload.get("call_id")
+            last_call = {"name": name if isinstance(name, str)
+                         and re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) else None,
+                         "call_hash": fingerprint(call_id), "call_id": call_id}
             if payload.get("name") != "followup_task":
                 continue
             try:
@@ -416,6 +447,9 @@ def codex_host_trace(home, session, lead_id, error_log):
                                       and item["agent_thread_id"] == lead_id
                                       for item in activities)}
                  for call_id, details in calls.items()]
+    if last_call:
+        last_call = {"name": last_call["name"], "call_hash": last_call["call_hash"],
+                     "return_recorded": last_call["call_id"] in outputs}
     turns = {}
     child_parent = None
     for record in records(child_file):
@@ -452,6 +486,8 @@ def codex_host_trace(home, session, lead_id, error_log):
             "lead_jsonl_present": child_file is not None,
             "lead_parent_matches_root": child_parent == session if child_file else None,
             "followup_calls": followups,
+            "root_turns_tail": list(root_turns.values())[-3:],
+            "last_root_function_call": last_call,
             "lead_activity": activities,
             "lead_turns": list(turns.values()),
             "subagent_stop_hook": {
@@ -728,28 +764,120 @@ def failure_state(root, provider):
     def short_hash(value):
         return sha256(str(value).encode()).hexdigest()[:12] if value else None
 
+    def outcome_marker(payload):
+        message = payload.get("last_assistant_message")
+        if not isinstance(message, str):
+            return None
+        markers = re.findall(r"^SYMPHONY_OUTCOME:\s*(\{[^\n]*\})", message, re.MULTILINE)
+        if len(markers) != 1:
+            return None
+        try:
+            status = json.loads(markers[0]).get("status")
+        except (ValueError, AttributeError):
+            return "invalid"
+        return status if status in {"completed", "blocked", "failed", "abandoned", "released"} else "other"
+
+    def observed_role(payload):
+        roles = {"assessor", "consultant", "lead", "worker"}
+        for value in payload.values():
+            if isinstance(value, str):
+                for line in value.splitlines():
+                    line = line.strip()
+                    if line.startswith("SYMPHONY_ROLE:"):
+                        role = line.removeprefix("SYMPHONY_ROLE:").strip()
+                        if role in roles:
+                            return role
+        role = str(payload.get("role") or "").strip().lower()
+        if role in roles:
+            return role
+        for key in ("agent_type", "task_name"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                if value.strip().lower() in roles:
+                    return value.strip().lower()
+                match = re.search(r"(?:^|[_:/-])symphony[_-](assessor|consultant|lead|worker)(?:[_:/-]|$)",
+                                  value.lower())
+                if match:
+                    return match.group(1)
+        return ""
+
+    def terminal_result_prefix(payload):
+        fields = ("provider", "session_id", "agent_id", "subagent_id", "turn_id",
+                  "prompt_id", "status", "last_assistant_message", "agent_transcript_path",
+                  "agent_type", "task_name", "role", "model", "model_reasoning_effort")
+        stable = {key: payload[key] for key in fields if key in payload}
+        stable["observed_role"] = observed_role(payload)
+        return sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
     def run_summary(run):
+        assessment = run.get("assessment") or {}
+        terminal_turns = assessment.get("_terminal_turns") or {}
         return {"session_id": run.get("session_id"), "lead_id": run.get("lead_identity"),
+                "run_id": run.get("run_id"),
                 "status": run.get("status"),
                 "outcome": (run.get("outcome") or {}).get("status"),
+                "terminal_result_prefixes": [str(item).split(":")[-1][:12]
+                                             for item in assessment.get("_terminal_event_ids", ())],
+                "terminal_turn_hashes": {identity: [short_hash(token) for token in tokens]
+                                         for identity, tokens in terminal_turns.items()},
                 "lead_delegations": [{"identity": item.get("identity"), "state": item.get("state"),
                                       "requested_tier": item.get("requested_tier"),
                                       "requested_effort": item.get("requested_effort")}
                                      for item in run.get("delegations", [])
                                      if item.get("role") == "lead"]}
 
-    def event_summary(event):
+    def event_summary(event, root_sessions):
         payload = event.get("payload") or {}
         invocation = next((payload[key] for key in ("invocation_id", "tool_use_id", "call_id", "turn_id")
                            if payload.get(key)), None)
         source_id = str(event.get("event_id") or "").split(":", 1)[0]
         return {"kind": event.get("kind"), "identity": payload.get("identity"),
+                "event_id_hash": short_hash(event.get("event_id")),
+                "session_id": payload.get("session_id"),
+                "parent_matches_root": payload.get("parent_thread_id") in root_sessions
+                if payload.get("parent_thread_id") else None,
+                "turn_id_hash": short_hash(payload.get("turn_id")),
+                "prompt_id_hash": short_hash(payload.get("prompt_id")),
                 "role": payload.get("role"), "delegation_state": payload.get("state"),
                 "outcome": (payload.get("outcome") or {}).get("status"),
                 "owner_generation": payload.get("owner_generation"),
                 "native_invocation_id_present": invocation is not None,
                 "native_invocation_id_hash": short_hash(invocation),
                 "source_event_hash": short_hash(source_id)}
+
+    def session_record_summary(record, root_sessions):
+        owner = record.get("owner_session")
+        pending = []
+        for item in record.get("pending", ()):
+            payload = item.get("payload") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            token = next((f"{key}:{payload[key]}" for key in ("turn_id", "prompt_id")
+                          if payload.get(key)), None)
+            event_id = str(item.get("event_id") or "")
+            parent = payload.get("parent_thread_id")
+            pending.append({
+                "kind": item.get("kind"), "event_id_hash": short_hash(event_id),
+                "event_id_prefix": event_id[:12] if re.fullmatch(r"[0-9a-f]{64}", event_id) else None,
+                "terminal_result_prefix": terminal_result_prefix(payload)
+                if item.get("kind") == "subagent_stopped" else None,
+                "session_id": payload.get("session_id"),
+                "agent_id": payload.get("agent_id") or payload.get("subagent_id"),
+                "parent_id": parent if parent in root_sessions else None,
+                "parent_matches_record_owner": parent == owner if parent else None,
+                "turn_id_present": bool(payload.get("turn_id")),
+                "turn_id_hash": short_hash(payload.get("turn_id")),
+                "prompt_id_present": bool(payload.get("prompt_id")),
+                "prompt_id_hash": short_hash(payload.get("prompt_id")),
+                "terminal_turn_hash": short_hash(token),
+                "outcome_marker_status": outcome_marker(payload),
+                "ambiguous_owner": bool(item.get("ambiguous_owner")),
+                "generation": item.get("generation"),
+            })
+        return {"session_id": record.get("session"), "owner_session_id": owner,
+                "owner_matches_root": owner in root_sessions, "migrated": record.get("migrated"),
+                "overflow": bool(record.get("overflow")), "pending_count": len(pending),
+                "pending": pending}
 
     def activation_summary(record):
         plugin_root = record.get("plugin_root")
@@ -795,9 +923,19 @@ def failure_state(root, provider):
                     if isinstance(activation, dict) else [])
         snapshot_file = case_root / "update_event_counts.json"
         snapshots = json.loads(snapshot_file.read_text()) if snapshot_file.is_file() else None
-        relevant_events = [event_summary(event) for event in document.get("event_history", [])
+        root_sessions = set(cli_sessions.values())
+        relevant_events = [event_summary(event, root_sessions)
+                           for event in document.get("event_history", [])
                            if event.get("kind") in {"delegation_updated", "lead_started",
                                                     "lead_failed", "lead_completed"}]
+        session_records = []
+        for record_path in (case_root / "state").glob(".session-*.json"):
+            try:
+                record = json.loads(record_path.read_text())
+            except (OSError, ValueError):
+                continue
+            if record.get("state_name") in {None, path.name}:
+                session_records.append(session_record_summary(record, root_sessions))
         cases.append({"case": case, "labels": labels, "cli_session_ids": cli_sessions,
                       "activation_profiles": [activation_summary(item) for item in profiles
                                               if isinstance(item, dict) and item.get("session_id")],
@@ -805,6 +943,7 @@ def failure_state(root, provider):
                       "recent_runs": [run_summary(run) for run in document.get("recent_runs", [])],
                       "event_kinds": [event.get("kind") for event in document.get("event_history", [])],
                       "lead_lifecycle_events": relevant_events,
+                      "session_records": session_records,
                       "event_counts": event_counts(document),
                       "update_event_counts": snapshots})
     host = {}
@@ -819,7 +958,10 @@ def failure_state(root, provider):
                 host[label] = codex_host_trace(
                     root / "codex-live-update-home", session, lead,
                     root / "live-update" / "logs" / f"{label}.errors")
+    resume_status_file = root / "live-update" / "logs" / "a.resume.status.json"
+    resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
     return {"provider": provider, "cases": cases, "native_host_trace": host,
+            "native_resume_status": resume_status,
             "native_hook_capture": codex_hook_capture_summary(root) if provider == "codex" else None}
 
 
@@ -864,6 +1006,7 @@ def main():
             print(json.dumps({"provider": args.provider, "error": str(error),
                               "logs": str(root)}), file=sys.stderr)
             diagnostics = failure_state(root, args.provider)
+            diagnostics["failure"] = {"type": type(error).__name__, "message": str(error)[:300]}
             print(json.dumps(diagnostics), file=sys.stderr)
             destination = os.environ.get("SYMPHONY_NATIVE_DIAGNOSTICS_DIR")
             if destination:
