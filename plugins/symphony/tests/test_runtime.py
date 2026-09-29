@@ -596,6 +596,8 @@ class RuntimeTests(unittest.TestCase):
             },
             self.environ,
         )
+        self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "completing")
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         self.assertEqual(
             StateStore(self.state_root).load(self.project).recent_runs[-1].outcome["status"],
             "completed",
@@ -659,6 +661,8 @@ class RuntimeTests(unittest.TestCase):
         handle(lead, self.environ)
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Avalon task done"}, self.environ)
+        self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "completing")
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         self.assertEqual(StateStore(self.state_root).load(self.project).recent_runs[-1].status, "completed")
 
     def test_stale_lead_stop_cannot_block_completed_current_lead(self):
@@ -759,6 +763,9 @@ class RuntimeTests(unittest.TestCase):
                             handle(lead, environ)
                             handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                                     "last_assistant_message": "Completed"}, environ)
+                            completing = StateStore(self.state_root).load(self.project)
+                            self.assertEqual(completing.active_run.status, "completing")
+                            handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
                             completed = StateStore(self.state_root).load(self.project)
                             self.assertIsNone(completed.active_run)
                             self.assertEqual(completed.recent_runs[-1].status, "completed")
@@ -1095,8 +1102,12 @@ class RuntimeTests(unittest.TestCase):
                 "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
 
         state = StateStore(self.state_root).load(self.project)
-        self.assertIsNone(state.active_run)
-        self.assertEqual(state.recent_runs[-1].outcome, {"status": "completed"})
+        self.assertEqual(state.active_run.status, "completing")
+        self.assertEqual(state.active_run.outcome, {"status": "completed"})
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
+        archived = StateStore(self.state_root).load(self.project)
+        self.assertIsNone(archived.active_run)
+        self.assertEqual(archived.recent_runs[-1].outcome, {"status": "completed"})
 
     def test_child_worktree_terminal_updates_original_root_project(self):
         choice = route_choice()
@@ -1113,6 +1124,8 @@ class RuntimeTests(unittest.TestCase):
         handle(terminal, self.environ)
 
         store = StateStore(self.state_root)
+        self.assertEqual("completing", store.load(self.project).active_run.status)
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         self.assertIsNone(store.load(self.project).active_run)
         self.assertEqual("completed", store.load(self.project).recent_runs[-1].status)
         self.assertFalse(store._path(child).exists())
@@ -1496,6 +1509,82 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual([], store.session_record(provider, session)["pending"])
                 self.assertEqual("completed", store.load(self.project).recent_runs[-1].status)
 
+    def test_completed_lead_remains_owned_until_root_stop_for_native_followups(self):
+        choice = route_choice()
+        self.seed_run(RunState("root-run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(Delegation("lead", "lead", "task", "working",
+                                                       choice["model"], choice["effort"]),)))
+        store = StateStore(self.state_root)
+        terminal = {**self.payload(""), "hook_event_name": "SubagentStop",
+                    "agent_id": "lead", "parent_thread_id": "codex-session",
+                    "model": choice["model"], "model_reasoning_effort": choice["effort"]}
+        handle({**terminal, "turn_id": "lead-turn-one",
+                "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+        first = store.load(self.project)
+        self.assertEqual("completing", first.active_runs["codex:codex-session"].status)
+        self.assertEqual([], store.session_record("codex", "codex-session")["pending"])
+
+        handle({**terminal, "turn_id": "lead-turn-two", "status": "blocked",
+                "last_assistant_message": "Waiting for a follow-up result."}, self.environ)
+        self.assertEqual("recovering", store.load(self.project)
+                         .active_runs["codex:codex-session"].status)
+        handle({**terminal, "turn_id": "lead-turn-three",
+                "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+        final = store.load(self.project)
+        self.assertEqual("completing", final.active_runs["codex:codex-session"].status)
+        self.assertEqual([], store.session_record("codex", "codex-session")["pending"])
+        stop = handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", self.output(stop).get("decision"))
+        archived = store.load(self.project)
+        self.assertNotIn("codex:codex-session", archived.active_runs)
+        self.assertEqual("completed", archived.recent_runs[-1].status)
+
+    def test_root_resume_preserves_completed_lead_until_stop(self):
+        choice = route_choice()
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(Delegation("lead", "lead", "task", "working",
+                                                       choice["model"], choice["effort"]),)))
+        store = StateStore(self.state_root)
+        handle({**self.payload(""), "hook_event_name": "SubagentStop", "agent_id": "lead",
+                "status": "completed", "last_assistant_message":
+                'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+        handle({**self.payload(""), "hook_event_name": "SessionStart", "source": "resume"}, self.environ)
+        resumed = store.load(self.project)
+        self.assertEqual("completing", resumed.active_runs["codex:codex-session"].status)
+        self.assertEqual({"status": "completed"}, resumed.active_run.outcome)
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
+        archived = store.load(self.project)
+        self.assertNotIn("codex:codex-session", archived.active_runs)
+        self.assertEqual("completed", archived.recent_runs[-1].status)
+
+    def test_restarted_worker_failure_after_lead_completion_requires_recovery(self):
+        choice = route_choice()
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(Delegation("lead", "lead", "task", "working",
+                                                       choice["model"], choice["effort"]),
+                                            Delegation("worker", "worker", "task", "completed",
+                                                       "model", "high"))))
+        store = StateStore(self.state_root)
+        handle({**self.payload(""), "hook_event_name": "SubagentStop", "agent_id": "lead",
+                "status": "completed", "last_assistant_message":
+                'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+        self.assertEqual("completing", store.load(self.project).active_run.status)
+        handle({**self.payload(""), "hook_event_name": "SubagentStart", "agent_id": "worker",
+                "parent_thread_id": "codex-session", "role": "worker"}, self.environ)
+        self.assertEqual("working", next(item.state for item in store.load(self.project)
+                                         .active_run.delegations if item.identity == "worker"))
+        handle({**self.payload(""), "hook_event_name": "SubagentStop", "agent_id": "worker",
+                "parent_thread_id": "codex-session", "status": "failed"}, self.environ)
+        recovering = store.load(self.project)
+        self.assertEqual("recovering", recovering.active_run.status)
+        self.assertIsNone(recovering.active_run.outcome)
+        self.assertEqual("block", self.output(handle({**self.payload(""), "hook_event_name": "Stop"},
+                                                     self.environ)).get("decision"))
+        self.assertEqual((), store.load(self.project).recent_runs)
+
     def test_archived_lead_exemption_requires_recorded_result_and_no_new_run(self):
         session = "codex-session"
         handle({**self.payload(""), "hook_event_name": "SessionStart"}, self.environ)
@@ -1594,6 +1683,9 @@ class RuntimeTests(unittest.TestCase):
 
         handle({**old, "turn_id": "new-turn"}, self.environ)
         state = store.load(self.project)
+        self.assertEqual("completing", state.active_run.status)
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
+        state = store.load(self.project)
         self.assertIsNone(state.active_run)
         self.assertEqual(["old-run", "middle-run", "new-run"],
                          [run.run_id for run in state.recent_runs])
@@ -1622,6 +1714,9 @@ class RuntimeTests(unittest.TestCase):
                     old["prompt_id"] = "old-turn"
                 handle(old, environ)
                 store = StateStore(self.state_root)
+                done = store.load(self.project)
+                self.assertEqual("completing", done.active_run.status)
+                handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
                 done = store.load(self.project)
                 self.assertIsNone(done.active_run)
                 self.assertEqual(1, len(done.terminal_receipts))
@@ -1654,6 +1749,8 @@ class RuntimeTests(unittest.TestCase):
                                             {pending[0]["event_id"]})
                 token_field = "turn_id" if provider == "codex" else "prompt_id"
                 handle({**old, token_field: "new-turn"}, environ)
+                self.assertEqual("completing", store.load(self.project).active_run.status)
+                handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
                 self.assertIsNone(store.load(self.project).active_run)
 
     def test_upgrade_preserves_available_legacy_terminal_lineage(self):
@@ -1867,6 +1964,8 @@ class RuntimeTests(unittest.TestCase):
                         'SYMPHONY_OUTCOME: {"status":"completed"}'}
         handle(old_terminal, self.environ)
         store = StateStore(self.state_root)
+        self.assertEqual("completing", store.load(self.project).active_run.status)
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         self.assertIsNone(store.load(self.project).active_run)
         new_project = self.root / "new-project"
         new_project.mkdir()
@@ -1910,6 +2009,8 @@ class RuntimeTests(unittest.TestCase):
 
         handle({**stopped, "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
 
+        self.assertEqual("completing", store.load(self.project).active_run.status)
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         self.assertIsNone(store.load(self.project).active_run)
 
     def test_worker_failure_after_blocked_lead_requires_new_lead(self):
@@ -2242,8 +2343,8 @@ class RuntimeTests(unittest.TestCase):
             self.environ,
         )
         reconciled = StateStore(self.state_root).load(self.project)
-        self.assertIsNone(reconciled.active_run)
-        self.assertEqual(reconciled.recent_runs[-1].outcome, {"status": "completed"})
+        self.assertEqual("completing", reconciled.active_run.status)
+        self.assertEqual(reconciled.active_run.outcome, {"status": "completed"})
         handle(
             {
                 **lead,
@@ -2253,6 +2354,7 @@ class RuntimeTests(unittest.TestCase):
             },
             self.environ,
         )
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         self.assertEqual(
             StateStore(self.state_root).load(self.project).recent_runs[-1].outcome["status"],
             "completed",
@@ -2438,6 +2540,9 @@ class RuntimeTests(unittest.TestCase):
             self.environ,
         )
 
+        state = StateStore(self.state_root).load(self.project)
+        self.assertEqual(state.active_run.status, "completing")
+        handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         state = StateStore(self.state_root).load(self.project)
         self.assertIsNone(state.active_run)
         self.assertEqual(state.recent_runs[-1].status, "completed")
@@ -2800,6 +2905,9 @@ class RuntimeTests(unittest.TestCase):
                 handle({**replacement, "hook_event_name": "SubagentStop", "status": "completed",
                         "last_assistant_message": "Recovered the failed worker and integrated its result."}, self.environ)
                 finished = StateStore(self.state_root).load(self.project)
+                self.assertEqual(finished.active_run.status, "completing")
+                handle({**self.payload("", provider), "hook_event_name": "Stop"}, self.environ)
+                finished = StateStore(self.state_root).load(self.project)
                 self.assertIsNone(finished.active_run)
                 self.assertEqual(finished.recent_runs[-1].status, "completed")
 
@@ -2917,6 +3025,9 @@ class RuntimeTests(unittest.TestCase):
                 handle({**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "lead",
                         "agent_type": agent_type, "status": "completed", "provider": provider, "model": choice["model"],
                         "model_reasoning_effort": choice["effort"]}, self.environ)
+                state = StateStore(self.state_root).load(self.project)
+                self.assertEqual(state.active_run.status, "completing")
+                handle({**self.payload("", provider), "hook_event_name": "Stop"}, self.environ)
                 state = StateStore(self.state_root).load(self.project)
                 self.assertIsNone(state.active_run)
                 self.assertEqual(state.recent_runs[-1].outcome, {"status": "completed"})

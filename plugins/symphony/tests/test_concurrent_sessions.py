@@ -480,6 +480,10 @@ class ConcurrentSessionTests(unittest.TestCase):
                         "status": "completed", "last_assistant_message":
                         'SYMPHONY_OUTCOME: {"status":"completed"}'}, env)
                 state = store.load(self.project)
+                self.assertEqual("completing", state.active_runs[f"{provider}:root-a"].status)
+                handle({"provider": provider, "session_id": "root-a", "cwd": str(self.project),
+                        "hook_event_name": "Stop"}, env)
+                state = store.load(self.project)
                 self.assertNotIn(f"{provider}:root-a", state.active_runs)
                 self.assertEqual("completed", state.recent_runs[-1].status)
                 self.assertEqual("root-a", state.recent_runs[-1].session_id)

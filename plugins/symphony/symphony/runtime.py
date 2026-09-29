@@ -16,7 +16,7 @@ from typing import Mapping
 
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
-from .host_evidence import codex_recovered_lead_event
+from .host_evidence import codex_completing_lead_turn, codex_recovered_lead_event
 from .model import Action, Delegation, Event, ProjectState
 from .reducer import reduce
 from .routing import (
@@ -149,6 +149,19 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, recovered)
+            if source.kind == "stop_requested":
+                scoped = _scope_state(state, f"codex:{session}", session, provider)
+                freshness, native_turn = codex_completing_lead_turn(scoped, session, environ)
+                if freshness in {"running", "unknown"}:
+                    reason = ("The tracked lead has a newer native turn still running. "
+                              "Wait for its result before completing this run."
+                              if freshness == "running" else
+                              "Symphony could not verify the tracked lead's latest native turn. "
+                              "Return to this session after its result is available.")
+                    return state, ((Action("block_stop", {"reason": reason}),), acknowledged)
+                if native_turn is not None:
+                    state = _hold_pending_batch(state, provider, session)
+                    state, _ = dispatch(state, native_turn)
         # A new turn delivered in this same hook can supersede an earlier
         # queued completion. Include it before releasing the archive hold.
         if source.kind != "stop_requested":
@@ -1658,6 +1671,7 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                     "identity": str(identity),
                     "owner_generation": state.active_run.owner_generation,
                     "outcome": outcome,
+                    **({"turn_token": token} if completion_kind == "lead_failed" and token else {}),
                 },
                 "lead-completion",
             ),

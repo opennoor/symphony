@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
-from .model import Event, ProjectState
+from .model import Event, ProjectState, RunState
 
 
 _CODEX_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
@@ -47,20 +47,16 @@ def _reported_status(message: object) -> str | None:
     return status if isinstance(status, str) and status else None
 
 
-def codex_recovered_lead_event(
+def _native_lead_turns(
     state: ProjectState, session: str, environ: Mapping[str, str],
-) -> Event | None:
-    """Return the exact lead's newest unobserved, host-completed native turn."""
+) -> tuple[RunState, dict[str, dict], list[str], str, datetime] | None:
+    """Read native turns only for this run's pinned lead and root parent."""
     run = state.active_run
-    if (not run or run.session_id != session or run.provider != "codex"
-            or run.status != "recovering"
-            or run.assessment.get("_retryable_lead") != run.lead_identity):
+    if not run or run.session_id != session or run.provider != "codex":
         return None
     lead_id = run.lead_identity or ""
     started_at = _instant(run.started_at)
-    failed_at = _instant(run.updated_at)
-    if (not _CODEX_ID.fullmatch(lead_id) or started_at is None or failed_at is None
-            or failed_at < started_at):
+    if not _CODEX_ID.fullmatch(lead_id) or started_at is None:
         return None
     lead = next((item for item in run.delegations
                  if item.identity == lead_id and item.role == "lead"), None)
@@ -109,6 +105,7 @@ def codex_recovered_lead_event(
                     turn["effort"] = payload.get("effort")
                 elif record.get("type") == "event_msg" and payload.get("type") == "task_started":
                     turn["started"] = True
+                    turn["started_at"] = _instant(record.get("timestamp"))
                     if turn_id not in turn_order:
                         turn_order.append(turn_id)
                     latest_started = turn_id
@@ -118,6 +115,29 @@ def codex_recovered_lead_event(
                     turn["outcome"] = _reported_status(turn["message"])
     except (OSError, TypeError, ValueError, json.JSONDecodeError, AttributeError):
         return None
+    return run, turns, turn_order, latest_started, started_at
+
+
+def codex_recovered_lead_event(
+    state: ProjectState, session: str, environ: Mapping[str, str],
+) -> Event | None:
+    """Return the exact lead's newest unobserved, host-completed recovery turn."""
+    run = state.active_run
+    if (not run or run.status != "recovering"
+            or run.assessment.get("_retryable_lead") != run.lead_identity):
+        return None
+    observed = _native_lead_turns(state, session, environ)
+    if observed is None:
+        return None
+    run, turns, turn_order, latest_started, started_at = observed
+    failed_at = _instant(run.updated_at)
+    if failed_at is None or failed_at < started_at:
+        return None
+    lead_id = run.lead_identity or ""
+    lead = next((item for item in run.delegations
+                 if item.identity == lead_id and item.role == "lead"), None)
+    if lead is None:
+        return None
     turn = turns.get(latest_started, {})
     completed_at = turn.get("completed_at")
     if (not latest_started or not turn.get("started") or completed_at is None
@@ -126,13 +146,24 @@ def codex_recovered_lead_event(
             or turn.get("effort") != lead.requested_effort):
         return None
     terminal_turns = run.assessment.get("_terminal_turns", {})
-    if f"turn_id:{latest_started}" in terminal_turns.get(lead_id, ()):
+    observed_turns = set(terminal_turns.get(lead_id, ()))
+    if f"turn_id:{latest_started}" in observed_turns:
         return None
     latest_index = turn_order.index(latest_started)
-    if not any((prior := turns[turn_id]).get("completed_at")
-               and prior["completed_at"] >= started_at
-               and prior.get("outcome") not in {None, "completed"}
-               for turn_id in turn_order[:latest_index]):
+    # The reducer pins the exact native turn that caused lead recovery. An
+    # unrelated older failure cannot authorize a completion that predates a
+    # later rejected callback; a markerless rejected turn is still valid
+    # evidence once its terminal callback was durably processed.
+    failed_token = run.assessment.get("_retryable_lead_turn")
+    if not isinstance(failed_token, str) or not failed_token.startswith("turn_id:"):
+        return None
+    failed_turn = failed_token.removeprefix("turn_id:")
+    if (failed_token not in observed_turns or failed_turn not in turn_order
+            or turn_order.index(failed_turn) >= latest_index):
+        return None
+    failed = turns[failed_turn]
+    if (not failed.get("completed_at") or failed["completed_at"] < started_at
+            or failed.get("outcome") == "completed"):
         return None
     message = turn.get("message")
     if not isinstance(message, str) or len(message) > 100_000:
@@ -147,3 +178,59 @@ def codex_recovered_lead_event(
     }
     event_id = hashlib.sha256(f"codex-host-turn\0{lead_id}\0{latest_started}".encode()).hexdigest()
     return Event(event_id, "subagent_stopped", completed_at.isoformat(), payload)
+
+
+def codex_completing_lead_turn(
+    state: ProjectState, session: str, environ: Mapping[str, str],
+) -> tuple[str, Event | None]:
+    """Check for a newer native lead turn before root Stop archives success.
+
+    An accepted terminal turn anchors transcript order. A later turn cannot
+    inherit that earlier outcome, even if its plugin SubagentStop is delayed.
+    """
+    run = state.active_run
+    if not run or run.status != "completing" or run.provider != "codex":
+        return "none", None
+    lead_id = run.lead_identity or ""
+    anchored = tuple(run.assessment.get("_terminal_turns", {}).get(lead_id, ()))
+    if not anchored or not _CODEX_ID.fullmatch(lead_id):
+        return "none", None
+    observed = _native_lead_turns(state, session, environ)
+    if observed is None:
+        return "unknown", None
+    run, turns, turn_order, latest_started, started_at = observed
+    anchors = [token.removeprefix("turn_id:") for token in anchored
+               if isinstance(token, str) and token.startswith("turn_id:")]
+    if not anchors or not latest_started or not any(token in turn_order for token in anchors):
+        return "unknown", None
+    if latest_started in anchors:
+        return "none", None
+    if turn_order.index(latest_started) <= max(turn_order.index(token)
+                                               for token in anchors if token in turn_order):
+        return "unknown", None
+    turn = turns.get(latest_started, {})
+    lead = next((item for item in run.delegations
+                 if item.identity == lead_id and item.role == "lead"), None)
+    began = turn.get("started_at")
+    if (not turn.get("started") or began is None or began <= started_at
+            or lead is None or turn.get("model") != lead.requested_tier
+            or turn.get("effort") != lead.requested_effort):
+        return "unknown", None
+    completed_at = turn.get("completed_at")
+    if completed_at is None:
+        return "running", None
+    if completed_at < began:
+        return "unknown", None
+    message = turn.get("message")
+    if not isinstance(message, str) or len(message) > 100_000:
+        return "unknown", None
+    outcome = _reported_status(message)
+    status = "completed" if outcome == "completed" else "blocked"
+    payload = {
+        "provider": "codex", "session_id": session, "agent_id": lead_id,
+        "parent_thread_id": session, "turn_id": latest_started, "status": status,
+        "model": lead.requested_tier, "model_reasoning_effort": lead.requested_effort,
+        "last_assistant_message": message,
+    }
+    event_id = hashlib.sha256(f"codex-host-turn\0{lead_id}\0{latest_started}".encode()).hexdigest()
+    return "completed", Event(event_id, "subagent_stopped", completed_at.isoformat(), payload)

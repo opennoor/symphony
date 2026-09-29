@@ -203,6 +203,9 @@ class RouteDriftTests(unittest.TestCase):
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("base"))
         state = StateStore(self.state_root).load(self.project)
+        self.assertEqual(state.active_run.status, "completing")
+        handle(self.payload("session-1", "Stop"), self.env("base"))
+        state = StateStore(self.state_root).load(self.project)
         self.assertIsNone(state.active_run)
         self.assertEqual(state.recent_runs[-1].status, "completed")
 
@@ -221,6 +224,9 @@ class RouteDriftTests(unittest.TestCase):
 
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("full"))
+        state = StateStore(self.state_root).load(self.project)
+        self.assertEqual(state.active_run.status, "completing")
+        handle(self.payload("session-1", "Stop"), self.env("full"))
         state = StateStore(self.state_root).load(self.project)
         self.assertIsNone(state.active_run)
         self.assertEqual(state.recent_runs[-1].status, "completed")
@@ -248,6 +254,9 @@ class RouteDriftTests(unittest.TestCase):
         handle(replacement, self.env("base"))
         handle({**replacement, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("base"))
+        state = StateStore(self.state_root).load(self.project)
+        self.assertEqual(state.active_run.status, "completing")
+        handle(self.payload("session-1", "Stop"), self.env("base"))
         state = StateStore(self.state_root).load(self.project)
         self.assertIsNone(state.active_run)
         self.assertEqual(state.recent_runs[-1].status, "completed")

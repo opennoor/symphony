@@ -77,6 +77,8 @@ jobs:
         run: npm install -g @openai/codex@0.158.0
 
       - name: Run real Windows Codex control smoke
+        id: windows_codex_native
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -134,6 +136,7 @@ jobs:
         run: npm.cmd install -g @anthropic-ai/claude-code
 
       - name: Run real Windows Claude control smoke
+        id: windows_claude_native
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -217,6 +220,10 @@ jobs:
             --candidate-plugin-root (Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony')
           if ($LASTEXITCODE -ne 0) { throw 'Native Claude live-update continuity failed' }
 
+      - name: Preserve Windows Codex native failure after Claude checks
+        if: ${{ always() && steps.windows_codex_native.outcome == 'failure' }}
+        run: throw 'Windows Codex native checks failed; Claude checks were allowed to run'
+
       - name: Retain sanitized native failure evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -272,6 +279,8 @@ jobs:
         run: npm install -g @openai/codex@0.158.0
 
       - name: Run real Codex control smoke when a credential is available
+        id: linux_codex_native
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -310,6 +319,7 @@ jobs:
             --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
 
       - name: Run real Claude control smoke when credential is available
+        id: linux_claude_native
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -343,6 +353,12 @@ jobs:
             --live-update \
             --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
             --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
+
+      - name: Preserve Linux Codex native failure after Claude checks
+        if: ${{ always() && steps.linux_codex_native.outcome == 'failure' }}
+        run: |
+          echo '::error::Linux Codex native checks failed; Claude checks were allowed to run'
+          exit 1
 
       - name: Retain sanitized Linux native failure evidence
         if: always()

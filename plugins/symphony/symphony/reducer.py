@@ -289,7 +289,7 @@ def _delegation_updated(state: ProjectState, event: Event):
     if (updated.status == "completing" and not updated.assessment.get("_batch_pending")
             and item.role not in {"consultant", "lead"}
             and _stop_block_reason(updated) is None):
-        return _archive(state, updated, "completed", event.observed_at), (
+        return replace(state, active_run=updated), (
             Action("permit_completion", {"run_id": updated.run_id}),
         )
     return replace(state, active_run=updated), ()
@@ -339,15 +339,24 @@ def _lead_completed(state: ProjectState, event: Event):
     active = [item for item in _active_identities(run) if item != identity]
     unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
                   and (item.role != "lead" or item.identity == run.lead_identity)]
-    completed = replace(run, outcome=dict(outcome), updated_at=event.observed_at)
+    assessment = dict(run.assessment)
+    assessment.pop("_retryable_lead", None)
+    assessment.pop("_retryable_lead_turn", None)
+    completed = replace(run, outcome=dict(outcome), assessment=assessment,
+                        updated_at=event.observed_at)
     if (active or unresolved or run.assessment.get("_batch_pending")
             or run.assessment.get("_ambiguous_child_starts")
             or run.assessment.get("_pending_delegations")
             or run.assessment.get("_invalid_consultants") or run.assessment.get("_lead_route_mismatch")):
         completed = replace(completed, status="completing")
         return replace(state, active_run=completed), (Action("wait_for_delegations", {"active": active}),)
-    next_state = _archive(state, completed, "completed", event.observed_at)
-    return next_state, (Action("permit_completion", {"run_id": run.run_id}),)
+    # A completed child may receive a later native follow-up before the root
+    # ends its turn. Keep its owner and outcome live until the root Stop can
+    # check every later lead and worker result.
+    completed = replace(completed, status="completing")
+    return replace(state, active_run=completed), (
+        Action("permit_completion", {"run_id": run.run_id}),
+    )
 
 
 def _lead_failed(state: ProjectState, event: Event):
@@ -358,8 +367,14 @@ def _lead_failed(state: ProjectState, event: Event):
     assessment.pop("_pending_lead_completion", None)
     if event.kind == "lead_failed":
         assessment["_retryable_lead"] = run.lead_identity
+        token = event.payload.get("turn_token")
+        if isinstance(token, str) and token:
+            assessment["_retryable_lead_turn"] = token
+        else:
+            assessment.pop("_retryable_lead_turn", None)
     else:
         assessment["_retryable_lead"] = ""
+        assessment.pop("_retryable_lead_turn", None)
     recovering = replace(run, status="recovering", outcome=None, assessment=assessment, updated_at=event.observed_at)
     return replace(state, active_run=recovering), (
         Action("replace_lead", {"owner_generation": run.owner_generation + 1}),
@@ -390,7 +405,7 @@ def _resume_reconciled(state: ProjectState, event: Event):
     if run.status in {"completing", "stopping"}:
         reconciled = replace(run, delegations=delegations, updated_at=event.observed_at)
         if run.status == "completing" and _stop_block_reason(reconciled) is None:
-            return _archive(state, reconciled, "completed", event.observed_at), (
+            return replace(state, active_run=reconciled), (
                 Action("permit_completion", {"run_id": run.run_id}),
             )
         return replace(state, active_run=reconciled), ()

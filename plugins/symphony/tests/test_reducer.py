@@ -215,7 +215,7 @@ class LifecycleReducerTests(unittest.TestCase):
                 ))
                 self.assertEqual(actions[0].kind, "block_stop")
 
-    def test_lead_completion_archives_run_and_permits_completion(self):
+    def test_lead_completion_waits_for_root_stop_to_archive(self):
         original = running_state(delegations=[delegation("worker-1", "completed")])
 
         state, actions = reduce(
@@ -228,10 +228,12 @@ class LifecycleReducerTests(unittest.TestCase):
             ),
         )
 
-        self.assertIsNone(state.active_run)
-        self.assertEqual(state.recent_runs[-1].status, "completed")
-        self.assertEqual(state.recent_runs[-1].outcome["summary"], "Done")
+        self.assertEqual(state.active_run.status, "completing")
+        self.assertEqual(state.active_run.outcome["summary"], "Done")
         self.assertEqual(actions, (Action("permit_completion", {"run_id": "run-1"}),))
+        archived, _ = reduce(state, event("stop_requested"))
+        self.assertIsNone(archived.active_run)
+        self.assertEqual(archived.recent_runs[-1].status, "completed")
 
     def test_lead_completion_waits_for_active_children(self):
         original = running_state(delegations=[delegation("worker-1")])
@@ -441,8 +443,10 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertEqual(recovered.active_run.delegations[0].state, "completed")
         registered, _ = reduce(recovered, event("lead_started", identity="fresh-lead", owner_generation=2))
         completed, _ = reduce(registered, event("lead_completed", identity="fresh-lead", owner_generation=2, outcome={"status": "completed"}))
-        self.assertIsNone(completed.active_run)
-        self.assertEqual(completed.recent_runs[-1].status, "completed")
+        self.assertEqual(completed.active_run.status, "completing")
+        archived, _ = reduce(completed, event("stop_requested"))
+        self.assertIsNone(archived.active_run)
+        self.assertEqual(archived.recent_runs[-1].status, "completed")
 
     def test_retry_does_not_supersede_uncorrelated_or_live_work(self):
         old = replace(delegation("old", "interrupted"), objective="Build the widget")
@@ -472,7 +476,9 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertIsNotNone(stopped.active_run)
         self.assertIn("interrupted", actions[0].payload["reason"])
         finished, _ = reduce(stopped, event("delegation_updated", identity="worker", state="completed"))
-        self.assertIsNone(finished.active_run)
+        self.assertEqual(finished.active_run.status, "completing")
+        archived, _ = reduce(finished, event("stop_requested"))
+        self.assertIsNone(archived.active_run)
 
     def test_pending_spawn_prevents_archiving_an_unstarted_run(self):
         state = running_state(lead=None)
@@ -494,8 +500,10 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertEqual(actions[0].kind, "wait_for_delegations")
         waiting = replace(waiting, active_run=replace(waiting.active_run, assessment={}))
         done, _ = reduce(waiting, event("delegation_updated", identity="worker-1", state="completed"))
-        self.assertIsNone(done.active_run)
-        self.assertEqual(done.recent_runs[-1].status, "completed")
+        self.assertEqual(done.active_run.status, "completing")
+        archived, _ = reduce(done, event("stop_requested"))
+        self.assertIsNone(archived.active_run)
+        self.assertEqual(archived.recent_runs[-1].status, "completed")
 
     def test_replacement_lead_cannot_archive_ambiguous_old_start(self):
         state = running_state(
