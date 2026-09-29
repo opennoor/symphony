@@ -280,9 +280,29 @@ class RuntimeRetentionTests(unittest.TestCase):
                                      {"hook_event_name": "SessionStart", "session_id": f"parallel-{index}", "cwd": str(directory)})[0]
             with ThreadPoolExecutor(max_workers=4) as pool:
                 results = list(pool.map(launch, range(4)))
-            for result in results:
-                self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(len(list((directory / "retained runtimes").iterdir())), 1)
-            document = json.loads(next((directory / "state").glob("*.v2.json")).read_text())
-            sessions = {event["payload"].get("session_id") for event in document["event_history"]}
-            self.assertTrue({f"parallel-{index}" for index in range(4)} <= sessions)
+            state_files = sorted((directory / "state").glob("*.v2.json"))
+            session_sets = {
+                path.name: sorted({str(event["payload"].get("session_id")) for event in
+                                   json.loads(path.read_text())["event_history"]})
+                for path in state_files
+            }
+            runtime_dir = directory / "retained runtimes"
+            retained = sorted(runtime_dir.iterdir()) if runtime_dir.exists() else []
+            expected = {f"parallel-{index}" for index in range(4)}
+            observed = set().union(*(set(items) for items in session_sets.values()))
+            if (any(result.returncode for result in results) or len(retained) != 1
+                    or len(state_files) != 1 or not expected <= observed):
+                def output(result):
+                    # Captured hook context embeds a long launcher; keep the
+                    # signal and omit that command from CI diagnostics.
+                    stdout = result.stdout.split("Check activation through the verified launcher:", 1)[0]
+                    return {"returncode": result.returncode, "stdout": stdout[:400],
+                            "stderr": result.stderr[:400]}
+
+                snapshots = {path.name: sorted(item.relative_to(path).as_posix()
+                                                for item in path.rglob("*") if item.is_file())
+                             for path in retained}
+                self.fail(json.dumps({"hooks": [output(item) for item in results],
+                                      "state_files": session_sets,
+                                      "retained_files": snapshots,
+                                      "missing_sessions": sorted(expected - observed)}, sort_keys=True))
