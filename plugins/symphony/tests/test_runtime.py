@@ -2667,7 +2667,7 @@ class RuntimeTests(unittest.TestCase):
             self.environ,
         )
 
-        path = next(self.state_root.glob("*.json"))
+        path = next(self.state_root.glob("*.v2.json"))
         document = json.loads(path.read_text())
         document["active_runs"]["codex:codex-session"]["owner_seen_at"] = "2020-01-01T00:00:00+00:00"
         path.write_text(json.dumps(document))

@@ -238,7 +238,7 @@ class ConcurrentSessionTests(unittest.TestCase):
         self.start_agent(session, "lead-1", "lead", FULL_SIMPLE["model"], FULL_SIMPLE["effort"])
 
     def state(self):
-        path = next(self.state_root.glob("*.json"))
+        path = next(self.state_root.glob("*.v2.json"))
         return json.loads(path.read_text())
 
     # ---- the renderer must speak ------------------------------------------
@@ -269,7 +269,7 @@ class ConcurrentSessionTests(unittest.TestCase):
 
     def test_foreign_resume_or_empty_roster_cannot_reconcile_a_live_owner(self):
         self.run_with_live_lead("root-a")
-        path = next(self.state_root.glob("*.json"))
+        path = next(self.state_root.glob("*.v2.json"))
         original = path.read_text()
         for evidence in ({"source": "resume"}, {"active_agent_ids": []}):
             with self.subTest(evidence=evidence):
@@ -295,7 +295,7 @@ class ConcurrentSessionTests(unittest.TestCase):
     def test_consent_recorded_before_it_was_keyed_by_session_survives(self):
         """An upgraded machine carries records with one unkeyed slot."""
         handle(self.payload("old-s", "SessionStart"), self.environ)
-        path = next(self.state_root.glob("*.json"))
+        path = next(self.state_root.glob("*.v2.json"))
         document = json.loads(path.read_text())
         document["activation"]["codex"] = {
             "session_id": "old-s", "profile": "base", "accepted_profile": "base",
@@ -311,7 +311,7 @@ class ConcurrentSessionTests(unittest.TestCase):
 
     def test_a_naive_timestamp_does_not_transfer_another_sessions_run(self):
         self.run_with_live_lead("root-a")
-        path = next(self.state_root.glob("*.json"))
+        path = next(self.state_root.glob("*.v2.json"))
         document = json.loads(path.read_text())
         document["active_runs"]["codex:root-a"]["owner_seen_at"] = "2020-01-01T00:00:00"
         path.write_text(json.dumps(document))
@@ -342,7 +342,7 @@ class ConcurrentSessionTests(unittest.TestCase):
 
     def test_stale_run_remains_with_its_original_session(self):
         self.run_with_live_lead("root-a")
-        path = next(self.state_root.glob("*.json"))
+        path = next(self.state_root.glob("*.v2.json"))
         document = json.loads(path.read_text())
         document["active_runs"]["codex:root-a"]["owner_seen_at"] = "2020-01-01T00:00:00+00:00"
         path.write_text(json.dumps(document))
@@ -365,7 +365,7 @@ class ConcurrentSessionTests(unittest.TestCase):
     # A timeout is not proof that another root may claim or cancel a run.
     def test_a_quiet_run_is_not_adopted_by_a_foreign_root(self):
         self.run_with_live_lead("root-a")
-        path = next(self.state_root.glob("*.json"))
+        path = next(self.state_root.glob("*.v2.json"))
         document = json.loads(path.read_text())
         document["active_runs"]["codex:root-a"]["owner_seen_at"] = "2020-01-01T00:00:00+00:00"
         path.write_text(json.dumps(document))
