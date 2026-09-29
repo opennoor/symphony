@@ -53,6 +53,11 @@ record = {"invocation_id": invocation, "event": event,
                                         else "CLAUDE_CONFIG_DIR"),
           "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
           "started_ns": time.time_ns()}
+if event == "UserPromptSubmit":
+    prompt = str(payload.get("prompt") or "").strip()
+    record["control"] = ("stop" if prompt == "$symphony:symphony stop" else
+                         "status" if prompt == "$symphony:symphony status" else
+                         "other")
 (destination / (invocation + "-entry.json")).write_text(json.dumps(record))
 (destination / (invocation + "-exit.json")).write_text(json.dumps({"invocation_id": invocation,
                                                                     "exit_code": 0,
@@ -184,7 +189,51 @@ def resume_claude(env, project, session, budget, deadline):
         raise RuntimeError(f"Claude resume for session {session} exited {completed.returncode}")
 
 
-def resume_codex(env, project, session, logs, deadline, already_completed=False):
+def codex_resume_phase(env, session, logs):
+    """Capture bounded state and native tool metadata while the root is still live."""
+    phase = {"root_process_alive_at_90s": True}
+    if os.name == "nt":
+        # Python's normal read handles can interfere with an atomic replace
+        # by a concurrent Windows hook. The final post-process artifact still
+        # captures the full state without adding a diagnostic writer race.
+        phase["state_sample"] = "omitted_live_windows"
+        return phase
+    try:
+        matches = []
+        for path in Path(env["SYMPHONY_STATE_DIR"]).glob("*.v2.json"):
+            document = json.loads(path.read_text())
+            run = document.get("active_runs", {}).get(f"codex:{session}")
+            if run:
+                matches.append(run)
+        phase["active_owner_count"] = len(matches)
+        if len(matches) == 1:
+            run = matches[0]
+            status = run.get("status")
+            outcome = (run.get("outcome") or {}).get("status")
+            phase["run_status"] = status if status in {
+                "active", "completing", "recovering", "interrupted", "stopping"} else "unknown"
+            phase["run_outcome"] = outcome if outcome in {
+                "completed", "done", "success", "succeeded", "blocked", "failed"} else "missing_or_invalid"
+            phase["lead_identity_present"] = bool(run.get("lead_identity"))
+            phase["pending_callback_count"] = sum(
+                len(item.get("pending", [])) for item in (
+                    json.loads(path.read_text()) for path in
+                    Path(env["SYMPHONY_STATE_DIR"]).glob(".session-*.json"))
+                if item.get("session") == session)
+            if run.get("lead_identity"):
+                host = codex_host_trace(Path(env["CODEX_HOME"]), session,
+                                        run["lead_identity"], logs / "a.resume.errors")
+                phase["last_root_function_call"] = host["last_root_function_call"]
+                phase["root_tool_calls_tail"] = host["root_tool_calls_tail"][-3:]
+                phase["guidance_mentions"] = host["guidance_observed"][-3:]
+                phase["manual_control_attempts"] = host["manual_controls"][-3:]
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        phase["snapshot_error_type"] = type(error).__name__
+    return phase
+
+
+def resume_codex(env, project, session, logs, deadline, already_completed=False,
+                 direct_stop=False):
     """Resume the original native root so newly installed candidate hooks load."""
     executable = shutil.which("codex")
     if not executable:
@@ -195,6 +244,8 @@ def resume_codex(env, project, session, logs, deadline, already_completed=False)
         "candidate. Report only the status and version. Do not start or stop work, delegate, "
         "call followup_task, or rerun the gate."
         if already_completed else
+        "$symphony:symphony stop"
+        if direct_stop else
         "Resume the original Symphony run in this session. Reconcile its registered lead "
         "from the native host result; if a retry is needed, call followup_task with the "
         "exact original spawn_agent task_name, without a /root/ prefix or UUID, and await "
@@ -205,24 +256,47 @@ def resume_codex(env, project, session, logs, deadline, already_completed=False)
                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
                "--model", "gpt-6-luna", session, prompt]
     status_file = logs / "a.resume.status.json"
+    started = time.monotonic()
+    budget = max(1, deadline - started - 15)
+    timed_out = False
+    process = None
     try:
         with (logs / "a.resume.stdout").open("w", encoding="utf-8") as stdout, \
                 (logs / "a.resume.errors").open("w", encoding="utf-8") as stderr:
-            completed = subprocess.run(command, cwd=project, env=env, stdin=subprocess.DEVNULL,
-                                       stdout=stdout, stderr=stderr, shell=False,
-                                       timeout=max(1, min(90, deadline - time.monotonic())))
-    except subprocess.TimeoutExpired:
+            process = subprocess.Popen(command, cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=stdout, stderr=stderr, shell=False)
+            try:
+                process.wait(timeout=min(90, budget))
+            except subprocess.TimeoutExpired:
+                if budget > 90:
+                    (logs / "a.resume.phase90.json").write_text(json.dumps(
+                        codex_resume_phase(env, session, logs)))
+                try:
+                    process.wait(timeout=max(0.01, budget - (time.monotonic() - started)))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+    if timed_out:
         status_file.write_text(json.dumps({"timed_out": True,
-                                           "mode": "status-version" if already_completed else "reconcile"}))
+                                           "allotted_seconds": round(budget, 2),
+                                           "elapsed_seconds": round(time.monotonic() - started, 2),
+                                           "mode": "status-version" if already_completed else
+                                                   "direct-stop" if direct_stop else "reconcile"}))
         raise RuntimeError("Codex same-session resume timed out") from None
     banner = re.search(r"^session id: ([0-9a-f-]+)$",
                        (logs / "a.resume.errors").read_text(errors="replace"), re.MULTILINE)
-    status_file.write_text(json.dumps({"mode": "status-version" if already_completed else "reconcile",
-                                       "exit_code": completed.returncode,
+    status_file.write_text(json.dumps({"mode": "status-version" if already_completed else
+                                              "direct-stop" if direct_stop else "reconcile",
+                                       "allotted_seconds": round(budget, 2),
+                                       "elapsed_seconds": round(time.monotonic() - started, 2),
+                                       "exit_code": process.returncode,
                                        "banner_present": banner is not None,
                                        "same_session": bool(banner and banner.group(1) == session)}))
-    if completed.returncode:
-        raise RuntimeError(f"Codex resume for session {session} exited {completed.returncode}")
+    if process.returncode:
+        raise RuntimeError(f"Codex resume for session {session} exited {process.returncode}")
     if not banner or banner.group(1) != session:
         raise RuntimeError("Codex resume changed the original root session ID")
 
@@ -307,7 +381,7 @@ def prepare_live_update(provider, root, old_source, candidate_source):
         if any(character.isspace() for character in str(script)):
             raise RuntimeError("native Codex hook capture requires a temporary path without spaces")
         hooks = {"hooks": {}}
-        for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
+        for event in ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop"):
             command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()} codex"
             windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()} codex"
             hooks["hooks"][event] = [{"hooks": [{"type": "command", "command": command,
@@ -526,8 +600,31 @@ def codex_host_trace(home, session, lead_id, error_log):
     root_turns = {}
     last_call = None
     root_call_history = []
+    guidance_observed = []
+    manual_controls = []
     for record in records(root_file):
         payload = record.get("payload") or {}
+        # A phrase in the native transcript is only a mention. It may be a
+        # quoted file/tool result rather than injected hook context.
+        rendered = json.dumps(payload, default=str)
+        provenance = {
+            "row_type": record.get("type") if isinstance(record.get("type"), str) and record.get("type") in
+                        {"event_msg", "response_item", "turn_context", "session_meta"} else None,
+            "payload_type": payload.get("type") if isinstance(payload.get("type"), str) and payload.get("type") in
+                            {"message", "function_call", "function_call_output",
+                             "task_started", "task_complete"} else None,
+            "payload_role": payload.get("role") if isinstance(payload.get("role"), str) and payload.get("role") in
+                            {"system", "developer", "user", "assistant", "tool"} else None,
+        }
+        if len(guidance_observed) < 8:
+            if "The lead outcome and tracked work are reconciled" in rendered:
+                guidance_observed.append({"at": record.get("timestamp"),
+                                          "kind": "candidate_normal_stop_mention",
+                                          **provenance})
+            elif "The observed lead is unavailable" in rendered:
+                guidance_observed.append({"at": record.get("timestamp"),
+                                          "kind": "old_recovering_mention",
+                                          **provenance})
         if record.get("type") == "event_msg" and payload.get("type") == "task_started":
             turn_id = payload.get("turn_id")
             if turn_id:
@@ -545,6 +642,19 @@ def codex_host_trace(home, session, lead_id, error_log):
         if record.get("type") == "response_item" and payload.get("type") == "function_call":
             name = payload.get("name")
             call_id = payload.get("call_id")
+            if name in {"exec", "exec_command"} and len(manual_controls) < 8:
+                arguments = str(payload.get("arguments") or "")
+                if "symphony" in arguments and any(
+                    control in arguments for control in ("status", "stop", "version")):
+                    manual_controls.append({
+                        "at": record.get("timestamp"),
+                        "runtime": "old" if "symphony-old" in arguments else
+                                   "candidate" if "symphony-candidate" in arguments else
+                                   "unknown",
+                        "attempted_control": "stop" if "symphony stop" in arguments else
+                                   "status" if "symphony status" in arguments else
+                                   "version" if "symphony version" in arguments else "other",
+                    })
             wait_timeout_ms = None
             if isinstance(name, str) and "wait" in name.lower():
                 try:
@@ -690,6 +800,8 @@ def codex_host_trace(home, session, lead_id, error_log):
             "root_turns_tail": list(root_turns.values())[-3:],
             "root_tool_calls_tail": root_call_history[-12:],
             "last_root_function_call": last_call,
+            "guidance_observed": guidance_observed,
+            "manual_controls": manual_controls,
             "lead_activity": activities,
             "lead_turns": list(turns.values()),
             "root_stop_hook": {
@@ -702,7 +814,8 @@ def codex_host_trace(home, session, lead_id, error_log):
                 "failed_count": len(re.findall(r"hook: SubagentStop Failed", log))}}
 
 
-def check_case(provider, root, separate, timeout, budget, update=None):
+def check_case(provider, root, separate, timeout, budget, update=None,
+               direct_stop_resume=False):
     case = root / ("live-update" if update else "worktrees" if separate else "same-worktree")
     case.mkdir()
     first, second = projects(case, separate)
@@ -866,13 +979,23 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                     before_resume, sessions["a"], update["home"])
                 snapshot_file.write_text(json.dumps(snapshot))
                 resume_codex(env, first, sessions["a"], logs, deadline,
-                             already_completed=pre_resume_state == "completed")
+                             already_completed=pre_resume_state == "completed",
+                             direct_stop=direct_stop_resume)
                 starts = [record for record in codex_hook_capture_summary(root)["records"]
                           if record.get("event") == "SessionStart"
                           and record.get("session_id") == sessions["a"]
                           and record.get("exit_marker_written")]
                 if len(starts) < 2:
                     raise RuntimeError("candidate resume lacked a second native SessionStart")
+                if direct_stop_resume and pre_resume_state != "completed":
+                    controls = [record for record in codex_hook_capture_summary(root)["records"]
+                                if record.get("event") == "UserPromptSubmit"
+                                and record.get("session_id") == sessions["a"]
+                                and record.get("control") == "stop"
+                                and record.get("started_ns", 0) > starts[-1]["started_ns"]
+                                and record.get("exit_marker_written")]
+                    if not controls:
+                        raise RuntimeError("candidate resume did not deliver a native normal Stop control")
                 checker = update["candidate_cache"] / "scripts" / "check_activation.py"
                 checked = subprocess.run([sys.executable, "-I", str(checker)], cwd=first,
                                          env={**env, "CODEX_SESSION_ID": sessions["a"]},
@@ -1027,7 +1150,8 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 **({"native_resumed": sorted(resumed)} if provider == "claude" else
                    {"native_resumed": ["a"]} if update and provider == "codex" else {}),
                 **({"native_resume_mode": "status-version" if pre_resume_state == "completed"
-                    else "reconcile"} if update and provider == "codex" else {}),
+                    else "direct-stop" if direct_stop_resume else "reconcile"}
+                   if update and provider == "codex" else {}),
                 **({"native_hook_capture": codex_hook_capture_summary(root, provider)}
                    if update else {}),
                 **({"live_update": f"{update['old_version']}->{update['candidate_version']}"} if update else {})}
@@ -1057,11 +1181,12 @@ def codex_hook_capture_summary(root, provider="codex"):
             marker = json.loads(exit_path.read_text()) if exit_path.is_file() else {}
         except (OSError, ValueError):
             continue
-        if entry.get("event") not in {"SessionStart", "SubagentStart", "SubagentStop", "Stop"}:
+        if entry.get("event") not in {"SessionStart", "UserPromptSubmit",
+                                      "SubagentStart", "SubagentStop", "Stop"}:
             continue
         records.append({key: entry.get(key) for key in
                         ("invocation_id", "event", "session_id", "agent_id", "turn_id",
-                         "parent_id", "cwd", "started_ns", "payload_keys")}
+                         "parent_id", "cwd", "started_ns", "payload_keys", "control")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
                           "native_home_matches_expected": (
                               Path(entry["native_home"]).resolve()
@@ -1575,6 +1700,8 @@ def failure_state(root, provider):
                 host[f"{case['case']}:{label}"] = trace
     resume_status_file = root / "live-update" / "logs" / "a.resume.status.json"
     resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
+    phase_file = root / "live-update" / "logs" / "a.resume.phase90.json"
+    resume_phase = json.loads(phase_file.read_text()) if phase_file.is_file() else None
     gate_timeouts = {}
     for snapshot in root.glob("*/gate_timeout.json"):
         try:
@@ -1583,6 +1710,7 @@ def failure_state(root, provider):
             gate_timeouts[snapshot.parent.name] = {"snapshot_unreadable": True}
     return {"provider": provider, "cases": cases, "native_host_trace": host,
             "native_resume_status": resume_status,
+            "native_resume_phase90": resume_phase,
             "gate_timeouts": gate_timeouts,
             "native_hook_capture": codex_hook_capture_summary(root, provider)}
 
@@ -1597,6 +1725,8 @@ def main():
                         help="run the bounded native upgrade case without baseline cases")
     parser.add_argument("--only-worktrees", action="store_true",
                         help="run only the two independent worktree owners")
+    parser.add_argument("--direct-stop-resume", action="store_true",
+                        help="probe an exact normal Stop control on Codex live-update resume")
     parser.add_argument("--old-plugin-root", type=Path)
     parser.add_argument("--candidate-plugin-root", type=Path,
                         default=Path(__file__).resolve().parents[2] / "plugins" / "symphony")
@@ -1605,6 +1735,8 @@ def main():
         parser.error("--only-live-update requires --live-update")
     if args.only_live_update and args.only_worktrees:
         parser.error("--only-live-update and --only-worktrees cannot be combined")
+    if args.direct_stop_resume and (args.provider != "codex" or not args.live_update):
+        parser.error("--direct-stop-resume requires a Codex live-update run")
     with tempfile.TemporaryDirectory(prefix="symphony-native-managed-", ignore_cleanup_errors=True) as temporary:
         root = Path(temporary)
         update = None
@@ -1633,7 +1765,8 @@ def main():
                 update = prepare_live_update(args.provider, root, args.old_plugin_root,
                                              args.candidate_plugin_root)
                 results.append(check_case(args.provider, root, False, args.timeout,
-                                          args.claude_budget_usd, update))
+                                          args.claude_budget_usd, update,
+                                          direct_stop_resume=args.direct_stop_resume))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(json.dumps({"provider": args.provider, "error": str(error),
                               "logs": str(root)}), file=sys.stderr)

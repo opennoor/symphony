@@ -27,7 +27,7 @@ jobs:
           git fetch origin tag v1.5.1
           git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
           python3 .github/scripts/native_managed_concurrency.py --provider codex \
-            --timeout 600 --live-update --only-live-update \
+            --timeout 600 --live-update --only-live-update --direct-stop-resume \
             --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
             --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
       - name: Retain sanitized native failure evidence
