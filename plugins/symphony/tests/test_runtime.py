@@ -980,7 +980,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("tracked lead has no reconciled outcome",
                       self.output(handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ))["reason"])
 
-        handle({**stopped, "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+        # Native followup_task can end again with identical prose, but its
+        # new turn_id makes this a new result rather than a replay.
+        handle({**stopped, "turn_id": "turn-2",
+                "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"blocked"}'}, self.environ)
+        self.assertEqual(2, len(StateStore(self.state_root).load(self.project)
+                                .active_run.assessment["_terminal_event_ids"]))
+
+        handle({**stopped, "turn_id": "turn-3",
+                "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
 
         state = StateStore(self.state_root).load(self.project)
         self.assertIsNone(state.active_run)

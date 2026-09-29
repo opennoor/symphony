@@ -9,15 +9,18 @@ died, which killed a live lead and rewrote the run's session to the stranger.
 """
 
 import json
+import multiprocessing
 import re
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from plugins.symphony.symphony import runtime as runtime_module
-from plugins.symphony.symphony.model import Action, ProjectState
+from plugins.symphony.symphony.model import Action, Delegation, ProjectState, RunState
 from plugins.symphony.symphony.runtime import handle
 from plugins.symphony.symphony.routing import profiles_for, snapshot_for
+from plugins.symphony.symphony.store import StateStore
 
 FULL_SIMPLE = snapshot_for("codex", "full").matrix["small/simple"]
 BASE_SIMPLE = snapshot_for("codex", "base").matrix["small/simple"]
@@ -33,6 +36,13 @@ MARKER = json.dumps(
     {"size": DRIFT_SIZE, "complexity": DRIFT_COMPLEXITY, "risk": "normal",
      "rationale": "bounded", "topology": "direct"}
 )
+
+
+def _foreign_heartbeats(project: str, state_dir: str, provider: str, profile: str, session: str):
+    env = {"SYMPHONY_STATE_DIR": state_dir, "SYMPHONY_PROFILE": profile}
+    for index in range(105):
+        handle({"provider": provider, "session_id": session, "cwd": project,
+                "hook_event_name": "SessionStart", "turn_id": str(index)}, env)
 
 
 class ActionCoverageTests(unittest.TestCase):
@@ -364,6 +374,89 @@ class ConcurrentSessionTests(unittest.TestCase):
 
         run = self.state()["active_run"]
         self.assertEqual("root-a", run["session_id"])
+
+    def test_foreign_churn_cannot_replay_a_recovered_lead_failure(self):
+        for provider, profile in (("codex", "full"), ("claude", "opus")):
+            with self.subTest(provider=provider):
+                env = {**self.environ, "SYMPHONY_STATE_DIR": str(self.state_root / provider),
+                       "SYMPHONY_PROFILE": profile}
+                route = snapshot_for(provider, profile).matrix["small/simple"]
+                run = RunState(
+                    "run-a", "task", session_id="root-a", provider=provider, lead_identity="lead-a",
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(
+                        Delegation("lead-a", "lead", "task", "working", route["model"], route["effort"]),
+                        Delegation("worker-a", "worker", "task", "working", route["model"], route["effort"]),
+                    ),
+                )
+                store = StateStore(Path(env["SYMPHONY_STATE_DIR"]))
+                store.save(self.project, ProjectState(active_run=run, active_runs={f"{provider}:root-a": run}))
+                failed = self.payload("root-a", "SubagentStop", provider=provider,
+                                      agent_id="lead-a", status="failed")
+                handle(failed, env)
+                handle({**failed, "status": "completed", "last_assistant_message": "recovered"}, env)
+                self.assertEqual({"status": "completed"}, store.load(self.project).active_runs[f"{provider}:root-a"].outcome)
+
+                context = multiprocessing.get_context("spawn")
+                processes = [context.Process(target=_foreign_heartbeats, args=(
+                    str(self.project), env["SYMPHONY_STATE_DIR"], provider, profile, session
+                )) for session in ("root-b", "root-c")]
+                for process in processes:
+                    process.start()
+                for process in processes:
+                    process.join(timeout=20)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join()
+                    self.assertEqual(0, process.exitcode)
+                handle({**failed, "stop_hook_active": True}, env)
+                handle(self.payload("root-a", "SubagentStop", provider=provider,
+                                    agent_id="worker-a", status="completed"), env)
+                stop = self.out(handle(self.payload("root-a", "Stop", provider=provider), env))
+
+                self.assertNotEqual("block", stop.get("decision"), stop.get("reason"))
+                self.assertNotIn(f"{provider}:root-a", store.load(self.project).active_runs)
+
+    def test_worktree_and_branch_changes_do_not_mix_session_runs(self):
+        def git(*args):
+            subprocess.run(["git", *args], cwd=self.project, check=True,
+                           capture_output=True, text=True)
+
+        git("init")
+        git("config", "user.email", "test@example.invalid")
+        git("config", "user.name", "Test")
+        (self.project / "README").write_text("test\n")
+        git("add", "README")
+        git("commit", "-m", "initial")
+        other = self.project.parent / "other worktree"
+        git("worktree", "add", "--detach", str(other))
+        git("switch", "-c", "changed-after-run-started")
+        for provider, profile in (("codex", "full"), ("claude", "opus")):
+            with self.subTest(provider=provider):
+                env = {**self.environ, "SYMPHONY_STATE_DIR": str(self.state_root / provider),
+                       "SYMPHONY_PROFILE": profile}
+                store = StateStore(Path(env["SYMPHONY_STATE_DIR"]))
+                route = snapshot_for(provider, profile).matrix["small/simple"]
+                for project, session, agent in ((self.project, "root-a", "lead-a"),
+                                                (other, "root-b", "lead-b")):
+                    run = RunState(
+                        session, "task", session_id=session, provider=provider, lead_identity=agent,
+                        assessment={"size": "small", "complexity": "simple"},
+                        delegations=(Delegation(agent, "lead", "task", "working",
+                                                route["model"], route["effort"]),),
+                    )
+                    store.save(project, ProjectState(active_run=run, active_runs={f"{provider}:{session}": run}))
+
+                handle(self.payload("root-a", "SubagentStop", provider=provider,
+                                    agent_id="lead-a", status="completed",
+                                    last_assistant_message='SYMPHONY_OUTCOME: {"status":"completed"}'), env)
+                self.assertNotEqual("block", self.out(handle(
+                    self.payload("root-a", "Stop", provider=provider), env)).get("decision"))
+                blocked = self.out(handle(self.payload("root-b", "Stop", provider=provider,
+                                                       cwd=str(other)), env))
+                self.assertEqual("block", blocked.get("decision"))
+                self.assertEqual("root-b", store.load(other).active_run.session_id)
+                self.assertIsNone(store.load(self.project).active_run)
 
 
 if __name__ == "__main__":

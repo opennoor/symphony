@@ -50,6 +50,68 @@ class RuntimeRetentionTests(unittest.TestCase):
     def test_captured_hooks_and_checker_survive_removed_cache_without_losing_outcome(self):
         self.exercise_removed_cache()
 
+    def test_new_checker_accepts_only_verified_old_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = self.materialize(directory, "Reviewed Old Plugin With Spaces")
+            for event, role in (("SessionStart", "assessor"),
+                                ("UserPromptSubmit", "assessor"),
+                                ("SubagentStart", "assessor")):
+                payload = _payload(root, "codex", event, directory, "old-session", role)
+                result, env = self.run_hook(self.command(root, "codex", event), root,
+                                            "codex", directory, payload)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            state_file = next((directory / "state").glob("*.v2.json"))
+            document = json.loads(state_file.read_text())
+            old_heartbeat = document["activation"]["codex"].copy()
+            old_schema = old_heartbeat["hook_schema_version"]
+            self.assertIn("codex:old-session", document["active_runs"])
+
+            new_root = self.materialize(directory, "Reviewed New Plugin With Spaces")
+            init = new_root / "symphony" / "__init__.py"
+            init.write_text(init.read_text().replace("1.5.1", "99.0.0"))
+            for path, content in generated(new_root).items():
+                path.write_text(content)
+            result, _ = self.run_hook(self.command(new_root, "codex", "SessionStart"),
+                                      new_root, "codex", directory,
+                                      {"hook_event_name": "SessionStart", "session_id": "new-session",
+                                       "cwd": str(directory)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            shutil.rmtree(root)
+
+            def check(session="old-session"):
+                return subprocess.run([sys.executable, "-I", str(new_root / "scripts/check_activation.py")],
+                                      cwd=directory, env={**env, "CODEX_SESSION_ID": session},
+                                      capture_output=True, text=True, check=False)
+
+            self.assertEqual(check().returncode, 0, check().stdout)
+            self.assertEqual(check("new-session").returncode, 0)
+            self.assertNotEqual(check("unknown-session").returncode, 0)
+
+            document = json.loads(state_file.read_text())
+            latest = document["activation"]["codex"]
+            alias = str(new_root / "symphony" / "..")
+            latest["plugin_root"] = alias.swapcase() if os.name == "nt" else alias
+            latest["session_profiles"] = []
+            document["event_history"] = []
+            state_file.write_text(json.dumps(document))
+            self.assertEqual(check("new-session").returncode, 0)
+
+            document = json.loads(state_file.read_text())
+            document["activation"]["codex"]["session_profiles"] = [old_heartbeat]
+            document["activation"]["codex"]["session_profiles"][0]["hook_schema_version"] = -1
+            state_file.write_text(json.dumps(document))
+            self.assertNotEqual(check().returncode, 0)
+
+            # The same reviewed session can begin another run after this one ends.
+            document["activation"]["codex"]["session_profiles"][0]["hook_schema_version"] = old_schema
+            document["active_runs"].pop("codex:old-session")
+            state_file.write_text(json.dumps(document))
+            self.assertEqual(check().returncode, 0)
+            retained = Path(old_heartbeat["runtime_root"])
+            (retained / "symphony" / "runtime.py").write_text("raise RuntimeError('tampered')\n")
+            self.assertNotEqual(check().returncode, 0)
+
     def exercise_removed_cache(self, providers=("codex", "claude")):
         for provider in providers:
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
@@ -87,6 +149,11 @@ class RuntimeRetentionTests(unittest.TestCase):
                                                                 "session_id": "new-session", "cwd": str(directory)})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 shutil.rmtree(root)
+                if provider == "codex":
+                    checked = subprocess.run([sys.executable, "-I", str(new_root / "scripts/check_activation.py")],
+                                             cwd=directory, env={**env, "CODEX_SESSION_ID": "old-session"},
+                                             capture_output=True, text=True, check=False)
+                    self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
                 for event in ("SubagentStop", "UserPromptSubmit"):
                     result, env = self.run_hook(commands[event], root, provider, directory, payloads[event])
                     self.assertEqual(result.returncode, 0, result.stderr)

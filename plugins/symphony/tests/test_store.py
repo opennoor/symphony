@@ -77,6 +77,16 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(project_key(alias), project_key(self.project.resolve()))
         self.assertNotEqual(project_key(other), project_key(self.project))
 
+    @unittest.skipUnless(os.name == "nt", "Windows path aliases")
+    def test_windows_project_key_collapses_case_and_short_path_aliases(self):
+        self.assertEqual(project_key(self.project), project_key(Path(str(self.project).swapcase())))
+
+        import ctypes
+        short_name = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(self.project), short_name, len(short_name))
+        if length and length < len(short_name):
+            self.assertEqual(project_key(self.project), project_key(Path(short_name.value)))
+
     def test_save_atomically_replaces_a_sibling_temporary_file(self):
         self.store.save(self.project, ProjectState(enabled=False))
         real_replace = os.replace

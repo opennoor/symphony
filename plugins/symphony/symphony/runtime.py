@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -683,6 +684,16 @@ def _derived(
     return Event(candidate, kind, source.observed_at, payload or {})
 
 
+def _terminal_result_id(source: Event) -> str:
+    """Identify a child result across hook retries without merging new turns."""
+    payload = source.payload
+    fields = ("provider", "session_id", "agent_id", "subagent_id", "turn_id",
+              "prompt_id", "status", "last_assistant_message", "agent_transcript_path",
+              "agent_type", "task_name", "model", "model_reasoning_effort")
+    stable = {key: payload[key] for key in fields if key in payload}
+    return hashlib.sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectState, tuple[Action, ...]]:
     identity = source.payload.get("agent_id") or source.payload.get("subagent_id")
     if not identity:
@@ -700,11 +711,13 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         (item for item in state.active_run.delegations if item.identity == str(identity)),
         None,
     )
-    if source.kind == "subagent_stopped" and any(
-        record.event_id == f"{source.event_id}:delegation:delegation_updated"
-        for record in state.event_history
-    ):
-        return state, opening
+    if source.kind == "subagent_stopped":
+        seen = state.active_run.assessment.get("_terminal_event_ids", ())
+        if _terminal_result_id(source) in seen or source.event_id in seen or any(
+            record.event_id == f"{source.event_id}:delegation:delegation_updated"
+            for record in state.event_history
+        ):
+            return state, opening
     pending: Mapping[str, object] = {}
     if current is None:
         state, pending = _consume_pending_delegation(state, source.payload)
@@ -719,6 +732,11 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         # plugin's. Recording those as workers buried the real delegations
         # under dozens of anonymous entries.
         return state, opening
+    if source.kind == "subagent_stopped":
+        assessment = dict(state.active_run.assessment)
+        assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
+                                              _terminal_result_id(source))
+        state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     terminal = source.kind == "subagent_stopped"
     status = str(source.payload.get("status") or ("completed" if terminal else "working"))
     role = str(pending.get("role") or _observed_role(source.payload) or (current.role if current else "worker"))
