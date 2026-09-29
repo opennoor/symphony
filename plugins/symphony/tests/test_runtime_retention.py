@@ -113,6 +113,61 @@ class RuntimeRetentionTests(unittest.TestCase):
             (retained / "symphony" / "runtime.py").write_text("raise RuntimeError('tampered')\n")
             self.assertNotEqual(check().returncode, 0)
 
+    def test_two_active_sessions_finish_from_old_runtime_after_update(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                root = self.materialize(directory, "Old Reviewed Plugin With Spaces")
+                commands = {event: self.command(root, provider, event) for event in
+                            ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop")}
+                for session in ("old-a", "old-b"):
+                    for event, role in (("SessionStart", "assessor"),
+                                        ("UserPromptSubmit", "assessor"),
+                                        ("SubagentStart", "assessor"),
+                                        ("SubagentStop", "assessor"),
+                                        ("SubagentStart", "lead")):
+                        payload = _payload(root, provider, event, directory, session, role)
+                        result, env = self.run_hook(commands[event], root, provider, directory, payload)
+                        self.assertEqual(0, result.returncode, result.stderr)
+                state_file = next((directory / "state").glob("*.v2.json"))
+                document = json.loads(state_file.read_text())
+                self.assertEqual({f"{provider}:old-a", f"{provider}:old-b"},
+                                 set(document["active_runs"]))
+
+                new_root = self.materialize(directory, "New Reviewed Plugin With Spaces")
+                init = new_root / "symphony" / "__init__.py"
+                old_version = json.loads((root / ".codex-plugin/plugin.json").read_text())["version"]
+                init.write_text(init.read_text().replace(old_version, "99.0.0"))
+                for path, content in generated(new_root).items():
+                    path.write_text(content)
+                result, _ = self.run_hook(self.command(new_root, provider, "SessionStart"),
+                                          new_root, provider, directory,
+                                          _payload(new_root, provider, "SessionStart", directory, "new-session"))
+                self.assertEqual(0, result.returncode, result.stderr)
+                shutil.rmtree(root)
+
+                for session in ("old-a", "old-b"):
+                    if provider == "codex":
+                        checked = subprocess.run(
+                            [sys.executable, "-I", str(new_root / "scripts/check_activation.py")],
+                            cwd=directory, env={**env, "CODEX_SESSION_ID": session},
+                            capture_output=True, text=True, check=False)
+                        self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
+                    payload = _payload(new_root, provider, "SubagentStop", directory, session, "lead")
+                    payload["last_assistant_message"] = 'SYMPHONY_OUTCOME: {"status":"completed"}'
+                    result, _ = self.run_hook(commands["SubagentStop"], root, provider, directory, payload)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    result, _ = self.run_hook(commands["Stop"], root, provider, directory,
+                                              _payload(new_root, provider, "Stop", directory, session))
+                    self.assertEqual(0, result.returncode, result.stderr)
+                document = json.loads(state_file.read_text())
+                self.assertFalse(document["active_runs"])
+                recent = {run["session_id"]: run for run in document["recent_runs"]
+                          if run["session_id"] in {"old-a", "old-b"}}
+                self.assertEqual({"old-a", "old-b"}, set(recent))
+                self.assertTrue(all(run["status"] == "completed" and
+                                    run["outcome"] == {"status": "completed"} for run in recent.values()))
+
     def exercise_removed_cache(self, providers=("codex", "claude")):
         for provider in providers:
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:

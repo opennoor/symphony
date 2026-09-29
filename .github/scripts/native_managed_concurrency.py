@@ -115,15 +115,136 @@ def codex_session(logs, label):
     return match.group(1)
 
 
-def check_case(provider, root, separate, timeout, budget):
-    case = root / ("worktrees" if separate else "same-worktree")
+def resume_claude(env, project, session, budget, deadline):
+    executable = shutil.which("claude")
+    if not executable:
+        raise RuntimeError("claude CLI is missing")
+    completed = subprocess.run(
+        [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
+         "--permission-mode", "bypassPermissions", "--resume", session,
+         "--output-format", "json",
+         "Continue this exact Symphony session after the background lead result. "
+         "Reconcile its outcome and finish. Do not start a new task."],
+        cwd=project, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        shell=False, timeout=max(1, min(90, deadline - time.monotonic())),
+    )
+    if completed.returncode:
+        raise RuntimeError(f"Claude resume for session {session} exited {completed.returncode}")
+
+
+def package_version(source):
+    source = source.resolve()
+    manifest = json.loads((source / ".codex-plugin" / "plugin.json").read_text())
+    version = manifest["version"]
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise RuntimeError(f"invalid plugin version at {source}")
+    recorded = re.search(r'^PLUGIN_VERSION = "([^"]+)"$',
+                         (source / "symphony" / "__init__.py").read_text(), re.MULTILINE)
+    if not recorded or recorded.group(1) != version:
+        raise RuntimeError(f"manifest and runtime versions differ at {source}")
+    return version
+
+
+def marketplace(root, name, source, version):
+    destination = root / name
+    plugin = destination / "plugins" / "symphony"
+    if any(path.is_symlink() for path in source.rglob("*")):
+        raise RuntimeError(f"plugin package contains symlinks: {source}")
+    shutil.copytree(source, plugin)
+    manifest = {"name": name, "plugins": [{"name": "symphony", "source": "./plugins/symphony",
+                                              "version": version}]}
+    catalog = destination / ".claude-plugin" / "marketplace.json"
+    catalog.parent.mkdir()
+    catalog.write_text(json.dumps(manifest), encoding="utf-8")
+    return destination
+
+
+def codex_command(env, cwd, *arguments, input_text=None, timeout=60):
+    executable = shutil.which("codex")
+    if not executable:
+        raise RuntimeError("codex CLI is missing")
+    completed = subprocess.run([executable, *arguments], cwd=cwd, env=env, input=input_text,
+                               capture_output=True, text=True, shell=False, timeout=timeout)
+    if completed.returncode:
+        raise RuntimeError(f"codex {' '.join(arguments[:2])} exited {completed.returncode}")
+    return completed
+
+
+def prepare_live_update(root, old_source, candidate_source):
+    old_source, candidate_source = old_source.resolve(), candidate_source.resolve()
+    old_version, candidate_version = package_version(old_source), package_version(candidate_source)
+    if old_version != "1.5.1" or tuple(map(int, candidate_version.split("."))) <= (1, 5, 1):
+        raise RuntimeError("live update requires an actual installed 1.5.1 package and a newer candidate")
+    token = os.environ.get("OPENAI_API_KEY")
+    if not token:
+        raise RuntimeError("live update requires OPENAI_API_KEY for a disposable Codex login")
+    home = root / "codex-live-update-home"
+    home.mkdir()
+    env = {**os.environ, "CODEX_HOME": str(home)}
+    old_market = marketplace(root, "symphony-old", old_source, old_version)
+    candidate_market = marketplace(root, "symphony-candidate", candidate_source, candidate_version)
+    codex_command(env, root, "login", "--with-api-key", input_text=token)
+    codex_command(env, root, "plugin", "marketplace", "add", str(old_market))
+    codex_command(env, root, "plugin", "add", "symphony@symphony-old")
+    old_cache = home / "plugins" / "cache" / "symphony-old" / "symphony" / old_version
+    if not (old_cache / "hooks" / "codex.json").is_file():
+        raise RuntimeError("old 1.5.1 package was not installed in the disposable Codex home")
+    return {"env": env, "home": home, "old_version": old_version,
+            "candidate_version": candidate_version, "old_cache": old_cache,
+            "candidate_market": candidate_market}
+
+
+def update_while_gated(update, env, docs, sessions, projects_by_label, deadline):
+    old_cache = update["old_cache"]
+    records = {}
+    for label, session in sessions.items():
+        activation = docs[label].get("activation", {}).get("codex", {})
+        choices = [activation, *activation.get("session_profiles", [])]
+        record = next((item for item in choices if item.get("session_id") == session
+                       and item.get("plugin_version") == update["old_version"]), None)
+        if not record or Path(record.get("plugin_root", "")).resolve() != old_cache.resolve():
+            raise RuntimeError(f"{label}: active native session is not using installed 1.5.1")
+        retained = Path(record.get("runtime_root", ""))
+        if not retained.is_dir() or retained.parent.resolve() != Path(env["SYMPHONY_RUNTIME_DIR"]).resolve():
+            raise RuntimeError(f"{label}: trusted old runtime was not retained before update")
+        records[label] = record
+    def change_plugin(*arguments):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("native live update exceeded its deadline")
+        return codex_command(env, update["home"], *arguments, timeout=min(60, remaining))
+
+    change_plugin("plugin", "remove", "symphony@symphony-old")
+    if old_cache.exists():
+        old_cache.rename(update["home"] / "removed-old-cache")
+    if old_cache.exists():
+        raise RuntimeError("old installed plugin cache still exists after removal")
+    change_plugin("plugin", "marketplace", "add", str(update["candidate_market"]))
+    change_plugin("plugin", "add", "symphony@symphony-candidate")
+    candidate_cache = (update["home"] / "plugins" / "cache" / "symphony-candidate"
+                       / "symphony" / update["candidate_version"])
+    checker = candidate_cache / "scripts" / "check_activation.py"
+    if not checker.is_file():
+        raise RuntimeError("newer candidate checker was not installed")
+    for label, session in sessions.items():
+        remaining = max(1, min(30, deadline - time.monotonic()))
+        completed = subprocess.run([sys.executable, "-I", str(checker)], cwd=projects_by_label[label],
+                                   env={**env, "CODEX_SESSION_ID": session}, capture_output=True,
+                                   text=True, timeout=remaining)
+        if completed.returncode or "guarded: matching current-session heartbeat" not in completed.stdout:
+            raise RuntimeError(f"{label}: newer installed checker rejected the active old session")
+    return records
+
+
+def check_case(provider, root, separate, timeout, budget, update=None):
+    case = root / ("live-update" if update else "worktrees" if separate else "same-worktree")
     case.mkdir()
     first, second = projects(case, separate)
     for project in {first, second}:
         (project / "gate.py").write_text(GATE)
     state_dir = case / "state"
     state_dir.mkdir()
-    env = {**os.environ, "SYMPHONY_STATE_DIR": str(state_dir),
+    env = {**os.environ, **(update["env"] if update else {}), "SYMPHONY_STATE_DIR": str(state_dir),
            "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
            "SYMPHONY_PROFILE": "base" if provider == "codex" else "sonnet"}
     if provider == "claude":
@@ -142,17 +263,23 @@ def check_case(provider, root, separate, timeout, budget):
         deadline = time.monotonic() + timeout
         paths = {label: state_file(state_dir, project) for label, project in (("a", first), ("b", second))}
         while time.monotonic() < deadline:
-            if any(process.poll() is not None for process in processes.values()):
+            if any(process.poll() not in (None, 0) for process in processes.values()):
+                raise RuntimeError("native CLI failed before both managed leads reached the gate")
+            if provider == "codex" and any(process.poll() is not None for process in processes.values()):
                 raise RuntimeError("native CLI exited before both managed leads reached the gate")
             if all((project / f"{label}.ready").exists()
                    for label, project in (("a", first), ("b", second))):
-                break
+                if provider == "codex" and not sessions["a"]:
+                    sessions = {label: codex_session(logs, label) for label in processes}
+                if all(path.exists() for path in paths.values()):
+                    docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+                    if all(docs[label].get("active_runs", {}).get(
+                            f"{provider}:{session}", {}).get("lead_identity")
+                            for label, session in sessions.items()):
+                        break
             time.sleep(.25)
         else:
-            raise RuntimeError("native leads did not overlap before deadline")
-        if provider == "codex":
-            sessions = {label: codex_session(logs, label) for label in processes}
-        docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+            raise RuntimeError("native lead ownership did not overlap before deadline")
         observed_leads = {}
         if separate:
             for label, doc in docs.items():
@@ -176,12 +303,46 @@ def check_case(provider, root, separate, timeout, budget):
                 raise RuntimeError("same worktree owner sessions differ from native CLI sessions")
             observed_leads = {label: by_session[session]["lead_identity"]
                               for label, session in sessions.items()}
+        observed_run_ids = {label: docs[label]["active_runs"][f"{provider}:{session}"]["run_id"]
+                            for label, session in sessions.items()}
+        old_records = (update_while_gated(update, env, docs, sessions,
+                                          {"a": first, "b": second}, deadline) if update else {})
         for project in {first, second}:
             (project / "release").touch()
-        for label, process in processes.items():
-            remaining = max(1, deadline - time.monotonic())
-            if process.wait(timeout=remaining):
-                raise RuntimeError(f"{label}: native CLI exited {process.returncode}")
+        if provider == "codex":
+            for label, process in processes.items():
+                remaining = max(1, deadline - time.monotonic())
+                if process.wait(timeout=remaining):
+                    raise RuntimeError(f"{label}: native CLI exited {process.returncode}")
+        else:
+            resumed = set()
+            while time.monotonic() < deadline:
+                if any(process.poll() not in (None, 0) for process in processes.values()):
+                    raise RuntimeError("native Claude CLI exited unsuccessfully")
+                current = {label: json.loads(path.read_text()) for label, path in paths.items()}
+                for label, process in processes.items():
+                    events = current[label].get("event_history", [])
+                    lead_returned = (any(event.get("kind") == "lead_completed"
+                                         and event.get("payload", {}).get("identity") == observed_leads[label]
+                                         for event in events)
+                                     or any(run.get("session_id") == sessions[label]
+                                            and run.get("status") == "completed"
+                                            for run in current[label].get("recent_runs", [])))
+                    if (process.poll() == 0 and label not in resumed
+                            and (lead_returned or deadline - time.monotonic() < 90)):
+                        resume_claude(env, first if label == "a" else second,
+                                      sessions[label], budget, deadline)
+                        resumed.add(label)
+                if (len(resumed) == len(processes)
+                        and all(any(run.get("session_id") == sessions[label]
+                                and run.get("status") == "completed"
+                                and (run.get("outcome") or {}).get("status") == "completed"
+                                for run in current[label].get("recent_runs", []))
+                                for label in processes)):
+                    break
+                time.sleep(.25)
+            else:
+                raise RuntimeError("background Claude leads did not resume and archive completed outcomes")
         final_docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
         for label, doc in final_docs.items():
             runs = [run for run in doc.get("recent_runs", []) if run.get("provider") == provider]
@@ -192,6 +353,16 @@ def check_case(provider, root, separate, timeout, budget):
                 raise RuntimeError(f"{label}: missing durable completed outcome")
             if matching[0].get("lead_identity") != observed_leads[label]:
                 raise RuntimeError(f"{label}: completed run changed lead identity")
+            if matching[0].get("run_id") != observed_run_ids[label]:
+                raise RuntimeError(f"{label}: active run was restarted during the native session")
+            if update:
+                activation = doc.get("activation", {}).get("codex", {})
+                records = [activation, *activation.get("session_profiles", [])]
+                if not any(item.get("session_id") == sessions[label]
+                           and item.get("plugin_version") == update["old_version"]
+                           and item.get("runtime_root") == old_records[label]["runtime_root"]
+                           for item in records):
+                    raise RuntimeError(f"{label}: old native session lost its retained runtime after update")
             if label == "a" and provider == "codex":
                 events = [event for event in doc.get("event_history", [])
                           if event.get("payload", {}).get("identity") == matching[0].get("lead_identity")]
@@ -199,7 +370,9 @@ def check_case(provider, root, separate, timeout, budget):
                 if "lead_failed" not in kinds or "lead_completed" not in kinds:
                     raise RuntimeError("recovered lead lacks durable failed and completed events")
         return {"case": "different-branch-worktrees" if separate else "same-worktree",
-                "observed_overlap": True, "completed": ["a", "b"]}
+                "observed_overlap": True, "completed": ["a", "b"],
+                **({"native_resumed": sorted(resumed)} if provider == "claude" else {}),
+                **({"live_update": f"{update['old_version']}->{update['candidate_version']}"} if update else {})}
     finally:
         for project in {first, second}:
             (project / "release").touch()
@@ -213,34 +386,65 @@ def check_case(provider, root, separate, timeout, budget):
                     process.wait()
 
 
+def failure_state(root, provider):
+    def run_summary(run):
+        return {"session_id": run.get("session_id"), "lead_id": run.get("lead_identity"),
+                "status": run.get("status"),
+                "outcome": (run.get("outcome") or {}).get("status")}
+
+    cases = []
+    for path in root.rglob("*.v2.json"):
+        document = json.loads(path.read_text())
+        cases.append({"case": path.relative_to(root).parts[0],
+                      "active_runs": [run_summary(run) for run in document.get("active_runs", {}).values()],
+                      "recent_runs": [run_summary(run) for run in document.get("recent_runs", [])],
+                      "event_kinds": [event.get("kind") for event in document.get("event_history", [])]})
+    return {"provider": provider, "cases": cases}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", choices=("codex", "claude"), required=True)
     parser.add_argument("--timeout", type=int, default=360)
     parser.add_argument("--claude-budget-usd", type=float, default=3.0)
+    parser.add_argument("--live-update", action="store_true")
+    parser.add_argument("--old-plugin-root", type=Path)
+    parser.add_argument("--candidate-plugin-root", type=Path,
+                        default=Path(__file__).resolve().parents[2] / "plugins" / "symphony")
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="symphony-native-managed-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="symphony-native-managed-", ignore_cleanup_errors=True) as temporary:
         root = Path(temporary)
+        update = None
         try:
+            if args.live_update:
+                if args.provider != "codex":
+                    raise RuntimeError("native Claude update needs a separately installed fresh session; no Codex checker exists")
+                if not args.old_plugin_root:
+                    raise RuntimeError("--live-update requires --old-plugin-root")
+                old_version = package_version(args.old_plugin_root)
+                candidate_version = package_version(args.candidate_plugin_root)
+                if (old_version != "1.5.1"
+                        or tuple(map(int, candidate_version.split("."))) <= (1, 5, 1)):
+                    raise RuntimeError("live update requires 1.5.1 and a genuinely newer candidate")
+                if not os.environ.get("OPENAI_API_KEY"):
+                    raise RuntimeError("live update requires OPENAI_API_KEY for scratch login")
             results = [check_case(args.provider, root, separate, args.timeout,
                                   args.claude_budget_usd) for separate in (False, True)]
+            if args.live_update:
+                update = prepare_live_update(root, args.old_plugin_root, args.candidate_plugin_root)
+                results.append(check_case(args.provider, root, False, args.timeout,
+                                          args.claude_budget_usd, update))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(json.dumps({"provider": args.provider, "error": str(error),
                               "logs": str(root)}), file=sys.stderr)
-            for path in root.rglob("*.v2.json"):
-                document = json.loads(path.read_text())
-                def summary(run):
-                    task = str(run.get("task") or "")
-                    return {"session_id": run.get("session_id"), "status": run.get("status"),
-                            "outcome_status": (run.get("outcome") or {}).get("status"),
-                            "lead_identity": run.get("lead_identity"),
-                            "task_matches": [label for label in ("a", "b")
-                                             if f"lifecycle {label}" in task]}
-                print(json.dumps({"state_file": str(path),
-                                  "active_runs": [summary(run) for run in document.get("active_runs", {}).values()],
-                                  "recent_runs": [summary(run) for run in document.get("recent_runs", [])],
-                                  "event_kinds": [event.get("kind") for event in document.get("event_history", [])]}),
-                      file=sys.stderr)
+            diagnostics = failure_state(root, args.provider)
+            print(json.dumps(diagnostics), file=sys.stderr)
+            destination = os.environ.get("SYMPHONY_NATIVE_DIAGNOSTICS_DIR")
+            if destination:
+                directory = Path(destination)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / f"native-managed-{args.provider}-failure.json").write_text(
+                    json.dumps(diagnostics, indent=2), encoding="utf-8")
             # Preserve command output as CI diagnostics before TemporaryDirectory removes it.
             for path in root.rglob("*.errors"):
                 print(f"{path}: {path.read_text(errors='replace')[-4000:]}", file=sys.stderr)
@@ -249,6 +453,9 @@ def main():
             for path in root.rglob("*.stdout"):
                 print(f"{path}: {path.read_text(errors='replace')[-2000:]}", file=sys.stderr)
             return 1
+        finally:
+            if update:
+                shutil.rmtree(update["home"], ignore_errors=True)
     print(json.dumps({"provider": args.provider, "native_managed": results}))
     return 0
 

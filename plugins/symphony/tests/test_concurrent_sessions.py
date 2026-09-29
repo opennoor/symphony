@@ -417,6 +417,67 @@ class ConcurrentSessionTests(unittest.TestCase):
                 self.assertNotEqual("block", stop.get("decision"), stop.get("reason"))
                 self.assertNotIn(f"{provider}:root-a", store.load(self.project).active_runs)
 
+    def test_shared_agent_id_uses_root_session_and_rejects_foreign_parent(self):
+        for provider, profile in (("codex", "full"), ("claude", "opus")):
+            with self.subTest(provider=provider):
+                env = {**self.environ, "SYMPHONY_STATE_DIR": str(self.state_root / provider),
+                       "SYMPHONY_PROFILE": profile}
+                store = StateStore(Path(env["SYMPHONY_STATE_DIR"]))
+                runs = {}
+                for session, lead in (("root-a", "lead-a"), ("root-b", "lead-b")):
+                    runs[f"{provider}:{session}"] = RunState(
+                        session, "task", session_id=session, provider=provider, lead_identity=lead,
+                        assessment={"size": "small", "complexity": "simple"},
+                        delegations=(Delegation(lead, "lead", "task", "working", "", ""),
+                                     Delegation("shared-worker", "worker", "task", "working", "", "")),
+                    )
+                store.save(self.project, ProjectState(active_run=runs[f"{provider}:root-a"], active_runs=runs))
+                base = {"provider": provider, "cwd": str(self.project), "agent_id": "shared-worker"}
+                handle({**base, "session_id": "root-b", "hook_event_name": "SubagentStop",
+                        "status": "failed", "last_assistant_message": "failed"}, env)
+                state = store.load(self.project)
+                worker = lambda session: next(item for item in state.active_runs[f"{provider}:{session}"].delegations
+                                              if item.identity == "shared-worker")
+                self.assertEqual("working", worker("root-a").state)
+                self.assertEqual("failed", worker("root-b").state)
+
+                handle({**base, "session_id": "root-b", "hook_event_name": "SubagentStart",
+                        "agent_id": "nested-b", "parent_thread_id": "shared-worker",
+                        "agent_type": "symphony_worker"}, env)
+                state = store.load(self.project)
+                self.assertIn("nested-b", {item.identity for item in state.active_runs[f"{provider}:root-b"].delegations})
+                self.assertNotIn("nested-b", {item.identity for item in state.active_runs[f"{provider}:root-a"].delegations})
+
+                handle({**base, "session_id": "root-b", "hook_event_name": "SubagentStart",
+                        "agent_id": "foreign-child", "parent_thread_id": "lead-a",
+                        "agent_type": "symphony_worker"}, env)
+                handle({**base, "session_id": "lead-b", "hook_event_name": "SubagentStart",
+                        "agent_id": "foreign-child", "parent_thread_id": "lead-a",
+                        "agent_type": "symphony_worker"}, env)
+                state = store.load(self.project)
+                self.assertNotIn("foreign-child", {item.identity for run in state.active_runs.values()
+                                                   for item in run.delegations})
+
+    def test_known_child_session_assessor_does_not_open_phantom_root(self):
+        for provider, profile in (("codex", "full"), ("claude", "opus")):
+            with self.subTest(provider=provider):
+                env = {**self.environ, "SYMPHONY_STATE_DIR": str(self.state_root / provider),
+                       "SYMPHONY_PROFILE": profile}
+                store = StateStore(Path(env["SYMPHONY_STATE_DIR"]))
+                run = RunState(
+                    "run", "task", session_id="root", provider=provider, lead_identity="lead-child",
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(Delegation("lead-child", "lead", "task", "working", "", ""),
+                                 Delegation("assessor-same", "assessor", "task", "working", "", "")),
+                )
+                store.save(self.project, ProjectState(active_run=run, active_runs={f"{provider}:root": run}))
+                handle({"provider": provider, "session_id": "lead-child", "cwd": str(self.project),
+                        "hook_event_name": "SubagentStart", "agent_id": "assessor-same",
+                        "agent_type": "symphony_assessor"}, env)
+                state = store.load(self.project)
+                self.assertEqual({f"{provider}:root"}, set(state.active_runs))
+                self.assertEqual("root", state.active_runs[f"{provider}:root"].session_id)
+
     def test_worktree_and_branch_changes_do_not_mix_session_runs(self):
         def git(*args):
             subprocess.run(["git", *args], cwd=self.project, check=True,

@@ -91,23 +91,45 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
 def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, str] | None:
     """Find the owning root without ever borrowing another session's run."""
     session = str(source.payload.get("session_id") or "")
+    key = f"{provider}:{session}" if session else ""
     parent = str(source.payload.get("parent_thread_id") or "")
     agent = str(source.payload.get("agent_id") or source.payload.get("subagent_id") or "")
     if source.kind in {"subagent_started", "subagent_stopped"}:
+        session_matches = [
+            (owned_key, run.session_id or session) for owned_key, run in state.active_runs.items()
+            if owned_key.startswith(f"{provider}:")
+            and session in {run.session_id, run.lead_identity,
+                            *(item.identity for item in run.delegations)}
+        ] if session else []
         if parent:
             matches = [
-                (key, run.session_id or parent) for key, run in state.active_runs.items()
-                if key.startswith(f"{provider}:")
+                (owned_key, run.session_id or parent) for owned_key, run in state.active_runs.items()
+                if owned_key.startswith(f"{provider}:")
                 and parent in {run.session_id, run.lead_identity,
                                *(item.identity for item in run.delegations)}
             ]
             if len(matches) == 1:
+                if ((key in state.active_runs and key != matches[0][0])
+                        or (session_matches and all(owner != matches[0][0]
+                                                    for owner, _ in session_matches))):
+                    return None
                 return matches[0]
             if matches:
+                owned = [match for match in matches if match in session_matches]
+                if len(owned) == 1 and (key not in state.active_runs or owned[0][0] == key):
+                    return owned[0]
+                return None
+            if session_matches:
                 return None
             if source.kind == "subagent_started":
                 return f"{provider}:{parent}", parent
             return None
+        if len(session_matches) == 1:
+            return session_matches[0]
+        if session_matches:
+            return None
+        if source.kind == "subagent_started" and session and _observed_role(source.payload) == "assessor":
+            return key, session
         if agent:
             matches = [
                 (key, run.session_id or session) for key, run in state.active_runs.items()
@@ -130,7 +152,6 @@ def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, 
             return None
     if not session:
         return None
-    key = f"{provider}:{session}"
     if key in state.active_runs:
         return key, session
     if source.kind in {"subagent_started", "subagent_stopped"}:
