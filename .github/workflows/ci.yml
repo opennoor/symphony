@@ -74,7 +74,7 @@ jobs:
           }
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex
+        run: npm install -g @openai/codex@0.158.0
 
       - name: Run real Windows Codex control smoke
         env:
@@ -203,6 +203,14 @@ jobs:
           $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
           python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600
           if ($LASTEXITCODE -ne 0) { throw 'Native Claude managed concurrency failed' }
+          $oldCheckout = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
+          if (-not (Test-Path (Join-Path $oldCheckout 'plugins/symphony/hooks/hooks.json'))) {
+            throw 'Released 1.5.1 source missing for Claude live update'
+          }
+          python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 `
+            --live-update --old-plugin-root (Join-Path $oldCheckout 'plugins/symphony') `
+            --candidate-plugin-root (Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony')
+          if ($LASTEXITCODE -ne 0) { throw 'Native Claude live-update continuity failed' }
 
       - name: Retain sanitized native failure evidence
         if: always()
@@ -256,7 +264,7 @@ jobs:
           claude plugin validate plugins/symphony
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex
+        run: npm install -g @openai/codex@0.158.0
 
       - name: Run real Codex control smoke when a credential is available
         env:
@@ -288,6 +296,13 @@ jobs:
             '$symphony:symphony help'
           python3 .github/scripts/assert_heartbeat.py codex
           python3 plugins/symphony/scripts/native_effort_smoke.py --provider codex
+          git fetch origin tag v1.5.1
+          git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
+          export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          python3 .github/scripts/native_managed_concurrency.py --provider codex --timeout 600 \
+            --live-update \
+            --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
+            --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
 
       - name: Run real Claude control smoke when credential is available
         env:
@@ -313,6 +328,23 @@ jobs:
             '/symphony:help' > "$RUNNER_TEMP/claude-help.txt"
           python3 .github/scripts/assert_heartbeat.py claude
           python3 plugins/symphony/scripts/native_effort_smoke.py --provider claude
+          if [ ! -d "$RUNNER_TEMP/symphony-old-release/plugins/symphony" ]; then
+            git fetch origin tag v1.5.1
+            git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
+          fi
+          export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          python3 .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 \
+            --live-update \
+            --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
+            --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
+
+      - name: Retain sanitized Linux native failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-managed-diagnostics
+          path: ${{ runner.temp }}/symphony-native-diagnostics/*.json
+          if-no-files-found: ignore
 
   release:
     needs: [verify, windows-hooks, dockur-windows]
