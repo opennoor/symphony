@@ -9,6 +9,7 @@ import argparse
 import ast
 from collections import Counter
 from dataclasses import replace
+from datetime import datetime
 from hashlib import sha256
 import json
 import os
@@ -32,6 +33,7 @@ while not (root / "release").exists():
     if time.monotonic() > deadline:
         raise SystemExit("gate timed out")
     time.sleep(.1)
+(root / (name + ".released")).touch()
 print("GATE_RELEASED", flush=True)
 '''
 
@@ -135,12 +137,14 @@ def prompt(provider, label, recover, project):
         "another checkout or worktree. The gate prints GATE_STARTED "
         "before blocking and GATE_RELEASED only after the harness releases it. "
         "Use the native command tool to run it; report success only after observing "
-        "GATE_RELEASED from that command. " + recovery +
-        "Await all children. Once their outcomes are reconciled, check Symphony status; "
-        f"if the original run remains completing, invoke the normal "
-        f"{'$symphony:symphony stop' if provider == 'codex' else '/symphony:stop'} "
-        "control in this same session and check durable status again. Never force stop. "
-        "Then finish briefly. Do not edit files or inspect other projects."
+        "GATE_RELEASED and exit code zero from that command. If the command tool returns "
+        "a running process/session, wait for that same process to finish. Include both "
+        "observed gate markers in the lead's report with its required outcome. " + recovery +
+        "Await all children, then finish briefly so the native Stop hook can finalize "
+        "the run. A completing run awaits that hook: do not poll for completed before "
+        "ending the turn, print status/stop controls as prose, or ask a completed lead "
+        "for extra confirmation. The harness verifies durable completion after Stop. "
+        "Never force stop. Do not edit files or inspect other projects."
     )
 
 
@@ -985,6 +989,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
     env = {**os.environ, **(update["env"] if update else baseline_env or {}),
            "SYMPHONY_STATE_DIR": str(state_dir),
            "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
+           "SYMPHONY_HOOK_DECISIONS_DIR": str(case / "hook decisions"),
            "SYMPHONY_PROFILE": "base" if provider == "codex" else "sonnet"}
     if provider == "claude":
         env.pop("CLAUDE_PLUGIN_ROOT", None)
@@ -1238,6 +1243,15 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             if record.get("pending") or record.get("overflow"):
                 raise RuntimeError("native session retained unresolved child callbacks after completion")
         for label, doc in final_docs.items():
+            released = (first if label == "a" else second) / f"{label}.released"
+            terminals = [event for event in doc.get("event_history", ())
+                         if event.get("kind") == "lead_completed"
+                         and event.get("payload", {}).get("identity") == observed_leads[label]]
+            # ponytail: allow 1s filesystem clock granularity; use host monotonic receipts if subsecond ordering matters.
+            if (not released.is_file() or not terminals
+                    or max(datetime.fromisoformat(event["observed_at"]).timestamp()
+                           for event in terminals) < released.stat().st_mtime - 1):
+                raise RuntimeError(f"{label}: lead completed before the gate released")
             runs = [run for run in doc.get("recent_runs", []) if run.get("provider") == provider]
             matching = [run for run in runs if run.get("session_id") == sessions[label]]
             if len(matching) != 1 or matching[0].get("status") != "completed":
@@ -1835,6 +1849,14 @@ def failure_state(root, provider):
                 if active and active.get("status") == "completing":
                     completion_probes[label] = codex_completion_probe(
                         document, session, native_home)
+        hook_decisions = []
+        for decision_path in (case_root / "hook decisions").glob("*.json"):
+            try:
+                decision = json.loads(decision_path.read_text())
+            except (OSError, ValueError):
+                continue
+            if decision.get("session_id") in root_sessions:
+                hook_decisions.append(decision)
         cases.append({"case": case, "labels": labels, "cli_session_ids": cli_sessions,
                       "activation_profiles": [activation_summary(item) for item in profiles
                                               if isinstance(item, dict) and item.get("session_id")],
@@ -1843,6 +1865,8 @@ def failure_state(root, provider):
                       "event_kinds": [event.get("kind") for event in document.get("event_history", [])],
                       "lead_lifecycle_events": relevant_events,
                       "root_stop_events": root_stop_events,
+                      "hook_decisions": sorted(hook_decisions,
+                                               key=lambda item: item.get("observed_at", "")),
                       "session_records": session_records,
                       "candidate_recovery_probes": recovery_probes,
                       "codex_completion_probes": completion_probes,

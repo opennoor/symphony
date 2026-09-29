@@ -347,7 +347,12 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                                 # authoritative binding to another root must
                                 # not block this independent session.
                                 continue
-                            if any(item.get("ambiguous_owner") for item in alias_record["pending"]):
+                            if any(item.get("ambiguous_owner") and not (
+                                roster is not None and _committed_child_start_replay(
+                                    roster, Event(item["event_id"], item["kind"],
+                                                  item["observed_at"], item["payload"]),
+                                    provider, session,
+                                )) for item in alias_record["pending"]):
                                 unresolved_alias = True
                                 continue
                             exact_owner = (alias_record["owner_session"] == session
@@ -366,7 +371,12 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                                                and bool(alias_record["pending"])
                                                and roster is not None
                                                and all(
-                                                   _committed_child_terminal_replay(
+                                                   _committed_child_start_replay(
+                                                       roster,
+                                                       Event(item["event_id"], item["kind"],
+                                                             item["observed_at"], item["payload"]),
+                                                       provider, session,
+                                                   ) or _committed_child_terminal_replay(
                                                        roster,
                                                        Event(item["event_id"], item["kind"],
                                                              item["observed_at"], item["payload"]),
@@ -1011,7 +1021,7 @@ def _claude_entitlement(environ: Mapping[str, str], *, probe: bool = False) -> s
     explicit = {model.strip() for model in models.split(",") if model.strip()}
     if explicit or not probe:
         return explicit or None
-    targets = ("claude-sonnet-5", "claude-opus-5-5")
+    targets = ("claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5")
     available = set()
     for model in targets:
         if model not in available and _claude_accepts(model):
@@ -1030,7 +1040,8 @@ def _claude_accepts(model: str) -> bool:
              "--tools", "", "--disallowedTools", "mcp__*",
              "--system-prompt", "Reply ok.", "--model", model,
              "--max-budget-usd", "0.25", "--output-format", "json", "Reply ok."],
-            capture_output=True, text=True, timeout=15,
+            # Three probes leave 15 seconds of the 45-second hook budget for bookkeeping.
+            capture_output=True, text=True, timeout=10,
             env={**os.environ, "SYMPHONY_CLAUDE_PROBE": "1"},
         )
         if completed.returncode:
@@ -2901,6 +2912,49 @@ def _record_fault(error: BaseException, environ: Mapping[str, str]) -> None:
         pass
 
 
+def _record_hook_decision(payload: Mapping[str, object], result: HookResult,
+                          environ: Mapping[str, str]) -> None:
+    """Record a bounded Stop decision in an explicitly opted-in test home."""
+    destination = environ.get("SYMPHONY_HOOK_DECISIONS_DIR")
+    if not destination or payload.get("hook_event_name") != "Stop":
+        return
+    try:
+        response = json.loads(result.stdout) if result.stdout else {}
+        if not isinstance(response, dict):
+            response = {}
+        reason = str(response.get("reason") or "")
+        categories = (
+            ("root ownership is unresolved", "owner_unresolved"),
+            ("active in multiple project states", "owner_conflict"),
+            ("state snapshot was unavailable", "owner_snapshot_unavailable"),
+            ("bound project state is unavailable", "bound_state_unavailable"),
+            ("unresolved child result", "pending_child"),
+            ("child lifecycle reconciliation", "batch_pending"),
+            ("child start has no invocation ID", "ambiguous_start"),
+            ("active work remains", "active_work"),
+            ("newer native turn still running", "native_running"),
+            ("latest native turn", "native_unknown"),
+            ("interrupted work still requires reconciliation", "interrupted_work"),
+            ("waiting for host launch confirmation", "launch_pending"),
+            ("consultant results still require", "consultant_pending"),
+            ("tracked lead has no reconciled outcome", "lead_outcome_missing"),
+            ("assessment work has ended", "lead_not_started"),
+        )
+        category = next((label for phrase, label in categories if phrase in reason),
+                        "other_block" if response.get("decision") == "block" else "permit")
+        record = {"session_id": str(payload.get("session_id") or ""),
+                  "category": category,
+                  "reason_hash": hashlib.sha256(reason.encode()).hexdigest()[:12] if reason else None,
+                  "observed_at": datetime.now(timezone.utc).isoformat(),
+                  "plugin_version": PLUGIN_VERSION}
+        path = Path(destination)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{os.getpid()}-{datetime.now(timezone.utc).timestamp():.9f}.json").write_text(
+            json.dumps(record), encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -2909,6 +2963,7 @@ def main() -> int:
         sys.stderr.write(f"Symphony hook fault: {type(error).__name__}\n")
         _record_fault(error, os.environ)
         return 0
+    _record_hook_decision(payload, result, os.environ)
     if result.stdout:
         sys.stdout.write(result.stdout)
     return 0

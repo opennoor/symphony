@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from plugins.symphony.symphony.adapters import event_from_payload
+from plugins.symphony.symphony.adapters import HookResult, event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.runtime import compact_delegations, format_delegation, handle
@@ -41,7 +41,7 @@ class RuntimeTests(unittest.TestCase):
         # Pin the entitlement profile so tests never probe the host machine.
         self.environ = {
             "SYMPHONY_STATE_DIR": str(self.state_root),
-            "SYMPHONY_PROFILE": "full",
+            "SYMPHONY_PROFILE": CODEX_FULL["id"],
         }
         self.claude_environ = {**self.environ, "SYMPHONY_PROFILE": CLAUDE_FULL["id"]}
         self.simple = route_choice()
@@ -283,7 +283,7 @@ class RuntimeTests(unittest.TestCase):
         after = store.load(self.project)
 
         self.assertNotEqual(result.get("decision"), "block", result.get("reason"))
-        self.assertEqual(after.activation["codex"]["profile"], "full")
+        self.assertEqual(after.activation["codex"]["profile"], CODEX_FULL["id"])
         self.assertIn("codex:starting-0", after.active_runs)
         self.assertNotIn("starting-0", after.activation["codex"]["pending_sessions"])
         handle({**self.payload("$symphony:symphony stop"), "session_id": "starting-1"}, self.environ)
@@ -658,9 +658,9 @@ class RuntimeTests(unittest.TestCase):
         })
         handle({**assessor, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": f"SYMPHONY_ASSESSMENT: {marker}"}, self.environ)
-        expected = resolve_tier(route_for(Assessment("small", "mixed")), snapshot_for("codex", "full"))
+        expected = resolve_tier(route_for(Assessment("small", "mixed")), snapshot_for("codex", CODEX_FULL["id"]))
         guidance = self.flush()
-        self.assertIn("Selected codex lead (full profile)", guidance)
+        self.assertIn(f"Selected codex lead ({CODEX_FULL['id']} profile)", guidance)
         self.assertIn(f"{expected['lead_model']}/{expected['lead_effort']}", guidance)
 
         def spawn(effort):
@@ -1563,11 +1563,14 @@ class RuntimeTests(unittest.TestCase):
                          "parent_thread_id": session, "role": "lead"}
                 start["turn_id" if provider == "codex" else "prompt_id"] = "old-invocation"
                 start_event = event_from_payload(provider, start)
+                alias_start = {**start, "session_id": "old-lead"}
+                alias_event = event_from_payload(provider, alias_start)
                 choice = route_choice(provider=provider)
                 finished = RunState(
                     "old-run", "task", status="completed", session_id=session,
                     provider=provider, lead_identity="old-lead",
-                    assessment={"_start_event_ids": (start_event.event_id,)},
+                    assessment={"_start_event_ids": (start_event.event_id,
+                                                     alias_event.event_id)},
                     delegations=(Delegation("old-lead", "lead", "task", "completed",
                                             choice["model"], choice["effort"]),),
                     outcome={"status": "completed"},
@@ -1592,6 +1595,16 @@ class RuntimeTests(unittest.TestCase):
                                            "hook_event_name": "Stop"}, environ))
                 self.assertNotEqual("block", stop.get("decision"), stop)
                 self.assertEqual([], store.session_record(provider, session)["pending"])
+                # The same committed start can arrive through a child-session
+                # alias after the original run has archived.
+                for ambiguous in (False, True):
+                    store.queue_session_event(provider, "old-lead", alias_event,
+                                              ambiguous_owner=ambiguous)
+                    stop = self.output(handle({**self.payload("", provider),
+                                               "session_id": session,
+                                               "hook_event_name": "Stop"}, environ))
+                    self.assertNotEqual("block", stop.get("decision"), stop)
+                    self.assertEqual([], store.session_record(provider, "old-lead")["pending"])
                 state = store.load(self.project)
                 self.assertEqual(baseline.active_runs, state.active_runs)
                 self.assertEqual(baseline.recent_runs, state.recent_runs)
@@ -3037,6 +3050,7 @@ class RuntimeTests(unittest.TestCase):
     def test_native_lead_completion_replay_cannot_hide_late_worker_failure(self):
         for provider in ("codex", "claude"):
             with self.subTest(provider=provider):
+                environ = self.claude_environ if provider == "claude" else self.environ
                 choice = route_choice(provider=provider)
                 self.seed_run(RunState("run", "task", lead_identity="lead", assessment={
                     "size": "small", "complexity": "simple",
@@ -3046,10 +3060,11 @@ class RuntimeTests(unittest.TestCase):
                 )), provider)
                 completion = {**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "lead",
                               "status": "completed", "last_assistant_message": "Integrated the task."}
-                handle(completion, self.environ)
+                handle({**self.payload("", provider), "hook_event_name": "SessionStart"}, environ)
+                handle(completion, environ)
                 handle({**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "worker",
-                        "status": "failed"}, self.environ)
-                handle(completion, self.environ)
+                        "status": "failed"}, environ)
+                handle(completion, environ)
                 state = StateStore(self.state_root).load(self.project)
                 self.assertIsNotNone(state.active_run)
                 self.assertEqual(state.active_run.status, "recovering")
@@ -3058,12 +3073,12 @@ class RuntimeTests(unittest.TestCase):
                 replacement = {**self.payload("", provider), "provider": provider,
                                "agent_id": "fresh-lead", "role": "lead", "model": choice["model"],
                                "model_reasoning_effort": choice["effort"]}
-                handle({**replacement, "hook_event_name": "SubagentStart"}, self.environ)
+                handle({**replacement, "hook_event_name": "SubagentStart"}, environ)
                 handle({**replacement, "hook_event_name": "SubagentStop", "status": "completed",
-                        "last_assistant_message": "Recovered the failed worker and integrated its result."}, self.environ)
+                        "last_assistant_message": "Recovered the failed worker and integrated its result."}, environ)
                 finished = StateStore(self.state_root).load(self.project)
                 self.assertEqual(finished.active_run.status, "completing")
-                handle({**self.payload("", provider), "hook_event_name": "Stop"}, self.environ)
+                handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
                 finished = StateStore(self.state_root).load(self.project)
                 self.assertIsNone(finished.active_run)
                 self.assertEqual(finished.recent_runs[-1].status, "completed")
@@ -3175,16 +3190,18 @@ class RuntimeTests(unittest.TestCase):
     def test_missing_lead_start_is_reconciled_from_native_terminal_event(self):
         for provider in ("codex", "claude"):
             with self.subTest(provider=provider):
+                environ = self.claude_environ if provider == "claude" else self.environ
                 choice = route_choice(provider=provider)
                 self.seed_run(RunState("run", "task", assessment={"size": "small", "complexity": "simple"}), provider)
+                handle({**self.payload("", provider), "hook_event_name": "SessionStart"}, environ)
                 agent_type = (codex_agent_type("lead", choice["model"], choice["effort"]) if provider == "codex"
                               else claude_agent_type("lead", choice))
                 handle({**self.payload("", provider), "hook_event_name": "SubagentStop", "agent_id": "lead",
                         "agent_type": agent_type, "status": "completed", "provider": provider, "model": choice["model"],
-                        "model_reasoning_effort": choice["effort"]}, self.environ)
+                        "model_reasoning_effort": choice["effort"]}, environ)
                 state = StateStore(self.state_root).load(self.project)
                 self.assertEqual(state.active_run.status, "completing")
-                handle({**self.payload("", provider), "hook_event_name": "Stop"}, self.environ)
+                handle({**self.payload("", provider), "hook_event_name": "Stop"}, environ)
                 state = StateStore(self.state_root).load(self.project)
                 self.assertIsNone(state.active_run)
                 self.assertEqual(state.recent_runs[-1].outcome, {"status": "completed"})
@@ -3455,6 +3472,23 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse((self.state_root.parent / "faults.log").exists())
         repeated = self.context(handle(self.payload("$symphony:symphony status"), self.environ))
         self.assertNotIn("RuntimeError", repeated)
+
+    def test_opt_in_stop_decision_receipt_omits_reason_text(self):
+        destination = self.root / "hook decisions"
+        payload = {**self.payload(""), "hook_event_name": "Stop"}
+        reason = "Symphony stop is blocked: an unresolved child result for secret-agent"
+        runtime_module._record_hook_decision(
+            payload, HookResult(json.dumps({"decision": "block", "reason": reason})),
+            {"SYMPHONY_HOOK_DECISIONS_DIR": str(destination)},
+        )
+        receipts = list(destination.glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual(receipt["category"], "pending_child")
+        self.assertEqual(receipt["session_id"], "codex-session")
+        self.assertNotIn("secret-agent", receipts[0].read_text())
+        runtime_module._record_hook_decision(payload, HookResult(), {})
+        self.assertEqual(len(list(destination.glob("*.json"))), 1)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ DRIFT_CELL = next(
 DRIFT_SIZE, DRIFT_COMPLEXITY = DRIFT_CELL.split("/")
 FULL_ROUTE = FULL_PROFILE.matrix[DRIFT_CELL]
 BASE_ROUTE = BASE_PROFILE.matrix[DRIFT_CELL]
+LATEST_PROFILE = profiles_for("codex")[0]["id"]
+LATEST_ROUTE = snapshot_for("codex", LATEST_PROFILE).matrix[DRIFT_CELL]
 FULL_STRONGEST = profiles_for("codex")[0]["tiers"]["strongest"]
 
 MARKER = json.dumps(
@@ -98,7 +100,7 @@ class RouteDriftTests(unittest.TestCase):
         """
         self.start(profile, session)
         self.spawn(profile, session, "assessor", FULL_STRONGEST, "high")
-        if profile != "full":
+        if profile != LATEST_PROFILE:
             self.proceed(profile, session)
         result = self.spawn(profile, session, "lead", model, effort, MARKER)
         self.assertNotEqual(
@@ -143,9 +145,9 @@ class RouteDriftTests(unittest.TestCase):
         """Moving to a better map is not a degradation and needs no consent."""
         self.accept_under("base", "session-1", BASE_ROUTE["model"], BASE_ROUTE["effort"])
 
-        self.start("full", "session-1")
+        self.start(LATEST_PROFILE, "session-1")
         output = self.output(
-            self.spawn("full", "session-1", "lead", FULL_ROUTE["model"], FULL_ROUTE["effort"], MARKER)
+            self.spawn(LATEST_PROFILE, "session-1", "lead", LATEST_ROUTE["model"], LATEST_ROUTE["effort"], MARKER)
         )
 
         self.assertNotEqual(output.get("decision"), "block", output.get("reason"))

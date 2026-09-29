@@ -122,8 +122,8 @@ class RosterTests(unittest.TestCase):
     def test_claude_generation_rejects_a_sonnet_only_opus_profile(self):
         current = json.loads(self.refresh.PROFILES.read_text())["providers"]["claude"]["profiles"]
         profiles = [{"id": item["id"], "matrix": json.loads(json.dumps(item["matrix"]))} for item in current]
-        profiles[1]["matrix"] = json.loads(json.dumps(profiles[-1]["matrix"]))
-        models = ("claude-sonnet-5", "claude-opus-5-5", "claude-fable-5-1")
+        next(item for item in profiles if item["id"] == "opus")["matrix"] = json.loads(json.dumps(profiles[-1]["matrix"]))
+        models = ("claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1")
         decision = {
             "profiles": profiles,
             "model_order": list(models),
@@ -148,6 +148,21 @@ class RosterTests(unittest.TestCase):
 
 
 class ShippedProfileTests(unittest.TestCase):
+    def test_new_models_have_reviewed_rates_and_supported_efforts(self):
+        refresh = load()
+        policy = refresh._policy()
+        profiles = json.loads(refresh.PROFILES.read_text())["providers"]
+        self.assertEqual(policy["reviewed_at"], "2026-09-29")
+        self.assertEqual(policy["models"]["gpt-6.1-sol"]["codex_credits_per_million_tokens"],
+                         {"input": 50, "cached_input": 2.5, "output": 250})
+        self.assertEqual(policy["models"]["claude-sonnet-5-5"]["api_usd_per_million_tokens"],
+                         {"input": 2, "cached_input": 0.2, "output": 10,
+                          "cache_write_5m": 2.5, "cache_write_1h": 4})
+        self.assertEqual(profiles["codex"]["profiles"][0]["efforts"]["gpt-6.1-sol"],
+                         ["low", "medium", "high", "xhigh", "max", "ultra"])
+        self.assertEqual(profiles["claude"]["profiles"][0]["efforts"]["claude-sonnet-5-5"],
+                         ["low", "medium", "high", "xhigh", "max"])
+
     def test_shipped_matrices_cover_each_cell_and_back_the_tier_summary(self):
         refresh = load()
         document = json.loads(refresh.PROFILES.read_text())
@@ -191,15 +206,15 @@ class ShippedProfileTests(unittest.TestCase):
                 return {"profiles": profiles, "model_efforts": current[0]["efforts"], "rationale": "test"}
 
             with patch.object(refresh, "PROFILES", path), \
-                 patch.object(refresh, "codex_roster", return_value=roster("gpt-6-luna", "gpt-6-sol", "gpt-6-astra")), \
-                 patch.object(refresh, "claude_roster", return_value=[{"id": "claude-sonnet-5"}, {"id": "claude-opus-5-5"}]), \
+                 patch.object(refresh, "codex_roster", return_value=roster("gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra")), \
+                 patch.object(refresh, "claude_roster", return_value=[{"id": "claude-sonnet-5"}, {"id": "claude-sonnet-5-5"}, {"id": "claude-opus-5-5"}]), \
                  patch.object(refresh, "_run_provider_agent", side_effect=decision):
                 self.assertTrue(refresh.agent_probe(Path(directory)))
             fable = json.loads(path.read_text())["providers"]["claude"]["profiles"][0]
-            self.assertEqual(fable["requires_all"], ["claude-opus-5-5", "claude-sonnet-5"])
+            self.assertEqual(fable["requires_all"], ["claude-opus-5-5", "claude-sonnet-5-5"])
             updated = json.loads(path.read_text())["providers"]
-            self.assertEqual(updated["codex"]["available_models"], ["gpt-6-astra", "gpt-6-luna", "gpt-6-sol"])
-            self.assertEqual(updated["claude"]["available_models"], ["claude-opus-5-5", "claude-sonnet-5"])
+            self.assertEqual(updated["codex"]["available_models"], ["gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"])
+            self.assertEqual(updated["claude"]["available_models"], ["claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-5-5"])
             sol = next(profile for profile in updated["codex"]["profiles"] if profile["id"] == "sol")
             self.assertEqual(sol["requires_all"], ["gpt-6-luna", "gpt-6-sol"])
 
@@ -321,11 +336,11 @@ class SemanticMatrixTests(unittest.TestCase):
     def test_sol_only_profile_cannot_gain_a_luna_requirement(self):
         current = json.loads(self.refresh.PROFILES.read_text())["providers"]["codex"]["profiles"]
         result = {"profiles": json.loads(json.dumps(current)),
-                  "model_order": ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]}
+                  "model_order": ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"]}
         next(profile for profile in result["profiles"] if profile["id"] == "sol")["matrix"]["large/simple"]["model"] = "gpt-6-luna"
         with self.assertRaisesRegex(SystemExit, "preserve its gated model coverage"):
             self.refresh.validate_matrix("codex", result, current,
-                                         roster("gpt-6-luna", "gpt-6-sol", "gpt-6-astra"))
+                                         roster("gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"))
 
     def test_noncurrent_model_rejected_even_in_raw_roster(self):
         result = self.result()
@@ -495,7 +510,7 @@ class PolicyCheckTests(unittest.TestCase):
             profile["matrix"] = choices
             profile["tiers"] = {tier: choices[cell]["model"] for tier, cell in self.refresh.TIER_CELLS.items()}
             profile["efforts"] = support
-            profile["requires_all"] = sorted({choice["model"] for choice in choices.values()}) if profile["id"] == "full" else []
+            profile["requires_all"] = sorted({choice["model"] for choice in choices.values()}) if profile is codex[0] else []
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             path.write_text(json.dumps(document))
@@ -515,7 +530,7 @@ class PolicyCheckTests(unittest.TestCase):
             self.refresh.validate_matrix("codex", result, codex, available)
 
     def test_policy_age_blocks_live_probe_only(self):
-        with patch.object(self.refresh, "_today", return_value="2026-11-08"):
+        with patch.object(self.refresh, "_today", return_value="2026-11-15"):
             self.assertEqual(self.refresh.check_policy(), 0)
             self.assertEqual(self.refresh.check_policy(require_fresh=True), 1)
 

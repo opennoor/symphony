@@ -54,7 +54,7 @@ class ClaudeCompatTests(unittest.TestCase):
         )
 
     def test_fable_is_the_strongest_claude_model(self):
-        self.assertEqual(CLAUDE_FULL["id"], "fable")
+        self.assertEqual(CLAUDE_FULL["id"], "fable-5-5")
         self.assertEqual(STRONGEST, "claude-fable-5-1")
 
     def test_guidance_names_the_exact_agent_types_and_how_to_wait(self):

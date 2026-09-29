@@ -34,9 +34,10 @@ class RuntimeRetentionTests(unittest.TestCase):
         return [bash, "-c", handler["command"]]
 
     def run_hook(self, command, root, provider, directory, payload):
+        profile = json.loads((PLUGIN / "profiles.json").read_text())["providers"][provider]["profiles"][0]["id"]
         env = {**os.environ, "PLUGIN_ROOT": str(root), "CLAUDE_PLUGIN_ROOT": str(root),
                "SYMPHONY_RUNTIME_DIR": str(directory / "retained runtimes"),
-               "SYMPHONY_STATE_DIR": str(directory / "state"), "SYMPHONY_PROFILE": "full",
+               "SYMPHONY_STATE_DIR": str(directory / "state"), "SYMPHONY_PROFILE": profile,
                "PYTHONPATH": str(directory),
                "CODEX_HOME": str(directory / "empty codex home")}
         if (directory / "pin barrier" / "barrier.py").is_file():
