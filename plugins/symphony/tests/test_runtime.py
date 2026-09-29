@@ -200,6 +200,11 @@ class RuntimeTests(unittest.TestCase):
                          ["worker-one"])
         self.assertEqual(state.active_runs["codex:second-session"], second)
 
+        handle({**started, "hook_event_name": "SubagentStop", "status": "completed"}, self.environ)
+        state = store.load(self.project)
+        self.assertEqual("completed", state.active_runs["codex:first-session"].delegations[0].state)
+        self.assertEqual(state.active_runs["codex:second-session"], second)
+
         child_stop = handle({**child, "hook_event_name": "Stop", "stop_hook_active": True}, self.environ)
         self.assertNotEqual(self.output(child_stop).get("decision"), "block")
         self.assertEqual(store.load(self.project).active_runs["codex:first-session"].status, "active")

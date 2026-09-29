@@ -201,6 +201,8 @@ jobs:
           python plugins/symphony/scripts/native_effort_smoke.py --provider claude
           if ($LASTEXITCODE -ne 0) { throw 'Native packaged Claude max assessor failed' }
           $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
+          python .github/scripts/claude_isolated_worktree.py --timeout 300
+          if ($LASTEXITCODE -ne 0) { throw 'Native Claude isolated child worktree failed' }
           python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600
           if ($LASTEXITCODE -ne 0) { throw 'Native Claude managed concurrency failed' }
           $oldCheckout = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
@@ -336,6 +338,7 @@ jobs:
             git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
           fi
           export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          python3 .github/scripts/claude_isolated_worktree.py --timeout 300
           python3 .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 \
             --live-update \
             --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \

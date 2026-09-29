@@ -84,7 +84,38 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             merged = _release_pending_session(merged, provider, current_session)
         return merged, rendered
 
-    actions = store.update(project, transition)
+    session = str(source.payload.get("session_id") or "")
+    if session:
+        with store.session_lock(provider, session):
+            owners = store.active_owner_paths(provider, session)
+            if owners is None or len(owners) > 1:
+                # A root session cannot safely own two active project files.
+                # A real Stop must still block, and controls must explain the
+                # conflict instead of silently hiding the unfinished work.
+                reason = (("Symphony could not verify this root session's project owner because "
+                           "a state snapshot was unavailable. Retry this turn after the other hook finishes.")
+                          if owners is None else
+                          ("Symphony found this root session active in multiple project states. "
+                           "Inspect and reconcile those runs before completing this session."))
+                if source.kind == "stop_requested":
+                    return render(provider, (Action("block_stop", {"reason": reason}),),
+                                  str(payload.get("hook_event_name") or "Stop"))
+                if source.kind in {"user_prompt", "session_heartbeat"}:
+                    return render(provider, (Action("inject_context", {"text": reason}),),
+                                  str(payload.get("hook_event_name") or "UserPromptSubmit"))
+                return HookResult()
+            if owners:
+                actions = store.update_owned(owners[0], provider, session, transition)
+                if actions is None:
+                    return HookResult()
+            elif source.kind == "subagent_stopped" and not store._path(project).is_file():
+                # Late terminal delivery cannot create a second empty project
+                # state after the owning run has already been archived.
+                return HookResult()
+            else:
+                actions = store.update(project, transition)
+    else:
+        actions = store.update(project, transition)
     return render(provider, actions, str(payload.get("hook_event_name") or "UserPromptSubmit"))
 
 

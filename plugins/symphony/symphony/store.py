@@ -298,6 +298,42 @@ def _locked(path: Path) -> Iterator[None]:
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _read_owner_snapshot(path: Path) -> str:
+    """Read an atomic state snapshot without blocking an unrelated writer."""
+    if os.name != "nt":
+        return path.read_text(encoding="utf-8")
+    # Python's ordinary Windows file open does not allow a concurrent
+    # os.replace. Request delete sharing so the writer can commit its atomic
+    # replacement while this reader finishes with the old snapshot.
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    handle = create(str(path), 0x80000000, 0x00000001 | 0x00000002 | 0x00000004,
+                    None, 3, 0x00000080, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), f"state snapshot unreadable: {path}")
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        close(handle)
+        raise
+    try:
+        file = os.fdopen(fd, "r", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    with file:
+        return file.read()
+
+
 class StateStore:
     def __init__(self, root: Path, legacy_roots: tuple[Path, ...] = ()):
         self.root = Path(root)
@@ -305,6 +341,49 @@ class StateStore:
 
     def _path(self, project: Path) -> Path:
         return self.root / f"{project_key(project)}.v2.json"
+
+    @contextmanager
+    def session_lock(self, provider: str, session: str) -> Iterator[None]:
+        """Serialize owner selection with updates from this root session."""
+        digest = hashlib.sha256(f"{provider}\0{session}".encode()).hexdigest()
+        with _locked(self.root / f".session-{digest}"):
+            yield
+
+    def active_owner_paths(self, provider: str, session: str) -> tuple[Path, ...] | None:
+        """Find exact active owners; None means a snapshot could not be read."""
+        matches: list[Path] = []
+        for path in self.root.glob("*.v2.json"):
+            if path.is_symlink():
+                continue
+            try:
+                state = _state_from_dict(json.loads(_read_owner_snapshot(path)))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                # A missing or invalid snapshot cannot prove this root has no
+                # other owner. Defer instead of trusting the event's CWD.
+                return None
+            run = state.active_runs.get(f"{provider}:{session}")
+            if run and run.session_id == session and run.provider in {"", provider}:
+                matches.append(path)
+        return tuple(matches)
+
+    def update_owned(
+        self,
+        path: Path,
+        provider: str,
+        session: str,
+        transition: Callable[[ProjectState], tuple[ProjectState, _UpdateResult]],
+    ) -> _UpdateResult | None:
+        """Update only while the selected file still owns this exact root."""
+        with _locked(path):
+            if not path.is_file() or path.is_symlink():
+                return None
+            state = _state_from_dict(json.loads(path.read_text(encoding="utf-8")))
+            run = state.active_runs.get(f"{provider}:{session}")
+            if not run or run.session_id != session or run.provider not in {"", provider}:
+                return None
+            next_state, result = transition(state)
+            self._write(path, replace(next_state, recent_runs=next_state.recent_runs[-20:]))
+            return result
 
     def load(self, project: Path) -> ProjectState:
         path = self._path(project)

@@ -8,8 +8,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from plugins.symphony.symphony import store as store_module
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.store import StateStore, project_key
+from plugins.symphony.symphony.store import StateStore, _locked, project_key
 
 
 class StateStoreTests(unittest.TestCase):
@@ -76,6 +77,122 @@ class StateStoreTests(unittest.TestCase):
 
         self.assertEqual(project_key(alias), project_key(self.project.resolve()))
         self.assertNotEqual(project_key(other), project_key(self.project))
+
+    def test_owner_scan_does_not_hold_project_lock(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        self.store.save(self.project, ProjectState(active_run=run,
+                                                   active_runs={"codex:root": run}))
+        reading = threading.Event()
+        release = threading.Event()
+        writing = threading.Event()
+        written = threading.Event()
+        errors = []
+        matches = []
+        original = store_module._read_owner_snapshot
+
+        def paused_read(path):
+            if path == self.state_path() and threading.current_thread().name == "owner-scan":
+                reading.set()
+                if not release.wait(5):
+                    raise TimeoutError("owner scan was not released")
+            return original(path)
+
+        def scan():
+            try:
+                matches.extend(self.store.active_owner_paths("codex", "root"))
+            except BaseException as error:
+                errors.append(error)
+
+        def write():
+            writing.set()
+            try:
+                self.store.update(self.project, lambda state: (state, None))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                written.set()
+
+        with patch.object(store_module, "_read_owner_snapshot", paused_read):
+            scanner = threading.Thread(target=scan, name="owner-scan")
+            writer = threading.Thread(target=write, name="other-session-writer")
+            scanner.start()
+            self.assertTrue(reading.wait(5))
+            writer.start()
+            self.assertTrue(writing.wait(5))
+            self.assertTrue(written.wait(1), "owner scan blocked an unrelated project writer")
+            release.set()
+            scanner.join(5)
+            writer.join(5)
+        self.assertFalse(scanner.is_alive() or writer.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual([self.state_path()], matches)
+        self.assertTrue(written.is_set())
+
+    def test_owner_scan_does_not_wait_for_unrelated_project_lock(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        self.store.save(self.project, ProjectState(active_run=run,
+                                                   active_runs={"codex:root": run}))
+        other = self.root / "other"
+        other.mkdir()
+        self.store.save(other, ProjectState(enabled=True))
+        other_path = self.store._path(other)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_other():
+            with _locked(other_path):
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_other)
+        holder.start()
+        try:
+            self.assertTrue(held.wait(5))
+            self.assertEqual((self.state_path(),), self.store.active_owner_paths(
+                "codex", "root"))
+        finally:
+            release.set()
+            holder.join(5)
+        self.assertFalse(holder.is_alive())
+
+    def test_new_duplicate_owner_after_prior_lookup_is_not_hidden(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        state = ProjectState(active_run=run, active_runs={"codex:root": run})
+        self.store.save(self.project, state)
+        self.assertEqual((self.state_path(),), self.store.active_owner_paths("codex", "root"))
+        other = self.root / "other"
+        other.mkdir()
+        self.store.save(other, state)
+        self.assertEqual({self.state_path(), self.store._path(other)},
+                         set(self.store.active_owner_paths("codex", "root")))
+
+    def test_snapshot_scan_and_atomic_replace_remain_compatible(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        self.store.save(self.project, ProjectState(active_run=run,
+                                                   active_runs={"codex:root": run}))
+        errors = []
+        start = threading.Event()
+
+        def write():
+            start.wait(5)
+            try:
+                for _ in range(300):
+                    self.store.update(self.project, lambda state: (state, None))
+            except BaseException as error:
+                errors.append(error)
+
+        writer = threading.Thread(target=write)
+        writer.start()
+        start.set()
+        for _ in range(300):
+            try:
+                self.assertEqual((self.state_path(),), self.store.active_owner_paths("codex", "root"))
+            except BaseException as error:
+                errors.append(error)
+                break
+        writer.join(10)
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(errors, errors)
 
     @unittest.skipUnless(os.name == "nt", "Windows path aliases")
     def test_windows_project_key_collapses_case_and_short_path_aliases(self):

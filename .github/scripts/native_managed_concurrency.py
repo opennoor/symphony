@@ -6,6 +6,8 @@ plugin. All Git checkouts, state, runtime pins, and gate files are temporary.
 """
 
 import argparse
+from collections import Counter
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -58,7 +60,6 @@ def projects(root, separate):
 
 
 def state_file(state_dir, project):
-    from hashlib import sha256
     key = sha256(os.path.normcase(str(project.resolve())).encode()).hexdigest()
     return state_dir / (key + ".v2.json")
 
@@ -303,6 +304,105 @@ def update_while_gated(update, env, docs, sessions, projects_by_label, deadline)
     return records
 
 
+def event_counts(document):
+    return dict(sorted(Counter(event.get("kind") for event in
+                               document.get("event_history", [])).items()))
+
+
+def codex_host_trace(home, session, lead_id, error_log):
+    """Extract only tool and turn metadata from disposable Codex JSONL."""
+    def fingerprint(value):
+        return sha256(str(value).encode()).hexdigest()[:12] if value else None
+
+    def records(path):
+        if not path:
+            return
+        for line in path.open(errors="replace"):
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+    session_dir = home / "sessions"
+    root_file = next(session_dir.rglob(f"*{session}.jsonl"), None) if session_dir.exists() else None
+    child_file = next(session_dir.rglob(f"*{lead_id}.jsonl"), None) if lead_id and session_dir.exists() else None
+    calls = {}
+    outputs = set()
+    activities = []
+    for record in records(root_file):
+        payload = record.get("payload") or {}
+        if record.get("type") == "response_item" and payload.get("type") == "function_call":
+            if payload.get("name") != "followup_task":
+                continue
+            try:
+                arguments = json.loads(payload.get("arguments") or "{}")
+            except ValueError:
+                arguments = {}
+            call_id = payload.get("call_id")
+            if call_id:
+                target = arguments.get("target")
+                calls[call_id] = {"call_hash": fingerprint(call_id),
+                                  "target": target if isinstance(target, str)
+                                  and re.fullmatch(r"[A-Za-z0-9_/-]{1,128}", target) else None}
+        elif record.get("type") == "response_item" and payload.get("type") == "function_call_output":
+            outputs.add(payload.get("call_id"))
+        elif record.get("type") == "event_msg" and payload.get("type") == "item_completed":
+            item = payload.get("item") or {}
+            if item.get("type") == "SubAgentActivity" and item.get("agent_thread_id") == lead_id:
+                activities.append({"call_hash": fingerprint(item.get("id")),
+                                   "kind": item.get("kind"),
+                                   "agent_thread_id": item.get("agent_thread_id")})
+    followups = [{**details, "tool_return_recorded": call_id in outputs,
+                  "activity_kinds": [item["kind"] for item in activities
+                                     if item["call_hash"] == details["call_hash"]],
+                  "same_lead_id": any(item["call_hash"] == details["call_hash"]
+                                      and item["agent_thread_id"] == lead_id
+                                      for item in activities)}
+                 for call_id, details in calls.items()]
+    turns = {}
+    child_parent = None
+    for record in records(child_file):
+        payload = record.get("payload") or {}
+        if record.get("type") == "session_meta":
+            spawn = ((payload.get("source") or {}).get("subagent") or {}).get("thread_spawn") or {}
+            child_parent = spawn.get("parent_thread_id")
+        elif record.get("type") == "event_msg" and payload.get("type") == "task_started":
+            turn_id = payload.get("turn_id")
+            if turn_id:
+                turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})["started"] = True
+        elif record.get("type") == "turn_context":
+            turn_id = payload.get("turn_id")
+            if turn_id:
+                turn = turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})
+                turn["model"] = payload.get("model")
+                turn["effort"] = payload.get("effort")
+        elif record.get("type") == "event_msg" and payload.get("type") == "task_complete":
+            turn_id = payload.get("turn_id")
+            if turn_id:
+                turn = turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})
+                turn["completed"] = True
+                message = str(payload.get("last_agent_message") or "")
+                markers = re.findall(r"^SYMPHONY_OUTCOME:\s*(\{[^\n]*\})", message, re.MULTILINE)
+                if markers:
+                    try:
+                        status = json.loads(markers[-1]).get("status")
+                    except (ValueError, AttributeError):
+                        status = None
+                    turn["reported_outcome"] = status if status in {
+                        "completed", "blocked", "failed", "abandoned"} else "other"
+    log = error_log.read_text(errors="replace") if error_log.is_file() else ""
+    return {"root_jsonl_present": root_file is not None,
+            "lead_jsonl_present": child_file is not None,
+            "lead_parent_matches_root": child_parent == session if child_file else None,
+            "followup_calls": followups,
+            "lead_activity": activities,
+            "lead_turns": list(turns.values()),
+            "subagent_stop_hook": {
+                "invocation_count": len(re.findall(r"hook: SubagentStop(?:\s|$)", log)),
+                "completed_count": len(re.findall(r"hook: SubagentStop Completed", log)),
+                "failed_count": len(re.findall(r"hook: SubagentStop Failed", log))}}
+
+
 def check_case(provider, root, separate, timeout, budget, update=None):
     case = root / ("live-update" if update else "worktrees" if separate else "same-worktree")
     case.mkdir()
@@ -372,8 +472,16 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                               for label, session in sessions.items()}
         observed_run_ids = {label: docs[label]["active_runs"][f"{provider}:{session}"]["run_id"]
                             for label, session in sessions.items()}
-        old_records = (update_while_gated(update, env, docs, sessions,
-                                          {"a": first, "b": second}, deadline) if update else {})
+        old_records = {}
+        if update:
+            snapshot_file = case / "update_event_counts.json"
+            snapshot = {"pre_update": {label: event_counts(docs[label]) for label in sessions}}
+            snapshot_file.write_text(json.dumps(snapshot))
+            old_records = update_while_gated(update, env, docs, sessions,
+                                             {"a": first, "b": second}, deadline)
+            snapshot["post_update"] = {label: event_counts(json.loads(paths[label].read_text()))
+                                       for label in sessions}
+            snapshot_file.write_text(json.dumps(snapshot))
         for project in {first, second}:
             (project / "release").touch()
         if provider == "codex":
@@ -474,19 +582,101 @@ def check_case(provider, root, separate, timeout, budget, update=None):
 
 
 def failure_state(root, provider):
+    def short_hash(value):
+        return sha256(str(value).encode()).hexdigest()[:12] if value else None
+
     def run_summary(run):
         return {"session_id": run.get("session_id"), "lead_id": run.get("lead_identity"),
                 "status": run.get("status"),
-                "outcome": (run.get("outcome") or {}).get("status")}
+                "outcome": (run.get("outcome") or {}).get("status"),
+                "lead_delegations": [{"identity": item.get("identity"), "state": item.get("state"),
+                                      "requested_tier": item.get("requested_tier"),
+                                      "requested_effort": item.get("requested_effort")}
+                                     for item in run.get("delegations", [])
+                                     if item.get("role") == "lead"]}
+
+    def event_summary(event):
+        payload = event.get("payload") or {}
+        invocation = next((payload[key] for key in ("invocation_id", "tool_use_id", "call_id", "turn_id")
+                           if payload.get(key)), None)
+        source_id = str(event.get("event_id") or "").split(":", 1)[0]
+        return {"kind": event.get("kind"), "identity": payload.get("identity"),
+                "role": payload.get("role"), "delegation_state": payload.get("state"),
+                "outcome": (payload.get("outcome") or {}).get("status"),
+                "owner_generation": payload.get("owner_generation"),
+                "native_invocation_id_present": invocation is not None,
+                "native_invocation_id_hash": short_hash(invocation),
+                "source_event_hash": short_hash(source_id)}
+
+    def activation_summary(record):
+        plugin_root = record.get("plugin_root")
+        runtime_root = record.get("runtime_root")
+        try:
+            relative_plugin = str(Path(plugin_root).relative_to(root)) if plugin_root else None
+        except ValueError:
+            relative_plugin = None
+        return {"session_id": record.get("session_id"),
+                "plugin_version": record.get("plugin_version"),
+                "guarded_state": record.get("state"),
+                "plugin_root_basename": Path(plugin_root).name if plugin_root else None,
+                "plugin_root_relative_to_scratch": relative_plugin,
+                "plugin_root_present": Path(plugin_root).exists() if plugin_root else False,
+                "runtime_root_present": Path(runtime_root).is_dir() if runtime_root else False,
+                "runtime_digest": Path(runtime_root).name if runtime_root else None,
+                "observed_at_present": bool(record.get("observed_at"))}
 
     cases = []
     for path in root.rglob("*.v2.json"):
-        document = json.loads(path.read_text())
-        cases.append({"case": path.relative_to(root).parts[0],
+        try:
+            document = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        case = path.relative_to(root).parts[0]
+        case_root = root / case
+        labels = [label for label, project in (("a", case_root / "primary"),
+                                                ("b", case_root / "second" if
+                                                 (case_root / "second").exists() else
+                                                 case_root / "primary"))
+                  if state_file(case_root / "state", project) == path]
+        cli_sessions = {}
+        for label in labels:
+            log = case_root / "logs" / f"{label}.{'errors' if provider == 'codex' else 'stdout'}"
+            if log.is_file():
+                pattern = (r"^session id: ([0-9a-f-]+)$" if provider == "codex" else
+                           r'"session_id"\s*:\s*"([0-9a-f-]+)"')
+                match = re.search(pattern, log.read_text(errors="replace"), re.MULTILINE)
+                if match:
+                    cli_sessions[label] = match.group(1)
+        activation = document.get("activation", {}).get(provider, {})
+        profiles = ([activation, *activation.get("session_profiles", [])]
+                    if isinstance(activation, dict) else [])
+        snapshot_file = case_root / "update_event_counts.json"
+        snapshots = json.loads(snapshot_file.read_text()) if snapshot_file.is_file() else None
+        relevant_events = [event_summary(event) for event in document.get("event_history", [])
+                           if event.get("kind") in {"delegation_updated", "lead_started",
+                                                    "lead_failed", "lead_completed"}]
+        cases.append({"case": case, "labels": labels, "cli_session_ids": cli_sessions,
+                      "activation_profiles": [activation_summary(item) for item in profiles
+                                              if isinstance(item, dict) and item.get("session_id")],
                       "active_runs": [run_summary(run) for run in document.get("active_runs", {}).values()],
                       "recent_runs": [run_summary(run) for run in document.get("recent_runs", [])],
-                      "event_kinds": [event.get("kind") for event in document.get("event_history", [])]})
-    return {"provider": provider, "cases": cases}
+                      "event_kinds": [event.get("kind") for event in document.get("event_history", [])],
+                      "lead_lifecycle_events": relevant_events,
+                      "event_counts": event_counts(document),
+                      "update_event_counts": snapshots})
+    host = {}
+    if provider == "codex":
+        for case in cases:
+            if case["case"] != "live-update":
+                continue
+            runs = [*case["active_runs"], *case["recent_runs"]]
+            for label, session in case["cli_session_ids"].items():
+                lead = next((run.get("lead_id") for run in runs
+                             if run.get("session_id") == session), None)
+                host[label] = codex_host_trace(
+                    root / "codex-live-update-home", session, lead,
+                    root / "live-update" / "logs" / f"{label}.errors")
+    return {"provider": provider, "cases": cases, "native_host_trace": host}
 
 
 def main():
