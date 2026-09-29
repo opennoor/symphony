@@ -32,6 +32,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Claude marketplace add failed' }
           claude.cmd plugin install -y symphony@symphony
           if ($LASTEXITCODE -ne 0) { throw 'Claude plugin install failed' }
+          claude.cmd --version
+          if ($LASTEXITCODE -ne 0) { throw 'Claude version probe failed' }
           $env:SYMPHONY_EXPECTED_PLUGIN_ROOT = Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony'
           python .github/scripts/claude_isolated_worktree.py --timeout 300
           if ($LASTEXITCODE -ne 0) { throw 'Native isolated Agent failed; see sanitized artifact' }

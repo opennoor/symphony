@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Check Claude's native background Agent worktree hooks in disposable state.
 
-The capture hook stores lifecycle identity, classified Agent failure flags,
-and one redacted line from a failed Agent tool response. This is a separate
+The capture hook stores lifecycle identity and classified Agent failure facts,
+without raw tool text or paths. This is a separate
 regression from the shared-checkout native managed concurrency harness.
 """
 
@@ -52,18 +52,31 @@ try:
         record["tool_failure_hash"] = hashlib.sha256(result.encode()).hexdigest()[:12] if result else None
         if failed:
             lowered = result.lower()
-            # This fixture is synthetic, but native errors can contain local
-            # paths. Keep one short redacted line so an unknown category can
-            # be diagnosed without publishing raw hook output.
-            excerpt = result.splitlines()[0] if result else ""
-            for name, value in os.environ.items():
-                if (re.search(r"key|token|secret|password|credential|auth", name, re.I)
-                        and isinstance(value, str) and len(value) >= 4):
-                    excerpt = excerpt.replace(value, "<credential>")
-            excerpt = re.sub(r"[A-Za-z]:[\\\\/].*", "<path>", excerpt)
-            excerpt = re.sub(r"(?:/[A-Za-z0-9_.~-]+){2,}", "<path>", excerpt)
-            excerpt = re.sub(r"[A-Za-z0-9+/=_-]{32,}", "<token>", excerpt)
-            record["tool_failure_excerpt"] = excerpt[:300]
+            match = re.search(
+                r"Refusing to use (.+?) as an isolation worktree:\\s*"
+                r"git resolves its working tree to ([^\\r\\n]+)", result, re.I)
+            if match:
+                pinned = match.group(1).strip().replace("\\\\", "/").rstrip("/")
+                resolved = match.group(2).strip()
+                note = "(a core.worktree redirect, or a checkout discovered above it)"
+                if note in resolved:
+                    resolved = resolved.split(note, 1)[0].strip().rstrip(",.")
+                if "(" not in resolved or re.search(r"\\([^)]*\\)[\\\\/]", resolved):
+                    resolved = resolved.replace("\\\\", "/").rstrip("/")
+                    record["worktree_path_relation"] = {
+                        "exact_match": pinned == resolved,
+                        "casefold_match": pinned.casefold() == resolved.casefold(),
+                        "drive_letter_case_differs": (
+                            len(pinned) > 1 and len(resolved) > 1
+                            and pinned[1] == resolved[1] == ":"
+                            and pinned[0] != resolved[0]
+                            and pinned[0].casefold() == resolved[0].casefold()),
+                    }
+                record["native_error_shape"] = "git-worktree-resolves-elsewhere"
+            elif "Refusing to use" in result and "git could not be run to resolve it" in result:
+                record["native_error_shape"] = "git-worktree-identity-unavailable"
+            else:
+                record["native_error_shape"] = "unclassified-agent-failure"
             reasons = {
                 "not-a-repo": r"not a git repository|outside repository",
                 "invalid-ref": r"invalid reference|unknown revision|bad revision|not a valid object name|reference is not a tree|ambiguous argument",
@@ -72,6 +85,8 @@ try:
                 "directory-exists": r"already exists|already used by worktree|already checked out|file exists",
                 "index-lock": r"index\\.lock|another git process|unable to create[^\\n]*\\.lock",
                 "git-missing": r"git: command not found|git[^\\n]*(?:not found|not recognized)|cannot find[^\\n]*git",
+                "worktree-path-mismatch": r"git resolves its working tree|work-tree-elsewhere|write outside the worktree",
+                "git-cannot-resolve": r"git could not be run to resolve|git identity could not be verified",
             }
             record["tool_failure_reason"] = next(
                 (name for name, pattern in reasons.items() if re.search(pattern, lowered)), "unknown")
