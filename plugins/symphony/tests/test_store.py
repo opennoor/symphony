@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -379,11 +380,45 @@ store.update(project, add)
             [sys.executable, "-c", script, str(self.data), str(self.project), session],
             cwd=Path(__file__).resolve().parents[3],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        ) for session in ("one", "two")]
+        ) for session in (f"worker-{index}" for index in range(8))]
         for process in processes:
             _, stderr = process.communicate(timeout=15)
             self.assertEqual(process.returncode, 0, stderr)
-        self.assertEqual(set(self.store.load(self.project).active_runs), {"codex:one", "codex:two"})
+        self.assertEqual(set(self.store.load(self.project).active_runs),
+                         {f"codex:worker-{index}" for index in range(8)})
+
+    @unittest.skipUnless(os.name == "nt", "Windows byte-range lock behavior")
+    def test_empty_windows_lockfile_contends_and_recovers_after_process_exit(self):
+        path = self.data / "fresh-state.json"
+        lock_path = path.with_name(path.name + ".lock")
+        lock_path.parent.mkdir(parents=True)
+        ready = self.root / "ready"
+        script = """
+import msvcrt, sys, time
+from pathlib import Path
+with Path(sys.argv[1]).open('a+b') as handle:
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    Path(sys.argv[2]).write_text('ready')
+    time.sleep(10)
+"""
+        holder = subprocess.Popen([sys.executable, "-c", script, str(lock_path), str(ready)],
+                                  stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(500):
+                if ready.exists() or holder.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), holder.stderr.read() if holder.poll() is not None else "")
+            with self.assertRaises(TimeoutError):
+                with _locked(path, timeout=0.1):
+                    pass
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+            holder.communicate(timeout=5)
+        with _locked(path, timeout=5):
+            self.assertEqual(0, lock_path.stat().st_size)
 
     def test_persistence_redacts_secret_values_and_credential_text(self):
         state = ProjectState(

@@ -11,6 +11,7 @@ TESTS = (
     "plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher",
     "plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path",
     "plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs",
+    "plugins.symphony.tests.test_store.StateStoreTests.test_empty_windows_lockfile_contends_and_recovers_after_process_exit",
     "plugins.symphony.tests.test_store.StateStoreTests.test_windows_project_key_collapses_case_and_short_path_aliases",
     "plugins.symphony.tests.test_store.StateStoreTests.test_owner_scan_coordinates_with_project_writer_on_windows",
     "plugins.symphony.tests.test_store.StateStoreTests.test_owner_scan_defers_on_busy_unrelated_windows_project",

@@ -349,9 +349,9 @@ def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
                                 raise TimeoutError(f"state lock timed out: {path}")
                             time.sleep(0.005)
             elif msvcrt is not None:
-                if lock_file.seek(0, os.SEEK_END) == 0:
-                    lock_file.write(b"\0")
-                    lock_file.flush()
+                # Win32 byte-range locks extend beyond EOF. Writing a
+                # sentinel before acquiring the lock races another process's
+                # first lock on a new file and can fail with PermissionError.
                 while True:
                     try:
                         lock_file.seek(0)
