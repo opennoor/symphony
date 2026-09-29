@@ -6,6 +6,7 @@ plugin. All Git checkouts, state, runtime pins, and gate files are temporary.
 """
 
 import argparse
+import ast
 from collections import Counter
 from dataclasses import replace
 from hashlib import sha256
@@ -481,8 +482,8 @@ def update_while_gated(update, env, docs, sessions, projects_by_label, deadline)
     return records
 
 
-def retained_old_profile(records, session, version, retained_root, source_root):
-    """Accept the released source profile or its exact retained-runtime callback.
+def retained_profile(records, session, version, retained_root, source_root):
+    """Accept a source profile or its exact retained-runtime callback.
 
     Released 1.5.1 writes runtime_root while the source cache is present. After
     removal, a callback launched from the reviewed snapshot can instead write
@@ -503,6 +504,116 @@ def retained_old_profile(records, session, version, retained_root, source_root):
         if not runtime and plugin and Path(plugin).resolve() == retained:
             return True
     return False
+
+
+def literal_runtime_constants(root):
+    tree = ast.parse((root / "symphony" / "__init__.py").read_text(encoding="utf-8"))
+    return {target.id: ast.literal_eval(node.value)
+            for node in tree.body if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
+            and target.id in {"PLUGIN_VERSION", "HOOK_SCHEMA_VERSION"}}
+
+
+def reviewed_snapshot_spec(source):
+    """Recompute the file set and digest embedded by generate_hooks.bootstrap."""
+    paths = [*source.glob("symphony/*.py"), *source.glob("agents/*.md"),
+             *source.glob("commands/*.md"), *source.glob("skills/**/*.md"),
+             source / "profiles.json", source / "model-policy.json",
+             source / "scripts/symphony_hook.py", source / "scripts/check_activation.py"]
+    expected = sorted(path.relative_to(source).as_posix() for path in paths)
+    aggregate = sha256()
+    for relative in expected:
+        aggregate.update(relative.encode() + b"\0" + sha256((source / relative).read_bytes()).digest())
+    return expected, aggregate.hexdigest(), literal_runtime_constants(source)
+
+
+def verified_candidate_retained(root, runtime_base, expected, digest, version, schema):
+    """Verify candidate bytes without executing a retained snapshot."""
+    try:
+        if (not root.is_absolute() or root.is_symlink() or
+                root.parent.resolve() != runtime_base.resolve() or root.name != digest):
+            return False
+        entries = list(root.rglob("*"))
+        if any(path.is_symlink() for path in entries):
+            return False
+        files = sorted(path.relative_to(root).as_posix() for path in entries if path.is_file())
+        if files != expected:
+            return False
+        aggregate = sha256()
+        for relative in expected:
+            aggregate.update(relative.encode() + b"\0" + sha256((root / relative).read_bytes()).digest())
+        if aggregate.hexdigest() != digest:
+            return False
+        constants = literal_runtime_constants(root)
+        return (constants.get("PLUGIN_VERSION") == version and
+                constants.get("HOOK_SCHEMA_VERSION") == schema)
+    except (OSError, ValueError, SyntaxError, TypeError):
+        return False
+
+
+def candidate_retained_profile(records, session, version, source, runtime_base):
+    files, digest, constants = reviewed_snapshot_spec(source)
+    retained = runtime_base / digest
+    schema = constants.get("HOOK_SCHEMA_VERSION")
+    if (constants.get("PLUGIN_VERSION") != version or
+            not isinstance(schema, int) or
+            not verified_candidate_retained(retained, runtime_base, files, digest, version, schema)):
+        return False
+    return any(item.get("session_id") == session
+               and item.get("plugin_version") == version
+               and item.get("hook_schema_version") == schema
+               and item.get("observed_at")
+               and (retained_profile((item,), session, version, retained, source)
+                    or (not item.get("runtime_root") and item.get("plugin_root")
+                        and Path(item["plugin_root"]).resolve() == source.resolve()))
+               for item in records)
+
+
+def read_state_snapshot(path):
+    if os.name == "nt":
+        # The reducer replaces state atomically; Windows readers must share its
+        # project lock instead of briefly holding an incompatible plain handle.
+        repository = str(Path(__file__).resolve().parents[2])
+        if repository not in sys.path:
+            sys.path.insert(0, repository)
+        from plugins.symphony.symphony.store import _locked, _read_owner_snapshot
+        if path.name.startswith(".session-") and path.suffix == ".json":
+            # Session ACKs use the stem lock, unlike project state writes.
+            with _locked(path.with_suffix(""), timeout=.1):
+                return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(_read_owner_snapshot(path))
+    return json.loads(path.read_text())
+
+
+def wait_for_completed_docs(paths, provider, sessions, run_ids, deadline,
+                            read_document=read_state_snapshot):
+    """Allow an already-delivered native Stop hook to commit after CLI exit."""
+    limit = min(deadline, time.monotonic() + 10)
+    latest = None
+    state_dir = next(iter(paths.values())).parent
+    while True:
+        try:
+            latest = {label: read_document(path) for label, path in paths.items()}
+            inboxes = [read_document(path) for path in state_dir.glob(".session-*.json")]
+        except (OSError, TimeoutError, ValueError):
+            latest = None
+            inboxes = []
+        if latest and all(any(run.get("provider") == provider
+                              and run.get("session_id") == sessions[label]
+                              and run.get("run_id") == run_ids[label]
+                              and run.get("status") == "completed"
+                              and (run.get("outcome") or {}).get("status") == "completed"
+                              for run in latest[label].get("recent_runs", []))
+                          for label in paths) and not any(
+                              record.get("pending") or record.get("overflow") for record in inboxes):
+            return latest
+        if time.monotonic() >= limit:
+            if latest is None:
+                raise RuntimeError("native final state remained unreadable after Stop")
+            if any(record.get("pending") or record.get("overflow") for record in inboxes):
+                raise RuntimeError("native callbacks remained unacknowledged after Stop")
+            return latest
+        time.sleep(.1)
 
 
 def event_counts(document):
@@ -956,7 +1067,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     for item in (run.get("delegations") or []) if item.get("role") == "lead"}
                 old_activation = before_resume.get("activation", {}).get("codex", {})
                 old_profiles = [old_activation, *old_activation.get("session_profiles", [])]
-                if not retained_old_profile(old_profiles, sessions["a"],
+                if not retained_profile(old_profiles, sessions["a"],
                                             update["old_version"],
                                             old_records["a"]["runtime_root"],
                                             old_records["a"]["plugin_root"]):
@@ -1029,7 +1140,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                         if update:
                             activation = current[label].get("activation", {}).get(provider, {})
                             records = [activation, *activation.get("session_profiles", [])]
-                            if not retained_old_profile(records, sessions[label],
+                            if not retained_profile(records, sessions[label],
                                                         update["old_version"],
                                                         old_records[label]["runtime_root"],
                                                         old_records[label]["plugin_root"]):
@@ -1056,7 +1167,9 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 time.sleep(.25)
             else:
                 raise RuntimeError("background Claude leads did not resume and archive completed outcomes")
-        final_docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+        final_docs = (wait_for_completed_docs(paths, provider, sessions, observed_run_ids, deadline)
+                      if provider == "codex" else
+                      {label: json.loads(path.read_text()) for label, path in paths.items()})
         if provider == "codex" and update:
             final_a = final_docs["a"]
             final_run_ids = {run.get("run_id") for run in [
@@ -1074,7 +1187,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
         # This case owns its disposable state directory exclusively, including
         # child-session aliases whose owner pointer was never populated.
         for record_path in state_dir.glob(".session-*.json"):
-            record = json.loads(record_path.read_text())
+            record = read_state_snapshot(record_path)
             if record.get("pending") or record.get("overflow"):
                 raise RuntimeError("native session retained unresolved child callbacks after completion")
         for label, doc in final_docs.items():
@@ -1103,18 +1216,15 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     raise RuntimeError(f"{label}: old retained runtime disappeared after update")
                 if provider == "codex":
                     expected = update["candidate_version"] if label == "a" else update["old_version"]
-                    matching = [item for item in records if item.get("session_id") == sessions[label]
-                                and item.get("plugin_version") == expected]
                     if label == "a":
-                        matching = [item for item in matching
-                                    if item.get("plugin_root") and
-                                    Path(item["plugin_root"]).resolve() == update["candidate_cache"].resolve()]
+                        matching = candidate_retained_profile(
+                            records, sessions[label], expected, update["candidate_cache"],
+                            Path(env["SYMPHONY_RUNTIME_DIR"]))
                     else:
-                        matching = [item for item in matching
-                                    if retained_old_profile((item,), sessions[label],
-                                                            update["old_version"],
-                                                            old_records[label]["runtime_root"],
-                                                            old_records[label]["plugin_root"])]
+                        matching = [item for item in records
+                                    if retained_profile((item,), sessions[label], expected,
+                                                        old_records[label]["runtime_root"],
+                                                        old_records[label]["plugin_root"])]
                     if not matching:
                         raise RuntimeError(f"{label}: native session lacks expected {expected} heartbeat")
                 elif not any(item.get("session_id") == sessions[label]
