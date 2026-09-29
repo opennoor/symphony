@@ -856,6 +856,9 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                             snapshot.setdefault("pre_candidate_resume", {})[label] = {
                                 "old_product_lead_completed": old_lead_completed,
                                 "native_lead_stop_captured": True,
+                                "candidate_recovery_probe": claude_recovery_probe(
+                                    current[label], sessions[label],
+                                    first if label == "a" else second, update["home"]),
                                 "events": event_counts(current[label]),
                             }
                             snapshot_file.write_text(json.dumps(snapshot))
@@ -952,6 +955,10 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                                     for label in sessions},
                 **({"old_product_lead_completed_before_resume": {
                     label: snapshot["pre_candidate_resume"][label]["old_product_lead_completed"]
+                    for label in sessions}}
+                   if update and provider == "claude" else {}),
+                **({"candidate_recovery_probe_before_resume": {
+                    label: snapshot["pre_candidate_resume"][label]["candidate_recovery_probe"]
                     for label in sessions}}
                    if update and provider == "claude" else {}),
                 **({"native_resumed": sorted(resumed)} if provider == "claude" else
