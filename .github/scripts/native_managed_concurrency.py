@@ -34,7 +34,7 @@ while not (root / "release").exists():
 print("GATE_RELEASED", flush=True)
 '''
 
-CODEX_HOOK_CAPTURE = '''import json, pathlib, sys, time, uuid
+CODEX_HOOK_CAPTURE = '''import json, os, pathlib, sys, time, uuid
 destination = pathlib.Path(sys.argv[2])
 destination.mkdir(parents=True, exist_ok=True)
 invocation = str(uuid.uuid4())
@@ -45,9 +45,12 @@ except (ValueError, OSError):
 if not isinstance(payload, dict):
     payload = {}
 event = sys.argv[1]
+provider = sys.argv[3]
 record = {"invocation_id": invocation, "event": event,
           "session_id": payload.get("session_id"), "agent_id": payload.get("agent_id"),
           "turn_id": payload.get("turn_id"), "parent_id": payload.get("parent_id"),
+          "native_home": os.environ.get("CODEX_HOME" if provider == "codex"
+                                        else "CLAUDE_CONFIG_DIR"),
           "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
           "started_ns": time.time_ns()}
 (destination / (invocation + "-entry.json")).write_text(json.dumps(record))
@@ -305,8 +308,8 @@ def prepare_live_update(provider, root, old_source, candidate_source):
             raise RuntimeError("native Codex hook capture requires a temporary path without spaces")
         hooks = {"hooks": {}}
         for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
-            command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()}"
-            windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()}"
+            command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()} codex"
+            windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()} codex"
             hooks["hooks"][event] = [{"hooks": [{"type": "command", "command": command,
                                                   "command_windows": windows, "timeout": 10}]}]
         (home / "hooks.json").write_text(json.dumps(hooks))
@@ -332,7 +335,7 @@ def prepare_live_update(provider, root, old_source, candidate_source):
         hooks = settings.setdefault("hooks", {})
         for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
             command = (f'python -I "{script.as_posix()}" {event} '
-                       f'"{capture.as_posix()}"')
+                       f'"{capture.as_posix()}" claude')
             hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command}]})
         settings_path.write_text(json.dumps(settings))
     old_cache = home / "plugins" / "cache" / "symphony-old" / "symphony" / old_version
@@ -809,7 +812,11 @@ def check_case(provider, root, separate, timeout, budget, update=None):
         old_records = {}
         if update:
             snapshot_file = case / "update_event_counts.json"
-            snapshot = {"pre_update": {label: event_counts(docs[label]) for label in sessions}}
+            snapshot = {"pre_update": {label: event_counts(docs[label]) for label in sessions},
+                        "original_owners": {label: {"session_id": sessions[label],
+                                                    "run_id": observed_run_ids[label],
+                                                    "lead_id": observed_leads[label]}
+                                            for label in sessions}}
             snapshot_file.write_text(json.dumps(snapshot))
             old_records = update_while_gated(update, env, docs, sessions,
                                              {"a": first, "b": second}, deadline)
@@ -855,6 +862,8 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                     raise RuntimeError("native lead transcript lacks a completed follow-up turn")
                 snapshot["pre_candidate_resume"] = event_counts(before_resume)
                 snapshot["pre_candidate_resume_run_state"] = pre_resume_state
+                snapshot["pre_candidate_recovery_probe"] = codex_recovery_probe(
+                    before_resume, sessions["a"], update["home"])
                 snapshot_file.write_text(json.dumps(snapshot))
                 resume_codex(env, first, sessions["a"], logs, deadline,
                              already_completed=pre_resume_state == "completed")
@@ -1054,6 +1063,10 @@ def codex_hook_capture_summary(root, provider="codex"):
                         ("invocation_id", "event", "session_id", "agent_id", "turn_id",
                          "parent_id", "cwd", "started_ns", "payload_keys")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
+                          "native_home_matches_expected": (
+                              Path(entry["native_home"]).resolve()
+                              == (root / f"{provider}-live-update-home").resolve())
+                          if entry.get("native_home") else False,
                           "script_exit_marker_code": marker.get("exit_code")})
     records.sort(key=lambda record: record.get("started_ns") or 0)
     terminals = Counter()
@@ -1097,6 +1110,20 @@ _CODEX_NATIVE_REJECT = {
     423: "child_path_trust", 427: "session_meta", 430: "child_identity",
     434: "parent_identity", 463: "transcript_parse",
 }
+_CODEX_RECOVERY_REJECT = {
+    533: "run_not_retryable", 536: "native_transcript_unavailable",
+    540: "failure_time_missing", 545: "lead_record_missing",
+    552: "latest_turn_route_or_time", 556: "latest_turn_already_observed",
+    570: "failed_turn_anchor_missing", 574: "failed_turn_order",
+    578: "failed_native_turn_invalid", 581: "latest_message_invalid",
+    583: "latest_outcome_invalid",
+}
+_RELEASED_FAILED_REJECT = {
+    481: "new_lineage_present", 490: "failure_count",
+    501: "start_count", 506: "failure_outcome",
+    509: "observed_failure_after_new_start", 514: "native_turn_count_before_failure",
+    522: "native_failed_turn_mismatch",
+}
 _CODEX_COMPLETION_RESULT = {
     604: "not_completing", 608: "no_terminal_anchor", 611: "native_transcript_unavailable",
     616: "terminal_anchor_missing", 618: "latest_is_accepted_terminal",
@@ -1104,6 +1131,82 @@ _CODEX_COMPLETION_RESULT = {
     632: "newer_turn_running", 634: "newer_turn_time",
     637: "newer_turn_message", 647: "newer_turn_completed",
 }
+
+
+def codex_recovery_probe(document, session, home):
+    """Classify why a released recovering lead's exact native result was not adopted."""
+    plugin = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
+    if str(plugin) not in sys.path:
+        sys.path.insert(0, str(plugin))
+    try:
+        from symphony import host_evidence
+        from symphony.store import _state_from_dict
+        state = _state_from_dict(document)
+        run = state.active_runs.get(f"codex:{session}")
+        if run is None:
+            return {"result": "no_active_run"}
+        state = replace(state, active_run=run)
+        captured = {"active_status": run.status,
+                    "retryable_matches_lead":
+                    run.assessment.get("_retryable_lead") == run.lead_identity,
+                    "lineage_fields_present": any(key in run.assessment for key in
+                                                  ("_retryable_lead_turn", "_terminal_turns")),
+                    "native_home_present": (home / "sessions").is_dir()}
+
+        def trace(frame, event, value):
+            if event != "return":
+                return trace
+            line = frame.f_lineno
+            local = frame.f_locals
+            if frame.f_code is host_evidence._native_lead_turns.__code__:
+                captured["native_stage"] = (
+                    "accepted" if value is not None else
+                    _CODEX_NATIVE_REJECT.get(line, "unknown"))
+                captured["native_source_line"] = line
+                captured["child_transcript_path_count"] = len(local.get("paths", ()))
+                if value is not None:
+                    _, turns, order, latest, _ = value
+                    captured["native_turn_count"] = len(order)
+                    captured["latest_native_turn_complete"] = bool(
+                        turns.get(latest, {}).get("completed_at"))
+                    outcome = turns.get(latest, {}).get("outcome")
+                    captured["latest_native_outcome"] = (
+                        outcome if outcome in {"completed", "blocked", "failed", "abandoned"}
+                        else "missing_or_invalid")
+            elif frame.f_code is host_evidence._released_failed_turn.__code__:
+                captured["released_failure_stage"] = (
+                    "accepted" if value is not None else
+                    _RELEASED_FAILED_REJECT.get(line, "unknown"))
+                captured["released_failure_source_line"] = line
+                for name, field in (("failures", "failure_event_count"),
+                                    ("starts", "lead_start_count"),
+                                    ("before_failure", "native_turns_before_failure")):
+                    if name in local:
+                        captured[field] = len(local[name])
+                if local.get("failed_at") and local.get("latest_start"):
+                    captured["observed_failure_before_latest_start"] = (
+                        local["failed_at"] < local["latest_start"])
+                if local.get("failed_at") and local.get("ended"):
+                    captured["native_failure_completed_before_observation"] = (
+                        local["ended"] <= local["failed_at"])
+            elif frame.f_code is host_evidence.codex_recovered_lead_event.__code__:
+                captured["result"] = "accepted" if value is not None else "rejected"
+                captured["stage"] = (
+                    "accepted" if value is not None else
+                    _CODEX_RECOVERY_REJECT.get(line, "unknown"))
+                captured["source_line"] = line
+            return trace
+
+        previous = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            host_evidence.codex_recovered_lead_event(
+                state, session, {"CODEX_HOME": str(home)})
+        finally:
+            sys.settrace(previous)
+        return captured
+    except Exception as error:
+        return {"result": "probe_error", "error_type": type(error).__name__}
 
 
 def codex_completion_probe(document, session, home):
@@ -1454,10 +1557,19 @@ def failure_state(root, provider):
                     Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
             runs = [*case["active_runs"], *case["recent_runs"]]
             for label, session in case["cli_session_ids"].items():
-                lead = next((run.get("lead_id") for run in runs
-                             if run.get("session_id") == session), None)
-                host[f"{case['case']}:{label}"] = codex_host_trace(
+                final_lead = next((run.get("lead_id") for run in runs
+                                   if run.get("session_id") == session), None)
+                owner = ((case.get("update_event_counts") or {}).get("original_owners")
+                         or {}).get(label) or {}
+                lead = owner.get("lead_id") or final_lead
+                trace = codex_host_trace(
                     home, session, lead, case_root / "logs" / f"{label}.errors")
+                if final_lead and final_lead != lead:
+                    replacement = codex_host_trace(
+                        home, session, final_lead, case_root / "logs" / f"{label}.errors")
+                    trace["replacement_lead_turns"] = replacement["lead_turns"]
+                    trace["replacement_parent_matches_root"] = replacement["lead_parent_matches_root"]
+                host[f"{case['case']}:{label}"] = trace
     resume_status_file = root / "live-update" / "logs" / "a.resume.status.json"
     resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
     gate_timeouts = {}
