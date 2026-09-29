@@ -404,6 +404,30 @@ def update_while_gated(update, env, docs, sessions, projects_by_label, deadline)
     return records
 
 
+def retained_old_profile(records, session, version, retained_root, source_root):
+    """Accept the released source profile or its exact retained-runtime callback.
+
+    Released 1.5.1 writes runtime_root while the source cache is present. After
+    removal, a callback launched from the reviewed snapshot can instead write
+    that same snapshot as plugin_root without a runtime_root field.
+    """
+    retained = Path(retained_root).resolve()
+    source = Path(source_root).resolve()
+    if not retained.is_dir():
+        return False
+    for record in records:
+        if record.get("session_id") != session or record.get("plugin_version") != version:
+            continue
+        runtime = record.get("runtime_root")
+        plugin = record.get("plugin_root")
+        if (runtime and plugin and Path(runtime).resolve() == retained
+                and Path(plugin).resolve() == source):
+            return True
+        if not runtime and plugin and Path(plugin).resolve() == retained:
+            return True
+    return False
+
+
 def event_counts(document):
     return dict(sorted(Counter(event.get("kind") for event in
                                document.get("event_history", [])).items()))
@@ -731,6 +755,25 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                         break
             time.sleep(.25)
         else:
+            gate_timeout = {}
+            for label, project in (("a", first), ("b", second)):
+                path = paths[label]
+                try:
+                    document = json.loads(path.read_text()) if path.is_file() else {}
+                except (OSError, ValueError):
+                    document = {}
+                owned = document.get("active_runs", {}).get(f"{provider}:{sessions[label]}")
+                archived = [run for run in document.get("recent_runs", [])
+                            if run.get("session_id") == sessions[label]]
+                gate_timeout[label] = {
+                    "ready": (project / f"{label}.ready").exists(),
+                    "state_exists": path.is_file(),
+                    "owner_status": owned.get("status") if owned else "missing",
+                    "lead_present": bool(owned and owned.get("lead_identity")),
+                    "archived_count": len(archived),
+                    "cli_exit_code": processes[label].poll(),
+                }
+            (case / "gate_timeout.json").write_text(json.dumps(gate_timeout))
             raise RuntimeError("native lead ownership did not overlap before deadline")
         observed_leads = {}
         if separate:
@@ -757,6 +800,12 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                               for label, session in sessions.items()}
         observed_run_ids = {label: docs[label]["active_runs"][f"{provider}:{session}"]["run_id"]
                             for label, session in sessions.items()}
+        gate_evidence = {label: {
+            "ready": (first if label == "a" else second).joinpath(f"{label}.ready").is_file(),
+            "owner_active": bool(docs[label]["active_runs"].get(f"{provider}:{session}")),
+            "lead_matches_original": docs[label]["active_runs"][f"{provider}:{session}"]
+                                     ["lead_identity"] == observed_leads[label],
+        } for label, session in sessions.items()}
         old_records = {}
         if update:
             snapshot_file = case / "update_event_counts.json"
@@ -787,10 +836,10 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                     for item in (run.get("delegations") or []) if item.get("role") == "lead"}
                 old_activation = before_resume.get("activation", {}).get("codex", {})
                 old_profiles = [old_activation, *old_activation.get("session_profiles", [])]
-                if not any(item.get("session_id") == sessions["a"]
-                           and item.get("plugin_version") == update["old_version"]
-                           and item.get("runtime_root") == old_records["a"]["runtime_root"]
-                           for item in old_profiles):
+                if not retained_old_profile(old_profiles, sessions["a"],
+                                            update["old_version"],
+                                            old_records["a"]["runtime_root"],
+                                            old_records["a"]["plugin_root"]):
                     raise RuntimeError("old retained runtime was lost before native candidate resume")
                 captured_stops = [record for record in codex_hook_capture_summary(root)["records"]
                                   if record.get("event") == "SubagentStop"
@@ -848,10 +897,10 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                         if update:
                             activation = current[label].get("activation", {}).get(provider, {})
                             records = [activation, *activation.get("session_profiles", [])]
-                            if not any(item.get("session_id") == sessions[label]
-                                       and item.get("plugin_version") == update["old_version"]
-                                       and item.get("runtime_root") == old_records[label]["runtime_root"]
-                                       for item in records):
+                            if not retained_old_profile(records, sessions[label],
+                                                        update["old_version"],
+                                                        old_records[label]["runtime_root"],
+                                                        old_records[label]["plugin_root"]):
                                 raise RuntimeError(f"{label}: old retained activation was lost before resume")
                             snapshot.setdefault("pre_candidate_resume", {})[label] = {
                                 "old_product_lead_completed": old_lead_completed,
@@ -930,7 +979,10 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                                     Path(item["plugin_root"]).resolve() == update["candidate_cache"].resolve()]
                     else:
                         matching = [item for item in matching
-                                    if item.get("runtime_root") == old_records[label]["runtime_root"]]
+                                    if retained_old_profile((item,), sessions[label],
+                                                            update["old_version"],
+                                                            old_records[label]["runtime_root"],
+                                                            old_records[label]["plugin_root"])]
                     if not matching:
                         raise RuntimeError(f"{label}: native session lacks expected {expected} heartbeat")
                 elif not any(item.get("session_id") == sessions[label]
@@ -949,6 +1001,8 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 "different-branch-worktrees" if separate else "same-worktree",
                 "observed_overlap": True, "completed": ["a", "b"],
                 "candidate_version": candidate_version, "pending_callbacks": 0,
+                "gate_version": update["old_version"] if update else candidate_version,
+                "gate_evidence": gate_evidence,
                 "original_owners": {label: {"session_id": sessions[label],
                                              "run_id": observed_run_ids[label],
                                              "lead_id": observed_leads[label]}
@@ -1406,8 +1460,15 @@ def failure_state(root, provider):
                     home, session, lead, case_root / "logs" / f"{label}.errors")
     resume_status_file = root / "live-update" / "logs" / "a.resume.status.json"
     resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
+    gate_timeouts = {}
+    for snapshot in root.glob("*/gate_timeout.json"):
+        try:
+            gate_timeouts[snapshot.parent.name] = json.loads(snapshot.read_text())
+        except (OSError, ValueError):
+            gate_timeouts[snapshot.parent.name] = {"snapshot_unreadable": True}
     return {"provider": provider, "cases": cases, "native_host_trace": host,
             "native_resume_status": resume_status,
+            "gate_timeouts": gate_timeouts,
             "native_hook_capture": codex_hook_capture_summary(root, provider)}
 
 
