@@ -176,20 +176,26 @@ def resume_claude(env, project, session, budget, deadline):
         raise RuntimeError(f"Claude resume for session {session} exited {completed.returncode}")
 
 
-def resume_codex(env, project, session, logs, deadline):
+def resume_codex(env, project, session, logs, deadline, already_completed=False):
     """Resume the original native root so newly installed candidate hooks load."""
     executable = shutil.which("codex")
     if not executable:
         raise RuntimeError("codex CLI is missing")
+    prompt = (
+        "Resume this exact native Symphony root session after the original run completed. "
+        "Run $symphony:symphony status and $symphony:symphony version to check the installed "
+        "candidate. Report only the status and version. Do not start or stop work, delegate, "
+        "call followup_task, or rerun the gate."
+        if already_completed else
+        "Resume the original Symphony run in this session. Reconcile its registered lead "
+        "from the native host result; if a retry is needed, call followup_task with the "
+        "exact original spawn_agent task_name, without a /root/ prefix or UUID, and await "
+        "the same lead. Preserve the original run and gate evidence. When the lead and "
+        "all tracked work are reconciled, invoke the normal $symphony:symphony stop "
+        "control and check durable status. Do not force stop or rerun the gate.")
     command = [executable, "exec", "resume", "--dangerously-bypass-hook-trust",
                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-               "--model", "gpt-6-luna", session,
-               "Resume the original Symphony run in this session. Reconcile its registered lead "
-               "from the native host result; if a retry is needed, call followup_task with the "
-               "exact original spawn_agent task_name, without a /root/ prefix or UUID, and await "
-               "the same lead. Preserve the original run and gate evidence. When the lead and "
-               "all tracked work are reconciled, invoke the normal $symphony:symphony stop "
-               "control and check durable status. Do not force stop or rerun the gate."]
+               "--model", "gpt-6-luna", session, prompt]
     status_file = logs / "a.resume.status.json"
     try:
         with (logs / "a.resume.stdout").open("w", encoding="utf-8") as stdout, \
@@ -198,11 +204,13 @@ def resume_codex(env, project, session, logs, deadline):
                                        stdout=stdout, stderr=stderr, shell=False,
                                        timeout=max(1, min(90, deadline - time.monotonic())))
     except subprocess.TimeoutExpired:
-        status_file.write_text(json.dumps({"timed_out": True}))
+        status_file.write_text(json.dumps({"timed_out": True,
+                                           "mode": "status-version" if already_completed else "reconcile"}))
         raise RuntimeError("Codex same-session resume timed out") from None
     banner = re.search(r"^session id: ([0-9a-f-]+)$",
                        (logs / "a.resume.errors").read_text(errors="replace"), re.MULTILINE)
-    status_file.write_text(json.dumps({"exit_code": completed.returncode,
+    status_file.write_text(json.dumps({"mode": "status-version" if already_completed else "reconcile",
+                                       "exit_code": completed.returncode,
                                        "banner_present": banner is not None,
                                        "same_session": bool(banner and banner.group(1) == session)}))
     if completed.returncode:
@@ -394,6 +402,30 @@ def update_while_gated(update, env, docs, sessions, projects_by_label, deadline)
 def event_counts(document):
     return dict(sorted(Counter(event.get("kind") for event in
                                document.get("event_history", [])).items()))
+
+
+def codex_pre_resume_state(document, session, run_id, lead_id):
+    """Accept only the original recovering run or its durable completed archive."""
+    key = f"codex:{session}"
+    active = document.get("active_runs", {})
+    owned = active.get(key)
+    active_for_session = [run for run in active.values() if run.get("session_id") == session]
+    archived = [run for run in document.get("recent_runs", [])
+                if run.get("session_id") == session]
+
+    def original(run):
+        return (run.get("provider") == "codex"
+                and run.get("session_id") == session
+                and run.get("run_id") == run_id
+                and run.get("lead_identity") == lead_id)
+    if (owned and len(active_for_session) == 1 and not archived
+            and original(owned) and owned.get("status") == "recovering"):
+        return "recovering"
+    if (not owned and not active_for_session and len(archived) == 1
+            and original(archived[0]) and archived[0].get("status") == "completed"
+            and (archived[0].get("outcome") or {}).get("status") == "completed"):
+        return "completed"
+    raise RuntimeError("old native run is neither the original recovering lead nor a durable completed archive")
 
 
 def codex_host_trace(home, session, lead_id, error_log):
@@ -708,11 +740,15 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                     raise RuntimeError(f"{label}: native CLI exited {process.returncode}")
             if update:
                 before_resume = json.loads(paths["a"].read_text())
-                owned = before_resume.get("active_runs", {}).get(f"codex:{sessions['a']}")
-                if (not owned or owned.get("run_id") != observed_run_ids["a"]
-                        or owned.get("lead_identity") != observed_leads["a"]
-                        or owned.get("status") != "recovering"):
-                    raise RuntimeError("old native follow-up did not leave the original lead to reconcile")
+                pre_resume_state = codex_pre_resume_state(
+                    before_resume, sessions["a"], observed_run_ids["a"], observed_leads["a"])
+                pre_resume_run_ids = {run.get("run_id") for run in [
+                    *before_resume.get("active_runs", {}).values(),
+                    *before_resume.get("recent_runs", [])]}
+                pre_resume_lead_ids = {item.get("identity") for run in [
+                    *before_resume.get("active_runs", {}).values(),
+                    *before_resume.get("recent_runs", [])]
+                    for item in (run.get("delegations") or []) if item.get("role") == "lead"}
                 old_activation = before_resume.get("activation", {}).get("codex", {})
                 old_profiles = [old_activation, *old_activation.get("session_profiles", [])]
                 if not any(item.get("session_id") == sessions["a"]
@@ -733,8 +769,10 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                            for turn in host["lead_turns"][1:]):
                     raise RuntimeError("native lead transcript lacks a completed follow-up turn")
                 snapshot["pre_candidate_resume"] = event_counts(before_resume)
+                snapshot["pre_candidate_resume_run_state"] = pre_resume_state
                 snapshot_file.write_text(json.dumps(snapshot))
-                resume_codex(env, first, sessions["a"], logs, deadline)
+                resume_codex(env, first, sessions["a"], logs, deadline,
+                             already_completed=pre_resume_state == "completed")
                 starts = [record for record in codex_hook_capture_summary(root)["records"]
                           if record.get("event") == "SessionStart"
                           and record.get("session_id") == sessions["a"]
@@ -799,6 +837,20 @@ def check_case(provider, root, separate, timeout, budget, update=None):
             else:
                 raise RuntimeError("background Claude leads did not resume and archive completed outcomes")
         final_docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+        if provider == "codex" and update:
+            final_a = final_docs["a"]
+            final_run_ids = {run.get("run_id") for run in [
+                *final_a.get("active_runs", {}).values(), *final_a.get("recent_runs", [])]}
+            if final_run_ids != pre_resume_run_ids:
+                raise RuntimeError("candidate resume changed the durable run set")
+            final_lead_ids = {item.get("identity") for run in [
+                *final_a.get("active_runs", {}).values(), *final_a.get("recent_runs", [])]
+                for item in (run.get("delegations") or []) if item.get("role") == "lead"}
+            if final_lead_ids != pre_resume_lead_ids:
+                raise RuntimeError("candidate resume changed the lead set")
+            if any(run.get("session_id") == sessions["a"]
+                   for run in final_a.get("active_runs", {}).values()):
+                raise RuntimeError("candidate resume left the original run active")
         # This case owns its disposable state directory exclusively, including
         # child-session aliases whose owner pointer was never populated.
         for record_path in state_dir.glob(".session-*.json"):
@@ -860,6 +912,8 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 "candidate_version": candidate_version, "pending_callbacks": 0,
                 **({"native_resumed": sorted(resumed)} if provider == "claude" else
                    {"native_resumed": ["a"]} if update and provider == "codex" else {}),
+                **({"native_resume_mode": "status-version" if pre_resume_state == "completed"
+                    else "reconcile"} if update and provider == "codex" else {}),
                 **({"native_hook_capture": codex_hook_capture_summary(root, provider)}
                    if update else {}),
                 **({"live_update": f"{update['old_version']}->{update['candidate_version']}"} if update else {})}
