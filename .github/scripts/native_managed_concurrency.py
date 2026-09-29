@@ -946,6 +946,14 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 "different-branch-worktrees" if separate else "same-worktree",
                 "observed_overlap": True, "completed": ["a", "b"],
                 "candidate_version": candidate_version, "pending_callbacks": 0,
+                "original_owners": {label: {"session_id": sessions[label],
+                                             "run_id": observed_run_ids[label],
+                                             "lead_id": observed_leads[label]}
+                                    for label in sessions},
+                **({"old_product_lead_completed_before_resume": {
+                    label: snapshot["pre_candidate_resume"][label]["old_product_lead_completed"]
+                    for label in sessions}}
+                   if update and provider == "claude" else {}),
                 **({"native_resumed": sorted(resumed)} if provider == "claude" else
                    {"native_resumed": ["a"]} if update and provider == "codex" else {}),
                 **({"native_resume_mode": "status-version" if pre_resume_state == "completed"
@@ -1021,6 +1029,75 @@ _CLAUDE_RECOVERY_REJECT = {
     244: "later_worker_failure_event", 246: "later_lead_restart",
     249: "report_length",
 }
+
+_CODEX_NATIVE_REJECT = {
+    402: "run_scope", 406: "lead_identity_or_start", 410: "lead_route",
+    414: "native_home", 417: "child_transcript_path",
+    423: "child_path_trust", 427: "session_meta", 430: "child_identity",
+    434: "parent_identity", 463: "transcript_parse",
+}
+_CODEX_COMPLETION_RESULT = {
+    604: "not_completing", 608: "no_terminal_anchor", 611: "native_transcript_unavailable",
+    616: "terminal_anchor_missing", 618: "latest_is_accepted_terminal",
+    621: "native_turn_order_conflict", 629: "native_turn_route_or_time",
+    632: "newer_turn_running", 634: "newer_turn_time",
+    637: "newer_turn_message", 647: "newer_turn_completed",
+}
+
+
+def codex_completion_probe(document, session, home):
+    """Classify why an original completing run did not finalize at native Stop."""
+    plugin = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
+    if str(plugin) not in sys.path:
+        sys.path.insert(0, str(plugin))
+    try:
+        from symphony import host_evidence
+        from symphony.store import _state_from_dict
+        state = _state_from_dict(document)
+        run = state.active_runs.get(f"codex:{session}")
+        if run is None:
+            return {"result": "no_active_run"}
+        state = replace(state, active_run=run)
+        lead_id = run.lead_identity or ""
+        anchors = tuple(run.assessment.get("_terminal_turns", {}).get(lead_id, ()))
+        captured = {"native_home_present": (home / "sessions").is_dir(),
+                    "terminal_anchor_count": len(anchors)}
+        def trace(frame, event, value):
+            native = frame.f_code is host_evidence._native_lead_turns.__code__
+            completion = frame.f_code is host_evidence.codex_completing_lead_turn.__code__
+            if not native and not completion:
+                return None
+            if event == "return":
+                if native:
+                    captured["native_stage"] = (
+                        "accepted" if value is not None else
+                        _CODEX_NATIVE_REJECT.get(frame.f_lineno, "unknown"))
+                    captured["native_source_line"] = frame.f_lineno
+                    local = frame.f_locals
+                    captured["child_transcript_path_count"] = len(local.get("paths", ()))
+                    if value is not None:
+                        _, turns, order, latest, _ = value
+                        captured["native_turn_count"] = len(order)
+                        captured["latest_turn_is_accepted_terminal"] = (
+                            f"turn_id:{latest}" in anchors)
+                        captured["latest_turn_completed"] = bool(
+                            turns.get(latest, {}).get("completed_at"))
+                else:
+                    captured["completion_stage"] = _CODEX_COMPLETION_RESULT.get(
+                        frame.f_lineno, "unknown")
+                    captured["completion_source_line"] = frame.f_lineno
+                    captured["freshness"] = value[0] if isinstance(value, tuple) else "unknown"
+            return trace
+        previous = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            host_evidence.codex_completing_lead_turn(
+                state, session, {"CODEX_HOME": str(home)})
+        finally:
+            sys.settrace(previous)
+        return captured
+    except Exception as error:
+        return {"result": "probe_error", "error_type": type(error).__name__}
 
 
 def claude_recovery_probe(document, session, project, home):
@@ -1287,6 +1364,15 @@ def failure_state(root, provider):
                                            (case_root / "second").exists() else "primary")
                     recovery_probes[label] = claude_recovery_probe(
                         document, session, project, native_home)
+        completion_probes = {}
+        if provider == "codex":
+            native_home = (root / "codex-live-update-home" if case == "live-update" else
+                           Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
+            for label, session in cli_sessions.items():
+                active = document.get("active_runs", {}).get(f"codex:{session}")
+                if active and active.get("status") == "completing":
+                    completion_probes[label] = codex_completion_probe(
+                        document, session, native_home)
         cases.append({"case": case, "labels": labels, "cli_session_ids": cli_sessions,
                       "activation_profiles": [activation_summary(item) for item in profiles
                                               if isinstance(item, dict) and item.get("session_id")],
@@ -1296,6 +1382,7 @@ def failure_state(root, provider):
                       "lead_lifecycle_events": relevant_events,
                       "session_records": session_records,
                       "candidate_recovery_probes": recovery_probes,
+                      "codex_completion_probes": completion_probes,
                       "event_counts": event_counts(document),
                       "update_event_counts": snapshots})
     host = {}
@@ -1325,12 +1412,16 @@ def main():
     parser.add_argument("--live-update", action="store_true")
     parser.add_argument("--only-live-update", action="store_true",
                         help="run the bounded native upgrade case without baseline cases")
+    parser.add_argument("--only-worktrees", action="store_true",
+                        help="run only the two independent worktree owners")
     parser.add_argument("--old-plugin-root", type=Path)
     parser.add_argument("--candidate-plugin-root", type=Path,
                         default=Path(__file__).resolve().parents[2] / "plugins" / "symphony")
     args = parser.parse_args()
     if args.only_live_update and not args.live_update:
         parser.error("--only-live-update requires --live-update")
+    if args.only_live_update and args.only_worktrees:
+        parser.error("--only-live-update and --only-worktrees cannot be combined")
     with tempfile.TemporaryDirectory(prefix="symphony-native-managed-", ignore_cleanup_errors=True) as temporary:
         root = Path(temporary)
         update = None
@@ -1351,9 +1442,10 @@ def main():
                     source_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
                     if not (source_config / ".credentials.json").is_file():
                         raise RuntimeError("Claude live update needs ANTHROPIC_API_KEY or existing auth")
-            results = ([] if args.only_live_update else
-                       [check_case(args.provider, root, separate, args.timeout,
-                                   args.claude_budget_usd) for separate in (False, True)])
+            cases = (() if args.only_live_update else
+                     (True,) if args.only_worktrees else (False, True))
+            results = [check_case(args.provider, root, separate, args.timeout,
+                                  args.claude_budget_usd) for separate in cases]
             if args.live_update:
                 update = prepare_live_update(args.provider, root, args.old_plugin_root,
                                              args.candidate_plugin_root)

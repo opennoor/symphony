@@ -297,11 +297,19 @@ def run_case(root, package, timeout, budget):
             time.sleep(.25)
         else:
             raise RuntimeError("isolated background lead did not reach the fixture gate")
-        (project / "release").touch()
         lead_start = isolated_starts[-1]
         lead_id = lead_start.get("agent_id")
         if not lead_id:
             raise RuntimeError("SubagentStart hook did not contain lead agent_id")
+        if not state_path.is_file():
+            raise RuntimeError("isolated lead did not register in its root project")
+        before_release = json.loads(state_path.read_text())
+        original_run = before_release.get("active_runs", {}).get(f"claude:{session}")
+        if (not original_run or original_run.get("lead_identity") != lead_id
+                or original_run.get("status") != "active"):
+            raise RuntimeError("isolated lead was not owned by the original active run")
+        original_run_id = original_run.get("run_id")
+        (project / "release").touch()
         resumed = False
         while time.monotonic() < deadline:
             records = capture_records(capture)
@@ -317,9 +325,25 @@ def run_case(root, package, timeout, budget):
                             if run.get("session_id") == session]
                 if (len(matching) == 1 and matching[0].get("status") == "completed"
                         and matching[0].get("lead_identity") == lead_id
+                        and matching[0].get("run_id") == original_run_id
                         and (matching[0].get("outcome") or {}).get("status") == "completed"):
+                    version = native.package_version(package)
+                    activation = document.get("activation", {}).get("claude", {})
+                    profiles = [activation, *activation.get("session_profiles", [])]
+                    if not any(item.get("session_id") == session
+                               and item.get("plugin_version") == version for item in profiles):
+                        raise RuntimeError("isolated root used another Symphony plugin version")
+                    for record_path in state.glob(".session-*.json"):
+                        record = json.loads(record_path.read_text())
+                        if record.get("pending") or record.get("overflow"):
+                            raise RuntimeError("isolated root retained unresolved callbacks")
                     return {"provider": "claude", "case": "isolated-worktree",
                             "session_id": session, "lead_id": lead_id,
+                            "run_id": original_run_id,
+                            "candidate_version": version,
+                            "pending_callbacks": 0,
+                            "isolated_child_cwd_different": True,
+                            "isolation_requested": True,
                             "git_worktree_preflight": preflight,
                             "captured_hook_events": sorted({item.get("hook_event_name") for item in records}),
                             "durable_parent_outcome": "completed"}
