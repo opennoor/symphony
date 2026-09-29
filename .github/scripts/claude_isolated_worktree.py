@@ -247,6 +247,9 @@ def run_case(root, package, timeout, budget):
     case = root / "case"
     case.mkdir()
     project, _ = native.projects(case, False)
+    # Windows tempfile may use an 8.3 alias; Claude compares its isolation
+    # worktree path with Git's expanded path even when both name one directory.
+    project = project.resolve(strict=True)
     preflight = git_worktree_preflight(root, project)
     (project / "gate.py").write_text(native.GATE)
     state = case / "state"

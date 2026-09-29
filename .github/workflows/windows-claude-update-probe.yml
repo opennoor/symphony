@@ -1,0 +1,45 @@
+name: Windows Claude active update probe
+
+on:
+  push:
+    branches:
+      - fix/session-terminal-replay-and-updates
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Claude Code
+        run: npm.cmd install -g @anthropic-ai/claude-code
+      - name: Probe active 1.5.1 to candidate update
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if (-not $env:ANTHROPIC_API_KEY) { throw 'ANTHROPIC_API_KEY is required' }
+          $env:CLAUDE_CODE_GIT_BASH_PATH = Join-Path $env:ProgramFiles 'Git/bin/bash.exe'
+          $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'claude-update-diagnostics'
+          git fetch origin tag v1.5.1
+          if ($LASTEXITCODE -ne 0) { throw 'Old release fetch failed' }
+          $old = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
+          git worktree add --detach $old v1.5.1
+          if ($LASTEXITCODE -ne 0) { throw 'Old release checkout failed' }
+          python .github/scripts/native_managed_concurrency.py --provider claude `
+            --timeout 540 --live-update --only-live-update `
+            --old-plugin-root (Join-Path $old 'plugins/symphony') `
+            --candidate-plugin-root (Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony')
+          if ($LASTEXITCODE -ne 0) { throw 'Active Claude update probe failed; see sanitized artifact' }
+      - name: Retain sanitized native failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-claude-update-probe
+          path: ${{ runner.temp }}/claude-update-diagnostics/*.json
+          if-no-files-found: ignore

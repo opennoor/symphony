@@ -7,6 +7,7 @@ plugin. All Git checkouts, state, runtime pins, and gate files are temporary.
 
 import argparse
 from collections import Counter
+from dataclasses import replace
 from hashlib import sha256
 import json
 import os
@@ -703,10 +704,12 @@ def check_case(provider, root, separate, timeout, budget, update=None):
         deadline = time.monotonic() + timeout
         paths = {label: state_file(state_dir, project) for label, project in (("a", first), ("b", second))}
         while time.monotonic() < deadline:
-            if any(process.poll() not in (None, 0) for process in processes.values()):
-                raise RuntimeError("native CLI failed before both managed leads reached the gate")
-            if provider == "codex" and any(process.poll() is not None for process in processes.values()):
-                raise RuntimeError("native CLI exited before both managed leads reached the gate")
+            exited = {label: code for label, process in processes.items()
+                      if (code := process.poll()) is not None
+                      and (provider == "codex" or code != 0)}
+            if exited:
+                exits = ",".join(f"{label}={code}" for label, code in sorted(exited.items()))
+                raise RuntimeError(f"native CLI exited before both managed leads reached the gate: {exits}")
             if all((project / f"{label}.ready").exists()
                    for label, project in (("a", first), ("b", second))):
                 if provider == "codex" and not sessions["a"]:
@@ -1004,6 +1007,101 @@ def captured_claude_lead_stop(root, session_id, lead_id):
                for record in codex_hook_capture_summary(root, "claude")["records"])
 
 
+_CLAUDE_RECOVERY_REJECT = {
+    78: "run_scope", 82: "lead_identity", 88: "lead_route_or_state",
+    92: "native_home", 95: "child_transcript_path", 100: "child_path_ancestry",
+    105: "child_meta_read", 108: "child_meta_parse", 110: "child_meta_shape",
+    117: "child_meta_launch", 121: "native_transcript_read", 132: "parent_launch_count",
+    138: "parent_launch_shape", 141: "parent_cwd", 143: "parent_cwd_resolve",
+    146: "parent_launch_time", 153: "child_identity", 157: "child_prompt_missing",
+    164: "target_prompt", 169: "prompt_uuid", 172: "prompt_chronology",
+    179: "latest_activity", 185: "latest_terminal", 190: "terminal_chronology",
+    194: "model_effort", 197: "terminal_content", 202: "final_marker_conflict",
+    212: "handback_count", 224: "handback_receipt", 234: "later_worker_failure",
+    244: "later_worker_failure_event", 246: "later_lead_restart",
+    249: "report_length",
+}
+
+
+def claude_recovery_probe(document, session, project, home):
+    """Classify the candidate's exact rejection stage without retaining transcript text."""
+    plugin = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
+    if str(plugin) not in sys.path:
+        sys.path.insert(0, str(plugin))
+    try:
+        from symphony import host_evidence
+        from symphony.store import _state_from_dict
+        state = _state_from_dict(document)
+        run = state.active_runs.get(f"claude:{session}")
+        if run is None:
+            return {"result": "no_active_run"}
+        state = replace(state, active_run=run)
+        captured = {}
+
+        def trace(frame, event, value):
+            if frame.f_code is not host_evidence._claude_native_lead_event.__code__:
+                return None
+            if event == "return":
+                captured["line"] = frame.f_lineno
+                captured["accepted"] = value is not None
+                values = frame.f_locals
+                if frame.f_lineno == 95:
+                    captured["child_path_count"] = len(values.get("paths", ()))
+                if frame.f_lineno == 194:
+                    lead = values.get("lead")
+                    assistants = values.get("assistants", ())
+                    if lead is not None:
+                        captured["requested_model"] = (
+                            lead.requested_tier if re.fullmatch(
+                                r"[A-Za-z0-9_.-]{1,80}", lead.requested_tier) else "other")
+                        captured["requested_effort"] = (
+                            lead.requested_effort if re.fullmatch(
+                                r"[A-Za-z0-9_.-]{1,40}", lead.requested_effort) else "other")
+                    captured["assistant_models"] = sorted({
+                        item for row in assistants
+                        if (item := str((row.get("message") or {}).get("model")))
+                        and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", item)})[:8]
+                    captured["assistant_efforts"] = sorted({
+                        item for row in assistants
+                        if (item := str(row.get("perTurnEffort") or row.get("effort")))
+                        and re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", item)})[:8]
+                if frame.f_lineno in {179, 185}:
+                    activity = values.get("activity", ())
+                    assistants = values.get("assistants", ())
+                    captured["latest_activity_is_assistant"] = bool(
+                        activity and assistants and activity[-1] is assistants[-1])
+                    terminal = values.get("terminal")
+                    if isinstance(terminal, dict):
+                        reason = (terminal.get("message") or {}).get("stop_reason")
+                        captured["latest_stop_reason"] = (
+                            reason if reason in {"end_turn", "tool_use", "max_tokens", "stop_sequence"}
+                            else "other")
+                if frame.f_lineno in {202, 212, 224}:
+                    status = values.get("final_status")
+                    captured["final_marker_status"] = (
+                        status if status in {"completed", "blocked", "failed", "abandoned"}
+                        else "missing_or_invalid")
+                    captured["handback_count"] = len(values.get("handbacks", ()))
+                    captured["handback_result_count"] = len(values.get("results", ()))
+            return trace
+
+        previous = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            event = host_evidence._claude_native_lead_event(
+                state, session, project, {"CLAUDE_CONFIG_DIR": str(home)},
+                require_missing=True)
+        finally:
+            sys.settrace(previous)
+        line = captured.pop("line", None)
+        accepted = captured.pop("accepted", False)
+        return {"result": "accepted" if accepted and event is not None else "rejected",
+                "stage": "accepted" if accepted else _CLAUDE_RECOVERY_REJECT.get(line, "unknown"),
+                "source_line": line, **captured}
+    except Exception as error:
+        return {"result": "probe_error", "error_type": type(error).__name__}
+
+
 def failure_state(root, provider):
     def short_hash(value):
         return sha256(str(value).encode()).hexdigest()[:12] if value else None
@@ -1180,6 +1278,15 @@ def failure_state(root, provider):
                 continue
             if record.get("state_name") in {None, path.name}:
                 session_records.append(session_record_summary(record, root_sessions))
+        recovery_probes = {}
+        if provider == "claude" and case == "live-update":
+            native_home = root / "claude-live-update-home"
+            for label, session in cli_sessions.items():
+                if f"claude:{session}" in document.get("active_runs", {}):
+                    project = case_root / ("second" if label == "b" and
+                                           (case_root / "second").exists() else "primary")
+                    recovery_probes[label] = claude_recovery_probe(
+                        document, session, project, native_home)
         cases.append({"case": case, "labels": labels, "cli_session_ids": cli_sessions,
                       "activation_profiles": [activation_summary(item) for item in profiles
                                               if isinstance(item, dict) and item.get("session_id")],
@@ -1188,6 +1295,7 @@ def failure_state(root, provider):
                       "event_kinds": [event.get("kind") for event in document.get("event_history", [])],
                       "lead_lifecycle_events": relevant_events,
                       "session_records": session_records,
+                      "candidate_recovery_probes": recovery_probes,
                       "event_counts": event_counts(document),
                       "update_event_counts": snapshots})
     host = {}
@@ -1215,10 +1323,14 @@ def main():
     parser.add_argument("--timeout", type=int, default=360)
     parser.add_argument("--claude-budget-usd", type=float, default=3.0)
     parser.add_argument("--live-update", action="store_true")
+    parser.add_argument("--only-live-update", action="store_true",
+                        help="run the bounded native upgrade case without baseline cases")
     parser.add_argument("--old-plugin-root", type=Path)
     parser.add_argument("--candidate-plugin-root", type=Path,
                         default=Path(__file__).resolve().parents[2] / "plugins" / "symphony")
     args = parser.parse_args()
+    if args.only_live_update and not args.live_update:
+        parser.error("--only-live-update requires --live-update")
     with tempfile.TemporaryDirectory(prefix="symphony-native-managed-", ignore_cleanup_errors=True) as temporary:
         root = Path(temporary)
         update = None
@@ -1239,8 +1351,9 @@ def main():
                     source_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
                     if not (source_config / ".credentials.json").is_file():
                         raise RuntimeError("Claude live update needs ANTHROPIC_API_KEY or existing auth")
-            results = [check_case(args.provider, root, separate, args.timeout,
-                                  args.claude_budget_usd) for separate in (False, True)]
+            results = ([] if args.only_live_update else
+                       [check_case(args.provider, root, separate, args.timeout,
+                                   args.claude_budget_usd) for separate in (False, True)])
             if args.live_update:
                 update = prepare_live_update(args.provider, root, args.old_plugin_root,
                                              args.candidate_plugin_root)
