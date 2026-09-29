@@ -1548,6 +1548,101 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual([], store.session_record(provider, session)["pending"])
                 self.assertEqual("completed", store.load(self.project).recent_runs[-1].status)
 
+    def test_archived_start_replay_cannot_block_its_root_or_sibling(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                session = f"{provider}-archived-root"
+                sibling = f"{provider}-active-root"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                handle({**self.payload("", provider), "session_id": session,
+                        "hook_event_name": "SessionStart"}, environ)
+                handle({**self.payload("", provider), "session_id": sibling,
+                        "hook_event_name": "SessionStart"}, environ)
+                start = {**self.payload("", provider), "session_id": session,
+                         "hook_event_name": "SubagentStart", "agent_id": "old-lead",
+                         "parent_thread_id": session, "role": "lead"}
+                start["turn_id" if provider == "codex" else "prompt_id"] = "old-invocation"
+                start_event = event_from_payload(provider, start)
+                choice = route_choice(provider=provider)
+                finished = RunState(
+                    "old-run", "task", status="completed", session_id=session,
+                    provider=provider, lead_identity="old-lead",
+                    assessment={"_start_event_ids": (start_event.event_id,)},
+                    delegations=(Delegation("old-lead", "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                    outcome={"status": "completed"},
+                )
+                active = RunState("sibling-run", "task", status="active",
+                                  session_id=sibling, provider=provider,
+                                  lead_identity="sibling-lead")
+                store = StateStore(self.state_root)
+                initial = ProjectState(active_run=active,
+                                       active_runs={f"{provider}:{sibling}": active},
+                                       recent_runs=(finished,))
+                store.save(self.project, initial)
+                baseline = store.load(self.project)
+
+                handle(start, environ)
+                self.assertEqual([], store.session_record(provider, session)["pending"])
+                # A crash may leave the same exact start in an older inbox.
+                store.queue_session_event(provider, session, start_event,
+                                          ambiguous_owner=True)
+                stop = self.output(handle({**self.payload("", provider),
+                                           "session_id": session,
+                                           "hook_event_name": "Stop"}, environ))
+                self.assertNotEqual("block", stop.get("decision"), stop)
+                self.assertEqual([], store.session_record(provider, session)["pending"])
+                state = store.load(self.project)
+                self.assertEqual(baseline.active_runs, state.active_runs)
+                self.assertEqual(baseline.recent_runs, state.recent_runs)
+
+                # The same bytes can be a genuine start in a newer run when
+                # a host omits turn identity. It must change that run rather
+                # than inherit the prior completion.
+                no_id_start = {key: value for key, value in start.items()
+                               if key not in {"turn_id", "prompt_id"}}
+                no_id_event = event_from_payload(provider, no_id_start)
+                old_with_no_id = replace(finished, assessment={
+                    "_start_event_ids": (start_event.event_id, no_id_event.event_id)})
+                new = replace(old_with_no_id, run_id="new-run", status="completing",
+                              assessment={}, outcome={"status": "completed"})
+                store.save(self.project, ProjectState(
+                    active_run=new,
+                    active_runs={f"{provider}:{session}": new,
+                                 f"{provider}:{sibling}": active},
+                    recent_runs=(old_with_no_id,),
+                ))
+                handle(no_id_start, environ)
+                restarted = store.load(self.project).active_runs[f"{provider}:{session}"]
+                self.assertEqual("active", restarted.status)
+                self.assertIsNone(restarted.outcome)
+
+    def test_unidentified_archived_assessor_start_is_not_silently_discarded(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                session = f"{provider}-unidentified-root"
+                environ = self.claude_environ if provider == "claude" else self.environ
+                handle({**self.payload("", provider), "session_id": session,
+                        "hook_event_name": "SessionStart"}, environ)
+                start = {**self.payload("", provider), "session_id": session,
+                         "hook_event_name": "SubagentStart", "agent_id": "assessor",
+                         "parent_thread_id": session, "role": "assessor"}
+                start.pop("turn_id", None)
+                event = event_from_payload(provider, start)
+                finished = RunState(
+                    "old-run", "task", status="completed", session_id=session,
+                    provider=provider,
+                    assessment={"_start_event_ids": (event.event_id,)},
+                    delegations=(Delegation("assessor", "assessor", "task", "completed",
+                                            "model", "high"),),
+                    outcome={"status": "completed"},
+                )
+                store = StateStore(self.state_root)
+                store.save(self.project, ProjectState(recent_runs=(finished,)))
+                handle(start, environ)
+                self.assertIn(f"{provider}:{session}",
+                              store.load(self.project).active_runs)
+
     def test_completed_lead_remains_owned_until_root_stop_for_native_followups(self):
         choice = route_choice()
         self.seed_run(RunState("root-run", "task", lead_identity="lead", status="active",

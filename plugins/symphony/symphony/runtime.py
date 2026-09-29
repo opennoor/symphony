@@ -131,6 +131,9 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     acknowledged.add(pending_event_id)
                 continue
             if current:
+                if (expected_owner and _committed_child_start_replay(
+                        state, event, provider, expected_owner)):
+                    continue
                 if (expected_owner and _committed_child_terminal_replay(
                         state, event, provider, expected_owner, allow_active=True)):
                     # A callback retried after archive cannot complete a
@@ -505,6 +508,8 @@ def _pending_child_disposition(
     state: ProjectState, event: Event, provider: str, session: str,
 ) -> str:
     """Replay only a child lifecycle that the current run already identifies."""
+    if _committed_child_start_replay(state, event, provider, session):
+        return "stale"
     if event.payload.get("_symphony_owner_conflict"):
         return "hold"
     if event.kind not in {"subagent_started", "subagent_stopped"}:
@@ -518,12 +523,6 @@ def _pending_child_disposition(
     if _prior_child_terminal_conflict(state, event, provider, session):
         return "hold"
     if run is None:
-        if event.kind == "subagent_started" and any(
-            item.provider == provider and item.session_id == session
-            and event.event_id in item.assessment.get("_start_event_ids", ())
-            for item in state.recent_runs
-        ):
-            return "stale"
         return "hold"
     if run.started_at and event.observed_at < run.started_at:
         return "stale"
@@ -554,6 +553,20 @@ def _committed_child_terminal_replay(
 ) -> bool:
     return _prior_child_terminal_disposition(
         state, event, provider, session, allow_active=allow_active) == "replay"
+
+
+def _committed_child_start_replay(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """An exact archived start is a retry, even if it arrived after archive."""
+    return (event.kind == "subagent_started"
+            and f"{provider}:{session}" not in state.active_runs
+            and bool(event.payload.get("turn_id") or event.payload.get("prompt_id"))
+            and any(
+                item.provider == provider and item.session_id == session
+                and event.event_id in item.assessment.get("_start_event_ids", ())
+                for item in state.recent_runs
+            ))
 
 
 def _prior_child_terminal_conflict(

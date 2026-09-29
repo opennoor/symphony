@@ -21,6 +21,28 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_native_capture_recognizes_disposable_baseline_home(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "claude-baseline-home"
+            home.mkdir()
+            capture = root / "claude-hook-capture"
+            capture.mkdir()
+            invocation = "capture-one"
+            (capture / f"{invocation}-entry.json").write_text(json.dumps({
+                "invocation_id": invocation, "event": "Stop", "session_id": "root-a",
+                "agent_id": None, "native_home": str(home), "started_ns": 123,
+                "prompt_id_hash": "prompt-hash", "payload_keys": ["session_id"],
+            }))
+            (capture / f"{invocation}-exit.json").write_text(json.dumps({
+                "invocation_id": invocation, "exit_code": 0, "finished_ns": 125,
+            }))
+            summary = native.codex_hook_capture_summary(root, "claude")
+            self.assertTrue(summary["configured"])
+            self.assertEqual(1, summary["event_counts"]["Stop"])
+            self.assertTrue(summary["records"][0]["native_home_matches_expected"])
+            self.assertEqual("prompt-hash", summary["records"][0]["prompt_id_hash"])
+
     def test_source_and_exact_retained_profiles_and_rejections(self):
         files, digest, constants = native.reviewed_snapshot_spec(PLUGIN)
         version = constants["PLUGIN_VERSION"]

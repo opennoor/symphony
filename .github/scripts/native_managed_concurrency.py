@@ -35,7 +35,7 @@ while not (root / "release").exists():
 print("GATE_RELEASED", flush=True)
 '''
 
-CODEX_HOOK_CAPTURE = '''import json, os, pathlib, sys, time, uuid
+CODEX_HOOK_CAPTURE = '''import hashlib, json, os, pathlib, sys, time, uuid
 destination = pathlib.Path(sys.argv[2])
 destination.mkdir(parents=True, exist_ok=True)
 invocation = str(uuid.uuid4())
@@ -50,6 +50,10 @@ provider = sys.argv[3]
 record = {"invocation_id": invocation, "event": event,
           "session_id": payload.get("session_id"), "agent_id": payload.get("agent_id"),
           "turn_id": payload.get("turn_id"), "parent_id": payload.get("parent_id"),
+          "prompt_id_hash": hashlib.sha256(str(payload.get("prompt_id") or "").encode()).hexdigest()[:12]
+              if payload.get("prompt_id") else None,
+          "message_hash": hashlib.sha256(str(payload.get("last_assistant_message") or "").encode()).hexdigest()[:12]
+              if payload.get("last_assistant_message") else None,
           "native_home": os.environ.get("CODEX_HOME" if provider == "codex"
                                         else "CLAUDE_CONFIG_DIR"),
           "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
@@ -352,6 +356,72 @@ def claude_command(env, cwd, *arguments, timeout=60):
     return completed
 
 
+def install_hook_capture(provider, root, home):
+    """Add an independent native callback clock to a disposable CLI home."""
+    capture = root / f"{provider}-hook-capture"
+    capture.mkdir(exist_ok=True)
+    script = root / f"capture_{provider}_hook.py"
+    script.write_text(CODEX_HOOK_CAPTURE)
+    if provider == "codex":
+        if any(character.isspace() for character in str(script)):
+            raise RuntimeError("native Codex hook capture requires a temporary path without spaces")
+        hooks = {"hooks": {}}
+        for event in ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop"):
+            command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()} codex"
+            windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()} codex"
+            hooks["hooks"][event] = [{"hooks": [{"type": "command", "command": command,
+                                                  "command_windows": windows, "timeout": 10}]}]
+        (home / "hooks.json").write_text(json.dumps(hooks))
+    else:
+        settings_path = home / "settings.json"
+        settings = json.loads(settings_path.read_text())
+        hooks = settings.setdefault("hooks", {})
+        for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
+            command = (f'python -I "{script.as_posix()}" {event} '
+                       f'"{capture.as_posix()}" claude')
+            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command}]})
+        settings_path.write_text(json.dumps(settings))
+
+
+def prepare_baseline_capture(provider, root, candidate_source):
+    """Install the candidate and capture hooks in a fresh native CLI home."""
+    candidate_source = candidate_source.resolve()
+    version = package_version(candidate_source)
+    home = root / f"{provider}-baseline-home"
+    home.mkdir()
+    env = {"CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR": str(home)}
+    native_env = {**os.environ, **env}
+    market = marketplace(root, "symphony-baseline", candidate_source, version)
+    if provider == "codex":
+        token = os.environ.get("OPENAI_API_KEY")
+        if token:
+            codex_command(native_env, root, "login", "--with-api-key", input_text=token)
+        else:
+            auth = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
+            if not auth.is_file():
+                raise RuntimeError("Codex baseline capture needs OPENAI_API_KEY or existing auth")
+            shutil.copyfile(auth, home / "auth.json")
+            (home / "auth.json").chmod(0o600)
+            codex_command(native_env, root, "login", "status")
+        codex_command(native_env, root, "plugin", "marketplace", "add", str(market))
+        codex_command(native_env, root, "plugin", "add", "symphony@symphony-baseline")
+    else:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            source_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+            credentials = source_config / ".credentials.json"
+            if not credentials.is_file():
+                raise RuntimeError("Claude baseline capture needs ANTHROPIC_API_KEY or existing auth")
+            shutil.copyfile(credentials, home / ".credentials.json")
+            (home / ".credentials.json").chmod(0o600)
+            status = json.loads(claude_command(native_env, root, "auth", "status", "--json").stdout)
+            if not status.get("loggedIn"):
+                raise RuntimeError("disposable Claude baseline config is not authenticated")
+        claude_command(native_env, root, "plugin", "marketplace", "add", str(market))
+        claude_command(native_env, root, "plugin", "install", "-y", "symphony@symphony-baseline")
+    install_hook_capture(provider, root, home)
+    return env
+
+
 def prepare_live_update(provider, root, old_source, candidate_source):
     old_source, candidate_source = old_source.resolve(), candidate_source.resolve()
     old_version, candidate_version = package_version(old_source), package_version(candidate_source)
@@ -375,19 +445,6 @@ def prepare_live_update(provider, root, old_source, candidate_source):
             codex_command(env, root, "login", "status")
         codex_command(env, root, "plugin", "marketplace", "add", str(old_market))
         codex_command(env, root, "plugin", "add", "symphony@symphony-old")
-        capture = root / "codex-hook-capture"
-        capture.mkdir()
-        script = root / "capture_codex_hook.py"
-        script.write_text(CODEX_HOOK_CAPTURE)
-        if any(character.isspace() for character in str(script)):
-            raise RuntimeError("native Codex hook capture requires a temporary path without spaces")
-        hooks = {"hooks": {}}
-        for event in ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop"):
-            command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()} codex"
-            windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()} codex"
-            hooks["hooks"][event] = [{"hooks": [{"type": "command", "command": command,
-                                                  "command_windows": windows, "timeout": 10}]}]
-        (home / "hooks.json").write_text(json.dumps(hooks))
     else:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             source_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
@@ -401,18 +458,7 @@ def prepare_live_update(provider, root, old_source, candidate_source):
                 raise RuntimeError("disposable Claude config is not authenticated")
         claude_command(env, root, "plugin", "marketplace", "add", str(old_market))
         claude_command(env, root, "plugin", "install", "-y", "symphony@symphony-old")
-        capture = root / "claude-hook-capture"
-        capture.mkdir()
-        script = root / "capture_claude_hook.py"
-        script.write_text(CODEX_HOOK_CAPTURE)
-        settings_path = home / "settings.json"
-        settings = json.loads(settings_path.read_text())
-        hooks = settings.setdefault("hooks", {})
-        for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
-            command = (f'python -I "{script.as_posix()}" {event} '
-                       f'"{capture.as_posix()}" claude')
-            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command}]})
-        settings_path.write_text(json.dumps(settings))
+    install_hook_capture(provider, root, home)
     old_cache = home / "plugins" / "cache" / "symphony-old" / "symphony" / old_version
     hook = "codex.json" if provider == "codex" else "hooks.json"
     if not (old_cache / "hooks" / hook).is_file():
@@ -926,7 +972,7 @@ def codex_host_trace(home, session, lead_id, error_log):
 
 
 def check_case(provider, root, separate, timeout, budget, update=None,
-               direct_stop_resume=False):
+               direct_stop_resume=False, baseline_env=None):
     case = root / ("live-update" if update else "worktrees" if separate else "same-worktree")
     case.mkdir()
     first, second = projects(case, separate)
@@ -936,7 +982,8 @@ def check_case(provider, root, separate, timeout, budget, update=None,
     state_dir.mkdir()
     candidate_version = (update["candidate_version"] if update else
                          package_version(Path(__file__).resolve().parents[2] / "plugins/symphony"))
-    env = {**os.environ, **(update["env"] if update else {}), "SYMPHONY_STATE_DIR": str(state_dir),
+    env = {**os.environ, **(update["env"] if update else baseline_env or {}),
+           "SYMPHONY_STATE_DIR": str(state_dir),
            "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
            "SYMPHONY_PROFILE": "base" if provider == "codex" else "sonnet"}
     if provider == "claude":
@@ -1239,6 +1286,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 kinds = [event.get("kind") for event in events]
                 if "lead_failed" not in kinds or "lead_completed" not in kinds:
                     raise RuntimeError("recovered lead lacks durable failed and completed events")
+        capture = codex_hook_capture_summary(root, provider)
         return {"case": "live-update" if update else
                 "different-branch-worktrees" if separate else "same-worktree",
                 "observed_overlap": True, "completed": ["a", "b"],
@@ -1262,8 +1310,11 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 **({"native_resume_mode": "status-version" if pre_resume_state == "completed"
                     else "direct-stop" if direct_stop_resume else "reconcile"}
                    if update and provider == "codex" else {}),
-                **({"native_hook_capture": codex_hook_capture_summary(root, provider)}
-                   if update else {}),
+                "native_hook_capture": {
+                    "configured": capture["configured"],
+                    "records": [record for record in capture["records"]
+                                if record.get("session_id") in set(sessions.values())],
+                },
                 **({"live_update": f"{update['old_version']}->{update['candidate_version']}"} if update else {})}
     finally:
         for project in {first, second}:
@@ -1296,11 +1347,14 @@ def codex_hook_capture_summary(root, provider="codex"):
             continue
         records.append({key: entry.get(key) for key in
                         ("invocation_id", "event", "session_id", "agent_id", "turn_id",
-                         "parent_id", "cwd", "started_ns", "payload_keys", "control")}
+                         "parent_id", "prompt_id_hash", "message_hash", "cwd",
+                         "started_ns", "payload_keys", "control")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
+                          "finished_ns": marker.get("finished_ns"),
                           "native_home_matches_expected": (
                               Path(entry["native_home"]).resolve()
-                              == (root / f"{provider}-live-update-home").resolve())
+                              in {(root / f"{provider}-live-update-home").resolve(),
+                                  (root / f"{provider}-baseline-home").resolve()})
                           if entry.get("native_home") else False,
                           "script_exit_marker_code": marker.get("exit_code")})
     records.sort(key=lambda record: record.get("started_ns") or 0)
@@ -1653,6 +1707,7 @@ def failure_state(root, provider):
                            if payload.get(key)), None)
         source_id = str(event.get("event_id") or "").split(":", 1)[0]
         return {"kind": event.get("kind"), "identity": payload.get("identity"),
+                "observed_at": event.get("observed_at"),
                 "event_id_hash": short_hash(event.get("event_id")),
                 "session_id": payload.get("session_id"),
                 "parent_matches_root": payload.get("parent_thread_id") in root_sessions
@@ -1679,6 +1734,7 @@ def failure_state(root, provider):
             parent = payload.get("parent_thread_id")
             pending.append({
                 "kind": item.get("kind"), "event_id_hash": short_hash(event_id),
+                "observed_at": item.get("observed_at"),
                 "event_id_prefix": event_id[:12] if re.fullmatch(r"[0-9a-f]{64}", event_id) else None,
                 "terminal_result_prefix": terminal_result_prefix(payload)
                 if item.get("kind") == "subagent_stopped" else None,
@@ -1749,6 +1805,9 @@ def failure_state(root, provider):
                            for event in document.get("event_history", [])
                            if event.get("kind") in {"delegation_updated", "lead_started",
                                                     "lead_failed", "lead_completed"}]
+        root_stop_events = [event_summary(event, root_sessions)
+                            for event in document.get("event_history", [])
+                            if event.get("kind") == "stop_requested"]
         session_records = []
         for record_path in (case_root / "state").glob(".session-*.json"):
             try:
@@ -1769,6 +1828,7 @@ def failure_state(root, provider):
         completion_probes = {}
         if provider == "codex":
             native_home = (root / "codex-live-update-home" if case == "live-update" else
+                           root / "codex-baseline-home" if (root / "codex-baseline-home").is_dir() else
                            Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
             for label, session in cli_sessions.items():
                 active = document.get("active_runs", {}).get(f"codex:{session}")
@@ -1782,6 +1842,7 @@ def failure_state(root, provider):
                       "recent_runs": [run_summary(run) for run in document.get("recent_runs", [])],
                       "event_kinds": [event.get("kind") for event in document.get("event_history", [])],
                       "lead_lifecycle_events": relevant_events,
+                      "root_stop_events": root_stop_events,
                       "session_records": session_records,
                       "candidate_recovery_probes": recovery_probes,
                       "codex_completion_probes": completion_probes,
@@ -1792,6 +1853,7 @@ def failure_state(root, provider):
         for case in cases:
             case_root = root / case["case"]
             home = (root / "codex-live-update-home" if case["case"] == "live-update" else
+                    root / "codex-baseline-home" if (root / "codex-baseline-home").is_dir() else
                     Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
             runs = [*case["active_runs"], *case["recent_runs"]]
             for label, session in case["cli_session_ids"].items():
@@ -1869,8 +1931,11 @@ def main():
                         raise RuntimeError("Claude live update needs ANTHROPIC_API_KEY or existing auth")
             cases = (() if args.only_live_update else
                      (True,) if args.only_worktrees else (False, True))
+            baseline_env = (prepare_baseline_capture(args.provider, root,
+                            args.candidate_plugin_root) if cases else None)
             results = [check_case(args.provider, root, separate, args.timeout,
-                                  args.claude_budget_usd) for separate in cases]
+                                  args.claude_budget_usd,
+                                  baseline_env=baseline_env) for separate in cases]
             if args.live_update:
                 update = prepare_live_update(args.provider, root, args.old_plugin_root,
                                              args.candidate_plugin_root)
