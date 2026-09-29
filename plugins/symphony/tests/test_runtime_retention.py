@@ -39,6 +39,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                "SYMPHONY_STATE_DIR": str(directory / "state"), "SYMPHONY_PROFILE": "full",
                "PYTHONPATH": str(directory),
                "CODEX_HOME": str(directory / "empty codex home")}
+        if (directory / "pin barrier" / "barrier.py").is_file():
+            env["SYMPHONY_TEST_PIN_BARRIER"] = str(directory / "pin barrier" / "barrier.py")
         if os.name == "nt":
             # The VM invokes Python by absolute path and does not install it
             # globally; provide that same interpreter to the captured hook.
@@ -271,9 +273,32 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse((directory / "state").exists())
 
     def test_first_pin_is_atomic_for_parallel_hooks(self):
+        for round_index in range(int(os.environ.get("SYMPHONY_FIRST_PIN_ROUNDS", "1"))):
+            self.exercise_first_pin_round(round_index)
+
+    def exercise_first_pin_round(self, round_index):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             root = self.materialize(directory, "Reviewed Parallel Plugin")
+            gate = directory / "pin barrier"
+            gate.mkdir()
+            (gate / "barrier.py").write_text("""import time
+gate = Path(os.environ["SYMPHONY_TEST_PIN_BARRIER"]).parent
+(gate / ("ready-" + str(os.getpid()))).touch()
+deadline = time.monotonic() + 20
+while len(list(gate.glob("ready-*"))) < 4:
+    if time.monotonic() > deadline:
+        raise RuntimeError("first-pin barrier timed out")
+    time.sleep(0.005)
+""")
+            bootstrap_path = root / "scripts" / "bootstrap_runtime.py"
+            source = bootstrap_path.read_text()
+            needle = "    if not verified(target, snapshot=True):"
+            self.assertIn(needle, source)
+            bootstrap_path.write_text(source.replace(
+                needle, '    exec(Path(os.environ["SYMPHONY_TEST_PIN_BARRIER"]).read_text())\n' + needle, 1))
+            for path, content in generated(root).items():
+                path.write_text(content)
             command = self.command(root, "codex", "SessionStart")
             def launch(index):
                 return self.run_hook(command, root, "codex", directory,
@@ -291,7 +316,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             expected = {f"parallel-{index}" for index in range(4)}
             observed = set().union(*(set(items) for items in session_sets.values()))
             if (any(result.returncode for result in results) or len(retained) != 1
-                    or len(state_files) != 1 or not expected <= observed):
+                    or len(state_files) != 1 or not expected <= observed
+                    or len(list(gate.glob("ready-*"))) != 4):
                 def output(result):
                     # Captured hook context embeds a long launcher; keep the
                     # signal and omit that command from CI diagnostics.
@@ -302,7 +328,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 snapshots = {path.name: sorted(item.relative_to(path).as_posix()
                                                 for item in path.rglob("*") if item.is_file())
                              for path in retained}
-                self.fail(json.dumps({"hooks": [output(item) for item in results],
+                self.fail(json.dumps({"round": round_index, "hooks": [output(item) for item in results],
                                       "state_files": session_sets,
                                       "retained_files": snapshots,
+                                      "barrier_arrivals": len(list(gate.glob("ready-*"))),
                                       "missing_sessions": sorted(expected - observed)}, sort_keys=True))

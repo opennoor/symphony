@@ -7,13 +7,13 @@ on:
 jobs:
   standard-user-parallel-pin:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Repeat focused first-pin test as standard user
+      - name: Stress cold first pin as a standard user
         shell: pwsh
         run: |
           $user = 'symphony-pin-ci'
@@ -28,23 +28,21 @@ jobs:
             $env:TEMP = $testRoot
             $env:TMP = $testRoot
             $env:SYMPHONY_REQUIRE_STANDARD_USER = '1'
+            $env:SYMPHONY_FIRST_PIN_ROUNDS = '100'
             $credential = [pscredential]::new("$env:COMPUTERNAME\$user", $secure)
             $python = (Get-Command python.exe -CommandType Application | Select-Object -First 1).Source
-            for ($index = 1; $index -le 10; $index++) {
-              $stdout = Join-Path $testRoot "stdout-$index.log"
-              $stderr = Join-Path $testRoot "stderr-$index.log"
-              $test = Start-Process -FilePath $python -WorkingDirectory $env:GITHUB_WORKSPACE `
-                -Credential $credential -LoadUserProfile -PassThru `
-                -ArgumentList '-m unittest plugins.symphony.tests.test_runtime_retention.RuntimeRetentionTests.test_first_pin_is_atomic_for_parallel_hooks' `
-                -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-              if (-not $test.WaitForExit(60000)) {
-                Stop-Process -Id $test.Id -Force -ErrorAction SilentlyContinue
-                throw "Focused run $index exceeded one minute"
-              }
-              Write-Host "Focused run $index exit $($test.ExitCode)"
-              Get-Content $stdout,$stderr -ErrorAction SilentlyContinue
-              if ($test.ExitCode -ne 0) { throw "Focused run $index failed" }
+            $stdout = Join-Path $testRoot 'stdout.log'
+            $stderr = Join-Path $testRoot 'stderr.log'
+            $test = Start-Process -FilePath $python -WorkingDirectory $env:GITHUB_WORKSPACE `
+              -Credential $credential -LoadUserProfile -PassThru `
+              -ArgumentList '-m unittest plugins.symphony.tests.test_runtime_retention.RuntimeRetentionTests.test_first_pin_is_atomic_for_parallel_hooks' `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            if (-not $test.WaitForExit(3000000)) {
+              Stop-Process -Id $test.Id -Force -ErrorAction SilentlyContinue
+              throw 'Focused stress exceeded fifty minutes'
             }
+            Get-Content $stdout,$stderr -ErrorAction SilentlyContinue
+            if ($test.ExitCode -ne 0) { throw "Focused stress exited $($test.ExitCode)" }
           } finally {
             Remove-LocalUser -Name $user
           }
