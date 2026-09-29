@@ -497,6 +497,23 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertIsNone(done.active_run)
         self.assertEqual(done.recent_runs[-1].status, "completed")
 
+    def test_replacement_lead_cannot_archive_ambiguous_old_start(self):
+        state = running_state(
+            lead="new-lead",
+            delegations=(delegation("old-lead", "interrupted", "lead"),
+                         delegation("new-lead", "completed", "lead")),
+        )
+        state = replace(state, active_run=replace(
+            state.active_run, assessment={"_ambiguous_child_starts": ("old-lead",)}))
+        waiting, actions = reduce(state, event(
+            "lead_completed", identity="new-lead", outcome={"status": "completed"}))
+        self.assertIsNotNone(waiting.active_run)
+        self.assertEqual("completing", waiting.active_run.status)
+        self.assertEqual("wait_for_delegations", actions[0].kind)
+        stopped, actions = reduce(waiting, event("stop_requested"))
+        self.assertIsNotNone(stopped.active_run)
+        self.assertIn("inspect or recover", actions[0].payload["reason"])
+
     def test_malformed_outcomes_cannot_complete_a_run(self):
         for outcome in ({}, [], "done", False, {"status": "blocked"}, {"status": {}}):
             with self.subTest(outcome=outcome):

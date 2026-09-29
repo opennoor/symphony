@@ -338,7 +338,8 @@ def _lead_completed(state: ProjectState, event: Event):
     unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
                   and (item.role != "lead" or item.identity == run.lead_identity)]
     completed = replace(run, outcome=dict(outcome), updated_at=event.observed_at)
-    if (active or unresolved or run.assessment.get("_pending_delegations")
+    if (active or unresolved or run.assessment.get("_ambiguous_child_starts")
+            or run.assessment.get("_pending_delegations")
             or run.assessment.get("_invalid_consultants") or run.assessment.get("_lead_route_mismatch")):
         completed = replace(completed, status="completing")
         return replace(state, active_run=completed), (Action("wait_for_delegations", {"active": active}),)

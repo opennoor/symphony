@@ -18,6 +18,7 @@ TESTS = (
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_identical_no_id_restart_keeps_outcome_unreconciled",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_identified_old_result_cannot_replay_into_a_new_child_turn",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_terminal_retry_can_correct_explicit_role_evidence",
+    "plugins.symphony.tests.test_reducer.LifecycleReducerTests.test_replacement_lead_cannot_archive_ambiguous_old_start",
     "plugins.symphony.tests.test_runtime_retention",
     "plugins.symphony.tests.test_boost",
 )

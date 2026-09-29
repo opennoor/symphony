@@ -9,18 +9,20 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 GATE = '''import pathlib, sys, time
 root = pathlib.Path(__file__).resolve().parent
 name = sys.argv[1]
 (root / (name + ".ready")).touch()
-deadline = time.monotonic() + 90
+deadline = time.monotonic() + 900
 while not (root / "release").exists():
     if time.monotonic() > deadline:
         raise SystemExit("gate timed out")
@@ -63,9 +65,10 @@ def prompt(provider, label, recover):
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
     route = '{"size":"small","complexity":"simple","risk":"normal","rationale":"disposable native CI gate","topology":"direct"}'
     recovery = (
-        'After the gate returns, first return SYMPHONY_OUTCOME: {"status":"blocked"}. '
-        'Then ask the SAME lead identity for a follow-up that returns '
-        'SYMPHONY_OUTCOME: {"status":"completed"}, and await it. '
+        'The lead MUST finish its first turn after the gate with exactly '
+        'SYMPHONY_OUTCOME: {"status":"blocked"}. Await that result. '
+        'Then use followup_task on the SAME lead identity, asking it to return exactly '
+        'SYMPHONY_OUTCOME: {"status":"completed"}; await the follow-up. '
         if recover else 'After the gate returns, return SYMPHONY_OUTCOME: {"status":"completed"}. '
     )
     return (
@@ -79,7 +82,7 @@ def prompt(provider, label, recover):
     )
 
 
-def launch(provider, project, label, recover, env, log_dir, budget):
+def launch(provider, project, label, recover, env, log_dir, budget, session):
     executable = shutil.which(provider)
     if not executable:
         raise RuntimeError(f"{provider} CLI is missing")
@@ -92,7 +95,8 @@ def launch(provider, project, label, recover, env, log_dir, budget):
                    "--output-last-message", str(output), prompt(provider, label, recover)]
     else:
         command = [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
-                   "--permission-mode", "bypassPermissions", "--output-format", "json",
+                   "--permission-mode", "bypassPermissions", "--session-id", session,
+                   "--output-format", "json",
                    prompt(provider, label, recover)]
     stdout = (log_dir / f"{label}.stdout").open("w", encoding="utf-8")
     stderr = errors.open("w", encoding="utf-8")
@@ -101,6 +105,14 @@ def launch(provider, project, label, recover, env, log_dir, budget):
     stdout.close()
     stderr.close()
     return process
+
+
+def codex_session(logs, label):
+    banner = (logs / f"{label}.errors").read_text(errors="replace")
+    match = re.search(r"^session id: ([0-9a-f-]+)$", banner, re.MULTILINE)
+    if not match:
+        raise RuntimeError(f"{label}: native Codex session ID missing from CLI banner")
+    return match.group(1)
 
 
 def check_case(provider, root, separate, timeout, budget):
@@ -119,11 +131,14 @@ def check_case(provider, root, separate, timeout, budget):
     logs = case / "logs"
     logs.mkdir()
     processes = {}
+    sessions = {}
     try:
         for label, project in (("a", first), ("b", second)):
             # Keep gate files outside Git; each checkout sees only its own gate.
             (project / "release").unlink(missing_ok=True)
-            processes[label] = launch(provider, project, label, label == "a", env, logs, budget)
+            sessions[label] = str(uuid.uuid4()) if provider == "claude" else ""
+            processes[label] = launch(provider, project, label, label == "a" and provider == "codex", env, logs,
+                                      budget, sessions[label])
         deadline = time.monotonic() + timeout
         paths = {label: state_file(state_dir, project) for label, project in (("a", first), ("b", second))}
         while time.monotonic() < deadline:
@@ -135,13 +150,18 @@ def check_case(provider, root, separate, timeout, budget):
             time.sleep(.25)
         else:
             raise RuntimeError("native leads did not overlap before deadline")
+        if provider == "codex":
+            sessions = {label: codex_session(logs, label) for label in processes}
         docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+        observed_leads = {}
         if separate:
             for label, doc in docs.items():
                 owned = [run for key, run in doc.get("active_runs", {}).items()
                          if key.startswith(provider + ":")]
-                if len(owned) != 1 or not owned[0].get("lead_identity"):
+                if (len(owned) != 1 or owned[0].get("session_id") != sessions[label]
+                        or not owned[0].get("lead_identity")):
                     raise RuntimeError(f"{label}: expected one owned lead in its worktree")
+                observed_leads[label] = owned[0]["lead_identity"]
             if paths["a"] == paths["b"]:
                 raise RuntimeError("different worktrees shared a state key")
         else:
@@ -151,6 +171,11 @@ def check_case(provider, root, separate, timeout, budget):
                 raise RuntimeError("same worktree did not preserve two independent owner sessions")
             if len({run.get("lead_identity") for run in owned}) != 2:
                 raise RuntimeError("same worktree did not preserve two independent leads")
+            by_session = {run.get("session_id"): run for run in owned}
+            if set(by_session) != set(sessions.values()):
+                raise RuntimeError("same worktree owner sessions differ from native CLI sessions")
+            observed_leads = {label: by_session[session]["lead_identity"]
+                              for label, session in sessions.items()}
         for project in {first, second}:
             (project / "release").touch()
         for label, process in processes.items():
@@ -160,12 +185,14 @@ def check_case(provider, root, separate, timeout, budget):
         final_docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
         for label, doc in final_docs.items():
             runs = [run for run in doc.get("recent_runs", []) if run.get("provider") == provider]
-            matching = [run for run in runs if run.get("task", "").find(f"lifecycle {label}") >= 0]
+            matching = [run for run in runs if run.get("session_id") == sessions[label]]
             if len(matching) != 1 or matching[0].get("status") != "completed":
                 raise RuntimeError(f"{label}: missing durable completed run")
-            if matching[0].get("outcome", {}).get("status") != "completed":
+            if (matching[0].get("outcome") or {}).get("status") != "completed":
                 raise RuntimeError(f"{label}: missing durable completed outcome")
-            if label == "a":
+            if matching[0].get("lead_identity") != observed_leads[label]:
+                raise RuntimeError(f"{label}: completed run changed lead identity")
+            if label == "a" and provider == "codex":
                 events = [event for event in doc.get("event_history", [])
                           if event.get("payload", {}).get("identity") == matching[0].get("lead_identity")]
                 kinds = [event.get("kind") for event in events]
@@ -200,6 +227,20 @@ def main():
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(json.dumps({"provider": args.provider, "error": str(error),
                               "logs": str(root)}), file=sys.stderr)
+            for path in root.rglob("*.v2.json"):
+                document = json.loads(path.read_text())
+                def summary(run):
+                    task = str(run.get("task") or "")
+                    return {"session_id": run.get("session_id"), "status": run.get("status"),
+                            "outcome_status": (run.get("outcome") or {}).get("status"),
+                            "lead_identity": run.get("lead_identity"),
+                            "task_matches": [label for label in ("a", "b")
+                                             if f"lifecycle {label}" in task]}
+                print(json.dumps({"state_file": str(path),
+                                  "active_runs": [summary(run) for run in document.get("active_runs", {}).values()],
+                                  "recent_runs": [summary(run) for run in document.get("recent_runs", [])],
+                                  "event_kinds": [event.get("kind") for event in document.get("event_history", [])]}),
+                      file=sys.stderr)
             # Preserve command output as CI diagnostics before TemporaryDirectory removes it.
             for path in root.rglob("*.errors"):
                 print(f"{path}: {path.read_text(errors='replace')[-4000:]}", file=sys.stderr)

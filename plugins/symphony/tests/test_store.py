@@ -81,11 +81,13 @@ class StateStoreTests(unittest.TestCase):
     def test_windows_project_key_collapses_case_and_short_path_aliases(self):
         self.assertEqual(project_key(self.project), project_key(Path(str(self.project).swapcase())))
 
+        spaced = self.root / "Project With Spaces"
+        spaced.mkdir()
         import ctypes
         short_name = ctypes.create_unicode_buffer(32768)
-        length = ctypes.windll.kernel32.GetShortPathNameW(str(self.project), short_name, len(short_name))
-        if length and length < len(short_name):
-            self.assertEqual(project_key(self.project), project_key(Path(short_name.value)))
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(spaced), short_name, len(short_name))
+        if length and length < len(short_name) and short_name.value != str(spaced):
+            self.assertEqual(project_key(spaced), project_key(Path(short_name.value)))
 
     def test_save_atomically_replaces_a_sibling_temporary_file(self):
         self.store.save(self.project, ProjectState(enabled=False))
