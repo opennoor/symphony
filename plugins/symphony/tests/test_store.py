@@ -8,7 +8,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from plugins.symphony.symphony import store as store_module
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony.store import StateStore, _locked, project_key
 
@@ -78,7 +77,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(project_key(alias), project_key(self.project.resolve()))
         self.assertNotEqual(project_key(other), project_key(self.project))
 
-    def test_owner_scan_does_not_hold_project_lock(self):
+    def test_owner_scan_coordinates_with_project_writer_on_windows(self):
         run = RunState("run", "task", session_id="root", provider="codex")
         self.store.save(self.project, ProjectState(active_run=run,
                                                    active_runs={"codex:root": run}))
@@ -88,14 +87,14 @@ class StateStoreTests(unittest.TestCase):
         written = threading.Event()
         errors = []
         matches = []
-        original = store_module._read_owner_snapshot
+        original = Path.read_text
 
-        def paused_read(path):
+        def paused_read(path, *args, **kwargs):
             if path == self.state_path() and threading.current_thread().name == "owner-scan":
                 reading.set()
                 if not release.wait(5):
                     raise TimeoutError("owner scan was not released")
-            return original(path)
+            return original(path, *args, **kwargs)
 
         def scan():
             try:
@@ -112,14 +111,17 @@ class StateStoreTests(unittest.TestCase):
             finally:
                 written.set()
 
-        with patch.object(store_module, "_read_owner_snapshot", paused_read):
+        with patch.object(Path, "read_text", paused_read):
             scanner = threading.Thread(target=scan, name="owner-scan")
             writer = threading.Thread(target=write, name="other-session-writer")
             scanner.start()
             self.assertTrue(reading.wait(5))
             writer.start()
             self.assertTrue(writing.wait(5))
-            self.assertTrue(written.wait(1), "owner scan blocked an unrelated project writer")
+            if os.name == "nt":
+                self.assertFalse(written.wait(0.1), "Windows writer bypassed the snapshot lock")
+            else:
+                self.assertTrue(written.wait(1), "POSIX snapshot blocked a project writer")
             release.set()
             scanner.join(5)
             writer.join(5)
@@ -128,7 +130,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual([self.state_path()], matches)
         self.assertTrue(written.is_set())
 
-    def test_owner_scan_does_not_wait_for_unrelated_project_lock(self):
+    def test_owner_scan_defers_on_busy_unrelated_windows_project(self):
         run = RunState("run", "task", session_id="root", provider="codex")
         self.store.save(self.project, ProjectState(active_run=run,
                                                    active_runs={"codex:root": run}))
@@ -148,8 +150,8 @@ class StateStoreTests(unittest.TestCase):
         holder.start()
         try:
             self.assertTrue(held.wait(5))
-            self.assertEqual((self.state_path(),), self.store.active_owner_paths(
-                "codex", "root"))
+            owners = self.store.active_owner_paths("codex", "root")
+            self.assertEqual(None if os.name == "nt" else (self.state_path(),), owners)
         finally:
             release.set()
             holder.join(5)
@@ -179,20 +181,22 @@ class StateStoreTests(unittest.TestCase):
                 for _ in range(300):
                     self.store.update(self.project, lambda state: (state, None))
             except BaseException as error:
-                errors.append(error)
+                errors.append(("writer", repr(error)))
 
         writer = threading.Thread(target=write)
         writer.start()
         start.set()
         for _ in range(300):
             try:
-                self.assertEqual((self.state_path(),), self.store.active_owner_paths("codex", "root"))
+                self.assertIn(self.store.active_owner_paths("codex", "root"),
+                              (None, (self.state_path(),)))
             except BaseException as error:
-                errors.append(error)
+                errors.append(("reader", repr(error)))
                 break
         writer.join(10)
         self.assertFalse(writer.is_alive())
         self.assertFalse(errors, errors)
+        self.assertEqual((self.state_path(),), self.store.active_owner_paths("codex", "root"))
 
     @unittest.skipUnless(os.name == "nt", "Windows path aliases")
     def test_windows_project_key_collapses_case_and_short_path_aliases(self):

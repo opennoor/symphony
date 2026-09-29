@@ -250,6 +250,7 @@ def _lead_started(state: ProjectState, event: Event):
         lead_identity=str(identity),
         owner_generation=generation,
         status="active",
+        outcome=None,
         assessment={key: value for key, value in run.assessment.items() if key != "_retryable_lead"},
         updated_at=event.observed_at,
     )
@@ -285,7 +286,8 @@ def _delegation_updated(state: ProjectState, event: Event):
         if updated.status == "completing" or updated.assessment.get("_pending_lead_completion"):
             return _lead_failed(replace(state, active_run=updated),
                                 replace(event, payload={"identity": updated.lead_identity}))
-    if (updated.status == "completing" and item.role not in {"consultant", "lead"}
+    if (updated.status == "completing" and not updated.assessment.get("_batch_pending")
+            and item.role not in {"consultant", "lead"}
             and _stop_block_reason(updated) is None):
         return _archive(state, updated, "completed", event.observed_at), (
             Action("permit_completion", {"run_id": updated.run_id}),
@@ -338,7 +340,8 @@ def _lead_completed(state: ProjectState, event: Event):
     unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
                   and (item.role != "lead" or item.identity == run.lead_identity)]
     completed = replace(run, outcome=dict(outcome), updated_at=event.observed_at)
-    if (active or unresolved or run.assessment.get("_ambiguous_child_starts")
+    if (active or unresolved or run.assessment.get("_batch_pending")
+            or run.assessment.get("_ambiguous_child_starts")
             or run.assessment.get("_pending_delegations")
             or run.assessment.get("_invalid_consultants") or run.assessment.get("_lead_route_mismatch")):
         completed = replace(completed, status="completing")
@@ -410,6 +413,8 @@ def _reassess(state: ProjectState, event: Event):
 
 def _stop_block_reason(run: RunState) -> dict | None:
     """Return the payload for a stop block, or None when completion is permitted."""
+    if run.assessment.get("_batch_pending"):
+        return {"reason": "child lifecycle reconciliation is still in progress"}
     ambiguous = run.assessment.get("_ambiguous_child_starts", ())
     if ambiguous:
         return {"reason": "child start has no invocation ID and matches an earlier start; "

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 import tempfile
@@ -269,69 +270,59 @@ def _local_lock(path: Path) -> threading.Lock:
 
 
 @contextmanager
-def _locked(path: Path) -> Iterator[None]:
+def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _local_lock(path), path.with_name(path.name + ".lock").open("a+b") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        elif msvcrt is not None:
-            if lock_file.seek(0, os.SEEK_END) == 0:
-                lock_file.write(b"\0")
-                lock_file.flush()
-            deadline = time.monotonic() + 5
-            while True:
-                try:
-                    lock_file.seek(0)
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(f"state lock timed out: {path}")
-                    time.sleep(0.02)
-        try:
-            yield
-        finally:
+    local = _local_lock(path)
+    if timeout is None:
+        local.acquire()
+    elif not local.acquire(timeout=timeout):
+        raise TimeoutError(f"state lock timed out: {path}")
+    try:
+        with path.with_name(path.name + ".lock").open("a+b") as lock_file:
+            deadline = time.monotonic() + (5 if timeout is None else timeout)
             if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                if timeout is None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                else:
+                    while True:
+                        try:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(f"state lock timed out: {path}")
+                            time.sleep(0.005)
             elif msvcrt is not None:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                if lock_file.seek(0, os.SEEK_END) == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                while True:
+                    try:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"state lock timed out: {path}")
+                        time.sleep(0.005)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        local.release()
 
 
 def _read_owner_snapshot(path: Path) -> str:
-    """Read an atomic state snapshot without blocking an unrelated writer."""
-    if os.name != "nt":
-        return path.read_text(encoding="utf-8")
-    # Python's ordinary Windows file open does not allow a concurrent
-    # os.replace. Request delete sharing so the writer can commit its atomic
-    # replacement while this reader finishes with the old snapshot.
-    import ctypes
-    from ctypes import wintypes
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    create = kernel.CreateFileW
-    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
-    create.restype = wintypes.HANDLE
-    close = kernel.CloseHandle
-    close.argtypes = (wintypes.HANDLE,)
-    close.restype = wintypes.BOOL
-    handle = create(str(path), 0x80000000, 0x00000001 | 0x00000002 | 0x00000004,
-                    None, 3, 0x00000080, None)
-    if handle == ctypes.c_void_p(-1).value:
-        raise OSError(ctypes.get_last_error(), f"state snapshot unreadable: {path}")
-    try:
-        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-    except BaseException:
-        close(handle)
-        raise
-    try:
-        file = os.fdopen(fd, "r", encoding="utf-8")
-    except BaseException:
-        os.close(fd)
-        raise
-    with file:
-        return file.read()
+    """Read while coordinating with Windows' replace-existing limitation."""
+    if os.name == "nt":
+        with _locked(path, timeout=0.1):
+            return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8")
 
 
 class StateStore:
@@ -342,15 +333,175 @@ class StateStore:
     def _path(self, project: Path) -> Path:
         return self.root / f"{project_key(project)}.v2.json"
 
+    def _session_path(self, provider: str, session: str) -> Path:
+        digest = hashlib.sha256(f"{provider}\0{session}".encode()).hexdigest()
+        return self.root / f".session-{digest}.json"
+
+    def _alias_path(self, provider: str, owner: str, child: str) -> Path:
+        root_digest = hashlib.sha256(f"{provider}\0{owner}".encode()).hexdigest()
+        child_digest = hashlib.sha256(f"{provider}\0{child}".encode()).hexdigest()
+        return self.root / f".alias-{root_digest}-{child_digest}.json"
+
+    def aliases_for_owner(self, provider: str, owner: str) -> tuple[str, ...]:
+        """Find only aliases recorded for this root; revalidate each before use."""
+        prefix = hashlib.sha256(f"{provider}\0{owner}".encode()).hexdigest()
+        aliases: list[str] = []
+        for path in self.root.glob(f".alias-{prefix}-*.json"):
+            if path.is_symlink():
+                raise ValueError("invalid child alias index")
+            item = _object(json.loads(path.read_text(encoding="utf-8")), "child alias index")
+            child = item.get("child")
+            if (item.get("provider") != provider or item.get("owner") != owner
+                    or not isinstance(child, str)
+                    or path != self._alias_path(provider, owner, child)):
+                raise ValueError("invalid child alias index")
+            aliases.append(child)
+        return tuple(aliases)
+
+    def _register_alias(self, provider: str, owner: str, child: str) -> None:
+        path = self._alias_path(provider, owner, child)
+        if not path.exists():
+            self._write_json(path, {"provider": provider, "owner": owner, "child": child})
+
+    def session_record(self, provider: str, session: str) -> dict[str, Any] | None:
+        """Read the root's durable owner and unresolved child events under its lock."""
+        path = self._session_path(provider, session)
+        if not path.exists():
+            return None
+        record = _object(json.loads(path.read_text(encoding="utf-8")), "session record")
+        project_name = record.get("project")
+        project = Path(project_name) if isinstance(project_name, str) else None
+        state_name = record.get("state_name")
+        state_path = self.root / state_name if isinstance(state_name, str) else None
+        if (record.get("schema") != 1 or record.get("provider") != provider
+                or record.get("session") != session
+                or (state_name is not None and (not isinstance(state_name, str)
+                                                or not re.fullmatch(r"[0-9a-f]{64}\.v2\.json", state_name)))
+                or (project is not None and (not project.is_absolute()
+                                             or record.get("state_name") != self._path(project).name))
+                or (project is None and state_path is None and record.get("state_name") is not None)
+                or (record.get("owner_session") is not None
+                    and not isinstance(record.get("owner_session"), str))
+                or not isinstance(record.get("migrated"), bool)
+                or not isinstance(record.get("generation", 1), int)
+                or record.get("generation", 1) < 1
+                or not isinstance(record.get("retired_agents", []), list)
+                or not isinstance(record.get("pending", []), list)
+                or not isinstance(record.get("overflow", False), bool)):
+            raise ValueError("invalid root session record")
+        return record
+
+    def bind_session(
+        self, provider: str, session: str, state_path: Path,
+        migrated: bool, project: Path | None = None, owner_session: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind a root once; a child working directory never changes it."""
+        project = Path(project).resolve() if project is not None else None
+        state_path = Path(state_path)
+        if (state_path.parent != self.root
+                or not re.fullmatch(r"[0-9a-f]{64}\.v2\.json", state_path.name)
+                or (project is not None and self._path(project) != state_path)):
+            raise ValueError("invalid root session state path")
+        existing = self.session_record(provider, session)
+        if existing is not None:
+            if existing["state_name"] not in {None, state_path.name}:
+                raise ValueError("root session is already bound to another project")
+            if existing["state_name"] is None:
+                existing["project"] = str(project) if project else None
+                existing["state_name"] = state_path.name
+                existing["migrated"] = migrated
+                existing["owner_session"] = owner_session or session
+                if existing["owner_session"] != session:
+                    self._register_alias(provider, existing["owner_session"], session)
+                self._write_json(self._session_path(provider, session), existing)
+            if existing["owner_session"] and existing["owner_session"] != session:
+                self._register_alias(provider, existing["owner_session"], session)
+            return existing
+        record = {
+            "schema": 1, "provider": provider, "session": session,
+            "project": str(project) if project else None, "state_name": state_path.name,
+            "owner_session": owner_session or session,
+            "migrated": migrated, "generation": 1, "retired_agents": [],
+            "pending": [], "overflow": False,
+        }
+        if record["owner_session"] != session:
+            self._register_alias(provider, record["owner_session"], session)
+        self._write_json(self._session_path(provider, session), record)
+        return record
+
+    def queue_session_event(
+        self, provider: str, session: str, event: Event, *, ambiguous_owner: bool = False,
+    ) -> None:
+        """Retain a child hook when an old session's owner cannot be read yet."""
+        record = self.session_record(provider, session)
+        if record is None:
+            record = {"schema": 1, "provider": provider, "session": session,
+                      "project": None, "state_name": None, "migrated": True,
+                      "owner_session": None,
+                      "generation": 1, "retired_agents": [],
+                      "pending": [], "overflow": False}
+        parent = str(event.payload.get("parent_thread_id") or "")
+        if parent and parent != session and record["owner_session"] is None:
+            # Discovery only: the root still verifies the active run, parent,
+            # session record and event under its own lock before replay.
+            self._register_alias(provider, parent, session)
+        pending = list(record["pending"])
+        event_payload = {
+            key: event.payload[key] for key in (
+                "provider", "session_id", "parent_thread_id", "agent_id", "subagent_id",
+                "turn_id", "prompt_id", "status", "last_assistant_message",
+                "agent_transcript_path", "transcript_path", "agent_type", "task_name",
+                "role", "model", "model_reasoning_effort", "task", "objective",
+                "_symphony_child_metadata",
+            ) if key in event.payload
+        }
+        entry = {"event_id": event.event_id, "kind": event.kind,
+                 "observed_at": event.observed_at, "payload": _redact(event_payload),
+                 "generation": record["generation"], "ambiguous_owner": ambiguous_owner}
+        existing = next((item for item in pending if item.get("event_id") == event.event_id), None)
+        if existing is not None and ambiguous_owner and not existing.get("ambiguous_owner"):
+            existing["ambiguous_owner"] = True
+            record["pending"] = pending
+            self._write_json(self._session_path(record["provider"], record["session"]), record)
+        if existing is None:
+            if len(pending) < 256 and len(json.dumps(entry)) <= 131072:
+                pending.append(entry)
+                record["pending"] = pending
+            else:
+                record["overflow"] = True
+            self._write_json(self._session_path(record["provider"], record["session"]), record)
+
+    def finish_session_events(self, record: dict[str, Any], event_ids: set[str]) -> None:
+        """Acknowledge only after the project transaction has committed."""
+        if not event_ids:
+            return
+        record["pending"] = [item for item in record["pending"]
+                             if item.get("event_id") not in event_ids]
+        self._write_json(self._session_path(record["provider"], record["session"]), record)
+
+    def rebind_session(self, record: dict[str, Any], project: Path, retired: set[str]) -> dict[str, Any]:
+        """Move a settled native session to a new root project at a task boundary."""
+        project = Path(project).resolve()
+        record["project"] = str(project)
+        record["state_name"] = self._path(project).name
+        # Keep migrated=True: old retained hooks may still write this session.
+        record["generation"] = record.get("generation", 1) + 1
+        record["retired_agents"] = sorted(set(record.get("retired_agents", ())) | retired)
+        self._write_json(self._session_path(record["provider"], record["session"]), record)
+        return record
+
+
     @contextmanager
-    def session_lock(self, provider: str, session: str) -> Iterator[None]:
+    def session_lock(self, provider: str, session: str, timeout: float | None = None) -> Iterator[None]:
         """Serialize owner selection with updates from this root session."""
         digest = hashlib.sha256(f"{provider}\0{session}".encode()).hexdigest()
-        with _locked(self.root / f".session-{digest}"):
+        with _locked(self.root / f".session-{digest}", timeout=timeout):
             yield
 
-    def active_owner_paths(self, provider: str, session: str) -> tuple[Path, ...] | None:
-        """Find exact active owners; None means a snapshot could not be read."""
+    def active_owner_paths(
+        self, provider: str, session: str, parent: str = "", include_ancestry: bool = False,
+    ) -> tuple[Path, ...] | None:
+        """Find active root or child ancestors; None means a snapshot could not be read."""
         matches: list[Path] = []
         for path in self.root.glob("*.v2.json"):
             if path.is_symlink():
@@ -361,9 +512,15 @@ class StateStore:
                 # A missing or invalid snapshot cannot prove this root has no
                 # other owner. Defer instead of trusting the event's CWD.
                 return None
-            run = state.active_runs.get(f"{provider}:{session}")
-            if run and run.session_id == session and run.provider in {"", provider}:
-                matches.append(path)
+            for run in state.active_runs.values():
+                if run.provider not in {"", provider}:
+                    continue
+                ancestry = ({run.session_id, run.lead_identity,
+                             *(item.identity for item in run.delegations)}
+                            if include_ancestry else {run.session_id})
+                if (session and session in ancestry) or (parent and parent in ancestry):
+                    matches.append(path)
+                    break
         return tuple(matches)
 
     def update_owned(
@@ -384,6 +541,25 @@ class StateStore:
             next_state, result = transition(state)
             self._write(path, replace(next_state, recent_runs=next_state.recent_runs[-20:]))
             return result
+
+    def update_path(
+        self, path: Path,
+        transition: Callable[[ProjectState], tuple[ProjectState, _UpdateResult]],
+    ) -> _UpdateResult | None:
+        """Update a previously bound existing state file without guessing its CWD."""
+        with _locked(path):
+            if not path.is_file() or path.is_symlink():
+                return None
+            state = _state_from_dict(json.loads(path.read_text(encoding="utf-8")))
+            next_state, result = transition(state)
+            self._write(path, replace(next_state, recent_runs=next_state.recent_runs[-20:]))
+            return result
+
+    def read_path(self, path: Path) -> ProjectState | None:
+        with _locked(path):
+            if not path.is_file() or path.is_symlink():
+                return None
+            return _state_from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def load(self, project: Path) -> ProjectState:
         path = self._path(project)
@@ -494,12 +670,16 @@ class StateStore:
 
     @staticmethod
     def _write(path: Path, state: ProjectState) -> None:
+        StateStore._write_json(path, _state_to_dict(state))
+
+    @staticmethod
+    def _write_json(path: Path, value: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(_redact(_state_to_dict(state)), handle, sort_keys=True, separators=(",", ":"))
+                json.dump(_redact(value), handle, sort_keys=True, separators=(",", ":"))
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())

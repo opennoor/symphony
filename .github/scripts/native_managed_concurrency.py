@@ -33,6 +33,28 @@ while not (root / "release").exists():
 print("GATE_RELEASED", flush=True)
 '''
 
+CODEX_HOOK_CAPTURE = '''import json, pathlib, sys, time, uuid
+destination = pathlib.Path(sys.argv[2])
+destination.mkdir(parents=True, exist_ok=True)
+invocation = str(uuid.uuid4())
+try:
+    payload = json.load(sys.stdin)
+except (ValueError, OSError):
+    payload = {}
+if not isinstance(payload, dict):
+    payload = {}
+event = sys.argv[1]
+record = {"invocation_id": invocation, "event": event,
+          "session_id": payload.get("session_id"), "agent_id": payload.get("agent_id"),
+          "turn_id": payload.get("turn_id"), "parent_id": payload.get("parent_id"),
+          "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
+          "started_ns": time.time_ns()}
+(destination / (invocation + "-entry.json")).write_text(json.dumps(record))
+(destination / (invocation + "-exit.json")).write_text(json.dumps({"invocation_id": invocation,
+                                                                    "exit_code": 0,
+                                                                    "finished_ns": time.time_ns()}))
+'''
+
 
 def run_git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
@@ -152,6 +174,25 @@ def resume_claude(env, project, session, budget, deadline):
         raise RuntimeError(f"Claude resume for session {session} exited {completed.returncode}")
 
 
+def resume_codex(env, project, session, logs, deadline):
+    """Resume the original native root so newly installed candidate hooks load."""
+    executable = shutil.which("codex")
+    if not executable:
+        raise RuntimeError("codex CLI is missing")
+    command = [executable, "exec", "resume", "--dangerously-bypass-hook-trust",
+               "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
+               "--model", "gpt-6-luna", session, "$symphony:symphony status"]
+    with (logs / "a.resume.stdout").open("w", encoding="utf-8") as stdout, \
+            (logs / "a.resume.errors").open("w", encoding="utf-8") as stderr:
+        completed = subprocess.run(command, cwd=project, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=stdout, stderr=stderr, shell=False,
+                                   timeout=max(1, min(90, deadline - time.monotonic())))
+    if completed.returncode:
+        raise RuntimeError(f"Codex resume for session {session} exited {completed.returncode}")
+    if codex_session(logs, "a.resume") != session:
+        raise RuntimeError("Codex resume changed the original root session ID")
+
+
 def package_version(source):
     source = source.resolve()
     manifest = json.loads((source / ".codex-plugin" / "plugin.json").read_text())
@@ -225,6 +266,19 @@ def prepare_live_update(provider, root, old_source, candidate_source):
             codex_command(env, root, "login", "status")
         codex_command(env, root, "plugin", "marketplace", "add", str(old_market))
         codex_command(env, root, "plugin", "add", "symphony@symphony-old")
+        capture = root / "codex-hook-capture"
+        capture.mkdir()
+        script = root / "capture_codex_hook.py"
+        script.write_text(CODEX_HOOK_CAPTURE)
+        if any(character.isspace() for character in str(script)):
+            raise RuntimeError("native Codex hook capture requires a temporary path without spaces")
+        hooks = {"hooks": {}}
+        for event in ("SessionStart", "SubagentStart", "SubagentStop"):
+            command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()}"
+            windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()}"
+            hooks["hooks"][event] = [{"hooks": [{"type": "command", "command": command,
+                                                  "command_windows": windows, "timeout": 10}]}]
+        (home / "hooks.json").write_text(json.dumps(hooks))
     else:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             source_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
@@ -244,6 +298,9 @@ def prepare_live_update(provider, root, old_source, candidate_source):
         raise RuntimeError(f"old 1.5.1 package was not installed in the disposable {provider} home")
     return {"provider": provider, "env": env, "home": home, "old_version": old_version,
             "candidate_version": candidate_version, "old_cache": old_cache,
+            "candidate_cache": home / "plugins" / "cache" / "symphony-candidate" /
+                               "symphony" / candidate_version,
+            "hook_capture_dir": root / "codex-hook-capture" if provider == "codex" else None,
             "old_source": old_market / "plugins" / "symphony",
             "candidate_source": candidate_market / "plugins" / "symphony",
             "candidate_market": candidate_market}
@@ -489,6 +546,50 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 remaining = max(1, deadline - time.monotonic())
                 if process.wait(timeout=remaining):
                     raise RuntimeError(f"{label}: native CLI exited {process.returncode}")
+            if update:
+                before_resume = json.loads(paths["a"].read_text())
+                owned = before_resume.get("active_runs", {}).get(f"codex:{sessions['a']}")
+                if (not owned or owned.get("run_id") != observed_run_ids["a"]
+                        or owned.get("lead_identity") != observed_leads["a"]
+                        or owned.get("status") != "recovering"):
+                    raise RuntimeError("old native follow-up did not leave the original lead to reconcile")
+                old_activation = before_resume.get("activation", {}).get("codex", {})
+                old_profiles = [old_activation, *old_activation.get("session_profiles", [])]
+                if not any(item.get("session_id") == sessions["a"]
+                           and item.get("plugin_version") == update["old_version"]
+                           and item.get("runtime_root") == old_records["a"]["runtime_root"]
+                           for item in old_profiles):
+                    raise RuntimeError("old retained runtime was lost before native candidate resume")
+                captured_stops = [record for record in codex_hook_capture_summary(root)["records"]
+                                  if record.get("event") == "SubagentStop"
+                                  and record.get("session_id") == sessions["a"]
+                                  and record.get("agent_id") == observed_leads["a"]
+                                  and record.get("exit_marker_written")]
+                if len({record.get("turn_id") for record in captured_stops}) < 2:
+                    raise RuntimeError("native host did not deliver a repeated same-lead terminal")
+                host = codex_host_trace(update["home"], sessions["a"], observed_leads["a"],
+                                        logs / "a.errors")
+                if not any(turn.get("reported_outcome") == "completed"
+                           for turn in host["lead_turns"][1:]):
+                    raise RuntimeError("native lead transcript lacks a completed follow-up turn")
+                snapshot["pre_candidate_resume"] = event_counts(before_resume)
+                snapshot_file.write_text(json.dumps(snapshot))
+                resume_codex(env, first, sessions["a"], logs, deadline)
+                starts = [record for record in codex_hook_capture_summary(root)["records"]
+                          if record.get("event") == "SessionStart"
+                          and record.get("session_id") == sessions["a"]
+                          and record.get("exit_marker_written")]
+                if len(starts) < 2:
+                    raise RuntimeError("candidate resume lacked a second native SessionStart")
+                checker = update["candidate_cache"] / "scripts" / "check_activation.py"
+                checked = subprocess.run([sys.executable, "-I", str(checker)], cwd=first,
+                                         env={**env, "CODEX_SESSION_ID": sessions["a"]},
+                                         capture_output=True, text=True,
+                                         timeout=max(1, min(30, deadline - time.monotonic())))
+                if checked.returncode or "guarded: matching current-session heartbeat" not in checked.stdout:
+                    raise RuntimeError("candidate checker rejected the resumed native root session")
+                snapshot["post_candidate_resume"] = event_counts(json.loads(paths["a"].read_text()))
+                snapshot_file.write_text(json.dumps(snapshot))
         else:
             resumed = set()
             while time.monotonic() < deadline:
@@ -534,11 +635,12 @@ def check_case(provider, root, separate, timeout, budget, update=None):
             matching = [run for run in runs if run.get("session_id") == sessions[label]]
             if len(matching) != 1 or matching[0].get("status") != "completed":
                 raise RuntimeError(f"{label}: missing durable completed run")
-            if (matching[0].get("outcome") or {}).get("status") != "completed":
+            completed_run = matching[0]
+            if (completed_run.get("outcome") or {}).get("status") != "completed":
                 raise RuntimeError(f"{label}: missing durable completed outcome")
-            if matching[0].get("lead_identity") != observed_leads[label]:
+            if completed_run.get("lead_identity") != observed_leads[label]:
                 raise RuntimeError(f"{label}: completed run changed lead identity")
-            if matching[0].get("run_id") != observed_run_ids[label]:
+            if completed_run.get("run_id") != observed_run_ids[label]:
                 raise RuntimeError(f"{label}: active run was restarted during the native session")
             if update:
                 activation = doc.get("activation", {}).get(provider, {})
@@ -546,11 +648,18 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 if not Path(old_records[label]["runtime_root"]).is_dir():
                     raise RuntimeError(f"{label}: old retained runtime disappeared after update")
                 if provider == "codex":
-                    if not any(item.get("session_id") == sessions[label]
-                               and item.get("plugin_version") == update["old_version"]
-                               and item.get("runtime_root") == old_records[label]["runtime_root"]
-                               for item in records):
-                        raise RuntimeError(f"{label}: old native session lost its retained runtime after update")
+                    expected = update["candidate_version"] if label == "a" else update["old_version"]
+                    matching = [item for item in records if item.get("session_id") == sessions[label]
+                                and item.get("plugin_version") == expected]
+                    if label == "a":
+                        matching = [item for item in matching
+                                    if item.get("plugin_root") and
+                                    Path(item["plugin_root"]).resolve() == update["candidate_cache"].resolve()]
+                    else:
+                        matching = [item for item in matching
+                                    if item.get("runtime_root") == old_records[label]["runtime_root"]]
+                    if not matching:
+                        raise RuntimeError(f"{label}: native session lacks expected {expected} heartbeat")
                 elif not any(item.get("session_id") == sessions[label]
                              and item.get("plugin_version") == update["candidate_version"]
                              and Path(item.get("plugin_root", "")).resolve()
@@ -559,14 +668,17 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                     raise RuntimeError(f"{label}: same-session Claude resume did not load the candidate")
             if label == "a" and provider == "codex":
                 events = [event for event in doc.get("event_history", [])
-                          if event.get("payload", {}).get("identity") == matching[0].get("lead_identity")]
+                          if event.get("payload", {}).get("identity") == completed_run.get("lead_identity")]
                 kinds = [event.get("kind") for event in events]
                 if "lead_failed" not in kinds or "lead_completed" not in kinds:
                     raise RuntimeError("recovered lead lacks durable failed and completed events")
         return {"case": "live-update" if update else
                 "different-branch-worktrees" if separate else "same-worktree",
                 "observed_overlap": True, "completed": ["a", "b"],
-                **({"native_resumed": sorted(resumed)} if provider == "claude" else {}),
+                **({"native_resumed": sorted(resumed)} if provider == "claude" else
+                   {"native_resumed": ["a"]} if update and provider == "codex" else {}),
+                **({"native_hook_capture": codex_hook_capture_summary(root)}
+                   if update and provider == "codex" else {}),
                 **({"live_update": f"{update['old_version']}->{update['candidate_version']}"} if update else {})}
     finally:
         for project in {first, second}:
@@ -579,6 +691,37 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+
+
+def codex_hook_capture_summary(root):
+    """Read independent user hooks without collecting native transcripts or payload bodies."""
+    directory = root / "codex-hook-capture"
+    if not directory.is_dir():
+        return {"configured": False, "records": []}
+    records = []
+    for path in directory.glob("*-entry.json"):
+        try:
+            entry = json.loads(path.read_text())
+            exit_path = path.with_name(path.name.replace("-entry.json", "-exit.json"))
+            marker = json.loads(exit_path.read_text()) if exit_path.is_file() else {}
+        except (OSError, ValueError):
+            continue
+        if entry.get("event") not in {"SessionStart", "SubagentStart", "SubagentStop"}:
+            continue
+        records.append({key: entry.get(key) for key in
+                        ("invocation_id", "event", "session_id", "agent_id", "turn_id",
+                         "parent_id", "cwd", "started_ns", "payload_keys")}
+                       | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
+                          "script_exit_marker_code": marker.get("exit_code")})
+    records.sort(key=lambda record: record.get("started_ns") or 0)
+    terminals = Counter()
+    for record in records:
+        if record["event"] == "SubagentStop":
+            identity = (record.get("session_id"), record.get("agent_id"))
+            terminals[identity] += 1
+            record["terminal_index_for_agent"] = terminals[identity]
+    return {"configured": True, "records": records,
+            "event_counts": dict(Counter(record["event"] for record in records))}
 
 
 def failure_state(root, provider):
@@ -676,7 +819,8 @@ def failure_state(root, provider):
                 host[label] = codex_host_trace(
                     root / "codex-live-update-home", session, lead,
                     root / "live-update" / "logs" / f"{label}.errors")
-    return {"provider": provider, "cases": cases, "native_host_trace": host}
+    return {"provider": provider, "cases": cases, "native_host_trace": host,
+            "native_hook_capture": codex_hook_capture_summary(root) if provider == "codex" else None}
 
 
 def main():

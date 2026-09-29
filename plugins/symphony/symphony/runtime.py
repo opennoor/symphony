@@ -1,6 +1,7 @@
 """Fast, offline hook runtime for Symphony's canonical lifecycle."""
 
 from dataclasses import replace
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -15,6 +16,7 @@ from typing import Mapping
 
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
+from .host_evidence import codex_recovered_lead_event
 from .model import Action, Delegation, Event, ProjectState
 from .reducer import reduce
 from .routing import (
@@ -65,30 +67,144 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         legacy_roots,
     )
     source = event_from_payload(provider, payload)
+    expected_owner = ""
 
-    def transition(state: ProjectState) -> tuple[ProjectState, tuple[Action, ...]]:
+    def dispatch(state: ProjectState, event: Event) -> tuple[ProjectState, tuple[Action, ...]]:
         # Select the owning run under the store lock so parallel hooks cannot
         # observe a stale project roster.
-        current_scope = _run_scope(state, source, provider)
+        current_scope = _run_scope(state, event, provider)
         if current_scope is None:
             return state, ()
+        if expected_owner and current_scope != (f"{provider}:{expected_owner}", expected_owner):
+            return state, ()
         current_key, current_session = current_scope
-        current_payload = {**payload, "session_id": current_session}
-        current_source = replace(source, payload={**source.payload, "session_id": current_session})
+        current_payload = {**event.payload, "session_id": current_session}
+        current_source = replace(event, payload=current_payload)
         scoped = _scope_state(state, current_key, current_session, provider)
         next_scoped, actions = _transition(scoped, current_source, provider, current_payload, environ)
-        rendered = _render_actions(actions, next_scoped, provider, source.kind)
+        rendered = _render_actions(actions, next_scoped, provider, event.kind)
         merged = _merge_scope(state, scoped, next_scoped, current_key, provider, current_session)
-        control = _parse_control(str(payload.get("prompt") or "")) if source.kind == "user_prompt" else None
-        if next_scoped.active_run or source.kind == "stop_requested" or (control and control[0] in {"disable", "stop"}):
+        control = _parse_control(str(event.payload.get("prompt") or "")) if event.kind == "user_prompt" else None
+        if next_scoped.active_run or event.kind == "stop_requested" or (control and control[0] in {"disable", "stop"}):
             merged = _release_pending_session(merged, provider, current_session)
         return merged, rendered
+
+    def transition(
+        state: ProjectState, pending: tuple[tuple[Event, int], ...] = (), generation: int = 1,
+        retired: frozenset[str] = frozenset(),
+    ) -> tuple[ProjectState, tuple[tuple[Action, ...], set[str]]]:
+        acknowledged: set[str] = set()
+        unresolved = False
+        lifecycle_source = source.kind in {"subagent_started", "subagent_stopped"}
+        source_actions: tuple[Action, ...] = ()
+        # The triggering lifecycle callback was timestamped before it waited
+        # for this session lock. A newer callback may have entered an inbox in
+        # the meantime, so sort it with the retained events, then hold archival
+        # until every relevant event has been considered.
+        batch = [(event, event_generation, False) for event, event_generation in pending]
+        if lifecycle_source:
+            batch.append((source, generation, True))
+        for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
+            state = _hold_pending_batch(state, provider, session)
+            if current:
+                if (expected_owner and _run_scope(state, event, provider)
+                        != (f"{provider}:{expected_owner}", expected_owner)):
+                    # Retain the source before this project transaction can
+                    # commit. A settled root may otherwise dispatch a child
+                    # terminal into another active run in the same file.
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    unresolved = True
+                    continue
+                state, source_actions = dispatch(state, event)
+                continue
+            identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+            disposition = ("stale" if event_generation < generation else
+                           "hold" if identity in retired else
+                           _pending_child_disposition(state, event, provider, session))
+            if disposition == "stale":
+                acknowledged.add(event.event_id)
+            elif disposition == "apply":
+                state, _ = dispatch(state, event)
+                acknowledged.add(event.event_id)
+            else:
+                unresolved = True
+        if source.kind == "stop_requested" and unresolved:
+            return state, ((Action("block_stop", {"reason":
+                "Symphony retained an unresolved child result for this session. "
+                "Retry this turn after its owning run is reconciled."}),), acknowledged)
+        if (not unresolved and provider == "codex"
+                and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
+            scoped = _scope_state(state, f"codex:{session}", session, provider)
+            recovered = codex_recovered_lead_event(scoped, session, environ)
+            if recovered is not None:
+                state = _hold_pending_batch(state, provider, session)
+                state, _ = dispatch(state, recovered)
+        # A new turn delivered in this same hook can supersede an earlier
+        # queued completion. Include it before releasing the archive hold.
+        if source.kind != "stop_requested":
+            if pending and not lifecycle_source:
+                state = _hold_pending_batch(state, provider, session)
+            if lifecycle_source:
+                actions = source_actions
+            else:
+                state, actions = dispatch(state, source)
+            if not unresolved:
+                state = _finish_pending_batch(state, provider, session, source)
+        else:
+            if not unresolved:
+                state = _finish_pending_batch(state, provider, session, source)
+            state, actions = dispatch(state, source)
+        if unresolved and source.kind in {"session_heartbeat", "user_prompt"}:
+            actions += (Action("inject_context", {"text":
+                "Symphony retained an unresolved child result for this session; "
+                "completion stays blocked until it is reconciled."}),)
+        return state, (actions, acknowledged)
 
     session = str(source.payload.get("session_id") or "")
     if session:
         with store.session_lock(provider, session):
-            owners = store.active_owner_paths(provider, session)
-            if owners is None or len(owners) > 1:
+            record = store.session_record(provider, session)
+            bound = store.root / record["state_name"] if record and record["state_name"] else None
+            ambiguous_scope = False
+            owners = (store.active_owner_paths(provider, session,
+                                               include_ancestry=not _is_root_origin(source))
+                      if bound is None or record["migrated"] else ())
+            if (bound is None and owners == () and source.kind in {"subagent_started", "subagent_stopped", "pre_tool_use"}):
+                parent = str(source.payload.get("parent_thread_id") or "")
+                if parent:
+                    owners = store.active_owner_paths(provider, session, parent, include_ancestry=True)
+            if owners is not None and len(owners) == 1 and bound is None:
+                origin = project if store._path(project) == owners[0] and _is_root_origin(source) else None
+                owner_state = store.read_path(owners[0])
+                scope = _run_scope(owner_state, source, provider) if owner_state else None
+                if scope is not None:
+                    record = store.bind_session(provider, session, owners[0], True, origin,
+                                                scope[1])
+                    bound = owners[0]
+                else:
+                    ambiguous_scope = True
+            if (owners == () and bound is None and _is_root_origin(source)):
+                record = store.bind_session(provider, session, store._path(project),
+                                            bool(record and record["pending"]), project)
+                bound = store._path(project)
+            if (bound is not None and record is not None and bound != store._path(project)
+                    and owners == () and _starts_new_root_task(source)
+                    and not record["pending"] and not record["overflow"]):
+                old_state = store.read_path(bound)
+                if old_state is not None and _settled_for_rebind(old_state, provider, session):
+                    retired = {agent for run in old_state.recent_runs
+                               if run.provider == provider and run.session_id == session
+                               for agent in (run.lead_identity,
+                                             *(item.identity for item in run.delegations)) if agent}
+                    record = store.rebind_session(record, project, retired)
+                    bound = store._path(project)
+            conflict = (owners is None or len(owners) > 1
+                        or (bound is not None and owners and owners[0] != bound))
+            if record and record["owner_session"] and record["owner_session"] != session:
+                # Repair an alias record persisted by an older candidate or
+                # interrupted before its discovery pointer was published.
+                store._register_alias(provider, record["owner_session"], session)
+            if conflict or bound is None:
                 # A root session cannot safely own two active project files.
                 # A real Stop must still block, and controls must explain the
                 # conflict instead of silently hiding the unfinished work.
@@ -96,27 +212,255 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                            "a state snapshot was unavailable. Retry this turn after the other hook finishes.")
                           if owners is None else
                           ("Symphony found this root session active in multiple project states. "
-                           "Inspect and reconcile those runs before completing this session."))
+                           "Inspect and reconcile those runs before completing this session.")
+                          if conflict else
+                          ("Symphony has not yet verified this child event's root project. "
+                           "Return to the root session to reconcile it."))
+                if source.kind in {"subagent_started", "subagent_stopped"}:
+                    store.queue_session_event(
+                        provider, session, source,
+                        ambiguous_owner=ambiguous_scope or bool(owners and (len(owners) > 1 or
+                            (bound is not None and owners[0] != bound))),
+                    )
+                    return HookResult()
+                if source.kind == "pre_tool_use":
+                    return render(provider, (Action("block_tool", {"reason": reason}),),
+                                  str(payload.get("hook_event_name") or "PreToolUse"))
                 if source.kind == "stop_requested":
+                    if owners == () and bound is None and record is None:
+                        actions, _ = store.update(project, lambda state: transition(state))
+                        return render(provider, actions, "Stop")
                     return render(provider, (Action("block_stop", {"reason": reason}),),
                                   str(payload.get("hook_event_name") or "Stop"))
                 if source.kind in {"user_prompt", "session_heartbeat"}:
                     return render(provider, (Action("inject_context", {"text": reason}),),
                                   str(payload.get("hook_event_name") or "UserPromptSubmit"))
                 return HookResult()
-            if owners:
-                actions = store.update_owned(owners[0], provider, session, transition)
-                if actions is None:
-                    return HookResult()
-            elif source.kind == "subagent_stopped" and not store._path(project).is_file():
-                # Late terminal delivery cannot create a second empty project
-                # state after the owning run has already been archived.
+            expected_owner = str(record["owner_session"] or session)
+            if (source.kind in {"subagent_started", "subagent_stopped"}
+                    and str(source.payload.get("agent_id") or source.payload.get("subagent_id") or "")
+                    in record["retired_agents"]):
+                store.queue_session_event(provider, session, source)
                 return HookResult()
-            else:
-                actions = store.update(project, transition)
+            if (record["owner_session"] != session
+                    and source.kind in {"subagent_started", "subagent_stopped"}):
+                # A child-session callback may belong to the root run, but it
+                # must share the root's pending batch and project transaction.
+                store.queue_session_event(provider, session, source)
+                return HookResult()
+            with ExitStack() as aliases:
+                records = [record]
+                unresolved_alias = False
+                if record["owner_session"] == session:
+                    roster = store.read_path(bound)
+                    own_run = roster.active_runs.get(f"{provider}:{session}") if roster else None
+                    ancestry = ({session, own_run.lead_identity,
+                                 *(item.identity for item in own_run.delegations)}
+                                if own_run else {session})
+                    names = set(ancestry)
+                    try:
+                        for parent in sorted(name for name in ancestry if name):
+                            names.update(store.aliases_for_owner(provider, parent))
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                        unresolved_alias = True
+                    for alias in sorted(name for name in names if name and name != session):
+                        try:
+                            aliases.enter_context(store.session_lock(provider, alias, timeout=0.1))
+                        except TimeoutError:
+                            unresolved_alias = True
+                            break
+                        alias_record = store.session_record(provider, alias)
+                        if alias_record and (alias_record["pending"] or alias_record["overflow"]):
+                            if alias_record["owner_session"] not in {None, session}:
+                                # The pointer is only a discovery hint. An
+                                # authoritative binding to another root must
+                                # not block this independent session.
+                                continue
+                            if any(item.get("ambiguous_owner") for item in alias_record["pending"]):
+                                unresolved_alias = True
+                                continue
+                            exact_owner = (alias_record["owner_session"] == session
+                                           and alias_record["state_name"] == bound.name)
+                            native_parent = (alias_record["owner_session"] is None
+                                             and bool(alias_record["pending"])
+                                             and all(item["payload"].get("parent_thread_id") in ancestry
+                                                     for item in alias_record["pending"])
+                                             and store.active_owner_paths(
+                                                 provider, alias,
+                                                 str(alias_record["pending"][0]["payload"].get(
+                                                     "parent_thread_id") or ""),
+                                                 include_ancestry=True,
+                                             ) == (bound,))
+                            if exact_owner or native_parent:
+                                records.append(alias_record)
+                            else:
+                                unresolved_alias = True
+                if unresolved_alias:
+                    reason = ("Symphony retained a child result whose root ownership is unresolved. "
+                              "Return to this session after its lifecycle is reconciled.")
+                    if source.kind in {"subagent_started", "subagent_stopped"}:
+                        store.queue_session_event(provider, session, source)
+                        return HookResult()
+                    if source.kind == "stop_requested":
+                        return render(provider, (Action("block_stop", {"reason": reason}),), "Stop")
+                    if source.kind == "pre_tool_use":
+                        return render(provider, (Action("block_tool", {"reason": reason}),), "PreToolUse")
+                    if source.kind in {"user_prompt", "session_heartbeat"}:
+                        return render(provider, (Action("inject_context", {"text": reason}),),
+                                      str(payload.get("hook_event_name") or "UserPromptSubmit"))
+                    return HookResult()
+                pending = tuple(
+                    (Event(item["event_id"], item["kind"], item["observed_at"],
+                           {**item["payload"], "_symphony_owner_conflict":
+                            bool(item.get("ambiguous_owner"))}),
+                     # Alias counters are local to that child session. Its
+                     # verified parent/owner and active run establish the
+                     # root generation; comparing raw counters drops events.
+                     item["generation"] if source_record is record else record["generation"])
+                    for source_record in records for item in source_record["pending"]
+                )
+                if any(item["overflow"] for item in records):
+                    reason = ("Symphony retained more unresolved child events than it can safely replay. "
+                              "Inspect this session before completion.")
+                    if source.kind in {"subagent_started", "subagent_stopped"}:
+                        store.queue_session_event(provider, session, source)
+                        return HookResult()
+                    action = ("block_stop" if source.kind == "stop_requested" else
+                              "block_tool" if source.kind == "pre_tool_use" else "inject_context")
+                    return render(provider, (Action(action, {"reason": reason, "text": reason}),),
+                                  str(payload.get("hook_event_name") or "UserPromptSubmit"))
+                if source.kind == "subagent_stopped" and not pending and not bound.is_file():
+                    return HookResult()
+                result = (store.update(Path(record["project"]),
+                                       lambda state: transition(state, pending, record["generation"],
+                                                                frozenset(record["retired_agents"])))
+                          if record["project"] else
+                          store.update_path(bound, lambda state: transition(state, pending, record["generation"],
+                                                                            frozenset(record["retired_agents"]))))
+                if result is None:
+                    return render(provider, (Action("block_stop", {"reason":
+                        "Symphony's bound project state is unavailable; recover this session before completion."}),),
+                                  "Stop") if source.kind == "stop_requested" else HookResult()
+                actions, acknowledged = result
+                for source_record in records:
+                    fresh = store.session_record(provider, source_record["session"])
+                    if fresh is not None:
+                        store.finish_session_events(fresh, acknowledged)
     else:
-        actions = store.update(project, transition)
+        actions, _ = store.update(project, lambda state: transition(state))
     return render(provider, actions, str(payload.get("hook_event_name") or "UserPromptSubmit"))
+
+
+def _is_root_origin(source: Event) -> bool:
+    """Only root-entry hooks may establish a CWD-based session binding."""
+    return (source.kind in {"session_heartbeat", "user_prompt"}
+            and not any(source.payload.get(field) for field in
+                        ("agent_id", "subagent_id", "parent_thread_id", "agent_transcript_path")))
+
+
+def _starts_new_root_task(source: Event) -> bool:
+    if not _is_root_origin(source) or source.kind != "user_prompt":
+        return False
+    # A settled session's next root prompt (including a project-scoped
+    # control) establishes the user's new project context. SessionStart alone
+    # can be a resume/compaction heartbeat and cannot move it.
+    return bool(str(source.payload.get("prompt") or "").strip())
+
+
+def _settled_for_rebind(state: ProjectState, provider: str, session: str) -> bool:
+    if f"{provider}:{session}" in state.active_runs:
+        return False
+    return not any(run.provider == provider and run.session_id == session and run.unreconciled
+                   for run in state.recent_runs)
+
+
+def _hold_pending_batch(state: ProjectState, provider: str, session: str) -> ProjectState:
+    key = f"{provider}:{session}"
+    run = state.active_runs.get(key)
+    if not run or run.assessment.get("_batch_pending"):
+        return state
+    held = replace(run, assessment={**run.assessment, "_batch_pending": True})
+    runs = {**state.active_runs, key: held}
+    return replace(state, active_runs=runs,
+                   active_run=held if state.active_run == run else state.active_run)
+
+
+def _finish_pending_batch(
+    state: ProjectState, provider: str, session: str, source: Event,
+) -> ProjectState:
+    key = f"{provider}:{session}"
+    run = state.active_runs.get(key)
+    if not run or not run.assessment.get("_batch_pending"):
+        return state
+    assessment = dict(run.assessment)
+    assessment.pop("_batch_pending", None)
+    settled = replace(run, assessment=assessment)
+    state = replace(state, active_runs={**state.active_runs, key: settled},
+                    active_run=settled if state.active_run == run else state.active_run)
+    lead = next((item for item in settled.delegations
+                 if item.identity == settled.lead_identity and item.role == "lead"), None)
+    if (settled.status != "completing" or not settled.outcome or not lead
+            or lead.state.lower() not in {"completed", "done", "success", "succeeded"}):
+        return state
+    scoped = _scope_state(state, key, session, provider)
+    final = Event(
+        f"{source.event_id}:pending-batch:{source.observed_at}", "lead_completed",
+        source.observed_at,
+        {"identity": settled.lead_identity, "owner_generation": settled.owner_generation,
+         "outcome": settled.outcome},
+    )
+    next_scoped, _ = reduce(scoped, final)
+    return _merge_scope(state, scoped, next_scoped, key, provider, session)
+
+
+def _pending_child_disposition(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> str:
+    """Replay only a child lifecycle that the current run already identifies."""
+    if event.payload.get("_symphony_owner_conflict"):
+        return "hold"
+    if event.kind not in {"subagent_started", "subagent_stopped"}:
+        return "hold"
+    identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+    if not identity:
+        return "hold"
+    run = state.active_runs.get(f"{provider}:{session}")
+    if run is None:
+        archived = [item for item in state.recent_runs
+                    if item.provider == provider and item.session_id == session]
+        if archived and any(item.lead_identity == identity
+                            or any(child.identity == identity for child in item.delegations)
+                            for item in archived):
+            return "stale"
+        return "hold"
+    if run.started_at and event.observed_at < run.started_at:
+        return "stale"
+    if any(item.provider == provider and item.session_id == session
+           and (item.lead_identity == identity
+                or any(child.identity == identity for child in item.delegations))
+           for item in state.recent_runs):
+        # A recycled child ID across run generations cannot establish that a
+        # delayed terminal belongs to the new run, even when it arrived later.
+        return "hold"
+    if _run_scope(state, event, provider) != (f"{provider}:{session}", session):
+        # One project file can contain several roots with the same child or
+        # parent ID. Never ACK an event dispatch would reject or misroute.
+        return "hold"
+    parent = str(event.payload.get("parent_thread_id") or "")
+    known = {run.session_id, run.lead_identity,
+             *(item.identity for item in run.delegations)}
+    if parent and parent not in known:
+        return "hold"
+    if not parent and str(event.payload.get("session_id") or "") not in known:
+        return "hold"
+    if identity in known:
+        return "apply"
+    if event.kind == "subagent_started":
+        role = _observed_role(event.payload)
+        pending = run.assessment.get("_pending_delegations", ())
+        if any(isinstance(item, Mapping) and item.get("role") == role for item in pending):
+            return "apply"
+    return "hold"
 
 
 def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, str] | None:

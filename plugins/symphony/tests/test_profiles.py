@@ -438,12 +438,13 @@ class EntitlementProbeTests(unittest.TestCase):
         handle({**owner, "hook_event_name": "SessionStart"}, environ)
         handle({**owner, "hook_event_name": "UserPromptSubmit", "prompt": "/symphony:proceed"}, environ)
         other = {"session_id": "other", "cwd": str(self.project)}
+        handle({**other, "hook_event_name": "SessionStart"}, environ)
         handle({**other, "hook_event_name": "PreToolUse", "tool_name": "Agent",
                 "tool_input": {}}, environ)
         activation = StateStore(self.state_root).load(self.project).activation["claude"]
         self.assertEqual(set(activation["accepted"]), {"owner"})
         self.assertEqual(activation["accepted"]["owner"]["profile"], "sonnet")
-        self.assertFalse(activation["accepted_profile"])
+        self.assertFalse(activation.get("accepted_profile"))
 
     def test_legacy_flat_consent_migrates_to_original_session(self):
         store = StateStore(self.state_root)
@@ -456,11 +457,13 @@ class EntitlementProbeTests(unittest.TestCase):
         ))
         environ = {"SYMPHONY_STATE_DIR": str(self.state_root), "SYMPHONY_PROVIDER": "claude"}
         handle({"session_id": "other", "cwd": str(self.project),
+                "hook_event_name": "SessionStart"}, environ)
+        handle({"session_id": "other", "cwd": str(self.project),
                 "hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_input": {}}, environ)
         activation = store.load(self.project).activation["claude"]
         self.assertEqual(set(activation["accepted"]), {"owner"})
         self.assertEqual(activation["accepted"]["owner"]["route"], "small/complex")
-        self.assertFalse(activation["accepted_profile"])
+        self.assertFalse(activation.get("accepted_profile"))
 
     def test_an_explicit_claude_profile_pin_is_an_opt_in(self):
         environ = {

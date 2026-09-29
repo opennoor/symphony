@@ -201,6 +201,8 @@ class AssessorBoostTests(unittest.TestCase):
                     if provider == "claude":
                         values = {"prompt": values["message"], "subagent_type": f"symphony-assessor-{selected['model']}-high"}
                     self.send(provider=provider, profile=profile, session=session,
+                              hook_event_name="SessionStart")
+                    self.send(provider=provider, profile=profile, session=session,
                               hook_event_name="PreToolUse", tool_name="Agent" if provider == "claude" else "spawn_agent", tool_input=values)
                     self.send(provider=provider, profile=profile, session=session, prompt=prefix + "boost max")
                     payload = {"agent_id": session + "-assessor", "role": "assessor", "model": selected["model"],
