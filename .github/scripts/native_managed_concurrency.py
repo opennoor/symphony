@@ -79,13 +79,18 @@ def prompt(provider, label, recover, project):
         "so the lead does not inherit this root's effort. "
         if provider == "codex" else ""
     )
+    claude_isolation = (
+        "Use Agent run_in_background=true for the lead, and omit isolation=worktree; "
+        "the fixture checkout is already disposable and its shared state must observe this lead. "
+        if provider == "claude" else ""
+    )
     gate = str(project / "gate.py").replace("\\", "/")
     return (
         f"{control} Disposable native CI lifecycle {label}. "
         "Use Symphony and the native agent tools. Spawn one assessor that returns exactly "
         f"SYMPHONY_ASSESSMENT: {route}. Await it. Spawn one lead with "
         f"SYMPHONY_ROUTE: {route} and the exact model and effort selected by Symphony. "
-        + codex_route +
+        + codex_route + claude_isolation +
         f"The lead's entire task is to run `python '{gate}' {label}` exactly once. "
         f"That absolute script path writes `{label}.ready` next to itself. Do not create "
         "another checkout or worktree. The gate prints GATE_STARTED "
@@ -239,6 +244,7 @@ def prepare_live_update(provider, root, old_source, candidate_source):
     return {"provider": provider, "env": env, "home": home, "old_version": old_version,
             "candidate_version": candidate_version, "old_cache": old_cache,
             "old_source": old_market / "plugins" / "symphony",
+            "candidate_source": candidate_market / "plugins" / "symphony",
             "candidate_market": candidate_market}
 
 
@@ -383,14 +389,24 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 current = {label: json.loads(path.read_text()) for label, path in paths.items()}
                 for label, process in processes.items():
                     events = current[label].get("event_history", [])
-                    lead_returned = (any(event.get("kind") == "lead_completed"
-                                         and event.get("payload", {}).get("identity") == observed_leads[label]
-                                         for event in events)
+                    old_lead_completed = any(event.get("kind") == "lead_completed"
+                                             and event.get("payload", {}).get("identity") == observed_leads[label]
+                                             for event in events)
+                    lead_returned = (old_lead_completed
                                      or any(run.get("session_id") == sessions[label]
                                             and run.get("status") == "completed"
                                             for run in current[label].get("recent_runs", [])))
                     if (process.poll() == 0 and label not in resumed
-                            and (lead_returned or deadline - time.monotonic() < 90)):
+                            and (old_lead_completed if update else
+                                 lead_returned or deadline - time.monotonic() < 90)):
+                        if update:
+                            activation = current[label].get("activation", {}).get(provider, {})
+                            records = [activation, *activation.get("session_profiles", [])]
+                            if not any(item.get("session_id") == sessions[label]
+                                       and item.get("plugin_version") == update["old_version"]
+                                       and item.get("runtime_root") == old_records[label]["runtime_root"]
+                                       for item in records):
+                                raise RuntimeError(f"{label}: old lead did not finish under retained runtime")
                         resume_claude(env, first if label == "a" else second,
                                       sessions[label], budget, deadline)
                         resumed.add(label)
@@ -419,11 +435,20 @@ def check_case(provider, root, separate, timeout, budget, update=None):
             if update:
                 activation = doc.get("activation", {}).get(provider, {})
                 records = [activation, *activation.get("session_profiles", [])]
-                if not any(item.get("session_id") == sessions[label]
-                           and item.get("plugin_version") == update["old_version"]
-                           and item.get("runtime_root") == old_records[label]["runtime_root"]
-                           for item in records):
-                    raise RuntimeError(f"{label}: old native session lost its retained runtime after update")
+                if not Path(old_records[label]["runtime_root"]).is_dir():
+                    raise RuntimeError(f"{label}: old retained runtime disappeared after update")
+                if provider == "codex":
+                    if not any(item.get("session_id") == sessions[label]
+                               and item.get("plugin_version") == update["old_version"]
+                               and item.get("runtime_root") == old_records[label]["runtime_root"]
+                               for item in records):
+                        raise RuntimeError(f"{label}: old native session lost its retained runtime after update")
+                elif not any(item.get("session_id") == sessions[label]
+                             and item.get("plugin_version") == update["candidate_version"]
+                             and Path(item.get("plugin_root", "")).resolve()
+                             == update["candidate_source"].resolve()
+                             for item in records):
+                    raise RuntimeError(f"{label}: same-session Claude resume did not load the candidate")
             if label == "a" and provider == "codex":
                 events = [event for event in doc.get("event_history", [])
                           if event.get("payload", {}).get("identity") == matching[0].get("lead_identity")]

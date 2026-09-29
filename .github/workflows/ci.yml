@@ -205,7 +205,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Native Claude managed concurrency failed' }
           $oldCheckout = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
           if (-not (Test-Path (Join-Path $oldCheckout 'plugins/symphony/hooks/hooks.json'))) {
-            throw 'Released 1.5.1 source missing for Claude live update'
+            git fetch origin tag v1.5.1
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch released 1.5.1 source' }
+            git worktree add --detach $oldCheckout v1.5.1
+            if ($LASTEXITCODE -ne 0) { throw 'Could not materialize released 1.5.1 source' }
           }
           python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 `
             --live-update --old-plugin-root (Join-Path $oldCheckout 'plugins/symphony') `
