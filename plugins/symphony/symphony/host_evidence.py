@@ -464,6 +464,65 @@ def _native_lead_turns(
     return run, turns, turn_order, latest_started, started_at
 
 
+def _released_failed_turn(
+    state: ProjectState, run: RunState, lead: Delegation,
+    turns: dict[str, dict], turn_order: list[str], latest_started: str,
+    started_at: datetime,
+) -> str | None:
+    """Find a unique failed native turn for a pre-turn-lineage recovering run.
+
+    Released 1.5.1 persisted the lead failure and retryable identity, but no
+    native turn token. A later candidate may adopt that run only when its one
+    recorded failure falls between exactly one matching native failed turn and
+    the next native start. Ambiguous or delayed evidence stays unreconciled.
+    """
+    if ("_retryable_lead_turn" in run.assessment
+            or "_terminal_turns" in run.assessment):
+        return None
+    failures = [event for event in state.event_history
+                if event.kind == "lead_failed"
+                and event.payload.get("identity") == run.lead_identity
+                and event.payload.get("owner_generation", run.owner_generation)
+                    == run.owner_generation
+                and (when := _instant(event.observed_at)) is not None
+                and when >= started_at]
+    if len(failures) != 1:
+        return None
+    failure = failures[0]
+    failed_at = _instant(failure.observed_at)
+    starts = [event for event in state.event_history
+              if event.kind == "lead_started"
+              and event.payload.get("identity") == run.lead_identity
+              and event.payload.get("owner_generation", run.owner_generation)
+                  == run.owner_generation
+              and (when := _instant(event.observed_at)) is not None
+              and when >= started_at and failed_at is not None and when < failed_at]
+    if len(starts) != 1:
+        return None
+    outcome = failure.payload.get("outcome")
+    status = outcome.get("status") if isinstance(outcome, Mapping) else None
+    if (failed_at is None or not isinstance(status, str) or not status
+            or status.lower() in {"completed", "done", "success", "succeeded"}):
+        return None
+    latest_start = turns.get(latest_started, {}).get("started_at")
+    if latest_start is None or failed_at >= latest_start:
+        return None
+    before_failure = [turn_id for turn_id in turn_order
+                      if (began := turns[turn_id].get("started_at")) is not None
+                      and began <= failed_at]
+    if len(before_failure) != 1:
+        return None
+    turn_id = before_failure[0]
+    failed = turns[turn_id]
+    if (not failed.get("started") or failed.get("model") != lead.requested_tier
+            or failed.get("effort") != lead.requested_effort
+            or str(failed.get("outcome") or "").lower() != status.lower()
+            or (ended := failed.get("completed_at")) is None
+            or ended <= started_at or ended > failed_at):
+        return None
+    return turn_id
+
+
 def codex_recovered_lead_event(
     state: ProjectState, session: str, environ: Mapping[str, str],
 ) -> Event | None:
@@ -501,6 +560,12 @@ def codex_recovered_lead_event(
     # later rejected callback; a markerless rejected turn is still valid
     # evidence once its terminal callback was durably processed.
     failed_token = run.assessment.get("_retryable_lead_turn")
+    if failed_token is None:
+        released = _released_failed_turn(
+            state, run, lead, turns, turn_order, latest_started, started_at)
+        if released is not None:
+            failed_token = f"turn_id:{released}"
+            observed_turns.add(failed_token)
     if not isinstance(failed_token, str) or not failed_token.startswith("turn_id:"):
         return None
     failed_turn = failed_token.removeprefix("turn_id:")

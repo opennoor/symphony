@@ -1,0 +1,44 @@
+name: Windows Claude isolated worktree probe
+
+on:
+  push:
+    branches:
+      - fix/session-terminal-replay-and-updates
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Claude Code
+        run: npm.cmd install -g @anthropic-ai/claude-code
+      - name: Probe native isolated Agent in disposable project
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if (-not $env:ANTHROPIC_API_KEY) { throw 'ANTHROPIC_API_KEY is required' }
+          $env:CLAUDE_CONFIG_DIR = Join-Path $env:RUNNER_TEMP 'Claude Config With Spaces'
+          $env:SYMPHONY_STATE_DIR = Join-Path $env:RUNNER_TEMP 'Claude State With Spaces'
+          $env:CLAUDE_CODE_GIT_BASH_PATH = Join-Path $env:ProgramFiles 'Git/bin/bash.exe'
+          $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'isolated-diagnostics'
+          New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR,$env:SYMPHONY_STATE_DIR | Out-Null
+          claude.cmd plugin marketplace add $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { throw 'Claude marketplace add failed' }
+          claude.cmd plugin install -y symphony@symphony
+          if ($LASTEXITCODE -ne 0) { throw 'Claude plugin install failed' }
+          $env:SYMPHONY_EXPECTED_PLUGIN_ROOT = Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony'
+          python .github/scripts/claude_isolated_worktree.py --timeout 300
+          if ($LASTEXITCODE -ne 0) { throw 'Native isolated Agent failed; see sanitized artifact' }
+      - name: Retain sanitized native failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-claude-isolated-probe
+          path: ${{ runner.temp }}/isolated-diagnostics/*.json
+          if-no-files-found: ignore

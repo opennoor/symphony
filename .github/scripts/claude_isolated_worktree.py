@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check Claude's native background Agent worktree hooks in disposable state.
 
-The capture hook stores lifecycle identity and classified Agent failure flags.
-It never stores prompts, transcripts, tool output, or credentials. This is a separate regression from the
-shared-checkout native managed concurrency harness.
+The capture hook stores lifecycle identity, classified Agent failure flags,
+and one redacted line from a failed Agent tool response. This is a separate
+regression from the shared-checkout native managed concurrency harness.
 """
 
 import argparse
@@ -52,6 +52,18 @@ try:
         record["tool_failure_hash"] = hashlib.sha256(result.encode()).hexdigest()[:12] if result else None
         if failed:
             lowered = result.lower()
+            # This fixture is synthetic, but native errors can contain local
+            # paths. Keep one short redacted line so an unknown category can
+            # be diagnosed without publishing raw hook output.
+            excerpt = result.splitlines()[0] if result else ""
+            for name, value in os.environ.items():
+                if (re.search(r"key|token|secret|password|credential|auth", name, re.I)
+                        and isinstance(value, str) and len(value) >= 4):
+                    excerpt = excerpt.replace(value, "<credential>")
+            excerpt = re.sub(r"[A-Za-z]:[\\\\/].*", "<path>", excerpt)
+            excerpt = re.sub(r"(?:/[A-Za-z0-9_.~-]+){2,}", "<path>", excerpt)
+            excerpt = re.sub(r"[A-Za-z0-9+/=_-]{32,}", "<token>", excerpt)
+            record["tool_failure_excerpt"] = excerpt[:300]
             reasons = {
                 "not-a-repo": r"not a git repository|outside repository",
                 "invalid-ref": r"invalid reference|unknown revision|bad revision|not a valid object name|reference is not a tree|ambiguous argument",

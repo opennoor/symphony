@@ -69,6 +69,55 @@ class HostEvidenceTests(unittest.TestCase):
                                             "last_agent_message": outcome}})
         self.transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
 
+    def load_released_recovering_state(self):
+        # Generated with v1.5.1 event_from_payload, _observe_delegation, and
+        # StateStore.save after syncing its canonical active_runs alias.
+        fixture = Path(__file__).parent / "fixtures" / "recovering-v1.5.1.json"
+        raw = json.loads(fixture.read_text())
+        self.assertEqual(2, raw["schema_version"])
+        self.assertNotIn("_retryable_lead_turn", raw["active_run"]["assessment"])
+        self.assertNotIn("_terminal_turns", raw["active_run"]["assessment"])
+        self.store._path(self.project).write_bytes(fixture.read_bytes())
+        return self.store.load(self.project)
+
+    def test_released_151_recovering_state_reconciles_unique_native_followup(self):
+        self.write_turns()
+        old = self.load_released_recovering_state()
+        self.assertIsNotNone(codex_recovered_lead_event(
+            old, ROOT_ID, self.environ))
+        result = handle({"session_id": ROOT_ID, "cwd": str(self.project),
+                         "hook_event_name": "Stop", "turn_id": "root-turn"}, self.environ)
+        self.assertNotEqual("block", json.loads(result.stdout).get("decision") if result.stdout else None)
+        state = self.store.load(self.project)
+        self.assertIsNone(state.active_run)
+        self.assertEqual("legacy-run", state.recent_runs[-1].run_id)
+        self.assertEqual(LEAD_ID, state.recent_runs[-1].lead_identity)
+        self.assertEqual("completed", state.recent_runs[-1].outcome["status"])
+
+    def test_released_151_recovery_requires_unique_failed_turn(self):
+        for edit in ("no_failure_event", "duplicate_lead_start", "extra_prior_failed_turn", "wrong_parent",
+                     "wrong_model", "newer_running"):
+            with self.subTest(edit=edit):
+                self.write_turns(parent="foreign-root" if edit == "wrong_parent" else ROOT_ID,
+                                 model="gpt-6-sol" if edit == "wrong_model" else "gpt-6-luna",
+                                 latest_complete=edit != "newer_running")
+                old = self.load_released_recovering_state()
+                if edit == "no_failure_event":
+                    old = replace(old, event_history=old.event_history[:-1])
+                elif edit == "duplicate_lead_start":
+                    old = replace(old, event_history=(old.event_history[0], *old.event_history))
+                elif edit == "extra_prior_failed_turn":
+                    rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+                    duplicate = []
+                    for row in rows:
+                        if (row.get("payload") or {}).get("turn_id") == OLD_TURN:
+                            copied = json.loads(json.dumps(row))
+                            copied["payload"]["turn_id"] = THIRD_TURN
+                            duplicate.append(copied)
+                    rows[4:4] = duplicate
+                    self.transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                self.assertIsNone(codex_recovered_lead_event(old, ROOT_ID, self.environ))
+
     def test_completed_native_followup_reconciles_same_run_at_root_stop(self):
         self.write_turns()
         result = handle({"session_id": ROOT_ID, "cwd": str(self.project),
