@@ -504,6 +504,8 @@ def check_case(provider, root, separate, timeout, budget, update=None):
         (project / "gate.py").write_text(GATE)
     state_dir = case / "state"
     state_dir.mkdir()
+    candidate_version = (update["candidate_version"] if update else
+                         package_version(Path(__file__).resolve().parents[2] / "plugins/symphony"))
     env = {**os.environ, **(update["env"] if update else {}), "SYMPHONY_STATE_DIR": str(state_dir),
            "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
            "SYMPHONY_PROFILE": "base" if provider == "codex" else "sonnet"}
@@ -533,6 +535,15 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                     sessions = {label: codex_session(logs, label) for label in processes}
                 if all(path.exists() for path in paths.values()):
                     docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+                    expected_gate_version = update["old_version"] if update else candidate_version
+                    for label, session in sessions.items():
+                        activation = docs[label].get("activation", {}).get(provider, {})
+                        profiles = [activation, *activation.get("session_profiles", [])]
+                        if not any(item.get("session_id") == session
+                                   and item.get("plugin_version") == expected_gate_version
+                                   for item in profiles):
+                            raise RuntimeError(
+                                f"{label}: native lead used another Symphony plugin version at gate")
                     if all(docs[label].get("active_runs", {}).get(
                             f"{provider}:{session}", {}).get("lead_identity")
                             for label, session in sessions.items()):
@@ -666,6 +677,12 @@ def check_case(provider, root, separate, timeout, budget, update=None):
             else:
                 raise RuntimeError("background Claude leads did not resume and archive completed outcomes")
         final_docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+        # This case owns its disposable state directory exclusively, including
+        # child-session aliases whose owner pointer was never populated.
+        for record_path in state_dir.glob(".session-*.json"):
+            record = json.loads(record_path.read_text())
+            if record.get("pending") or record.get("overflow"):
+                raise RuntimeError("native session retained unresolved child callbacks after completion")
         for label, doc in final_docs.items():
             runs = [run for run in doc.get("recent_runs", []) if run.get("provider") == provider]
             matching = [run for run in runs if run.get("session_id") == sessions[label]]
@@ -678,6 +695,13 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 raise RuntimeError(f"{label}: completed run changed lead identity")
             if completed_run.get("run_id") != observed_run_ids[label]:
                 raise RuntimeError(f"{label}: active run was restarted during the native session")
+            if not update:
+                activation = doc.get("activation", {}).get(provider, {})
+                profiles = [activation, *activation.get("session_profiles", [])]
+                if not any(item.get("session_id") == sessions[label]
+                           and item.get("plugin_version") == candidate_version
+                           for item in profiles):
+                    raise RuntimeError(f"{label}: completed under another Symphony plugin version")
             if update:
                 activation = doc.get("activation", {}).get(provider, {})
                 records = [activation, *activation.get("session_profiles", [])]
@@ -711,6 +735,7 @@ def check_case(provider, root, separate, timeout, budget, update=None):
         return {"case": "live-update" if update else
                 "different-branch-worktrees" if separate else "same-worktree",
                 "observed_overlap": True, "completed": ["a", "b"],
+                "candidate_version": candidate_version, "pending_callbacks": 0,
                 **({"native_resumed": sorted(resumed)} if provider == "claude" else
                    {"native_resumed": ["a"]} if update and provider == "codex" else {}),
                 **({"native_hook_capture": codex_hook_capture_summary(root)}
