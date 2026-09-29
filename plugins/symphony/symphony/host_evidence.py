@@ -514,11 +514,14 @@ def _released_failed_turn(
         return None
     turn_id = before_failure[0]
     failed = turns[turn_id]
+    began = failed.get("started_at")
+    next_start = turns[turn_order[1]].get("started_at") if len(turn_order) > 1 else None
     if (not failed.get("started") or failed.get("model") != lead.requested_tier
             or failed.get("effort") != lead.requested_effort
             or str(failed.get("outcome") or "").lower() != status.lower()
             or (ended := failed.get("completed_at")) is None
-            or ended <= started_at or ended > failed_at):
+            or began is None or began < started_at or next_start is None
+            or ended < began or ended >= next_start):
         return None
     return turn_id
 

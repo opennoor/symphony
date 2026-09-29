@@ -8,7 +8,8 @@ from plugins.symphony.symphony.host_evidence import (
     codex_completing_lead_turn, codex_recovered_lead_event,
 )
 from plugins.symphony.symphony.adapters import event_from_payload
-from plugins.symphony.symphony.model import Delegation, ProjectState, RunState
+from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
+from plugins.symphony.symphony.reducer import reduce
 from plugins.symphony.symphony.runtime import handle
 from plugins.symphony.symphony.store import StateStore
 
@@ -49,7 +50,8 @@ class HostEvidenceTests(unittest.TestCase):
 
     def write_turns(self, *, parent=ROOT_ID, model="gpt-6-luna", effort="low",
                     latest_complete=True, latest_time="2026-09-29T02:02:00Z",
-                    message='SYMPHONY_OUTCOME: {"status":"completed"}'):
+                    message='SYMPHONY_OUTCOME: {"status":"completed"}',
+                    old_complete_time="2026-09-29T02:01:00Z"):
         records = [{"timestamp": "2026-09-29T01:59:00Z", "type": "session_meta",
                     "payload": {"id": LEAD_ID, "source": {"subagent": {
                         "thread_spawn": {"parent_thread_id": parent}}}}}]
@@ -64,7 +66,8 @@ class HostEvidenceTests(unittest.TestCase):
                  "payload": {"turn_id": turn_id, "model": model, "effort": effort}},
             ]
             if turn_id != NEW_TURN or latest_complete:
-                records.append({"timestamp": stamp, "type": "event_msg",
+                records.append({"timestamp": old_complete_time if turn_id == OLD_TURN else stamp,
+                                "type": "event_msg",
                                 "payload": {"type": "task_complete", "turn_id": turn_id,
                                             "last_agent_message": outcome}})
         self.transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
@@ -104,6 +107,46 @@ class HostEvidenceTests(unittest.TestCase):
         self.assertIn("Invoke the normal `$symphony:symphony stop`", context)
         self.assertNotIn("tracked work still requires reconciliation", context)
         self.assertEqual("completing", self.store.load(self.project).active_run.status)
+
+    def test_released_151_callback_can_precede_failed_native_task_complete(self):
+        # Codex may invoke SubagentStop before appending task_complete for the
+        # same turn. The old callback still identifies a unique failed turn.
+        self.write_turns(old_complete_time="2026-09-29T02:01:07Z")
+        old = self.load_released_recovering_state()
+        recovered = codex_recovered_lead_event(old, ROOT_ID, self.environ)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(NEW_TURN, recovered.payload["turn_id"])
+
+        # A task_complete after the newer turn started has uncertain lineage.
+        self.write_turns(old_complete_time="2026-09-29T02:02:01Z")
+        self.assertIsNone(codex_recovered_lead_event(old, ROOT_ID, self.environ))
+
+        # An intermediate turn is also a boundary, even if the latest turn
+        # starts much later and reports success.
+        self.write_turns(old_complete_time="2026-09-29T02:01:15Z")
+        rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        middle = "2026-09-29T02:01:10Z"
+        rows[3:3] = [
+            {"timestamp": middle, "type": "event_msg",
+             "payload": {"type": "task_started", "turn_id": THIRD_TURN}},
+            {"timestamp": middle, "type": "turn_context",
+             "payload": {"turn_id": THIRD_TURN, "model": "gpt-6-luna", "effort": "low"}},
+        ]
+        rows[6:6] = [{"timestamp": "2026-09-29T02:01:20Z", "type": "event_msg",
+                      "payload": {"type": "task_complete", "turn_id": THIRD_TURN,
+                                  "last_agent_message": 'SYMPHONY_OUTCOME: {"status":"blocked"}'}}]
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        self.assertIsNone(codex_recovered_lead_event(old, ROOT_ID, self.environ))
+
+    def test_released_151_later_worker_failure_cannot_reuse_completed_lead_turn(self):
+        self.write_turns(old_complete_time="2026-09-29T02:01:07Z")
+        old = self.load_released_recovering_state()
+        failed, _ = reduce(old, Event(
+            "later-worker-failure", "delegation_updated", "2026-09-29T02:01:30Z",
+            {"identity": "worker-1", "role": "worker", "state": "failed"},
+        ))
+        self.assertEqual("", failed.active_run.assessment["_retryable_lead"])
+        self.assertIsNone(codex_recovered_lead_event(failed, ROOT_ID, self.environ))
 
     def test_released_151_recovery_requires_unique_failed_turn(self):
         for edit in ("no_failure_event", "duplicate_lead_start", "extra_prior_failed_turn", "wrong_parent",

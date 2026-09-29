@@ -1111,25 +1111,25 @@ _CODEX_NATIVE_REJECT = {
     434: "parent_identity", 463: "transcript_parse",
 }
 _CODEX_RECOVERY_REJECT = {
-    533: "run_not_retryable", 536: "native_transcript_unavailable",
-    540: "failure_time_missing", 545: "lead_record_missing",
-    552: "latest_turn_route_or_time", 556: "latest_turn_already_observed",
-    570: "failed_turn_anchor_missing", 574: "failed_turn_order",
-    578: "failed_native_turn_invalid", 581: "latest_message_invalid",
-    583: "latest_outcome_invalid",
+    536: "run_not_retryable", 539: "native_transcript_unavailable",
+    543: "failure_time_missing", 548: "lead_record_missing",
+    555: "latest_turn_route_or_time", 559: "latest_turn_already_observed",
+    573: "failed_turn_anchor_missing", 577: "failed_turn_order",
+    581: "failed_native_turn_invalid", 584: "latest_message_invalid",
+    586: "latest_outcome_invalid",
 }
 _RELEASED_FAILED_REJECT = {
     481: "new_lineage_present", 490: "failure_count",
     501: "start_count", 506: "failure_outcome",
     509: "observed_failure_after_new_start", 514: "native_turn_count_before_failure",
-    522: "native_failed_turn_mismatch",
+    525: "native_failed_turn_mismatch",
 }
 _CODEX_COMPLETION_RESULT = {
-    604: "not_completing", 608: "no_terminal_anchor", 611: "native_transcript_unavailable",
-    616: "terminal_anchor_missing", 618: "latest_is_accepted_terminal",
-    621: "native_turn_order_conflict", 629: "native_turn_route_or_time",
-    632: "newer_turn_running", 634: "newer_turn_time",
-    637: "newer_turn_message", 647: "newer_turn_completed",
+    607: "not_completing", 611: "no_terminal_anchor", 614: "native_transcript_unavailable",
+    619: "terminal_anchor_missing", 621: "latest_is_accepted_terminal",
+    624: "native_turn_order_conflict", 632: "native_turn_route_or_time",
+    635: "newer_turn_running", 637: "newer_turn_time",
+    640: "newer_turn_message", 650: "newer_turn_completed",
 }
 
 
@@ -1189,6 +1189,9 @@ def codex_recovery_probe(document, session, home):
                 if local.get("failed_at") and local.get("ended"):
                     captured["native_failure_completed_before_observation"] = (
                         local["ended"] <= local["failed_at"])
+                if local.get("next_start") and local.get("ended"):
+                    captured["native_failure_completed_before_next_start"] = (
+                        local["ended"] < local["next_start"])
             elif frame.f_code is host_evidence.codex_recovered_lead_event.__code__:
                 captured["result"] = "accepted" if value is not None else "rejected"
                 captured["stage"] = (
