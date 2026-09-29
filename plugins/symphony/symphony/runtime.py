@@ -16,7 +16,11 @@ from typing import Mapping
 
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
-from .host_evidence import codex_completing_lead_turn, codex_recovered_lead_event
+from .host_evidence import (
+    claude_committed_native_terminal_replay, claude_completing_lead_turn,
+    claude_current_native_lead_event, claude_recovered_lead_event,
+    codex_completing_lead_turn, codex_recovered_lead_event,
+)
 from .model import Action, Delegation, Event, ProjectState
 from .reducer import reduce
 from .routing import (
@@ -113,6 +117,19 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             batch.append((source, generation, True))
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
             state = _hold_pending_batch(state, provider, session)
+            pending_event_id = event.event_id
+            if provider == "claude" and expected_owner:
+                scoped = _scope_state(state, f"claude:{expected_owner}", expected_owner, provider)
+                native = claude_current_native_lead_event(
+                    scoped, event, expected_owner, project, environ)
+                if native is not None:
+                    event = native
+            if (provider == "claude" and expected_owner
+                    and claude_committed_native_terminal_replay(
+                        state, event, expected_owner, project, environ)):
+                if not current:
+                    acknowledged.add(pending_event_id)
+                continue
             if current:
                 if (expected_owner and _committed_child_terminal_replay(
                         state, event, provider, expected_owner, allow_active=True)):
@@ -139,16 +156,34 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                            "hold" if identity in retired else
                            _pending_child_disposition(state, event, provider, session))
             if disposition == "stale":
-                acknowledged.add(event.event_id)
+                acknowledged.add(pending_event_id)
             elif disposition == "apply":
                 state, _ = dispatch(state, event)
-                acknowledged.add(event.event_id)
+                acknowledged.add(pending_event_id)
             else:
                 unresolved = True
         if source.kind == "stop_requested" and unresolved:
             return state, ((Action("block_stop", {"reason":
                 "Symphony retained an unresolved child result for this session. "
                 "Retry this turn after its owning run is reconciled."}),), acknowledged)
+        if (not unresolved and provider == "claude"
+                and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
+            scoped = _scope_state(state, f"claude:{session}", session, provider)
+            recovered = claude_recovered_lead_event(scoped, session, project, environ)
+            if recovered is not None:
+                state = _hold_pending_batch(state, provider, session)
+                state, _ = dispatch(state, recovered)
+            if source.kind == "stop_requested":
+                scoped = _scope_state(state, f"claude:{session}", session, provider)
+                freshness, native_turn = claude_completing_lead_turn(
+                    scoped, session, project, environ)
+                if freshness == "unknown":
+                    return state, ((Action("block_stop", {"reason":
+                        "Symphony could not verify the tracked lead's latest native Claude turn. "
+                        "Return to this session after its result is available."}),), acknowledged)
+                if native_turn is not None:
+                    state = _hold_pending_batch(state, provider, session)
+                    state, _ = dispatch(state, native_turn)
         if (not unresolved and provider == "codex"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"codex:{session}", session, provider)
@@ -324,12 +359,20 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                             archived_replay = (alias_record["owner_session"] is None
                                                and bool(alias_record["pending"])
                                                and roster is not None
-                                               and all(_committed_child_terminal_replay(
-                                                   roster,
-                                                   Event(item["event_id"], item["kind"],
-                                                         item["observed_at"], item["payload"]),
-                                                   provider, session,
-                                               ) for item in alias_record["pending"]))
+                                               and all(
+                                                   _committed_child_terminal_replay(
+                                                       roster,
+                                                       Event(item["event_id"], item["kind"],
+                                                             item["observed_at"], item["payload"]),
+                                                       provider, session,
+                                                   ) or (provider == "claude" and
+                                                         claude_committed_native_terminal_replay(
+                                                             roster,
+                                                             Event(item["event_id"], item["kind"],
+                                                                   item["observed_at"], item["payload"]),
+                                                             session, Path(record["project"] or project),
+                                                             environ))
+                                                   for item in alias_record["pending"]))
                             if exact_owner or native_parent or archived_replay:
                                 records.append(alias_record)
                             else:
@@ -1284,7 +1327,12 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             "turn": token, "result": base_result_id,
             "parent": str(source.payload.get("parent_thread_id") or ""),
             "lead": str(state.active_run.lead_identity or ""),
+            "status": str(source.payload.get("status") or "completed").lower(),
         }
+        if source.payload.get("_symphony_native_recovery"):
+            receipt["native_agent_type"] = str(source.payload.get("agent_type") or "")
+            receipt["native_model"] = str(source.payload.get("model") or "")
+            receipt["native_effort"] = str(source.payload.get("model_reasoning_effort") or "")
         state = replace(state, terminal_receipts=(*state.terminal_receipts, receipt))
         assessment = dict(state.active_run.assessment)
         assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
@@ -1299,6 +1347,9 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             terminal_turns = dict(assessment.get("_terminal_turns", {}))
             terminal_turns[str(identity)] = (*terminal_turns.get(str(identity), ()), token)
             assessment["_terminal_turns"] = terminal_turns
+            if (role := _observed_role(source.payload)) == "lead" and source.payload.get(
+                    "_symphony_native_recovery") and token:
+                assessment["_claude_native_recovery"] = token
         state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     terminal = source.kind == "subagent_stopped"
     status = str(source.payload.get("status") or ("completed" if terminal else "working"))

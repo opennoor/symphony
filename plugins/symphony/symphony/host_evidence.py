@@ -1,4 +1,4 @@
-"""Recover a Codex lead turn only from native completed-turn evidence.
+"""Recover a lead turn only from native completed-turn evidence.
 
 Some Codex followup turns deliver user SubagentStop hooks but omit a plugin's
 SubagentStop command. The root's next hook can reconcile the same recorded
@@ -14,10 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
-from .model import Event, ProjectState, RunState
+from .model import Delegation, Event, ProjectState, RunState
 
 
 _CODEX_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+_CLAUDE_ID = re.compile(r"[0-9a-f]{16,32}")
 _MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
 
 
@@ -45,6 +46,351 @@ def _reported_status(message: object) -> str | None:
         return None
     status = outcome.get("status") if isinstance(outcome, dict) else None
     return status if isinstance(status, str) and status else None
+
+
+def _native_jsonl(path: Path) -> list[dict] | None:
+    """Read one complete, bounded native transcript without following aliases."""
+    try:
+        if (path.is_symlink() or not path.is_file()
+                or path.stat().st_size > _MAX_TRANSCRIPT_BYTES):
+            return None
+        with path.open(encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream]
+        return rows if rows and all(isinstance(row, dict) for row in rows) else None
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return None
+
+
+def _claude_native_lead_event(
+    state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
+    *, require_missing: bool, target_prompt: str | None = None,
+) -> Event | None:
+    """Validate one lead terminal against Claude's native parent and child turns.
+
+    A removed 1.5.1 plugin cache can strand its old SubagentStop command while
+    the native agent and its transcript finish. The active run, exact parent
+    Agent launch, child identity, pinned route, and latest native turn must all
+    agree before the ordinary lifecycle reducer sees a terminal event.
+    """
+    run = state.active_run
+    if (not run or run.provider != "claude" or run.session_id != session
+            or (require_missing and (run.status != "active" or run.outcome is not None))):
+        return None
+    lead_id = run.lead_identity or ""
+    started_at = _instant(run.started_at)
+    if not _CLAUDE_ID.fullmatch(lead_id) or started_at is None:
+        return None
+    lead = next((item for item in run.delegations
+                 if item.identity == lead_id and item.role == "lead"), None)
+    if (lead is None or (require_missing and lead.state.lower() not in {"working", "pending"})
+            or not lead.requested_tier or not lead.requested_effort
+            or (require_missing and run.assessment.get("_terminal_turns", {}).get(lead_id))):
+        return None
+    home = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    projects = home / "projects"
+    if projects.is_symlink() or not projects.is_dir():
+        return None
+    paths = tuple(projects.glob(f"*/{session}/subagents/agent-{lead_id}.jsonl"))
+    if len(paths) != 1:
+        return None
+    child_path = paths[0]
+    root_dir = child_path.parent.parent
+    if (root_dir.name != session or root_dir.is_symlink()
+            or child_path.parent.is_symlink() or root_dir.parent.is_symlink()):
+        return None
+    meta_path = child_path.with_suffix(".meta.json")
+    try:
+        if (meta_path.is_symlink() or not meta_path.is_file()
+                or meta_path.stat().st_size > 64 * 1024):
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return None
+    if not isinstance(meta, dict) or meta.get("spawnDepth") != 1:
+        return None
+    agent_type = meta.get("agentType")
+    launch_id = meta.get("toolUseId")
+    if (not isinstance(agent_type, str)
+            or not agent_type.endswith(
+                f"symphony-lead-{lead.requested_tier}-{lead.requested_effort}")
+            or not isinstance(launch_id, str) or not launch_id):
+        return None
+    parent_rows = _native_jsonl(root_dir.with_suffix(".jsonl"))
+    child_rows = _native_jsonl(child_path)
+    if parent_rows is None or child_rows is None:
+        return None
+    launches = []
+    for row in parent_rows:
+        if row.get("type") != "assistant" or row.get("sessionId") != session:
+            continue
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for item in content if isinstance(content, list) else ():
+            if isinstance(item, dict) and item.get("id") == launch_id:
+                launches.append((row, item))
+    if len(launches) != 1:
+        return None
+    parent, launch = launches[0]
+    launch_input = launch.get("input")
+    if (launch.get("type") != "tool_use" or launch.get("name") != "Agent"
+            or not isinstance(launch_input, dict)
+            or launch_input.get("subagent_type") != agent_type):
+        return None
+    try:
+        if Path(str(parent.get("cwd") or "")).resolve() != project.resolve():
+            return None
+    except (OSError, ValueError):
+        return None
+    launched_at = _instant(parent.get("timestamp"))
+    if launched_at is None or launched_at < started_at:
+        return None
+    # A tool-result user row belongs to the current turn. A new textual user
+    # prompt starts a new turn and invalidates an older completed report.
+    prompt_indices = []
+    for index, row in enumerate(child_rows):
+        if (row.get("sessionId") != session or row.get("agentId") != lead_id
+                or row.get("isSidechain") is not True):
+            return None
+        if row.get("type") == "user" and isinstance((row.get("message") or {}).get("content"), str):
+            prompt_indices.append(index)
+    if not prompt_indices:
+        return None
+    if target_prompt is None:
+        prompt_index = len(prompt_indices) - 1
+    else:
+        matches = [index for index, position in enumerate(prompt_indices)
+                   if child_rows[position].get("uuid") == target_prompt]
+        if len(matches) != 1:
+            return None
+        prompt_index = matches[0]
+    last_prompt = prompt_indices[prompt_index]
+    prompt_id = child_rows[last_prompt].get("uuid")
+    if not isinstance(prompt_id, str) or not prompt_id:
+        return None
+    prompt_at = _instant(child_rows[last_prompt].get("timestamp"))
+    if prompt_at is None or prompt_at < launched_at:
+        return None
+    end = (prompt_indices[prompt_index + 1] if prompt_index + 1 < len(prompt_indices)
+           else len(child_rows))
+    turn = child_rows[last_prompt + 1:end]
+    assistants = [row for row in turn if row.get("type") == "assistant"]
+    activity = [row for row in turn if row.get("type") in {"assistant", "user"}]
+    if not assistants or not activity or activity[-1] is not assistants[-1]:
+        return None
+    terminal = assistants[-1]
+    message = terminal.get("message")
+    if (not isinstance(message, dict) or message.get("stop_reason") != "end_turn"
+            or any((row.get("message") or {}).get("stop_reason") == "end_turn"
+                   for row in assistants[:-1])):
+        return None
+    completed_at = _instant(terminal.get("timestamp"))
+    terminal_id = terminal.get("uuid")
+    if (completed_at is None or completed_at <= prompt_at
+            or not isinstance(terminal_id, str) or not terminal_id):
+        return None
+    if any((row.get("message") or {}).get("model") != lead.requested_tier
+           or (row.get("perTurnEffort") or row.get("effort")) != lead.requested_effort
+           for row in assistants):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    final_text = "\n".join(item.get("text", "") for item in content
+                           if isinstance(item, dict) and item.get("type") == "text")
+    final_status = _reported_status(final_text)
+    if "SYMPHONY_OUTCOME:" in final_text and final_status != "completed":
+        return None
+    reports = [final_text] if final_status == "completed" else []
+    if not reports:
+        # Background agents hand their result to the parent and then end with
+        # a brief goodbye. Only the current turn's successful handback counts.
+        handbacks = [(item, row) for row in assistants[:-1]
+                     for item in ((row.get("message") or {}).get("content") or [])
+                     if isinstance(item, dict) and item.get("type") == "tool_use"
+                     and item.get("name") == "SubagentHandback"]
+        if len(handbacks) != 1:
+            return None
+        handback, _ = handbacks[0]
+        handback_id = handback.get("id")
+        handback_input = handback.get("input")
+        report = handback_input.get("message") if isinstance(handback_input, dict) else None
+        results = [item for row in turn if row.get("type") == "user"
+                   for item in ((row.get("message") or {}).get("content") or [])
+                   if isinstance(item, dict) and item.get("type") == "tool_result"
+                   and item.get("tool_use_id") == handback_id]
+        if (not isinstance(handback_id, str) or len(results) != 1
+                or results[0].get("is_error") is True
+                or _reported_status(report) != "completed"):
+            return None
+        reports = [report]
+    # A later worker failure or restart supersedes this result, even when its
+    # callback reached the root before the missing lead callback was recovered.
+    run_identities = {item.identity for item in run.delegations if item.role != "lead"}
+    for item in run.delegations if target_prompt is None else ():
+        when = _instant(item.updated_at)
+        if (item.identity in run_identities and when is not None and when > completed_at
+                and item.state.lower() in {"failed", "interrupted", "cancelled",
+                                           "canceled", "error", "terminated"}):
+            return None
+    for record in state.event_history if target_prompt is None else ():
+        when = _instant(record.observed_at)
+        if when is None or when <= completed_at:
+            continue
+        payload = record.payload
+        if (record.kind == "delegation_updated" and payload.get("identity") in run_identities
+                and payload.get("role") != "lead"
+                and str(payload.get("state") or "").lower() in {
+                    "failed", "interrupted", "cancelled", "canceled", "error", "terminated"}):
+            return None
+        if record.kind in {"lead_failed", "lead_started"} and payload.get("identity") == lead_id:
+            return None
+    report = reports[0]
+    if len(report) > 100_000:
+        return None
+    payload = {
+        "provider": "claude", "session_id": session, "agent_id": lead_id,
+        "parent_thread_id": session, "agent_type": agent_type,
+        "prompt_id": prompt_id, "status": "completed",
+        "model": lead.requested_tier, "model_reasoning_effort": lead.requested_effort,
+        "last_assistant_message": report,
+        "_symphony_native_recovery": True,
+    }
+    event_id = hashlib.sha256(f"claude-host-turn\0{session}\0{lead_id}\0{terminal_id}".encode()).hexdigest()
+    return Event(event_id, "subagent_stopped", completed_at.isoformat(), payload)
+
+
+def claude_recovered_lead_event(
+    state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
+) -> Event | None:
+    """Recover an unobserved first terminal through the ordinary reducer."""
+    return _claude_native_lead_event(
+        state, session, project, environ, require_missing=True)
+
+
+def claude_completing_lead_turn(
+    state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
+) -> tuple[str, Event | None]:
+    """Prevent Stop from archiving an older recovered Claude outcome."""
+    run = state.active_run
+    if not run or run.status != "completing" or run.provider != "claude":
+        return "none", None
+    anchor = run.assessment.get("_claude_native_recovery")
+    if not isinstance(anchor, str) or not anchor:
+        return "none", None
+    event = _claude_native_lead_event(
+        state, session, project, environ, require_missing=False)
+    if event is None:
+        return "unknown", None
+    token = f"prompt_id:{event.payload['prompt_id']}"
+    if token == anchor:
+        return "none", None
+    return "completed", event
+
+
+def _claude_callback_matches_native(source: Event, native: Event, session: str) -> bool:
+    identity = native.payload["agent_id"]
+    payload = source.payload
+    report = payload.get("last_assistant_message")
+    return bool(
+        source.kind == "subagent_stopped" and payload.get("provider") == "claude"
+        and not payload.get("_symphony_owner_conflict")
+        and (payload.get("agent_id") or payload.get("subagent_id")) == identity
+        and payload.get("parent_thread_id") in {None, "", session}
+        and payload.get("session_id") in {session, identity}
+        and str(payload.get("status") or "completed").lower() == "completed"
+        and payload.get("prompt_id") in {None, "", native.payload["prompt_id"]}
+        and payload.get("agent_type") in {None, "", native.payload["agent_type"]}
+        and payload.get("model") in {None, "", native.payload["model"]}
+        and payload.get("model_reasoning_effort") in {
+            None, "", native.payload["model_reasoning_effort"]}
+        and isinstance(report, str) and _reported_status(report) == "completed"
+        and native.payload["last_assistant_message"] in report
+    )
+
+
+def claude_current_native_lead_event(
+    state: ProjectState, source: Event, session: str, project: Path,
+    environ: Mapping[str, str],
+) -> Event | None:
+    """Attach a current native prompt to a callback missing its turn ID."""
+    run = state.active_run
+    if not run or run.provider != "claude" or run.session_id != session or run.status != "active":
+        return None
+    lead = next((item for item in run.delegations
+                 if item.identity == run.lead_identity and item.role == "lead"), None)
+    if not lead or lead.state.lower() not in {"working", "pending"}:
+        return None
+    native = _claude_native_lead_event(
+        state, session, project, environ, require_missing=False)
+    if (native is None or f"prompt_id:{native.payload['prompt_id']}" in
+            run.assessment.get("_terminal_turns", {}).get(lead.identity, ())
+            or not _claude_callback_matches_native(source, native, session)):
+        return None
+    return native
+
+
+def claude_committed_native_terminal_replay(
+    state: ProjectState, source: Event, session: str, project: Path,
+    environ: Mapping[str, str],
+) -> bool:
+    """Match a delayed hook to the exact native terminal already accepted."""
+    if (source.kind != "subagent_stopped" or source.payload.get("provider") != "claude"
+            or source.payload.get("_symphony_owner_conflict")):
+        return False
+    identity = source.payload.get("agent_id") or source.payload.get("subagent_id")
+    if not identity or str(source.payload.get("status") or "completed").lower() != "completed":
+        return False
+    if (source.payload.get("parent_thread_id") not in {None, "", session}
+            or source.payload.get("session_id") not in {session, identity}):
+        return False
+    report = source.payload.get("last_assistant_message")
+    if _reported_status(report) != "completed":
+        return False
+    current = state.active_runs.get(f"claude:{session}")
+    if (current is None and state.active_run and state.active_run.provider == "claude"
+            and state.active_run.session_id == session):
+        current = state.active_run
+    if (current and current.provider == "claude" and current.session_id == session
+            and current.lead_identity == identity and current.status == "active"
+            and any(item.identity == identity and item.state.lower() in {"working", "pending"}
+                    for item in current.delegations)):
+        # This lead has started another turn. A byte-identical old report
+        # cannot identify an untagged callback from the newer native turn.
+        return False
+    candidates = ([current] if current else []) + list(state.recent_runs)
+    # Recent runs are a bounded display archive. The atomic terminal receipt
+    # is the lifetime proof for a root that may resume after that trim.
+    for receipt in state.terminal_receipts:
+        if (receipt.get("provider") != "claude" or receipt.get("session") != session
+                or receipt.get("agent") != identity or receipt.get("lead") != identity
+                or receipt.get("status") != "completed"
+                or not str(receipt.get("turn") or "").startswith("prompt_id:")
+                or not all(receipt.get(field) for field in (
+                    "native_agent_type", "native_model", "native_effort", "run_id"))):
+            continue
+        candidates.append(RunState(
+            str(receipt["run_id"]), "", status="completed", session_id=session,
+            provider="claude", lead_identity=str(identity),
+            started_at="1970-01-01T00:00:00+00:00",
+            assessment={"_claude_native_recovery": receipt["turn"]},
+            delegations=(Delegation(str(identity), "lead", "", "completed",
+                                    str(receipt["native_model"]),
+                                    str(receipt["native_effort"])),),
+        ))
+    for run in candidates:
+        if not run or run.provider != "claude" or run.session_id != session or run.lead_identity != identity:
+            continue
+        anchor = run.assessment.get("_claude_native_recovery")
+        if not isinstance(anchor, str) or not anchor:
+            continue
+        native = _claude_native_lead_event(
+            ProjectState(active_run=run, event_history=state.event_history),
+            session, project, environ, require_missing=False,
+            target_prompt=anchor.removeprefix("prompt_id:"))
+        if (native is not None and anchor == f"prompt_id:{native.payload['prompt_id']}"
+                and _claude_callback_matches_native(source, native, session)):
+            return True
+    return False
 
 
 def _native_lead_turns(

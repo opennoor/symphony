@@ -111,9 +111,13 @@ def _delegation_from_dict(value: Any) -> Delegation:
 
 def _receipt_from_dict(value: Any) -> dict[str, str]:
     receipt = _object(value, "terminal receipt")
-    return {key: _text(receipt.get(key), f"terminal receipt.{key}")
-            for key in ("provider", "session", "agent", "run_id",
-                        "turn", "result", "parent", "lead")}
+    required = ("provider", "session", "agent", "run_id",
+                "turn", "result", "parent", "lead")
+    optional = ("status", "native_agent_type", "native_model", "native_effort")
+    return {**{key: _text(receipt.get(key), f"terminal receipt.{key}")
+               for key in required},
+            **{key: _text(receipt.get(key, ""), f"terminal receipt.{key}")
+               for key in optional}}
 
 
 def _run_from_dict(value: Any) -> RunState:

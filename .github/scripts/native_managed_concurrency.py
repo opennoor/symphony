@@ -410,13 +410,55 @@ def codex_host_trace(home, session, lead_id, error_log):
             except ValueError:
                 continue
 
+    def output_summary(payload):
+        value = payload.get("output")
+        parsed = value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = value
+        empty = value is None or value == "" or value == [] or value == {}
+        shape = ("null" if value is None else
+                 "empty_string" if value == "" else
+                 "json_object" if isinstance(value, str) and isinstance(parsed, dict) else
+                 "json_array" if isinstance(value, str) and isinstance(parsed, list) else
+                 "text" if isinstance(value, str) else type(value).__name__)
+        details = {"payload_keys": sorted(key for key in payload
+                                           if re.fullmatch(r"[A-Za-z0-9_]{1,64}", key))[:16],
+                   "output_field_present": "output" in payload,
+                   "output_shape": shape, "output_empty": empty,
+                   "output_json_keys": sorted(key for key in parsed
+                                              if re.fullmatch(r"[A-Za-z0-9_]{1,64}", key))[:16]
+                   if isinstance(parsed, dict) else []}
+        return parsed, details
+
+    def agent_roster(parsed):
+        agents = parsed.get("agents") if isinstance(parsed, dict) else None
+        if not isinstance(agents, list):
+            return None
+        roster = []
+        for agent in agents[:16]:
+            if not isinstance(agent, dict):
+                continue
+            name = agent.get("agent_name") or agent.get("task_name") or agent.get("name")
+            status = agent.get("agent_status") or agent.get("status")
+            roster.append({"name": name if isinstance(name, str) and
+                           re.fullmatch(r"[A-Za-z0-9_/-]{1,128}", name) else None,
+                           "status": status if isinstance(status, str) and
+                           re.fullmatch(r"[A-Za-z0-9_ -]{1,64}", status) else None})
+        return {"count": len(agents), "entries": roster,
+                "truncated": len(agents) > 16}
+
     session_dir = home / "sessions"
     root_file = next(session_dir.rglob(f"*{session}.jsonl"), None) if session_dir.exists() else None
     child_file = next(session_dir.rglob(f"*{lead_id}.jsonl"), None) if lead_id and session_dir.exists() else None
     calls = {}
     spawns = {}
+    roster_call_ids = set()
     outputs = {}
     activities = []
+    last_roster = None
     root_turns = {}
     last_call = None
     for record in records(root_file):
@@ -441,6 +483,8 @@ def codex_host_trace(home, session, lead_id, error_log):
             last_call = {"name": name if isinstance(name, str)
                          and re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) else None,
                          "call_hash": fingerprint(call_id), "call_id": call_id}
+            if name == "list_agents" and call_id:
+                roster_call_ids.add(call_id)
             if name not in {"followup_task", "spawn_agent"}:
                 continue
             try:
@@ -459,22 +503,49 @@ def codex_host_trace(home, session, lead_id, error_log):
                                   "target": target if isinstance(target, str)
                                   and re.fullmatch(r"[A-Za-z0-9_/-]{1,128}", target) else None}
         elif record.get("type") == "response_item" and payload.get("type") == "function_call_output":
-            output = str(payload.get("output") or "")
-            kind = ("invalid_name" if "agent_name must use only lowercase" in output else
-                    "unknown_agent" if "agent" in output.lower() and any(
-                        term in output.lower() for term in ("not found", "does not exist", "unknown")) else
-                    "tool_error" if '"isError":true' in output or '"is_error":true' in output else
-                    "returned")
-            outputs[payload.get("call_id")] = {"kind": kind, "hash": fingerprint(output)}
+            parsed, shape = output_summary(payload)
+            output = payload.get("output")
+            output_text = output if isinstance(output, str) else json.dumps(output, default=str)
+            error = (payload.get("is_error") is True or payload.get("isError") is True
+                     or isinstance(parsed, dict) and (
+                         parsed.get("is_error") is True or parsed.get("isError") is True
+                         or (isinstance(parsed.get("status"), str) and
+                             parsed["status"] in {"failed", "error", "rejected"})
+                         or bool(parsed.get("error")))
+                     or '"isError":true' in output_text or '"is_error":true' in output_text)
+            kind = ("invalid_name" if "agent_name must use only lowercase" in output_text else
+                    "unknown_agent" if "agent" in output_text.lower() and any(
+                        term in output_text.lower() for term in ("not found", "does not exist", "unknown")) else
+                    "tool_error" if error else
+                    "empty_output" if shape["output_empty"] else "returned")
+            call_id = payload.get("call_id")
+            outputs[call_id] = {"kind": kind,
+                                "hash": fingerprint(output_text) if not shape["output_empty"] else None,
+                                "error_detected": bool(error), "shape": shape}
+            if call_id in roster_call_ids:
+                # Keep only the last parseable roster; never retain tool prose.
+                roster = agent_roster(parsed)
+                if roster is not None:
+                    last_roster = roster
         elif record.get("type") == "event_msg" and payload.get("type") == "item_completed":
             item = payload.get("item") or {}
             if item.get("type") == "SubAgentActivity" and item.get("agent_thread_id") == lead_id:
                 activities.append({"call_hash": fingerprint(item.get("id")),
                                    "kind": item.get("kind"),
                                    "agent_thread_id": item.get("agent_thread_id")})
-    followups = [{**details, "tool_return_recorded": call_id in outputs,
+    spawned_names = {item["task_name"] for item in spawns.values() if item.get("task_name")}
+    lead_spawn_names = {item["task_name"] for item in spawns.values()
+                        if item.get("task_name") and any(
+                            activity["call_hash"] == item["call_hash"]
+                            and activity["agent_thread_id"] == lead_id for activity in activities)}
+    followups = [{**details, "target_matches_spawn_name": details["target"] in spawned_names,
+                  "target_matches_lead_spawn_name": details["target"] in lead_spawn_names
+                  if lead_spawn_names else None,
+                  "tool_return_recorded": call_id in outputs,
                   "tool_return_kind": (outputs.get(call_id) or {}).get("kind"),
                   "tool_return_hash": (outputs.get(call_id) or {}).get("hash"),
+                  "tool_return_error_detected": (outputs.get(call_id) or {}).get("error_detected"),
+                  "tool_return_shape": (outputs.get(call_id) or {}).get("shape"),
                   "activity_kinds": [item["kind"] for item in activities
                                      if item["call_hash"] == details["call_hash"]],
                   "same_lead_id": any(item["call_hash"] == details["call_hash"]
@@ -482,6 +553,7 @@ def codex_host_trace(home, session, lead_id, error_log):
                                       for item in activities)}
                  for call_id, details in calls.items()]
     spawn_calls = [{**details, "tool_return_kind": (outputs.get(call_id) or {}).get("kind"),
+                    "tool_return_shape": (outputs.get(call_id) or {}).get("shape"),
                     "same_lead_id": any(item["call_hash"] == details["call_hash"]
                                         and item["agent_thread_id"] == lead_id
                                         for item in activities)}
@@ -526,6 +598,7 @@ def codex_host_trace(home, session, lead_id, error_log):
             "lead_parent_matches_root": child_parent == session if child_file else None,
             "followup_calls": followups,
             "spawn_calls": spawn_calls,
+            "last_list_agents_roster": last_roster,
             "root_turns_tail": list(root_turns.values())[-3:],
             "last_root_function_call": last_call,
             "lead_activity": activities,
@@ -692,8 +765,11 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                                      or any(run.get("session_id") == sessions[label]
                                             and run.get("status") == "completed"
                                             for run in current[label].get("recent_runs", [])))
+                    native_lead_stopped = (captured_claude_lead_stop(root, sessions[label],
+                                                                     observed_leads[label])
+                                           if update else False)
                     if (process.poll() == 0 and label not in resumed
-                            and (old_lead_completed if update else
+                            and (native_lead_stopped if update else
                                  lead_returned or deadline - time.monotonic() < 90)):
                         if update:
                             activation = current[label].get("activation", {}).get(provider, {})
@@ -702,7 +778,13 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                                        and item.get("plugin_version") == update["old_version"]
                                        and item.get("runtime_root") == old_records[label]["runtime_root"]
                                        for item in records):
-                                raise RuntimeError(f"{label}: old lead did not finish under retained runtime")
+                                raise RuntimeError(f"{label}: old retained activation was lost before resume")
+                            snapshot.setdefault("pre_candidate_resume", {})[label] = {
+                                "old_product_lead_completed": old_lead_completed,
+                                "native_lead_stop_captured": True,
+                                "events": event_counts(current[label]),
+                            }
+                            snapshot_file.write_text(json.dumps(snapshot))
                         resume_claude(env, first if label == "a" else second,
                                       sessions[label], budget, deadline)
                         resumed.add(label)
@@ -823,6 +905,16 @@ def codex_hook_capture_summary(root, provider="codex"):
             record["terminal_index_for_agent"] = terminals[identity]
     return {"configured": True, "records": records,
             "event_counts": dict(Counter(record["event"] for record in records))}
+
+
+def captured_claude_lead_stop(root, session_id, lead_id):
+    """Require an independent completed host callback for this original lead."""
+    return any(record.get("event") == "SubagentStop"
+               and record.get("session_id") == session_id
+               and record.get("agent_id") == lead_id
+               and record.get("exit_marker_written")
+               and record.get("script_exit_marker_code") == 0
+               for record in codex_hook_capture_summary(root, "claude")["records"])
 
 
 def failure_state(root, provider):
