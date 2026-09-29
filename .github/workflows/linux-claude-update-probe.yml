@@ -1,6 +1,9 @@
 name: Linux Claude active update probe
 
 on:
+  push:
+    branches:
+      - fix/session-terminal-replay-and-updates
   workflow_dispatch:
 
 jobs:
