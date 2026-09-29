@@ -92,7 +92,9 @@ def prompt(provider, label, recover, project):
     recovery = (
         'The lead MUST finish its first turn after the gate with exactly '
         'SYMPHONY_OUTCOME: {"status":"blocked"}. Await that result. '
-        'Then use followup_task on the SAME lead identity, asking it to return exactly '
+        'Then use followup_task on the SAME lead identity, passing the exact task_name '
+        'used in spawn_agent as target (lowercase letters, digits, and underscores; '
+        'do not pass a /root/ path or agent UUID), asking it to return exactly '
         'SYMPHONY_OUTCOME: {"status":"completed"}; await the follow-up. '
         if recover else 'After the gate returns, return SYMPHONY_OUTCOME: {"status":"completed"}. '
     )
@@ -181,7 +183,13 @@ def resume_codex(env, project, session, logs, deadline):
         raise RuntimeError("codex CLI is missing")
     command = [executable, "exec", "resume", "--dangerously-bypass-hook-trust",
                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-               "--model", "gpt-6-luna", session, "$symphony:symphony status"]
+               "--model", "gpt-6-luna", session,
+               "Resume the original Symphony run in this session. Reconcile its registered lead "
+               "from the native host result; if a retry is needed, call followup_task with the "
+               "exact original spawn_agent task_name, without a /root/ prefix or UUID, and await "
+               "the same lead. Preserve the original run and gate evidence. When the lead and "
+               "all tracked work are reconciled, invoke the normal $symphony:symphony stop "
+               "control and check durable status. Do not force stop or rerun the gate."]
     status_file = logs / "a.resume.status.json"
     try:
         with (logs / "a.resume.stdout").open("w", encoding="utf-8") as stdout, \
@@ -283,7 +291,7 @@ def prepare_live_update(provider, root, old_source, candidate_source):
         if any(character.isspace() for character in str(script)):
             raise RuntimeError("native Codex hook capture requires a temporary path without spaces")
         hooks = {"hooks": {}}
-        for event in ("SessionStart", "SubagentStart", "SubagentStop"):
+        for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
             command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()}"
             windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()}"
             hooks["hooks"][event] = [{"hooks": [{"type": "command", "command": command,
@@ -302,6 +310,18 @@ def prepare_live_update(provider, root, old_source, candidate_source):
                 raise RuntimeError("disposable Claude config is not authenticated")
         claude_command(env, root, "plugin", "marketplace", "add", str(old_market))
         claude_command(env, root, "plugin", "install", "-y", "symphony@symphony-old")
+        capture = root / "claude-hook-capture"
+        capture.mkdir()
+        script = root / "capture_claude_hook.py"
+        script.write_text(CODEX_HOOK_CAPTURE)
+        settings_path = home / "settings.json"
+        settings = json.loads(settings_path.read_text())
+        hooks = settings.setdefault("hooks", {})
+        for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
+            command = (f'python -I "{script.as_posix()}" {event} '
+                       f'"{capture.as_posix()}"')
+            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command}]})
+        settings_path.write_text(json.dumps(settings))
     old_cache = home / "plugins" / "cache" / "symphony-old" / "symphony" / old_version
     hook = "codex.json" if provider == "codex" else "hooks.json"
     if not (old_cache / "hooks" / hook).is_file():
@@ -394,7 +414,8 @@ def codex_host_trace(home, session, lead_id, error_log):
     root_file = next(session_dir.rglob(f"*{session}.jsonl"), None) if session_dir.exists() else None
     child_file = next(session_dir.rglob(f"*{lead_id}.jsonl"), None) if lead_id and session_dir.exists() else None
     calls = {}
-    outputs = set()
+    spawns = {}
+    outputs = {}
     activities = []
     root_turns = {}
     last_call = None
@@ -420,20 +441,31 @@ def codex_host_trace(home, session, lead_id, error_log):
             last_call = {"name": name if isinstance(name, str)
                          and re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) else None,
                          "call_hash": fingerprint(call_id), "call_id": call_id}
-            if payload.get("name") != "followup_task":
+            if name not in {"followup_task", "spawn_agent"}:
                 continue
             try:
                 arguments = json.loads(payload.get("arguments") or "{}")
             except ValueError:
                 arguments = {}
             call_id = payload.get("call_id")
-            if call_id:
+            if call_id and name == "spawn_agent":
+                task_name = arguments.get("task_name")
+                spawns[call_id] = {"call_hash": fingerprint(call_id),
+                                   "task_name": task_name if isinstance(task_name, str)
+                                   and re.fullmatch(r"[a-z0-9_]{1,128}", task_name) else None}
+            if call_id and name == "followup_task":
                 target = arguments.get("target")
                 calls[call_id] = {"call_hash": fingerprint(call_id),
                                   "target": target if isinstance(target, str)
                                   and re.fullmatch(r"[A-Za-z0-9_/-]{1,128}", target) else None}
         elif record.get("type") == "response_item" and payload.get("type") == "function_call_output":
-            outputs.add(payload.get("call_id"))
+            output = str(payload.get("output") or "")
+            kind = ("invalid_name" if "agent_name must use only lowercase" in output else
+                    "unknown_agent" if "agent" in output.lower() and any(
+                        term in output.lower() for term in ("not found", "does not exist", "unknown")) else
+                    "tool_error" if '"isError":true' in output or '"is_error":true' in output else
+                    "returned")
+            outputs[payload.get("call_id")] = {"kind": kind, "hash": fingerprint(output)}
         elif record.get("type") == "event_msg" and payload.get("type") == "item_completed":
             item = payload.get("item") or {}
             if item.get("type") == "SubAgentActivity" and item.get("agent_thread_id") == lead_id:
@@ -441,12 +473,19 @@ def codex_host_trace(home, session, lead_id, error_log):
                                    "kind": item.get("kind"),
                                    "agent_thread_id": item.get("agent_thread_id")})
     followups = [{**details, "tool_return_recorded": call_id in outputs,
+                  "tool_return_kind": (outputs.get(call_id) or {}).get("kind"),
+                  "tool_return_hash": (outputs.get(call_id) or {}).get("hash"),
                   "activity_kinds": [item["kind"] for item in activities
                                      if item["call_hash"] == details["call_hash"]],
                   "same_lead_id": any(item["call_hash"] == details["call_hash"]
                                       and item["agent_thread_id"] == lead_id
                                       for item in activities)}
                  for call_id, details in calls.items()]
+    spawn_calls = [{**details, "tool_return_kind": (outputs.get(call_id) or {}).get("kind"),
+                    "same_lead_id": any(item["call_hash"] == details["call_hash"]
+                                        and item["agent_thread_id"] == lead_id
+                                        for item in activities)}
+                   for call_id, details in spawns.items()]
     if last_call:
         last_call = {"name": last_call["name"], "call_hash": last_call["call_hash"],
                      "return_recorded": last_call["call_id"] in outputs}
@@ -486,6 +525,7 @@ def codex_host_trace(home, session, lead_id, error_log):
             "lead_jsonl_present": child_file is not None,
             "lead_parent_matches_root": child_parent == session if child_file else None,
             "followup_calls": followups,
+            "spawn_calls": spawn_calls,
             "root_turns_tail": list(root_turns.values())[-3:],
             "last_root_function_call": last_call,
             "lead_activity": activities,
@@ -738,8 +778,8 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                 "candidate_version": candidate_version, "pending_callbacks": 0,
                 **({"native_resumed": sorted(resumed)} if provider == "claude" else
                    {"native_resumed": ["a"]} if update and provider == "codex" else {}),
-                **({"native_hook_capture": codex_hook_capture_summary(root)}
-                   if update and provider == "codex" else {}),
+                **({"native_hook_capture": codex_hook_capture_summary(root, provider)}
+                   if update else {}),
                 **({"live_update": f"{update['old_version']}->{update['candidate_version']}"} if update else {})}
     finally:
         for project in {first, second}:
@@ -754,9 +794,9 @@ def check_case(provider, root, separate, timeout, budget, update=None):
                     process.wait()
 
 
-def codex_hook_capture_summary(root):
+def codex_hook_capture_summary(root, provider="codex"):
     """Read independent user hooks without collecting native transcripts or payload bodies."""
-    directory = root / "codex-hook-capture"
+    directory = root / f"{provider}-hook-capture"
     if not directory.is_dir():
         return {"configured": False, "records": []}
     records = []
@@ -767,7 +807,7 @@ def codex_hook_capture_summary(root):
             marker = json.loads(exit_path.read_text()) if exit_path.is_file() else {}
         except (OSError, ValueError):
             continue
-        if entry.get("event") not in {"SessionStart", "SubagentStart", "SubagentStop"}:
+        if entry.get("event") not in {"SessionStart", "SubagentStart", "SubagentStop", "Stop"}:
             continue
         records.append({key: entry.get(key) for key in
                         ("invocation_id", "event", "session_id", "agent_id", "turn_id",
@@ -987,7 +1027,7 @@ def failure_state(root, provider):
     resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
     return {"provider": provider, "cases": cases, "native_host_trace": host,
             "native_resume_status": resume_status,
-            "native_hook_capture": codex_hook_capture_summary(root) if provider == "codex" else None}
+            "native_hook_capture": codex_hook_capture_summary(root, provider)}
 
 
 def main():

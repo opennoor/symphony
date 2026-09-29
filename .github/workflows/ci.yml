@@ -205,9 +205,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Native packaged Claude max assessor failed' }
           $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
           python .github/scripts/claude_isolated_worktree.py --timeout 300
-          if ($LASTEXITCODE -ne 0) { throw 'Native Claude isolated child worktree failed' }
+          $isolatedExit = $LASTEXITCODE
           python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600
-          if ($LASTEXITCODE -ne 0) { throw 'Native Claude managed concurrency failed' }
+          $managedExit = $LASTEXITCODE
           $oldCheckout = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
           if (-not (Test-Path (Join-Path $oldCheckout 'plugins/symphony/hooks/hooks.json'))) {
             git fetch origin tag v1.5.1
@@ -218,7 +218,10 @@ jobs:
           python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 `
             --live-update --old-plugin-root (Join-Path $oldCheckout 'plugins/symphony') `
             --candidate-plugin-root (Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony')
-          if ($LASTEXITCODE -ne 0) { throw 'Native Claude live-update continuity failed' }
+          $updateExit = $LASTEXITCODE
+          if ($isolatedExit -ne 0 -or $managedExit -ne 0 -or $updateExit -ne 0) {
+            throw "Native Claude checks failed: isolated=$isolatedExit managed=$managedExit update=$updateExit"
+          }
 
       - name: Preserve Windows Codex native failure after Claude checks
         if: ${{ always() && steps.windows_codex_native.outcome == 'failure' }}
@@ -348,11 +351,19 @@ jobs:
             git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
           fi
           export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          set +e
           python3 .github/scripts/claude_isolated_worktree.py --timeout 300
+          isolated_exit=$?
           python3 .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 \
             --live-update \
             --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
             --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
+          update_exit=$?
+          set -e
+          if [ "$isolated_exit" -ne 0 ] || [ "$update_exit" -ne 0 ]; then
+            echo "::error::Claude native checks failed: isolated=$isolated_exit update=$update_exit"
+            exit 1
+          fi
 
       - name: Preserve Linux Codex native failure after Claude checks
         if: ${{ always() && steps.linux_codex_native.outcome == 'failure' }}

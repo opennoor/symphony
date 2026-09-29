@@ -67,6 +67,13 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         legacy_roots,
     )
     source = event_from_payload(provider, payload)
+    # A graceful user control is a Stop request for ownership, inbox replay,
+    # and native-turn freshness as well as for the reducer. Keeping it as a
+    # user_prompt until _handle_control would bypass those shared guards.
+    explicit_stop = (source.kind == "user_prompt" and
+                     _parse_control(str(source.payload.get("prompt") or "")) == ("stop", ""))
+    if explicit_stop:
+        source = replace(source, kind="stop_requested")
     expected_owner = ""
 
     def dispatch(state: ProjectState, event: Event) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -2418,7 +2425,18 @@ def _render_actions(
             identities = ", ".join(map(str, action.payload.get("active", ())))
             rendered.append(Action("inject_context", {"text": f"Stop these tracked Symphony agents and verify their host status: {identities}."}))
         elif action.kind == "replace_lead":
-            rendered.append(Action("inject_context", {"text": "The observed lead is unavailable. Spawn one safe replacement at the recorded owner generation."}))
+            run = state.active_run
+            if (provider == "codex" and run and run.lead_identity
+                    and run.assessment.get("_retryable_lead") == run.lead_identity):
+                rendered.append(Action("inject_context", {"text":
+                    "The registered lead ended a retryable turn. Continue that same lead first with "
+                    "followup_task using the original task_name from spawn_agent (lowercase letters, "
+                    "digits, and underscores), not a /root/ path or agent UUID. Await its new result. "
+                    "Spawn a replacement at the recorded owner generation only if the host confirms "
+                    "the original lead is unavailable."}))
+            else:
+                rendered.append(Action("inject_context", {"text":
+                    "The observed lead is unavailable. Spawn one safe replacement at the recorded owner generation."}))
         elif action.kind == "route_run":
             route = state.active_run.assessment.get("route", {}) if state.active_run else {}
             model, effort = _required_lead_route(state.active_run.assessment) if state.active_run else ("", "")
@@ -2590,11 +2608,16 @@ def _recovery_guidance(state: ProjectState) -> str:
     pending = run.assessment.get("_pending_delegations", ())
     awaiting = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
     lead = f" Lead {run.lead_identity} [{_governance(state)}]." if run.lead_identity else " Lead not yet observed."
+    retry = ("For a retryable Codex lead, use followup_task with the original spawn_agent "
+             "task_name (lowercase letters, digits, and underscores), not its /root/ path or UUID; "
+             "replace it only if the host confirms it is unavailable. "
+             if run.provider == "codex" and run.lead_identity
+             and run.assessment.get("_retryable_lead") == run.lead_identity else "")
     return (
         f"Symphony run {run.run_id} remains {run.status}.{lead} "
         f"Observed agents: {records or 'none'}. "
         + (f"Awaiting host launch confirmation: {awaiting}. " if awaiting else "")
-        + "Reconcile returned or interrupted results, preserve ownership, and continue unfinished work. "
+        + retry + "Reconcile returned or interrupted results, preserve ownership, and continue unfinished work. "
         "An ended host turn does not complete this run; report completion only when durable status confirms it."
     )
 

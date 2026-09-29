@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Check Claude's native background Agent worktree hooks in disposable state.
 
-The capture hook stores only lifecycle identity fields. It never stores prompts,
-transcripts, tool output, or credentials. This is a separate regression from the
+The capture hook stores lifecycle identity and classified Agent failure flags.
+It never stores prompts, transcripts, tool output, or credentials. This is a separate regression from the
 shared-checkout native managed concurrency harness.
 """
 
@@ -20,7 +20,7 @@ import uuid
 import native_managed_concurrency as native
 
 
-CAPTURE = '''import json, os, pathlib, sys, uuid
+CAPTURE = '''import hashlib, json, os, pathlib, re, sys, uuid
 try:
     payload = json.load(sys.stdin)
     record = {key: payload.get(key) for key in
@@ -33,6 +33,31 @@ try:
                                 ("subagent_type", "isolation", "run_in_background")}
     elif payload.get("hook_event_name") == "PreToolUse":
         raise SystemExit(0)
+    if payload.get("hook_event_name") in ("PostToolUse", "PostToolUseFailure"):
+        if payload.get("tool_name") != "Agent":
+            raise SystemExit(0)
+        response = payload.get("tool_response") or payload.get("tool_result") or {}
+        failed = (payload.get("hook_event_name") == "PostToolUseFailure"
+                  or payload.get("is_error") is True
+                  or isinstance(response, dict) and (response.get("is_error") is True
+                      or response.get("status") in ("failed", "error", "rejected")))
+        result = payload.get("error") or response or ""
+        if isinstance(result, dict):
+            result = result.get("error") or result.get("message") or result.get("content") or ""
+        if isinstance(result, list):
+            result = " ".join(str(item.get("text", "")) for item in result if isinstance(item, dict))
+        result = str(result)
+        record["tool_failure_hash"] = hashlib.sha256(result.encode()).hexdigest()[:12] if result else None
+        if failed:
+            lowered = result.lower()
+            record["tool_failure_flags"] = sorted(name for name, pattern in {
+                "worktree": r"worktree", "git": r"\\bgit\\b", "isolation": r"isolat",
+                "unsupported": r"unsupported|not supported", "missing": r"not found|does not exist|missing",
+                "permission": r"permission|access denied", "dirty": r"uncommitted|dirty",
+                "path": r"directory|path|folder", "collision": r"already exists|conflict",
+                "launch": r"spawn|launch|start", "failed": r"fail|error|reject",
+            }.items() if re.search(pattern, lowered))
+            record["tool_failure_unknown"] = not bool(record["tool_failure_flags"])
     destination = pathlib.Path(os.environ["SYMPHONY_CAPTURE_DIR"])
     destination.mkdir(parents=True, exist_ok=True)
     (destination / (str(uuid.uuid4()) + ".json")).write_text(json.dumps(record))
@@ -80,6 +105,8 @@ def scratch_claude(root, package):
     settings = json.loads(settings_file.read_text())
     settings["hooks"] = {
         "PreToolUse": [{"matcher": "Agent", "hooks": [{"type": "command", "command": command}]}],
+        "PostToolUse": [{"matcher": "Agent", "hooks": [{"type": "command", "command": command}]}],
+        "PostToolUseFailure": [{"matcher": "Agent", "hooks": [{"type": "command", "command": command}]}],
         "SubagentStart": [{"hooks": [{"type": "command", "command": command}]}],
         "SubagentStop": [{"hooks": [{"type": "command", "command": command}]}],
     }

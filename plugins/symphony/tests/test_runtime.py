@@ -982,6 +982,7 @@ class RuntimeTests(unittest.TestCase):
         state = StateStore(self.state_root).load(self.project)
         self.assertEqual(state.active_run.status, "recovering")
         self.assertEqual(state.active_run.delegations[-1].state, "failed")
+        self.assertIn("original task_name", self.flush())
         stop = {**self.payload(""), "hook_event_name": "Stop"}
         self.assertEqual(self.output(handle(stop, self.environ))["decision"], "block")
 
@@ -1557,6 +1558,29 @@ class RuntimeTests(unittest.TestCase):
         handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
         archived = store.load(self.project)
         self.assertNotIn("codex:codex-session", archived.active_runs)
+        self.assertEqual("completed", archived.recent_runs[-1].status)
+
+    def test_explicit_graceful_stop_shares_native_freshness_gate(self):
+        choice = route_choice()
+        run = RunState("run", "task", lead_identity="lead", status="completing",
+                       outcome={"status": "completed"},
+                       delegations=(Delegation("lead", "lead", "task", "completed",
+                                               choice["model"], choice["effort"]),))
+        self.seed_run(run)
+        with patch.object(runtime_module, "codex_completing_lead_turn",
+                          return_value=("running", None)):
+            blocked = handle(self.payload("$symphony:symphony stop"), self.environ)
+        self.assertEqual("block", self.output(blocked)["decision"])
+        self.assertIn("newer native turn still running", self.output(blocked)["reason"])
+        store = StateStore(self.state_root)
+        self.assertEqual("completing", store.load(self.project).active_run.status)
+        with patch.object(runtime_module, "codex_completing_lead_turn",
+                          return_value=("complete", None)):
+            allowed = handle({**self.payload("$symphony:symphony stop"),
+                              "turn_id": "turn-2"}, self.environ)
+        self.assertNotEqual("block", self.output(allowed).get("decision"))
+        archived = store.load(self.project)
+        self.assertIsNone(archived.active_run)
         self.assertEqual("completed", archived.recent_runs[-1].status)
 
     def test_restarted_worker_failure_after_lead_completion_requires_recovery(self):
