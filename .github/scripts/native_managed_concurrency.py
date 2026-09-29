@@ -122,7 +122,11 @@ def prompt(provider, label, recover, project):
         "before blocking and GATE_RELEASED only after the harness releases it. "
         "Use the native command tool to run it; report success only after observing "
         "GATE_RELEASED from that command. " + recovery +
-        "Await all children and finish briefly. Do not edit files or inspect other projects."
+        "Await all children. Once their outcomes are reconciled, check Symphony status; "
+        f"if the original run remains completing, invoke the normal "
+        f"{'$symphony:symphony stop' if provider == 'codex' else '/symphony:stop'} "
+        "control in this same session and check durable status again. Never force stop. "
+        "Then finish briefly. Do not edit files or inspect other projects."
     )
 
 
@@ -493,6 +497,7 @@ def codex_host_trace(home, session, lead_id, error_log):
     last_roster = None
     root_turns = {}
     last_call = None
+    root_call_history = []
     for record in records(root_file):
         payload = record.get("payload") or {}
         if record.get("type") == "event_msg" and payload.get("type") == "task_started":
@@ -512,6 +517,24 @@ def codex_host_trace(home, session, lead_id, error_log):
         if record.get("type") == "response_item" and payload.get("type") == "function_call":
             name = payload.get("name")
             call_id = payload.get("call_id")
+            wait_timeout_ms = None
+            if isinstance(name, str) and "wait" in name.lower():
+                try:
+                    wait_arguments = json.loads(payload.get("arguments") or "{}")
+                except (TypeError, ValueError):
+                    wait_arguments = {}
+                value = (wait_arguments.get("timeout_ms", wait_arguments.get("timeoutMs"))
+                         if isinstance(wait_arguments, dict) else None)
+                if isinstance(value, int) and 0 <= value <= 3600000:
+                    wait_timeout_ms = value
+            root_call_history.append({
+                "name": name if isinstance(name, str) and
+                re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) else None,
+                "call_hash": fingerprint(call_id),
+                "called_at": record.get("timestamp"),
+                "wait_timeout_ms": wait_timeout_ms,
+                "returned": False,
+            })
             last_call = {"name": name if isinstance(name, str)
                          and re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) else None,
                          "call_hash": fingerprint(call_id), "call_id": call_id}
@@ -551,6 +574,11 @@ def codex_host_trace(home, session, lead_id, error_log):
                     "tool_error" if error else
                     "empty_output" if shape["output_empty"] else "returned")
             call_id = payload.get("call_id")
+            for call in reversed(root_call_history):
+                if call_id and call["call_hash"] == fingerprint(call_id):
+                    call["returned"] = True
+                    call["returned_at"] = record.get("timestamp")
+                    break
             outputs[call_id] = {"kind": kind,
                                 "hash": fingerprint(output_text) if not shape["output_empty"] else None,
                                 "error_detected": bool(error), "shape": shape}
@@ -632,11 +660,16 @@ def codex_host_trace(home, session, lead_id, error_log):
             "spawn_calls": spawn_calls,
             "last_list_agents_roster": last_roster,
             "root_turns_tail": list(root_turns.values())[-3:],
+            "root_tool_calls_tail": root_call_history[-12:],
             "last_root_function_call": last_call,
             "lead_activity": activities,
             "lead_turns": list(turns.values()),
+            "root_stop_hook": {
+                "invocation_count": len(re.findall(r"(?m)^hook: Stop(?: Started)?\r?$", log)),
+                "completed_count": len(re.findall(r"hook: Stop Completed", log)),
+                "failed_count": len(re.findall(r"hook: Stop Failed", log))},
             "subagent_stop_hook": {
-                "invocation_count": len(re.findall(r"hook: SubagentStop(?:\s|$)", log)),
+                "invocation_count": len(re.findall(r"(?m)^hook: SubagentStop(?: Started)?\r?$", log)),
                 "completed_count": len(re.findall(r"hook: SubagentStop Completed", log)),
                 "failed_count": len(re.findall(r"hook: SubagentStop Failed", log))}}
 
@@ -1160,15 +1193,15 @@ def failure_state(root, provider):
     host = {}
     if provider == "codex":
         for case in cases:
-            if case["case"] != "live-update":
-                continue
+            case_root = root / case["case"]
+            home = (root / "codex-live-update-home" if case["case"] == "live-update" else
+                    Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
             runs = [*case["active_runs"], *case["recent_runs"]]
             for label, session in case["cli_session_ids"].items():
                 lead = next((run.get("lead_id") for run in runs
                              if run.get("session_id") == session), None)
-                host[label] = codex_host_trace(
-                    root / "codex-live-update-home", session, lead,
-                    root / "live-update" / "logs" / f"{label}.errors")
+                host[f"{case['case']}:{label}"] = codex_host_trace(
+                    home, session, lead, case_root / "logs" / f"{label}.errors")
     resume_status_file = root / "live-update" / "logs" / "a.resume.status.json"
     resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
     return {"provider": provider, "cases": cases, "native_host_trace": host,

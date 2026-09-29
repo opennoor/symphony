@@ -63,9 +63,29 @@ try:
                     resolved = resolved.split(note, 1)[0].strip().rstrip(",.")
                 if "(" not in resolved or re.search(r"\\([^)]*\\)[\\\\/]", resolved):
                     resolved = resolved.replace("\\\\", "/").rstrip("/")
+                    pinned_path = pathlib.Path(pinned)
+                    resolved_path = pathlib.Path(resolved)
+                    try:
+                        same_file = os.path.samefile(pinned_path, resolved_path)
+                    except (OSError, ValueError):
+                        same_file = None
+                    try:
+                        pinned_real = os.path.realpath(pinned)
+                        resolved_real = os.path.realpath(resolved)
+                        pinned_exists = pinned_path.exists()
+                        resolved_exists = resolved_path.exists()
+                    except (OSError, ValueError):
+                        pinned_real = resolved_real = None
+                        pinned_exists = resolved_exists = None
                     record["worktree_path_relation"] = {
                         "exact_match": pinned == resolved,
                         "casefold_match": pinned.casefold() == resolved.casefold(),
+                        "realpath_casefold_match": (
+                            pinned_real.casefold() == resolved_real.casefold()
+                            if pinned_real is not None and resolved_real is not None else None),
+                        "same_file": same_file,
+                        "pinned_exists": pinned_exists,
+                        "resolved_exists": resolved_exists,
                         "drive_letter_case_differs": (
                             len(pinned) > 1 and len(resolved) > 1
                             and pinned[1] == resolved[1] == ":"
