@@ -30,7 +30,8 @@ def verified_retained(record):
         entries = list(source.rglob("*"))
         if not entries or any(path.is_symlink() for path in entries):
             return False
-        files = sorted(path for path in entries if path.is_file())
+        files = sorted((path for path in entries if path.is_file()),
+                       key=lambda path: path.relative_to(source).as_posix())
         aggregate = hashlib.sha256()
         for path in files:
             relative = path.relative_to(source).as_posix()

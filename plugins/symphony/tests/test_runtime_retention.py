@@ -69,7 +69,8 @@ class RuntimeRetentionTests(unittest.TestCase):
 
             new_root = self.materialize(directory, "Reviewed New Plugin With Spaces")
             init = new_root / "symphony" / "__init__.py"
-            init.write_text(init.read_text().replace("1.5.1", "99.0.0"))
+            old_version = json.loads((root / ".codex-plugin/plugin.json").read_text())["version"]
+            init.write_text(init.read_text().replace(old_version, "99.0.0"))
             for path, content in generated(new_root).items():
                 path.write_text(content)
             result, _ = self.run_hook(self.command(new_root, "codex", "SessionStart"),

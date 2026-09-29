@@ -689,9 +689,17 @@ def _terminal_result_id(source: Event) -> str:
     payload = source.payload
     fields = ("provider", "session_id", "agent_id", "subagent_id", "turn_id",
               "prompt_id", "status", "last_assistant_message", "agent_transcript_path",
-              "agent_type", "task_name", "model", "model_reasoning_effort")
+              "agent_type", "task_name", "role", "model", "model_reasoning_effort")
     stable = {key: payload[key] for key in fields if key in payload}
+    stable["observed_role"] = _observed_role(payload)
     return hashlib.sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _child_turn_token(payload: Mapping[str, object]) -> str:
+    for field in ("turn_id", "prompt_id"):
+        if payload.get(field):
+            return f"{field}:{payload[field]}"
+    return ""
 
 
 def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -711,12 +719,31 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         (item for item in state.active_run.delegations if item.identity == str(identity)),
         None,
     )
+    assessment = state.active_run.assessment
+    token = _child_turn_token(source.payload)
+    if source.kind == "subagent_started":
+        if source.event_id in assessment.get("_start_event_ids", ()):
+            return state, opening
+        terminal_turns = assessment.get("_terminal_turns", {})
+        if (current and current.state.lower() not in {"working", "pending"} and token
+                and token in terminal_turns.get(str(identity), ())):
+            return state, opening
+        updated = dict(assessment)
+        updated["_start_event_ids"] = (*assessment.get("_start_event_ids", ()), source.event_id)
+        if current and current.state.lower() not in {"working", "pending"}:
+            epochs = dict(assessment.get("_terminal_epochs", {}))
+            epochs[str(identity)] = epochs.get(str(identity), 0) + 1
+            updated["_terminal_epochs"] = epochs
+        state = replace(state, active_run=replace(state.active_run, assessment=updated))
     if source.kind == "subagent_stopped":
-        seen = state.active_run.assessment.get("_terminal_event_ids", ())
-        if _terminal_result_id(source) in seen or source.event_id in seen or any(
-            record.event_id == f"{source.event_id}:delegation:delegation_updated"
-            for record in state.event_history
-        ):
+        seen = assessment.get("_terminal_event_ids", ())
+        epoch = assessment.get("_terminal_epochs", {}).get(str(identity), 0)
+        result_id = _terminal_result_id(source)
+        if not token and epoch:
+            result_id = f"{epoch}:{result_id}"
+        if (result_id in seen or source.event_id in seen or
+                (not seen and any(record.event_id == f"{source.event_id}:delegation:delegation_updated"
+                                  for record in state.event_history))):
             return state, opening
     pending: Mapping[str, object] = {}
     if current is None:
@@ -735,7 +762,11 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     if source.kind == "subagent_stopped":
         assessment = dict(state.active_run.assessment)
         assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
-                                              _terminal_result_id(source))
+                                              result_id)
+        if token:
+            terminal_turns = dict(assessment.get("_terminal_turns", {}))
+            terminal_turns[str(identity)] = (*terminal_turns.get(str(identity), ()), token)
+            assessment["_terminal_turns"] = terminal_turns
         state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     terminal = source.kind == "subagent_stopped"
     status = str(source.payload.get("status") or ("completed" if terminal else "working"))

@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.runtime import compact_delegations, format_delegation, handle
@@ -964,6 +965,75 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(state.active_run.delegations[-1].state, "failed")
         stop = {**self.payload(""), "hook_event_name": "Stop"}
         self.assertEqual(self.output(handle(stop, self.environ))["decision"], "block")
+
+    def test_same_text_result_after_a_new_start_is_a_new_lifecycle(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                run = RunState(
+                    "run", "task", session_id="session", provider=provider, lead_identity="lead",
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(Delegation("lead", "lead", "task", "working", "", ""),
+                                 Delegation("worker", "worker", "task", "working", "", "")),
+                )
+                state = ProjectState(active_run=run)
+                base = {"provider": provider, "session_id": "session", "agent_id": "worker",
+                        "last_assistant_message": "Done."}
+                for event, extra in (("SubagentStop", {"status": "completed", "timestamp": "one"}),
+                                     ("SubagentStart", {"status": "working", "timestamp": "two"}),
+                                     ("SubagentStop", {"status": "completed", "timestamp": "three"})):
+                    state, _ = runtime_module._observe_delegation(
+                        state, event_from_payload(provider, {**base, **extra, "hook_event_name": event}))
+                worker = next(item for item in state.active_run.delegations if item.identity == "worker")
+                self.assertEqual("completed", worker.state)
+
+    def test_identified_old_result_cannot_replay_into_a_new_child_turn(self):
+        for provider, field in (("codex", "turn_id"), ("claude", "prompt_id")):
+            with self.subTest(provider=provider):
+                run = RunState(
+                    "run", "task", session_id="session", provider=provider, lead_identity="lead",
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(Delegation("lead", "lead", "task", "working", "", ""),
+                                 Delegation("worker", "worker", "task", "working", "", "")),
+                )
+                state = ProjectState(active_run=run)
+                base = {"provider": provider, "session_id": "session", "agent_id": "worker",
+                        "last_assistant_message": "Done."}
+
+                def observe(name, token, status):
+                    nonlocal state
+                    state, _ = runtime_module._observe_delegation(state, event_from_payload(
+                        provider, {**base, field: token, "hook_event_name": name, "status": status}))
+
+                observe("SubagentStop", "turn-one", "completed")
+                observe("SubagentStart", "turn-one", "working")  # delayed old start
+                self.assertEqual("completed", next(item.state for item in state.active_run.delegations
+                                                  if item.identity == "worker"))
+                observe("SubagentStart", "turn-two", "working")
+                observe("SubagentStop", "turn-two", "failed")
+                observe("SubagentStart", "turn-two", "working")  # duplicate start
+                observe("SubagentStop", "turn-one", "completed")  # stale old result
+                self.assertEqual("failed", next(item.state for item in state.active_run.delegations
+                                               if item.identity == "worker"))
+                observe("SubagentStop", "turn-two", "completed")
+                self.assertEqual("completed", next(item.state for item in state.active_run.delegations
+                                                  if item.identity == "worker"))
+
+    def test_terminal_retry_can_correct_explicit_role_evidence(self):
+        run = RunState(
+            "run", "task", session_id="session", provider="codex", lead_identity="lead",
+            assessment={"size": "small", "complexity": "simple"},
+            delegations=(Delegation("lead", "lead", "task", "working", "", ""),
+                         Delegation("worker", "worker", "task", "working", "", "")),
+        )
+        state = ProjectState(active_run=run)
+        base = {"provider": "codex", "session_id": "session", "agent_id": "worker",
+                "turn_id": "turn-one", "hook_event_name": "SubagentStop", "status": "completed",
+                "last_assistant_message": "Done."}
+        for role in ("worker", "consultant"):
+            state, _ = runtime_module._observe_delegation(
+                state, event_from_payload("codex", {**base, "role": role}))
+        worker = next(item for item in state.active_run.delegations if item.identity == "worker")
+        self.assertEqual("consultant", worker.role)
 
     def test_same_lead_followup_recovers_without_another_start_hook(self):
         choice = route_choice()

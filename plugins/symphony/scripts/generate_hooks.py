@@ -18,7 +18,7 @@ def bootstrap(root=PLUGIN):
              *root.glob("commands/*.md"), *root.glob("skills/**/*.md"),
              root / "profiles.json", root / "model-policy.json",
              root / "scripts/symphony_hook.py", root / "scripts/check_activation.py"]
-    expected = [path.relative_to(root).as_posix() for path in sorted(paths)]
+    expected = sorted(path.relative_to(root).as_posix() for path in paths)
     aggregate = hashlib.sha256()
     for relative in expected:
         aggregate.update(relative.encode() + b"\0" + hashlib.sha256((root / relative).read_bytes()).digest())
