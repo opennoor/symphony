@@ -94,6 +94,17 @@ class HostEvidenceTests(unittest.TestCase):
         self.assertEqual(LEAD_ID, state.recent_runs[-1].lead_identity)
         self.assertEqual("completed", state.recent_runs[-1].outcome["status"])
 
+    def test_released_151_status_guides_stop_after_native_recovery(self):
+        self.write_turns()
+        self.load_released_recovering_state()
+        response = handle({"session_id": ROOT_ID, "cwd": str(self.project),
+                           "hook_event_name": "UserPromptSubmit", "turn_id": "root-turn",
+                           "prompt": "$symphony:symphony status"}, self.environ)
+        context = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Invoke the normal `$symphony:symphony stop`", context)
+        self.assertNotIn("tracked work still requires reconciliation", context)
+        self.assertEqual("completing", self.store.load(self.project).active_run.status)
+
     def test_released_151_recovery_requires_unique_failed_turn(self):
         for edit in ("no_failure_event", "duplicate_lead_start", "extra_prior_failed_turn", "wrong_parent",
                      "wrong_model", "newer_running"):

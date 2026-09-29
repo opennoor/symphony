@@ -21,8 +21,8 @@ from .host_evidence import (
     claude_current_native_lead_event, claude_recovered_lead_event,
     codex_completing_lead_turn, codex_recovered_lead_event,
 )
-from .model import Action, Delegation, Event, ProjectState
-from .reducer import reduce
+from .model import Action, Delegation, Event, ProjectState, RunState
+from .reducer import _stop_block_reason, reduce
 from .routing import (
     Assessment,
     EFFORTS,
@@ -214,7 +214,10 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             else:
                 state, actions = dispatch(state, source)
             if not unresolved:
+                before_finish = state
                 state = _finish_pending_batch(state, provider, session, source)
+                actions = _refresh_completion_guidance(
+                    actions, before_finish, state, source, provider)
         else:
             if not unresolved:
                 state = _finish_pending_batch(state, provider, session, source)
@@ -807,7 +810,7 @@ def _transition(
         state, resume_actions = _reconcile_session(state, source, payload)
         actions += resume_actions
         if state.active_run:
-            actions += (Action("inject_context", {"text": _recovery_guidance(state)}),)
+            actions += (Action("inject_context", {"text": _recovery_guidance(state, provider)}),)
     elif source.kind == "pre_tool_use":
         state, delegation_actions = _prepare_delegation(state, source, provider)
         actions += delegation_actions
@@ -1169,7 +1172,7 @@ def _task_guidance(state: ProjectState, task: str, provider: str, session_id: st
     if _applied_profile(state, provider) == NO_PROFILE:
         return "Symphony has no launchable route in this account's available model roster."
     if state.active_run:
-        return _recovery_guidance(state)
+        return _recovery_guidance(state, provider)
     return _assessment_guidance(task, provider, state, session_id)
 
 
@@ -2469,7 +2472,7 @@ def _render_actions(
                 )
             )
         elif action.kind == "run_already_active":
-            rendered.append(Action("inject_context", {"text": _recovery_guidance(state)}))
+            rendered.append(Action("inject_context", {"text": _recovery_guidance(state, provider)}))
         elif action.kind == "preserve_recovery_context":
             rendered.append(Action("inject_context", {"text": "Symphony recorded the interruption for safe reconciliation on resume."}))
         elif action.kind == "stop_delegations":
@@ -2651,10 +2654,57 @@ def _governance(state: ProjectState) -> str:
     return "enabled" if state.enabled else "transactional"
 
 
-def _recovery_guidance(state: ProjectState) -> str:
+def _completion_ready_guidance(run: RunState, provider: str) -> str:
+    if run.status != "completing" or _stop_block_reason(run) is not None:
+        return ""
+    stop = _control_name("stop", provider or run.provider or "codex")
+    return (
+        "The lead outcome and tracked work are reconciled. Invoke the normal "
+        f"`{stop}` control in this same session now, then check durable status. "
+        "The Stop guard verifies native freshness before archiving. Do not follow up "
+        "or replace a completed lead solely because this run remains completing."
+    )
+
+
+def _refresh_completion_guidance(
+    actions: tuple[Action, ...], before: ProjectState, after: ProjectState,
+    source: Event, provider: str,
+) -> tuple[Action, ...]:
+    """Render guidance from the committed batch, after its temporary archive hold clears."""
+    if not after.active_run or not _completion_ready_guidance(after.active_run, provider):
+        return actions
+    if not before.active_run or _completion_ready_guidance(before.active_run, provider):
+        return actions
+    if source.kind == "session_heartbeat":
+        old, new = _recovery_guidance(before, provider), _recovery_guidance(after, provider)
+    elif source.kind == "user_prompt":
+        prompt = str(source.payload.get("prompt") or "").strip()
+        control = _parse_control(prompt)
+        if control and control[0] in {"status", "agents"}:
+            history = control[0] == "agents" and control[1] == "--all"
+            session = str(source.payload.get("session_id") or "")
+            old = _status(before, history, provider, session)
+            new = _status(after, history, provider, session)
+        elif control is None or control[0] == "start":
+            old, new = _recovery_guidance(before, provider), _recovery_guidance(after, provider)
+        else:
+            return actions
+    else:
+        return actions
+    return tuple(
+        Action("inject_context", {**action.payload, "text": new})
+        if action.kind == "inject_context" and action.payload.get("text") == old else action
+        for action in actions
+    )
+
+
+def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     run = state.active_run
     if not run:
         return "Symphony has no active run."
+    completion = _completion_ready_guidance(run, provider)
+    if completion:
+        return f"Symphony run {run.run_id} remains completing. {completion}"
     records = ", ".join(f"{item.role} {item.identity} ({item.state})" for item in run.delegations)
     pending = run.assessment.get("_pending_delegations", ())
     awaiting = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
@@ -2749,7 +2799,10 @@ def _status(
         if pending:
             roles = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
             lines.append(f"Awaiting host launch confirmation: {roles}")
-        if state.active_run.outcome:
+        completion = _completion_ready_guidance(state.active_run, provider)
+        if completion:
+            lines.append(completion)
+        elif state.active_run.outcome:
             lines.append("Lead outcome recorded; tracked work still requires reconciliation.")
         if not state.enabled:
             control = _control_name("enable", provider) if provider else "enable"

@@ -100,9 +100,12 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(recovered)
         self.assertEqual(LEAD, recovered.payload["agent_id"])
         self.assertEqual("prompt-one", recovered.payload["prompt_id"])
-        handle({"session_id": SESSION, "cwd": str(self.project),
-                "hook_event_name": "UserPromptSubmit",
-                "prompt": "$symphony:symphony status"}, self.environ)
+        response = handle({"session_id": SESSION, "cwd": str(self.project),
+                           "hook_event_name": "UserPromptSubmit",
+                           "prompt": "$symphony:symphony status"}, self.environ)
+        context = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Invoke the normal `/symphony:stop`", context)
+        self.assertNotIn("tracked work still requires reconciliation", context)
         active = self.store.load(self.project).active_run
         self.assertEqual("original-run", active.run_id)
         self.assertEqual("completing", active.status)
@@ -146,6 +149,14 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 "prompt": "$symphony:symphony status"}, self.environ)
         record = self.store.session_record("claude", LEAD)
         self.assertFalse(record and record["pending"])
+
+    def test_session_start_guides_stop_after_native_recovery(self):
+        response = handle({"session_id": SESSION, "cwd": str(self.project),
+                           "hook_event_name": "SessionStart"}, self.environ)
+        context = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Invoke the normal `/symphony:stop`", context)
+        self.assertNotIn("continue unfinished work", context)
+        self.assertEqual("completing", self.store.load(self.project).active_run.status)
 
     def test_latest_successful_background_handback_is_accepted(self):
         self.write_native(handback=True)

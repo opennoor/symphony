@@ -321,6 +321,44 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("guarded", self.context(result).lower())
         self.assertNotIn("unarmed", self.context(result).lower())
 
+    def test_reconciled_completing_run_guides_normal_stop_on_both_hosts(self):
+        for provider, control in (("codex", "$symphony:symphony"),
+                                  ("claude", "/symphony:")):
+            with self.subTest(provider=provider):
+                run = self.seed_run(RunState(
+                    "run-ready", "task", status="completing", lead_identity="lead-1",
+                    outcome={"status": "completed"},
+                    delegations=(Delegation("lead-1", "lead", "task", "completed", "", ""),),
+                ), provider=provider, enabled=True)
+                environ = self.claude_environ if provider == "claude" else self.environ
+                text = self.context(handle(self.payload(f"{control}status" if provider == "claude"
+                                                        else f"{control} status", provider), environ))
+                self.assertIn(f"`{control}stop`" if provider == "claude"
+                              else f"`{control} stop`", text)
+                self.assertIn("then check durable status", text)
+                self.assertIn("Do not follow up or replace a completed lead", text)
+                self.assertNotIn("tracked work still requires reconciliation", text)
+                self.assertEqual("completing", StateStore(self.state_root).load(self.project)
+                                 .active_runs[f"{provider}:{run.session_id}"].status)
+
+                guidance = runtime_module._recovery_guidance(
+                    ProjectState(active_run=run), provider)
+                self.assertIn("Invoke the normal", guidance)
+                self.assertNotIn("continue unfinished work", guidance)
+
+    def test_completing_run_with_unfinished_work_does_not_guide_stop(self):
+        run = self.seed_run(RunState(
+            "run-working", "task", status="completing", lead_identity="lead-1",
+            outcome={"status": "completed"},
+            delegations=(Delegation("lead-1", "lead", "task", "completed", "", ""),
+                         Delegation("worker-1", "worker", "task", "working", "", "")),
+        ), enabled=True)
+        status = self.context(handle(self.payload("$symphony:symphony status"), self.environ))
+        self.assertNotIn("Invoke the normal", status)
+        self.assertIn("tracked work still requires reconciliation", status)
+        guidance = runtime_module._recovery_guidance(ProjectState(active_run=run), "codex")
+        self.assertIn("continue unfinished work", guidance)
+
     def test_status_names_agents_left_unreconciled_by_force_stop(self):
         run = RunState(
             "run-1", "task", session_id="codex-session",
