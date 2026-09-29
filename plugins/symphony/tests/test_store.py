@@ -175,27 +175,55 @@ class StateStoreTests(unittest.TestCase):
                                                    active_runs={"codex:root": run}))
         errors = []
         start = threading.Event()
+        stop = threading.Event()
+        progress = {"writer": 0, "reader": 0, "max_write_seconds": 0.0,
+                    "max_read_seconds": 0.0, "writer_inflight_since": None}
 
         def write():
             start.wait(5)
             try:
                 for _ in range(300):
+                    if stop.is_set():
+                        break
+                    begun = time.monotonic()
+                    progress["writer_inflight_since"] = begun
                     self.store.update(self.project, lambda state: (state, None))
+                    progress["writer"] += 1
+                    progress["max_write_seconds"] = max(
+                        progress["max_write_seconds"], time.monotonic() - begun)
+                    progress["writer_inflight_since"] = None
             except BaseException as error:
                 errors.append(("writer", repr(error)))
 
         writer = threading.Thread(target=write)
         writer.start()
         start.set()
-        for _ in range(300):
-            try:
-                self.assertIn(self.store.active_owner_paths("codex", "root"),
-                              (None, (self.state_path(),)))
-            except BaseException as error:
-                errors.append(("reader", repr(error)))
-                break
-        writer.join(10)
-        self.assertFalse(writer.is_alive())
+        stalled = False
+        snapshot = {}
+        try:
+            for _ in range(300):
+                begun = time.monotonic()
+                try:
+                    self.assertIn(self.store.active_owner_paths("codex", "root"),
+                                  (None, (self.state_path(),)))
+                    progress["reader"] += 1
+                    progress["max_read_seconds"] = max(
+                        progress["max_read_seconds"], time.monotonic() - begun)
+                except BaseException as error:
+                    errors.append(("reader", repr(error)))
+                    break
+            writer.join(10)
+            stalled = writer.is_alive()
+            snapshot = progress.copy()
+            if snapshot["writer_inflight_since"] is not None:
+                snapshot["inflight_seconds"] = round(
+                    time.monotonic() - snapshot["writer_inflight_since"], 3)
+        finally:
+            if stalled:
+                print(f"Snapshot stress: {snapshot}, errors={errors}", flush=True)
+            stop.set()
+            writer.join()
+        self.assertFalse(stalled, f"writer exceeded 10s after reader: {snapshot}, errors={errors}")
         self.assertFalse(errors, errors)
         self.assertEqual((self.state_path(),), self.store.active_owner_paths("codex", "root"))
 
