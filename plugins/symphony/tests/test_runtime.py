@@ -978,13 +978,34 @@ class RuntimeTests(unittest.TestCase):
                 state = ProjectState(active_run=run)
                 base = {"provider": provider, "session_id": "session", "agent_id": "worker",
                         "last_assistant_message": "Done."}
-                for event, extra in (("SubagentStop", {"status": "completed", "timestamp": "one"}),
-                                     ("SubagentStart", {"status": "working", "timestamp": "two"}),
-                                     ("SubagentStop", {"status": "completed", "timestamp": "three"})):
+                for event, extra in (("SubagentStop", {"status": "completed"}),
+                                     ("SubagentStart", {"status": "working"}),
+                                     ("SubagentStop", {"status": "completed"})):
                     state, _ = runtime_module._observe_delegation(
                         state, event_from_payload(provider, {**base, **extra, "hook_event_name": event}))
                 worker = next(item for item in state.active_run.delegations if item.identity == "worker")
                 self.assertEqual("completed", worker.state)
+
+    def test_identical_no_id_restart_keeps_outcome_unreconciled(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                run = RunState(
+                    "run", "task", session_id="session", provider=provider, lead_identity="lead",
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(Delegation("lead", "lead", "task", "working", "", ""),
+                                 Delegation("worker", "worker", "task", "working", "", "")),
+                )
+                state = ProjectState(active_run=run)
+                base = {"provider": provider, "session_id": "session", "agent_id": "worker",
+                        "last_assistant_message": "Done."}
+                start = event_from_payload(provider, {**base, "hook_event_name": "SubagentStart"})
+                stop = event_from_payload(provider, {**base, "hook_event_name": "SubagentStop",
+                                                     "status": "completed"})
+                for event in (start, stop, start):
+                    state, _ = runtime_module._observe_delegation(state, event)
+                worker = next(item for item in state.active_run.delegations if item.identity == "worker")
+                self.assertEqual("interrupted", worker.state)
+                self.assertIn("worker", state.active_run.assessment["_ambiguous_child_starts"])
 
     def test_identified_old_result_cannot_replay_into_a_new_child_turn(self):
         for provider, field in (("codex", "turn_id"), ("claude", "prompt_id")):
@@ -1009,6 +1030,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual("completed", next(item.state for item in state.active_run.delegations
                                                   if item.identity == "worker"))
                 observe("SubagentStart", "turn-two", "working")
+                observe("SubagentStart", "turn-one", "working")  # delayed after new turn began
                 observe("SubagentStop", "turn-two", "failed")
                 observe("SubagentStart", "turn-two", "working")  # duplicate start
                 observe("SubagentStop", "turn-one", "completed")  # stale old result

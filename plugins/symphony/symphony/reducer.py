@@ -409,6 +409,10 @@ def _reassess(state: ProjectState, event: Event):
 
 def _stop_block_reason(run: RunState) -> dict | None:
     """Return the payload for a stop block, or None when completion is permitted."""
+    ambiguous = run.assessment.get("_ambiguous_child_starts", ())
+    if ambiguous:
+        return {"reason": "child start has no invocation ID and matches an earlier start; "
+                "inspect or recover: " + ", ".join(map(str, ambiguous))}
     active = _active_identities(run)
     if active:
         return {"active": active}

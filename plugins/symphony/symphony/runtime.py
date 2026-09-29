@@ -723,10 +723,22 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     token = _child_turn_token(source.payload)
     if source.kind == "subagent_started":
         if source.event_id in assessment.get("_start_event_ids", ()):
+            if not token and current and current.state.lower() not in {"working", "pending", "interrupted"}:
+                # A host without invocation IDs cannot distinguish a replay
+                # from a fresh byte-identical start. Preserve unfinished work.
+                updated = dict(assessment)
+                updated["_ambiguous_child_starts"] = (*updated.get("_ambiguous_child_starts", ()),
+                                                       str(identity))
+                delegations = tuple(replace(item, state="interrupted", updated_at=source.observed_at)
+                                    if item.identity == str(identity) else item
+                                    for item in state.active_run.delegations)
+                run = replace(state.active_run, assessment=updated, delegations=delegations)
+                if current.role == "lead":
+                    run = replace(run, outcome=None, status="recovering")
+                state = replace(state, active_run=run)
             return state, opening
         terminal_turns = assessment.get("_terminal_turns", {})
-        if (current and current.state.lower() not in {"working", "pending"} and token
-                and token in terminal_turns.get(str(identity), ())):
+        if current and token and token in terminal_turns.get(str(identity), ()):
             return state, opening
         updated = dict(assessment)
         updated["_start_event_ids"] = (*assessment.get("_start_event_ids", ()), source.event_id)
@@ -745,6 +757,8 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                 (not seen and any(record.event_id == f"{source.event_id}:delegation:delegation_updated"
                                   for record in state.event_history))):
             return state, opening
+        if not token and epoch:
+            source = replace(source, event_id=f"{source.event_id}:terminal-epoch:{epoch}")
     pending: Mapping[str, object] = {}
     if current is None:
         state, pending = _consume_pending_delegation(state, source.payload)
@@ -763,6 +777,12 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         assessment = dict(state.active_run.assessment)
         assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
                                               result_id)
+        ambiguous = tuple(item for item in assessment.get("_ambiguous_child_starts", ())
+                          if item != str(identity))
+        if ambiguous:
+            assessment["_ambiguous_child_starts"] = ambiguous
+        else:
+            assessment.pop("_ambiguous_child_starts", None)
         if token:
             terminal_turns = dict(assessment.get("_terminal_turns", {}))
             terminal_turns[str(identity)] = (*terminal_turns.get(str(identity), ()), token)
