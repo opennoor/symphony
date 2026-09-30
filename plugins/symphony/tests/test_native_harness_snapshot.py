@@ -163,6 +163,24 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertEqual(len(saved["cases"][0]["native_trace"]), 100000)
             self.assertLess(len(stderr.getvalue()), 1000)
 
+    def test_success_keeps_full_hook_trace_in_artifact_without_flooding_ci_stdout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = {"case": "same-worktree", "completed": ["a", "b"],
+                      "native_hook_capture": {"records": ["x" * 100000]}}
+            stdout = io.StringIO()
+            with patch.object(native, "prepare_baseline_capture", return_value={}), \
+                 patch.object(native, "check_case", return_value=result), \
+                 patch.object(sys, "argv", ["native_managed_concurrency.py", "--provider", "claude"]), \
+                 patch.object(sys, "stdout", stdout), \
+                 patch.dict(native.os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
+                self.assertEqual(native.main(), 0)
+            saved = json.loads((Path(temporary) / "native-managed-claude-receipt.json").read_text())
+            self.assertEqual(len(saved["native_managed"][0]["native_hook_capture"]["records"][0]),
+                             100000)
+            self.assertEqual(json.loads(stdout.getvalue())["native_managed"][0]["completed"],
+                             ["a", "b"])
+            self.assertLess(len(stdout.getvalue()), 1000)
+
     def test_opaque_transport_cannot_replace_durable_recovery_events(self):
         def document(kinds, identity="original"):
             return {"event_history": [{"kind": kind, "payload": {"identity": identity}}
@@ -176,6 +194,24 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             native.require_recovered_lead_events(document(["lead_failed", "lead_completed"], "replacement"),
                                                   "original")
+
+    def test_recovery_events_required_only_for_codex_update_original_lead(self):
+        plain_completion = {"event_history": [
+            {"kind": "lead_completed", "payload": {"identity": "original"}}]}
+        for provider, update, label in (("codex", None, "a"),
+                                        ("codex", {"old_version": "1.5.1"}, "b"),
+                                        ("claude", {"old_version": "1.5.1"}, "a")):
+            with self.subTest(provider=provider, update=bool(update), label=label):
+                native.require_case_recovery_events(
+                    plain_completion, "original", provider, update, label)
+        with self.assertRaisesRegex(RuntimeError, "ordered durable failed and completed"):
+            native.require_case_recovery_events(
+                plain_completion, "original", "codex", {"old_version": "1.5.1"}, "a")
+        native.require_case_recovery_events(
+            {"event_history": [
+                {"kind": "lead_failed", "payload": {"identity": "original"}},
+                {"kind": "lead_completed", "payload": {"identity": "original"}}]},
+            "original", "codex", {"old_version": "1.5.1"}, "a")
 
     def test_native_launch_pins_current_provider_profile(self):
         with tempfile.TemporaryDirectory() as temporary:

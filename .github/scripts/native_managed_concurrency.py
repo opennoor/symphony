@@ -820,6 +820,11 @@ def require_recovered_lead_events(document, lead_id):
         raise RuntimeError("recovered lead lacks ordered durable failed and completed events")
 
 
+def require_case_recovery_events(document, lead_id, provider, update, label):
+    if provider == "codex" and update and label == "a":
+        require_recovered_lead_events(document, lead_id)
+
+
 def codex_pre_resume_state(document, session, run_id, lead_id):
     """Accept only the original recovering run or its durable completed archive."""
     key = f"codex:{session}"
@@ -1493,8 +1498,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                              == update["candidate_source"].resolve()
                              for item in records):
                     raise RuntimeError(f"{label}: same-session Claude resume did not load the candidate")
-            if label == "a" and provider == "codex":
-                require_recovered_lead_events(doc, observed_leads[label])
+            require_case_recovery_events(doc, observed_leads[label], provider, update, label)
         capture = codex_hook_capture_summary(root, provider)
         for label, session in sessions.items():
             gate_starts = [record for record in capture["records"]
@@ -2374,7 +2378,19 @@ def main():
         finally:
             if update:
                 shutil.rmtree(update["home"], ignore_errors=True)
-    print(json.dumps({"provider": args.provider, "native_managed": results}))
+    receipt = {"provider": args.provider, "native_managed": results}
+    destination = os.environ.get("SYMPHONY_NATIVE_DIAGNOSTICS_DIR")
+    if destination:
+        directory = Path(destination)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"native-managed-{args.provider}-receipt.json").write_text(
+            json.dumps(receipt, indent=2), encoding="utf-8")
+    # Full hook timelines belong in the artifact. A large single stdout write
+    # can fail on CI's nonblocking pipe after every native check has passed.
+    print(json.dumps({"provider": args.provider, "native_managed": [
+        {key: value for key, value in result.items()
+         if key not in ("native_hook_capture", "native_host_trace")}
+        for result in results]}))
     return 0
 
 
