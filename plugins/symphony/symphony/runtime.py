@@ -2715,7 +2715,9 @@ def _render_actions(
                     "followup_task using the original task_name from spawn_agent (lowercase letters, "
                     "digits, and underscores), not a /root/ path or agent UUID. A completed host roster "
                     "entry alone does not prove the agent unavailable; do not call spawn_agent for the same "
-                    "task_name. Await the original lead's new result. Only if followup_task returns an "
+                    "task_name. Await the original lead's new result, then finish this root turn so native Stop "
+                    "can reconcile its actual outcome. A missing marker in the returned text is not permission "
+                    "to spawn another lead. Only if followup_task returns an "
                     "explicit unavailable error may you spawn one replacement at the recorded route; "
                     "Symphony verifies the original spawn, exact error, and turn lineage before accepting it."
                 )}))
@@ -2969,7 +2971,9 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     retry = ("For this retryable Codex lead, call followup_task on the original spawn_agent "
              "task_name (lowercase letters, digits, and underscores), not its /root/ path or UUID. "
              "A completed host roster entry alone does not prove the agent unavailable; do not spawn "
-             "another lead for that name. Only an explicit unavailable error from followup_task can "
+             "another lead for that name. After its result, finish this root turn so native Stop can "
+             "reconcile the actual outcome; a missing text marker alone never authorizes replacement. "
+             "Only an explicit unavailable error from followup_task can "
              "authorize one replacement; Symphony verifies the original spawn, exact error, and native "
              "turn lineage at the new child's Start. If verification fails, the extra child stays rejected. "
              if run.provider == "codex" and run.lead_identity

@@ -57,6 +57,38 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         self.assertIn("WAIT", deferred_packet["message"])
         self.assertIn("only READY permits", deferred_packet["message"])
 
+    def test_mixed_codex_upgrade_uses_packaged_full_route(self):
+        profiles = json.loads((PLUGIN / "profiles.json").read_text())["providers"]["codex"]["profiles"]
+        project = Path("/tmp/native-project")
+        for label, profile_id in (("a", "full"), ("b", "latest")):
+            with self.subTest(profile=profile_id):
+                profile = next(item for item in profiles if item["id"] == profile_id)
+                assessor, lead = native.codex_fixture_roles(profile_id)
+                self.assertEqual((lead["model"], lead["effort"]),
+                                 (profile["matrix"]["medium/complex"]["model"],
+                                  profile["matrix"]["medium/complex"]["effort"]))
+                self.assertEqual((assessor["model"], assessor["effort"]),
+                                 (profile["tiers"]["strongest"], "high"))
+                fixture_prompt = native.prompt("codex", label, label == "a", project,
+                                               defer_recovery=label == "a",
+                                               codex_profile=profile_id)
+                self.assertIn('"size":"medium","complexity":"complex"', fixture_prompt)
+                for marker, role in (("ASSESSOR_SPAWN_PACKET", assessor),
+                                     ("LEAD_SPAWN_PACKET", lead)):
+                    packet = json.loads(re.search(marker + r": (\{[^\n]+\})", fixture_prompt).group(1))
+                    self.assertEqual((packet["task_name"], packet["model"],
+                                      packet["reasoning_effort"]),
+                                     (role["task_name"], role["model"], role["effort"]))
+                with tempfile.TemporaryDirectory() as temporary, \
+                        patch.object(native.shutil, "which", return_value="codex"), \
+                        patch.object(native.subprocess, "Popen") as popen:
+                    native.launch("codex", project, label, label == "a",
+                                  {"SYMPHONY_PROFILE": profile_id}, Path(temporary), 3, "",
+                                  defer_recovery=label == "a")
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--model") + 1], lead["model"])
+                self.assertIn(lead["task_name"], command[-1])
+
     def test_windows_native_observer_retries_only_bounded_lock_contention(self):
         before = native.OBSERVER_SNAPSHOT_LOCK_RETRIES
         reader = Mock(side_effect=[TimeoutError("writer owns lock"), '{"active_runs": {}}'])
@@ -456,6 +488,30 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertEqual(receipt, native.held_codex_stop_capture(
                 Path("/tmp/native"), "root-a", "held-1", native.time.monotonic() + 1))
         self.assertEqual(3, capture.call_count)
+
+    def test_native_stop_sidecar_records_only_outcome_category(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "codex-hook-capture"
+            for message in ('SYMPHONY_OUTCOME: {"status":"completed"}',
+                            'SYMPHONY_OUTCOME: {"status":[]}',
+                            'SYMPHONY_OUTCOME: {"status":{}}',
+                            'SYMPHONY_OUTCOME: {broken}',
+                            "Completed without a marker"):
+                payload = {"session_id": "root-a", "agent_id": "lead-a",
+                           "turn_id": message[:4],
+                           "last_assistant_message": message}
+                subprocess.run(
+                    [sys.executable, "-c", native.CODEX_HOOK_CAPTURE,
+                     "SubagentStop", str(destination), "codex"],
+                    input=json.dumps(payload), text=True, check=True,
+                    capture_output=True,
+                )
+            outcomes = {record["reported_outcome"] for record in
+                        native.codex_hook_capture_summary(root)["records"]}
+            self.assertEqual({"completed", "missing"}, outcomes)
+            self.assertNotIn('SYMPHONY_OUTCOME: {"status":"completed"}', json.dumps(
+                native.codex_hook_capture_summary(root)))
 
     def test_native_markerless_parse_requires_new_latest_hooked_completion(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -884,7 +940,21 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertIn("followup_task", prompt)
             self.assertIn("Do not rerun the gate", prompt)
             self.assertIn("native Stop hook", prompt)
+            self.assertIn("finish this root turn immediately", prompt)
+            self.assertIn("returned text lacks a marker", prompt)
             self.assertTrue(json.loads((logs / "a.resume.status.json").read_text())["same_session"])
+
+            with patch.object(native.shutil, "which", return_value="codex"), \
+                    patch.object(native.subprocess, "Popen", side_effect=launch) as popen:
+                native.resume_codex({"SYMPHONY_PROFILE": "full"}, logs, session, logs,
+                                    time.monotonic() + 30, lead_id=lead,
+                                    lead_task_name=task, native_status_nonce="nonce123")
+            command = popen.call_args.args[0]
+            self.assertEqual("gpt-6-sol", command[command.index("--model") + 1])
+            self.assertIn("target 'original_lead_custom_name'", command[-1])
+            self.assertIn("read NATIVE_STATUS.txt", command[-1])
+            self.assertIn("READY nonce123", command[-1])
+            self.assertIn("Never edit the file", command[-1])
 
             # Status-only and exact Stop probes must not become recovery requests.
             with patch.object(native.shutil, "which", return_value="codex"), \

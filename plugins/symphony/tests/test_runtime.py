@@ -1105,6 +1105,10 @@ class RuntimeTests(unittest.TestCase):
         first = StateStore(self.state_root).load(self.project).active_run
         self.assertEqual("recovering", first.status)
         self.assertNotIn("lead-1", first.assessment.get("_active_turns", {}))
+        guidance = runtime_module._recovery_guidance(
+            StateStore(self.state_root).load(self.project), "codex")
+        self.assertIn("finish this root turn so native Stop", guidance)
+        self.assertIn("missing text marker alone never authorizes replacement", guidance)
         handle({**packet, "hook_event_name": "SubagentStop", "turn_id": "new",
                 "status": "completed", "last_assistant_message":
                 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)

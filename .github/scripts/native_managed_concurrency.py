@@ -67,6 +67,15 @@ record = {"invocation_id": invocation, "event": event,
                                         else "CLAUDE_CONFIG_DIR"),
           "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
           "started_ns": time.time_ns()}
+if event == "SubagentStop":
+    message = payload.get("last_assistant_message")
+    markers = re.findall(r'^SYMPHONY_OUTCOME:\\s*(\\{[^\\n]*\\})', message, re.MULTILINE) if isinstance(message, str) else []
+    try:
+        outcome = json.loads(markers[-1]).get("status") if markers else None
+    except (ValueError, AttributeError):
+        outcome = None
+    record["reported_outcome"] = outcome if isinstance(outcome, str) and outcome in {
+        "completed", "blocked", "failed", "abandoned"} else "missing"
 gate_dir = pathlib.Path(os.environ["SYMPHONY_NATIVE_GATE_DIR"]) if os.environ.get(
     "SYMPHONY_NATIVE_GATE_DIR") else None
 env_label = os.environ.get("SYMPHONY_NATIVE_GATE_LABEL")
@@ -224,26 +233,32 @@ def state_file(state_dir, project):
     return state_dir / (key + ".v2.json")
 
 
-def codex_fixture_roles():
+def codex_fixture_roles(profile_id="base"):
     profiles = json.loads((Path(__file__).resolve().parents[2] / "plugins" / "symphony" /
                            "profiles.json").read_text(encoding="utf-8"))
-    base = next(item for item in profiles["providers"]["codex"]["profiles"]
-                if item["id"] == "base")
-    lead = base["matrix"]["small/simple"]
-    assessor = {"model": base["tiers"]["strongest"], "effort": "high"}
+    profile = next(item for item in profiles["providers"]["codex"]["profiles"]
+                   if item["id"] == profile_id)
+    route = "small/simple" if profile_id == "base" else "medium/complex"
+    lead = profile["matrix"][route]
+    assessor = {"model": profile["tiers"]["strongest"], "effort": "high"}
     for role in (assessor, lead):
-        if role["effort"] not in base["efforts"][role["model"]]:
-            raise RuntimeError("native fixture route is unsupported by the packaged base profile")
+        if role["effort"] not in profile["efforts"][role["model"]]:
+            raise RuntimeError("native fixture route is unsupported by the packaged profile")
     def with_name(role_name, route):
         model_slug = re.sub(r"[^a-z0-9]+", "_", route["model"]).strip("_")
         return {**route, "task_name": f"symphony_{role_name}_{model_slug}_{route['effort']}"}
     return with_name("assessor", assessor), with_name("lead", lead)
 
 
-def prompt(provider, label, recover, project, *, defer_recovery=False):
-    assessor_role, lead_role = codex_fixture_roles() if provider == "codex" else ({}, {})
+def prompt(provider, label, recover, project, *, defer_recovery=False,
+           codex_profile="base"):
+    assessor_role, lead_role = codex_fixture_roles(codex_profile) if provider == "codex" else ({}, {})
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
-    route = '{"size":"small","complexity":"simple","risk":"normal","rationale":"disposable native CI gate","topology":"direct"}'
+    route = ('{"size":"medium","complexity":"complex","risk":"normal",'
+             '"rationale":"disposable native CI upgrade gate","topology":"direct"}'
+             if provider == "codex" and codex_profile != "base" else
+             '{"size":"small","complexity":"simple","risk":"normal",'
+             '"rationale":"disposable native CI gate","topology":"direct"}')
     recovery = (
         'The lead MUST finish its first turn after its native start hook is released, '
         'followed by the exact line '
@@ -345,13 +360,15 @@ def launch(provider, project, label, recover, env, log_dir, budget, session,
     output = log_dir / f"{label}.output"
     errors = log_dir / f"{label}.errors"
     if provider == "codex":
-        _, lead_role = codex_fixture_roles()
+        codex_profile = env.get("SYMPHONY_PROFILE", "base")
+        _, lead_role = codex_fixture_roles(codex_profile)
         command = [executable, "exec", "--dangerously-bypass-hook-trust",
                    "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
                    "--model", lead_role["model"], "-C", str(project),
                    "--output-last-message", str(output),
                    prompt(provider, label, recover, project,
-                          defer_recovery=defer_recovery)]
+                          defer_recovery=defer_recovery,
+                          codex_profile=codex_profile)]
     else:
         command = [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
                    "--permission-mode", "bypassPermissions", "--session-id", session,
@@ -469,7 +486,8 @@ def codex_resume_phase(env, session, logs):
 
 
 def resume_codex(env, project, session, logs, deadline, already_completed=False,
-                 direct_stop=False, *, lead_id, lead_task_name):
+                 direct_stop=False, *, lead_id, lead_task_name,
+                 native_status_nonce=None):
     """Resume the original native root so newly installed candidate hooks load."""
     executable = shutil.which("codex")
     if not executable:
@@ -490,8 +508,16 @@ def resume_codex(env, project, session, logs, deadline, already_completed=False,
         "native Stop archives it. Only if the run is still recovering because gate "
         "markers or exit code are missing from its report, use followup_task "
         f"with target {lead_task_name!r}, without a /root/ prefix or UUID, and await "
-        "that SAME lead. Ask it to report only evidence from its existing command "
-        "result with its outcome; never invent missing evidence. Do not spawn a replacement "
+        "that SAME lead. "
+        + (f"Ask it to read NATIVE_STATUS.txt in this project now. Only the exact "
+           f"line READY {native_status_nonce} permits its completed outcome; if the file "
+           "still says WAIT, report blocked. Never edit the file or invent evidence. "
+           if native_status_nonce else
+           "Ask it to report only evidence from its existing command result with its "
+           "outcome; never invent missing evidence. ")
+        + "After that same-ID result, "
+        "finish this root turn immediately so native Stop checks and reconciles it, even if "
+        "the returned text lacks a marker. Do not spawn a replacement "
         "or another assessor, even if the old lead is absent from list_agents. If the "
         "host cannot resume that lead or its evidence is unavailable, report the "
         "limitation and end the turn without changing ownership. Do not rerun the gate "
@@ -500,7 +526,8 @@ def resume_codex(env, project, session, logs, deadline, already_completed=False,
         "or poll a completing run before ending the turn.")
     command = [executable, "exec", "resume", "--dangerously-bypass-hook-trust",
                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-               "--model", codex_fixture_roles()[1]["model"], session, prompt]
+               "--model", codex_fixture_roles(env.get("SYMPHONY_PROFILE", "base"))[1]["model"],
+               session, prompt]
     status_file = logs / "a.resume.status.json"
     started = time.monotonic()
     budget = max(1, deadline - started - 15)
@@ -1200,9 +1227,10 @@ def require_post_removal_lead_completion(document, provider, session, lead_id,
             "native_turn_spanned_removal": True}
 
 
-def codex_host_trace(home, session, lead_id, error_log, *, strict=False):
+def codex_host_trace(home, session, lead_id, error_log, *, strict=False,
+                     codex_profile="base"):
     """Extract only tool and turn metadata from disposable Codex JSONL."""
-    _, lead_role = codex_fixture_roles()
+    _, lead_role = codex_fixture_roles(codex_profile)
     def fingerprint(value):
         return sha256(str(value).encode()).hexdigest()[:12] if value else None
 
@@ -2040,7 +2068,7 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
     env = {**os.environ, **update["env"], "SYMPHONY_STATE_DIR": str(state_dir),
            "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
            "SYMPHONY_HOOK_DECISIONS_DIR": str(case / "hook decisions"),
-           "SYMPHONY_PROFILE": "base"}
+           "SYMPHONY_PROFILE": "full"}
     state_path = state_file(state_dir, first)
     deadline = time.monotonic() + timeout
     processes = {}
@@ -2123,7 +2151,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                     and old_run.get("status") == "recovering"
                     and (gate_dir / "a.stop-ready.json").is_file()):
                 old_turns = codex_host_trace(
-                    update["home"], sessions["a"], leads["a"], logs / "a.errors"
+                    update["home"], sessions["a"], leads["a"], logs / "a.errors",
+                    codex_profile="full"
                 ).get("lead_turns", [])
                 held = json.loads((gate_dir / "a.stop-ready.json").read_text())
                 if held.get("session_id") != sessions["a"] or not held.get("invocation_id"):
@@ -2137,7 +2166,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                 break
             if not old_run:
                 old_turns = codex_host_trace(
-                    update["home"], sessions["a"], leads["a"], logs / "a.errors"
+                    update["home"], sessions["a"], leads["a"], logs / "a.errors",
+                    codex_profile="full"
                 ).get("lead_turns", [])
                 if old_turns and old_turns[0].get("reported_outcome") == "completed":
                     raise RuntimeError("old original lead ignored the unfinished WAIT task before candidate B")
@@ -2146,7 +2176,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                 raise RuntimeError("old original lead did not become recovering before B launch")
             time.sleep(.1)
         processes["b"] = launch("codex", second, "b", False,
-                                {**env, "SYMPHONY_NATIVE_GATE_DIR": str(gate_dir),
+                                {**env, "SYMPHONY_PROFILE": "latest",
+                                 "SYMPHONY_NATIVE_GATE_DIR": str(gate_dir),
                                  "SYMPHONY_NATIVE_GATE_LABEL": "b"}, logs, budget, "")
         while time.monotonic() < deadline:
             if (gate_dir / "b.ready").is_file():
@@ -2190,7 +2221,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
         snapshot["candidate_b_native_start_ns"] = json.loads(
             (gate_dir / "b.ready").read_text())["started_ns"]
         old_host_at_overlap = codex_host_trace(
-            update["home"], sessions["a"], leads["a"], logs / "a.errors", strict=True)
+            update["home"], sessions["a"], leads["a"], logs / "a.errors",
+            strict=True, codex_profile="full")
         old_turns_at_overlap = old_host_at_overlap["lead_turns"]
         if (len(old_turns_at_overlap) != 1
                 or not old_turns_at_overlap[0].get("completed")
@@ -2226,7 +2258,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                                 old_records["a"]["plugin_root"]):
             raise RuntimeError("old retained runtime was lost before candidate resume")
         host = codex_host_trace(update["home"], sessions["a"], leads["a"],
-                                logs / "a.errors", strict=True)
+                                logs / "a.errors", strict=True,
+                                codex_profile="full")
         if (host["lead_turns"][0]["turn_hash"]
                 != snapshot["old_host_at_b_registration"]["original_turn_hash"]
                 or any(timestamp_ns(turn["started_at"]) < stop_release_ns
@@ -2252,7 +2285,7 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
         resume_codex(env, first, sessions["a"], logs, deadline,
                      already_completed=pre_resume_state == "completed",
                      direct_stop=direct_stop_resume, lead_id=leads["a"],
-                     lead_task_name=lead_task_name)
+                     lead_task_name=lead_task_name, native_status_nonce=status_nonce)
         after_resume = read_state_snapshot(state_path)
         resumed_activation = after_resume.get("activation", {}).get("codex", {})
         resumed_profiles = [resumed_activation,
@@ -2269,7 +2302,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
         if len(starts) < 2:
             raise RuntimeError("original A lacked candidate native SessionStart")
         resumed_host = codex_host_trace(update["home"], sessions["a"], leads["a"],
-                                        logs / "a.resume.errors", strict=True)
+                                        logs / "a.resume.errors", strict=True,
+                                        codex_profile="full")
         if any(item["call_hash"] not in original_spawn_calls
                for item in resumed_host["spawn_calls"]):
             raise RuntimeError("candidate A resume attempted an extra native spawn")
@@ -2315,10 +2349,12 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
         proof = require_post_removal_lead_completion(
             document, "codex", sessions["a"], leads["a"],
             codex_host_trace(update["home"], sessions["a"], leads["a"],
-                             logs / "a.errors", strict=True), update["old_source_removed_ns"])
+                             logs / "a.errors", strict=True, codex_profile="full"),
+            update["old_source_removed_ns"])
         for label in ("a", "b"):
             host = codex_host_trace(update["home"], sessions[label], leads[label],
-                                    logs / f"{label}.errors", strict=True)
+                                    logs / f"{label}.errors", strict=True,
+                                    codex_profile="full" if label == "a" else "latest")
             original_calls = [call for call in host["spawn_calls"]
                               if call["same_lead_id"]]
             if (len(original_calls) != 1
@@ -2412,7 +2448,7 @@ def codex_hook_capture_summary(root, provider="codex"):
                          "tool_use_id_hash", "agent_type", "isolation", "background",
                          "native_gate_label", "native_gate_session_id",
                          "background_tasks_type", "background_tasks_count",
-                         "background_task_states", "native_task_wait",
+                         "background_task_states", "reported_outcome", "native_task_wait",
                          "native_stop_hold_label")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
                           "finished_ns": marker.get("finished_ns"),
@@ -3093,10 +3129,14 @@ def failure_state(root, provider):
                          or {}).get(label) or {}
                 lead = owner.get("lead_id") or final_lead
                 trace = codex_host_trace(
-                    home, session, lead, case_root / "logs" / f"{label}.errors")
+                    home, session, lead, case_root / "logs" / f"{label}.errors",
+                    codex_profile=("full" if label == "a" else "latest")
+                    if case["case"] == "live-update" else "base")
                 if final_lead and final_lead != lead:
                     replacement = codex_host_trace(
-                        home, session, final_lead, case_root / "logs" / f"{label}.errors")
+                        home, session, final_lead, case_root / "logs" / f"{label}.errors",
+                        codex_profile=("full" if label == "a" else "latest")
+                        if case["case"] == "live-update" else "base")
                     trace["replacement_lead_turns"] = replacement["lead_turns"]
                     trace["replacement_parent_matches_root"] = replacement["lead_parent_matches_root"]
                 host[f"{case['case']}:{label}"] = trace
