@@ -120,17 +120,17 @@ def _claude_native_lead_event(
     if parent_rows is None or child_rows is None:
         return None
     launches = []
-    for row in parent_rows:
+    for index, row in enumerate(parent_rows):
         if row.get("type") != "assistant" or row.get("sessionId") != session:
             continue
         message = row.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         for item in content if isinstance(content, list) else ():
             if isinstance(item, dict) and item.get("id") == launch_id:
-                launches.append((row, item))
+                launches.append((index, row, item))
     if len(launches) != 1:
         return None
-    parent, launch = launches[0]
+    parent_index, parent, launch = launches[0]
     launch_input = launch.get("input")
     if (launch.get("type") != "tool_use" or launch.get("name") != "Agent"
             or not isinstance(launch_input, dict)
@@ -144,6 +144,27 @@ def _claude_native_lead_event(
     launched_at = _instant(parent.get("timestamp"))
     if launched_at is None or launched_at < started_at:
         return None
+    # Claude's SubagentStop prompt_id identifies the root prompt that launched
+    # Agent, while the child transcript uses a separate prompt uuid. Keep both
+    # native identities; a callback cannot establish this relation by itself.
+    root_prompts = []
+    for row in parent_rows[:parent_index]:
+        if row.get("type") != "user" or row.get("sessionId") != session:
+            continue
+        message = row.get("message")
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        textual = isinstance(content, str) or (isinstance(content, list) and content
+                    and all(isinstance(item, dict) and item.get("type") == "text"
+                            and isinstance(item.get("text"), str) for item in content))
+        when = _instant(row.get("timestamp"))
+        if textual and when is not None and when <= launched_at:
+            prompt_id = row.get("uuid")
+            if not isinstance(prompt_id, str) or not prompt_id:
+                return None
+            root_prompts.append(prompt_id)
+    root_prompt_id = root_prompts[-1] if root_prompts else None
     # A tool-result user row belongs to the current turn. A new textual user
     # prompt starts a new turn and invalidates an older completed report.
     prompt_indices = []
@@ -255,6 +276,8 @@ def _claude_native_lead_event(
         "last_assistant_message": report,
         "_symphony_native_recovery": True,
     }
+    if root_prompt_id:
+        payload["_symphony_root_prompt_id"] = root_prompt_id
     event_id = hashlib.sha256(f"claude-host-turn\0{session}\0{lead_id}\0{terminal_id}".encode()).hexdigest()
     return Event(event_id, "subagent_stopped", completed_at.isoformat(), payload)
 
@@ -410,18 +433,24 @@ def claude_completing_lead_turn(
     return "completed", event
 
 
-def _claude_callback_matches_native(source: Event, native: Event, session: str) -> bool:
+def _claude_callback_matches_native(
+    source: Event, native: Event, session: str, *, allow_conflict: bool = False,
+) -> bool:
     identity = native.payload["agent_id"]
     payload = source.payload
     report = payload.get("last_assistant_message")
     return bool(
         source.kind == "subagent_stopped" and payload.get("provider") == "claude"
-        and not payload.get("_symphony_owner_conflict")
+        and (not payload.get("_symphony_owner_conflict") or
+             (allow_conflict and payload.get("prompt_id")
+              == native.payload.get("_symphony_root_prompt_id")))
         and (payload.get("agent_id") or payload.get("subagent_id")) == identity
         and payload.get("parent_thread_id") in {None, "", session}
         and payload.get("session_id") in {session, identity}
         and str(payload.get("status") or "completed").lower() == "completed"
-        and payload.get("prompt_id") in {None, "", native.payload["prompt_id"]}
+        and payload.get("prompt_id") in {
+            None, "", native.payload["prompt_id"],
+            native.payload.get("_symphony_root_prompt_id")}
         and payload.get("agent_type") in {None, "", native.payload["agent_type"]}
         and payload.get("model") in {None, "", native.payload["model"]}
         and payload.get("model_reasoning_effort") in {
@@ -457,8 +486,7 @@ def claude_committed_native_terminal_replay(
     environ: Mapping[str, str],
 ) -> bool:
     """Match a delayed hook to the exact native terminal already accepted."""
-    if (source.kind != "subagent_stopped" or source.payload.get("provider") != "claude"
-            or source.payload.get("_symphony_owner_conflict")):
+    if source.kind != "subagent_stopped" or source.payload.get("provider") != "claude":
         return False
     identity = source.payload.get("agent_id") or source.payload.get("subagent_id")
     if not identity or str(source.payload.get("status") or "completed").lower() != "completed":
@@ -510,8 +538,22 @@ def claude_committed_native_terminal_replay(
             ProjectState(active_run=run, event_history=state.event_history),
             session, project, environ, require_missing=False,
             target_prompt=anchor.removeprefix("prompt_id:"))
-        if (native is not None and anchor == f"prompt_id:{native.payload['prompt_id']}"
-                and _claude_callback_matches_native(source, native, session)):
+        if native is None or anchor != f"prompt_id:{native.payload['prompt_id']}":
+            continue
+        root_prompt = native.payload.get("_symphony_root_prompt_id")
+        root_callback = bool(root_prompt and source.payload.get("prompt_id") == root_prompt)
+        if root_callback:
+            # A later native child prompt may be an unfinished new turn. The
+            # root prompt identifies the launch, not which child turn ended.
+            try:
+                activity, latest = _claude_native_prompt_activity(
+                    ProjectState(active_run=run), session, project, environ)
+            except (AttributeError, OSError, TypeError, ValueError):
+                continue
+            if activity not in {"single", "multiple"} or latest != native.payload["prompt_id"]:
+                continue
+        if _claude_callback_matches_native(
+                source, native, session, allow_conflict=root_callback):
             return True
     return False
 

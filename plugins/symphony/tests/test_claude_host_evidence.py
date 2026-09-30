@@ -95,6 +95,86 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         return claude_recovered_lead_event(ProjectState(active_run=self.run), SESSION,
                                            self.project, self.environ)
 
+    def write_root_prompt(self):
+        parent = self.parent.read_text()
+        root_prompt = {"type": "user", "uuid": "root-prompt", "sessionId": SESSION,
+                       "timestamp": "2026-09-29T02:00:30Z",
+                       "message": {"content": "Start the original managed lead."}}
+        self.parent.write_text(json.dumps(root_prompt) + "\n" + parent)
+
+    def test_archived_native_result_accepts_late_original_root_prompt_callback(self):
+        self.write_root_prompt()
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", json.loads(stop.stdout).get("decision") if stop.stdout else None)
+        archived = self.store.load(self.project)
+        self.assertIsNone(archived.active_run)
+        self.assertEqual("original-run", archived.recent_runs[-1].run_id)
+        self.assertEqual("completed", archived.recent_runs[-1].status)
+        callback = {"session_id": SESSION, "cwd": str(self.project),
+                    "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                    "agent_type": TYPE, "prompt_id": "root-prompt",
+                    "agent_transcript_path": str(self.child),
+                    "last_assistant_message": REPORT, "status": "completed"}
+        handle(callback, self.environ)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "$symphony:symphony status"}, self.environ)
+        record = self.store.session_record("claude", SESSION)
+        self.assertFalse(record and record["pending"])
+        self.assertEqual(archived.recent_runs[-1].run_id,
+                         self.store.load(self.project).recent_runs[-1].run_id)
+
+        # A callback queued by the previous hook must clear on the next root
+        # event without losing its original run or needing a new lead.
+        with self.store.session_lock("claude", SESSION):
+            self.store.queue_session_event(
+                "claude", SESSION, event_from_payload("claude", callback),
+                ambiguous_owner=True)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "$symphony:symphony status"}, self.environ)
+        record = self.store.session_record("claude", SESSION)
+        self.assertFalse(record and record["pending"])
+
+        for changed in ("foreign-root-prompt", "prompt-two"):
+            with self.subTest(changed=changed):
+                source = event_from_payload("claude", {**callback, "prompt_id": changed})
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    archived, source, SESSION, self.project, self.environ))
+
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        rows.append({"type": "user", "uuid": "prompt-two", "sessionId": SESSION,
+                     "agentId": LEAD, "isSidechain": True,
+                     "timestamp": "2026-09-29T02:03:00Z",
+                     "message": {"content": "New work is still running."}})
+        self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        source = event_from_payload("claude", callback)
+        self.assertFalse(claude_committed_native_terminal_replay(
+            archived, source, SESSION, self.project, self.environ))
+        conflicted = Event(source.event_id, source.kind, source.observed_at,
+                           {**source.payload, "_symphony_owner_conflict": True})
+        self.assertFalse(claude_committed_native_terminal_replay(
+            archived, conflicted, SESSION, self.project, self.environ))
+
+    def test_malformed_parent_prompt_with_queued_callback_blocks_stop(self):
+        self.write_root_prompt()
+        rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+        rows[0]["message"] = "malformed native prompt"
+        self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        callback = event_from_payload("claude", {
+            "session_id": SESSION, "hook_event_name": "SubagentStop",
+            "agent_id": LEAD, "agent_type": TYPE, "prompt_id": "root-prompt",
+            "last_assistant_message": REPORT, "status": "completed"})
+        with self.store.session_lock("claude", SESSION):
+            self.store.queue_session_event("claude", SESSION, callback,
+                                           ambiguous_owner=True)
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout).get("decision"))
+        self.assertEqual("original-run", self.store.load(self.project).active_run.run_id)
+        self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
+
     def test_missing_old_callback_reconciles_original_run_on_root_stop(self):
         recovered = self.recovered()
         self.assertIsNotNone(recovered)

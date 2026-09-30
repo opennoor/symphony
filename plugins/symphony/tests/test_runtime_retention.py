@@ -12,12 +12,46 @@ import unittest
 
 from plugins.symphony.scripts.generate_hooks import bootstrap, generated
 from plugins.symphony.scripts.package_smoke import _payload
+from plugins.symphony.symphony.runtime import _retained_activation_command
 
 
 PLUGIN = Path(__file__).resolve().parents[1]
 
 
 class RuntimeRetentionTests(unittest.TestCase):
+    def test_compact_activation_command_verifies_retained_tree_and_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = self.materialize(directory, "Reviewed 'Old' Plugin With Spaces")
+            result, env = self.run_hook(self.command(root, "codex", "SessionStart"), root,
+                                        "codex", directory,
+                                        {"hook_event_name": "SessionStart",
+                                         "session_id": "original-session", "cwd": str(directory)})
+            self.assertEqual(0, result.returncode, result.stderr)
+            retained = next((directory / "retained runtimes").iterdir())
+            command = _retained_activation_command(str(retained), str(root))
+            self.assertLess(len(command), 1200)
+            self.assertNotIn("base64", command)
+            self.assertIn(command, json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"])
+            shutil.rmtree(root)
+            env["CODEX_SESSION_ID"] = "original-session"
+            def check():
+                invocation = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
+                              if os.name == "nt" else ["bash", "-c", command])
+                return subprocess.run(invocation, cwd=directory, env=env,
+                                      capture_output=True, text=True, timeout=20)
+            accepted = check()
+            self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
+            self.assertIn("guarded: matching current-session heartbeat", accepted.stdout)
+            env["CODEX_SESSION_ID"] = "foreign-session"
+            self.assertNotEqual(0, check().returncode)
+            env["CODEX_SESSION_ID"] = "original-session"
+            checker = retained / "scripts/check_activation.py"
+            checker.write_text("raise RuntimeError('untrusted checker executed')\n")
+            rejected = check()
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertNotIn("untrusted checker executed", rejected.stderr)
+
     def materialize(self, directory, name):
         root = directory / name
         shutil.copytree(PLUGIN, root)

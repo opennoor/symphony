@@ -56,6 +56,31 @@ ROLES = {"assessor", "consultant", "lead", "worker"}
 HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
 
 
+def _retained_activation_command(retained: str, original: str) -> str:
+    """Give Codex a short checker that verifies the pinned tree before import."""
+    digest = Path(retained).name
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return ""
+    code = (
+        "import hashlib,pathlib,runpy,sys;"
+        "r=pathlib.Path(sys.argv[1]);f=sorted(r.rglob(\"*\"));"
+        "assert r.is_dir() and not r.is_symlink() and not any(p.is_symlink() for p in f);"
+        "d=hashlib.sha256(b\"\".join(p.relative_to(r).as_posix().encode()+bytes(1)"
+        "+hashlib.sha256(p.read_bytes()).digest() for p in f if p.is_file())).hexdigest();"
+        f"assert d==\"{digest}\";"
+        "sys.argv=[str(r/\"scripts/check_activation.py\"),\"--plugin-root\",sys.argv[2]];"
+        "runpy.run_path(sys.argv[0],run_name=\"__main__\")"
+    )
+    if os.name == "nt":
+        # Windows PowerShell 5.1 strips double quotes inside native arguments.
+        # Single-quoted Python literals survive its legacy argument passing.
+        code = code.replace('"', "'")
+    executable = "python.exe" if os.name == "nt" else "python3"
+    arguments = [executable, "-I", "-c", code, retained, original]
+    return ("& " + " ".join("'" + value.replace("'", "''") + "'" for value in arguments)
+            if os.name == "nt" else shlex.join(arguments))
+
+
 def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
     if environ.get("SYMPHONY_CLAUDE_PROBE"):
         return HookResult()
@@ -385,10 +410,20 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                                 # not block this independent session.
                                 continue
                             if any(item.get("ambiguous_owner") and not (
-                                roster is not None and _committed_child_start_replay(
-                                    roster, Event(item["event_id"], item["kind"],
-                                                  item["observed_at"], item["payload"]),
-                                    provider, session,
+                                roster is not None and (
+                                    _committed_child_start_replay(
+                                        roster, Event(item["event_id"], item["kind"],
+                                                      item["observed_at"], item["payload"]),
+                                        provider, session,
+                                    ) or _committed_child_terminal_replay(
+                                        roster, Event(item["event_id"], item["kind"],
+                                                      item["observed_at"], item["payload"]),
+                                        provider, session,
+                                    ) or (provider == "claude" and
+                                          claude_committed_native_terminal_replay(
+                                              roster, Event(item["event_id"], item["kind"],
+                                                            item["observed_at"], item["payload"]),
+                                              session, Path(record["project"] or project), environ))
                                 )) for item in alias_record["pending"]):
                                 unresolved_alias = True
                                 continue
@@ -858,17 +893,14 @@ def _transition(
         retained = environ.get("SYMPHONY_PINNED_RUNTIME")
         original = str(heartbeat.payload["plugin_root"])
         if retained and (source.kind == "session_heartbeat" or not Path(original).is_dir()):
-            executable = "python.exe" if os.name == "nt" else "python3"
             text = (
                 f"Symphony retained the reviewed runtime at {retained}. "
                 "If the loaded plugin cache disappears, use this retained root for Symphony references. "
             )
-            bootstrap = environ.get("SYMPHONY_BOOTSTRAP_CODE")
-            if provider == "codex" and bootstrap:
-                arguments = [executable, "-I", "-c", bootstrap, original, provider, "--check-activation"]
-                command = ("& " + " ".join("'" + value.replace("'", "''") + "'" for value in arguments)
-                           if os.name == "nt" else shlex.join(arguments))
-                text += f"Check activation through the verified launcher: {command}"
+            if provider == "codex":
+                command = _retained_activation_command(retained, original)
+                if command:
+                    text += f"Check activation through the verified launcher: {command}"
             actions += (Action("inject_context", {"text": text}),)
 
     # Every event from the owning session is evidence it is still alive, which

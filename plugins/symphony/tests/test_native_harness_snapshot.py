@@ -342,6 +342,25 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaises(RuntimeError):
                 native.codex_pre_resume_state(changed, "root-a", "run-a", "lead-a")
 
+    def test_codex_old_terminal_branches_require_native_proof(self):
+        first = {"turn_id": "first"}
+        second = {"turn_id": "second"}
+        blocked = {"completed": True, "reported_outcome": "blocked"}
+        completed = {"completed": True, "reported_outcome": "completed"}
+        self.assertEqual("original_completed", native.require_codex_old_lead_terminal(
+            "completed", [first], [completed]))
+        self.assertEqual("same_id_recovered", native.require_codex_old_lead_terminal(
+            "recovering", [first, second], [blocked, completed]))
+        for state, stops, turns in (
+            ("completed", [first], [blocked]),
+            ("completed", [first], [{**completed, "completed": False}]),
+            ("recovering", [first], [blocked, completed]),
+            ("recovering", [first, second], [blocked, blocked]),
+            ("unknown", [first, second], [blocked, completed]),
+        ):
+            with self.subTest(state=state, stops=stops, turns=turns), self.assertRaises(RuntimeError):
+                native.require_codex_old_lead_terminal(state, stops, turns)
+
     def test_native_gate_can_release_before_product_start_but_update_requires_working_leads(self):
         sessions = {"a": "root-a", "b": "root-b"}
         run_ids = {"a": "run-a", "b": "run-b"}

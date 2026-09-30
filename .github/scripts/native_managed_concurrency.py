@@ -932,6 +932,23 @@ def codex_pre_resume_state(document, session, run_id, lead_id):
     raise RuntimeError("old native run is neither the original recovering lead nor a durable completed archive")
 
 
+def require_codex_old_lead_terminal(pre_resume_state, captured_stops, lead_turns):
+    """A completed original run needs one turn; recovery needs a later same-ID turn."""
+    completed = [turn for turn in lead_turns if turn.get("completed")
+                 and turn.get("reported_outcome") == "completed"]
+    if pre_resume_state == "completed":
+        if not completed:
+            raise RuntimeError("archived original lead lacks a native completed turn")
+        return "original_completed"
+    if pre_resume_state != "recovering":
+        raise RuntimeError("old original lead has no supported resume state")
+    if len({record.get("turn_id") for record in captured_stops if record.get("turn_id")}) < 2:
+        raise RuntimeError("native host did not deliver a repeated same-lead terminal")
+    if not any(turn.get("reported_outcome") == "completed" for turn in lead_turns[1:]):
+        raise RuntimeError("native lead transcript lacks a completed follow-up turn")
+    return "same_id_recovered"
+
+
 def verified_old_codex_wait(document, session, run_id, lead_id, capture, host):
     """Prove an old CLI is only waiting after its original lead's completed turn."""
     if codex_pre_resume_state(document, session, run_id, lead_id) != "recovering":
@@ -1607,15 +1624,13 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                                   and record.get("session_id") == sessions["a"]
                                   and record.get("agent_id") == observed_leads["a"]
                                   and record.get("exit_marker_written")]
-                if len({record.get("turn_id") for record in captured_stops}) < 2:
-                    raise RuntimeError("native host did not deliver a repeated same-lead terminal")
                 host = codex_host_trace(update["home"], sessions["a"], observed_leads["a"],
                                         logs / "a.errors")
-                if not any(turn.get("reported_outcome") == "completed"
-                           for turn in host["lead_turns"][1:]):
-                    raise RuntimeError("native lead transcript lacks a completed follow-up turn")
+                terminal_branch = require_codex_old_lead_terminal(
+                    pre_resume_state, captured_stops, host["lead_turns"])
                 snapshot["pre_candidate_resume"] = event_counts(before_resume)
                 snapshot["pre_candidate_resume_run_state"] = pre_resume_state
+                snapshot["pre_candidate_terminal_branch"] = terminal_branch
                 snapshot["pre_candidate_recovery_probe"] = codex_recovery_probe(
                     before_resume, sessions["a"], update["home"])
                 snapshot_file.write_text(json.dumps(snapshot))
