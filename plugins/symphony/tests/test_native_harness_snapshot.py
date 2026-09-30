@@ -827,6 +827,50 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertLess(native.timestamp_ns(trace["followup_calls"][0]["called_at"]),
                             native.timestamp_ns("2026-09-30T00:00:20+00:00"))
 
+    def test_codex_trace_classifies_child_status_read_without_exposing_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            (sessions / "root-a.jsonl").write_text("{}\n")
+            nonce = "a" * 32
+            rows = [
+                {"type": "response_item", "payload": {
+                    "type": "function_call", "name": "exec_command", "call_id": "read-1",
+                    "arguments": json.dumps({"cmd": "cat NATIVE_STATUS.txt"})}},
+                {"type": "response_item", "payload": {
+                    "type": "function_call_output", "call_id": "read-1",
+                    "output": f"WAIT {nonce}\n"}},
+                {"type": "response_item", "payload": {
+                    "type": "function_call", "name": "exec_command", "call_id": "other-2",
+                    "arguments": json.dumps({"cmd": "pwd"})}},
+            ]
+            (sessions / "lead-a.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows))
+            trace = native.codex_host_trace(home, "root-a", "lead-a", home / "errors")
+            self.assertEqual([call["status_file_mentioned"] for call in
+                              trace["lead_tool_calls"]], [True, False])
+            self.assertTrue(trace["lead_tool_calls"][0]["wait_token_seen"])
+            self.assertFalse(trace["lead_tool_calls"][1]["return_recorded"])
+            self.assertNotIn(nonce, json.dumps(trace))
+
+            rows = [{"type": "response_item", "payload": {
+                "type": "function_call", "name": "exec_command",
+                "call_id": f"extra-{index}",
+                "arguments": json.dumps({"cmd": "pwd"})}}
+                for index in range(24)]
+            rows.append({"type": "response_item", "payload": {
+                "type": "function_call", "name": "exec_command",
+                "call_id": "late-read", "arguments": json.dumps({"cmd": "cat NATIVE_STATUS.txt"})}})
+            (sessions / "lead-a.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows))
+            trace = native.codex_host_trace(home, "root-a", "lead-a", home / "errors")
+            self.assertEqual(25, trace["lead_tool_call_count"])
+            self.assertEqual(24, len(trace["lead_tool_calls"]))
+            self.assertTrue(trace["lead_tool_calls_truncated"])
+            self.assertFalse(any(call["status_file_mentioned"] for call in
+                                 trace["lead_tool_calls"]))
+
     def test_native_launch_pins_current_provider_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             for provider, profile in (("codex", "base"), ("claude", "sonnet-5-5")):

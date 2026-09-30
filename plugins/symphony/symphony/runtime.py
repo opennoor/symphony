@@ -2239,8 +2239,8 @@ def _clamp_actions(
             f"Your plan routes this work to {clamp['actual_model']} instead of the "
             f"matrix-selected {clamp['intended_model']}"
             + (" and no entitlement could be read" if not profile else "")
-            + f". Run `{control}` to accept the weaker route for this session, or "
-            "upgrade the plan and start a new session."
+            + f". Run `{control}` to accept the weaker route and continue this "
+            "session. Model availability is checked again in a new session."
         )
         return (_block_tool(reason),)
     if clamp["effort_clamped"]:

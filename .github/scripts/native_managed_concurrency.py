@@ -1488,6 +1488,8 @@ def codex_host_trace(home, session, lead_id, error_log, *, strict=False,
                      "return_recorded": last_call["call_id"] in outputs}
     turns = {}
     child_parent = None
+    child_tools = {}
+    child_tool_count = 0
     for record in records(child_file):
         payload = record.get("payload") or {}
         if record.get("type") == "session_meta":
@@ -1521,6 +1523,31 @@ def codex_host_trace(home, session, lead_id, error_log, *, strict=False,
                         status = None
                     turn["reported_outcome"] = status if status in {
                         "completed", "blocked", "failed", "abandoned"} else "other"
+        elif record.get("type") == "response_item" and payload.get("type") == "function_call":
+            call_id = payload.get("call_id")
+            child_tool_count += 1
+            if call_id and len(child_tools) < 24:
+                arguments = str(payload.get("arguments") or "")
+                name = payload.get("name")
+                child_tools[call_id] = {
+                    "name": name if isinstance(name, str) and
+                    re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) else None,
+                    "call_hash": fingerprint(call_id),
+                    "called_at": record.get("timestamp"),
+                    "status_file_mentioned": "NATIVE_STATUS.txt" in arguments,
+                    "arguments_hash": fingerprint(arguments),
+                    "return_recorded": False,
+                }
+        elif (record.get("type") == "response_item"
+              and payload.get("type") == "function_call_output"):
+            tool = child_tools.get(payload.get("call_id"))
+            if tool is not None:
+                output = str(payload.get("output") or "")
+                tool["return_recorded"] = True
+                tool["returned_at"] = record.get("timestamp")
+                tool["wait_token_seen"] = bool(re.search(r"\bWAIT [0-9a-f]{32}\b", output))
+                tool["ready_token_seen"] = bool(re.search(r"\bREADY [0-9a-f]{32}\b", output))
+                tool["output_hash"] = fingerprint(output)
     log = error_log.read_text(errors="replace") if error_log.is_file() else ""
     return {"root_jsonl_present": root_file is not None,
             "lead_jsonl_present": child_file is not None,
@@ -1535,6 +1562,9 @@ def codex_host_trace(home, session, lead_id, error_log, *, strict=False,
             "manual_controls": manual_controls,
             "lead_activity": activities,
             "lead_turns": list(turns.values()),
+            "lead_tool_calls": list(child_tools.values()),
+            "lead_tool_call_count": child_tool_count,
+            "lead_tool_calls_truncated": child_tool_count > len(child_tools),
             "root_stop_hook": {
                 "invocation_count": len(re.findall(r"(?m)^hook: Stop(?: Started)?\r?$", log)),
                 "completed_count": len(re.findall(r"hook: Stop Completed", log)),

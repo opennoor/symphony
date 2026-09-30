@@ -656,6 +656,9 @@ class ClampGateTests(unittest.TestCase):
         self.assertIn(CODEX_BASE_ROUTE["model"], output["reason"])
         self.assertIn(CODEX_FULL_ROUTE["model"], output["reason"])
         self.assertIn("$symphony:symphony proceed", output["reason"])
+        self.assertIn("continue this session", output["reason"])
+        self.assertIn("availability is checked again in a new session", output["reason"])
+        self.assertNotIn("start a new session", output["reason"])
 
     def test_accepting_the_clamp_unblocks_the_rest_of_the_session(self):
         environ, blocked = self.open_and_spawn_lead("base")
