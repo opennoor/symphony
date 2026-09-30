@@ -246,7 +246,13 @@ class HostEvidenceTests(unittest.TestCase):
         self.assertIsNone(state.active_run)
         self.assertEqual("legacy-run", state.recent_runs[-1].run_id)
         self.assertEqual(LEAD_ID, state.recent_runs[-1].lead_identity)
+        self.assertEqual(old.active_run.owner_generation,
+                         state.recent_runs[-1].owner_generation)
         self.assertEqual("completed", state.recent_runs[-1].outcome["status"])
+        record = self.store.session_record("codex", ROOT_ID)
+        self.assertIsNotNone(record)
+        self.assertEqual([], record["pending"])
+        self.assertFalse(record["overflow"])
 
     def test_released_151_status_guides_stop_after_native_recovery(self):
         self.write_turns()

@@ -39,6 +39,11 @@ jobs:
       - name: Execute Windows hooks under Restricted PowerShell policy
         run: python .github/scripts/windows_acceptance.py
 
+      - name: Replay released 1.5.1 recovering state through candidate Stop on Windows
+        # The immutable 1.5.1 Codex host may complete a fixture lead before its
+        # requested WAIT turn. This checks candidate migration independently.
+        run: python -m unittest plugins.symphony.tests.test_host_evidence.HostEvidenceTests.test_released_151_recovering_state_reconciles_unique_native_followup
+
       - name: Execute Windows hooks as a standard user
         timeout-minutes: 5
         run: |
@@ -122,15 +127,6 @@ jobs:
           $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
           python .github/scripts/native_managed_concurrency.py --provider codex --timeout 600
           if ($LASTEXITCODE -ne 0) { throw 'Native Codex managed concurrency failed' }
-          git fetch origin tag v1.5.1
-          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch released 1.5.1 source' }
-          $oldCheckout = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
-          git worktree add --detach $oldCheckout v1.5.1
-          if ($LASTEXITCODE -ne 0) { throw 'Could not materialize released 1.5.1 source' }
-          python .github/scripts/native_managed_concurrency.py --provider codex --timeout 600 `
-            --live-update --old-plugin-root (Join-Path $oldCheckout 'plugins/symphony') `
-            --candidate-plugin-root (Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony')
-          if ($LASTEXITCODE -ne 0) { throw 'Native Codex live-update continuity failed' }
 
       - name: Install Claude Code
         run: npm.cmd install -g @anthropic-ai/claude-code
