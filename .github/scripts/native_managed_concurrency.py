@@ -241,19 +241,21 @@ def prompt(provider, label, recover, project):
         if provider == "claude" else ""
     )
     lead_task = (
-        "FIRST-TURN CONTRACT: After your native start hook releases, reply with exactly "
-        "these two lines (no Markdown):\nGATE_RELEASED\n"
+        "FIRST-TURN CONTRACT: There is no gate command or file to find or run. "
+        "After your native start hook releases, your only action is to reply with "
+        "exactly these two literal lines (no Markdown):\nGATE_RELEASED\n"
         + ('SYMPHONY_OUTCOME: {"status":"blocked"}' if recover else
            'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
         + ("This recovery fixture is deliberately blocked even after the native hook releases; "
            "the root will resume this same lead for completion.\n" if recover else "") +
         "The test-only native SubagentStart hook holds your first turn until both "
-        "lead starts are recorded. Do not run tools, delegate, or create a worktree."
+        "lead starts are recorded. GATE_RELEASED is a report line, not an operation. "
+        "Do not inspect files, run tools, delegate, or create a worktree."
     )
     lead_relay = (
         "Pass LEAD_SPAWN_PACKET verbatim as spawn_agent arguments, including message. "
         "The child has no root context; do not expand, paraphrase, or omit its contract. "
-        "Never replace the lead or rerun the gate.\n"
+        "Never replace the lead or reinterpret GATE_RELEASED as a command.\n"
         "LEAD_SPAWN_PACKET: " + json.dumps({
             "task_name": lead_role["task_name"],
             "model": lead_role["model"],
@@ -280,7 +282,7 @@ def prompt(provider, label, recover, project):
         "If a spawn name is rejected, retry the exact underscore name from its packet. "
         if provider == "codex" else "")
     return (
-        f"{control} Disposable native CI lifecycle {label}. "
+        f"{control} Disposable native callback report {label}. "
         "Use Symphony and the native agent tools. Spawn one assessor that returns exactly "
         f"SYMPHONY_ASSESSMENT: {route}. Await it. Spawn one lead with "
         f"SYMPHONY_ROUTE: {route} and the exact model and effort selected by Symphony. "
@@ -1756,9 +1758,12 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                          if event.get("kind") == "lead_completed"
                          and event.get("payload", {}).get("identity") == observed_leads[label]]
             # ponytail: allow 1s filesystem clock granularity; use host monotonic receipts if subsecond ordering matters.
-            if (not released.is_file() or not terminals
-                    or min(datetime.fromisoformat(event["observed_at"]).timestamp()
-                           for event in terminals) < released.stat().st_mtime - 1):
+            if not released.is_file():
+                raise RuntimeError(f"{label}: native lead start gate was never released")
+            if not terminals:
+                raise RuntimeError(f"{label}: original lead has no durable completed terminal")
+            if (min(datetime.fromisoformat(event["observed_at"]).timestamp()
+                    for event in terminals) < released.stat().st_mtime - 1):
                 raise RuntimeError(f"{label}: lead completed before the gate released")
             runs = [run for run in doc.get("recent_runs", []) if run.get("provider") == provider]
             matching = [run for run in runs if run.get("session_id") == sessions[label]]

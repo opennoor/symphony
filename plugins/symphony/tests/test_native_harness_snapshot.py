@@ -585,7 +585,9 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertIsNotNone(packet_line, "lead instructions must be an explicit relay packet")
                     packet = json.loads(packet_line.group(1))
                     self.assertIn("Pass LEAD_SPAWN_PACKET verbatim as spawn_agent arguments", root_prompt)
-                    self.assertIn("Never replace the lead or rerun the gate", root_prompt)
+                    self.assertIn("Never replace the lead or reinterpret GATE_RELEASED as a command",
+                                  root_prompt)
+                    self.assertIn("Disposable native callback report", root_prompt)
                     child_message = packet["message"]
                     self.assertIn('SYMPHONY_ROLE: lead\n', child_message)
                     self.assertIn(f'SYMPHONY_OUTCOME: {{"status":"{status}"}}', child_message)
@@ -599,6 +601,9 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                                      else 'SYMPHONY_OUTCOME: {"status":"blocked"}', child_message)
                     self.assertIn("native SubagentStart hook holds your first turn", child_message)
                     self.assertIn("GATE_RELEASED\nSYMPHONY_OUTCOME", child_message)
+                    self.assertIn("There is no gate command or file to find or run", child_message)
+                    self.assertIn("GATE_RELEASED is a report line, not an operation", child_message)
+                    self.assertIn("Do not inspect files, run tools", child_message)
                     self.assertNotIn("gate.py", child_message)
                     self.assertEqual("none", packet["fork_turns"])
                     self.assertEqual(("gpt-6-luna", "low"),
