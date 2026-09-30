@@ -22,6 +22,11 @@ import uuid
 import native_managed_concurrency as native
 
 
+PROFILE = "sonnet-5-5"
+MODEL = "claude-sonnet-5-5"
+LEAD_AGENT = f"symphony:symphony-lead-{MODEL}-low"
+
+
 CAPTURE = '''import hashlib, json, os, pathlib, re, sys, uuid
 try:
     payload = json.load(sys.stdin)
@@ -225,6 +230,20 @@ def scratch_claude(root, package):
     return env, home
 
 
+def verify_lead_model(env, root):
+    result = native.claude_command(
+        env, root, "--settings", '{"disableAllHooks":true}', "--print",
+        "--no-session-persistence", "--tools", "", "--disallowedTools", "mcp__*",
+        "--agent", LEAD_AGENT, "--max-budget-usd", "0.25", "--output-format", "json",
+        "Reply only OK. Do not use tools.", timeout=30,
+    )
+    report = json.loads(result.stdout)
+    usage = report.get("modelUsage") if isinstance(report, dict) else None
+    if not isinstance(usage, dict) or report.get("is_error") or set(usage) != {MODEL}:
+        raise RuntimeError("packaged isolated lead did not run on the exact Sonnet 5.5 model")
+    return {"model": MODEL, "evidence": "native packaged lead accepted; exact modelUsage"}
+
+
 def prompt(project):
     route = ('{"size":"small","complexity":"simple","risk":"normal",'
              '"rationale":"disposable native worktree hook check","topology":"direct"}')
@@ -233,7 +252,7 @@ def prompt(project):
         "/symphony:start Disposable native Claude isolated Agent hook check. "
         "Spawn one Symphony assessor and await its assessment: SYMPHONY_ASSESSMENT: "
         + route + ". Spawn one Symphony lead with SYMPHONY_ROUTE: " + route +
-        " using native Agent with subagent_type=symphony:symphony-lead-claude-sonnet-5-low, "
+        f" using native Agent with subagent_type={LEAD_AGENT}, "
         "run_in_background=true, and isolation=worktree. This isolation choice is required "
         "for the regression. The lead must run `python '" + gate + "' isolated` once, "
         "wait for GATE_RELEASED from that command, and return exactly "
@@ -259,7 +278,8 @@ def run_case(root, package, timeout, budget):
     capture.mkdir()
     env, home = scratch_claude(root, package)
     env.update({"SYMPHONY_STATE_DIR": str(state), "SYMPHONY_RUNTIME_DIR": str(runtime),
-                "SYMPHONY_PROFILE": "sonnet", "SYMPHONY_CAPTURE_DIR": str(capture)})
+                "SYMPHONY_PROFILE": PROFILE, "SYMPHONY_CAPTURE_DIR": str(capture)})
+    model_check = verify_lead_model(env, root)
     session = str(uuid.uuid4())
     executable = shutil.which("claude")
     if not executable:
@@ -281,13 +301,14 @@ def run_case(root, package, timeout, budget):
         while time.monotonic() < deadline:
             records = capture_records(capture)
             lead_starts = [item for item in records if item.get("hook_event_name") == "SubagentStart"
-                           and "lead" in str(item.get("agent_type") or "")]
+                           and item.get("agent_type") == LEAD_AGENT]
             isolated_starts = [item for item in lead_starts
                                if item.get("cwd")
                                and Path(item["cwd"]).resolve() != project.resolve()
                                and ".claude/worktrees/" in
                                str(item["cwd"]).replace("\\", "/")]
             isolated_calls = [item for item in records if item.get("tool_name") == "Agent"
+                              and (item.get("tool_input") or {}).get("subagent_type") == LEAD_AGENT
                               and (item.get("tool_input") or {}).get("isolation") == "worktree"
                               and (item.get("tool_input") or {}).get("run_in_background") is True]
             if (project / "isolated.ready").exists() and isolated_starts and isolated_calls:
@@ -345,6 +366,7 @@ def run_case(root, package, timeout, budget):
                             "isolated_child_cwd_different": True,
                             "isolation_requested": True,
                             "git_worktree_preflight": preflight,
+                            "native_model_check": model_check,
                             "captured_hook_events": sorted({item.get("hook_event_name") for item in records}),
                             "durable_parent_outcome": "completed"}
             if process.poll() not in (None, 0):

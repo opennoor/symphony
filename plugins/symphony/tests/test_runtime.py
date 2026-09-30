@@ -1376,6 +1376,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual("working", next(item.state for item in run.delegations
                                           if item.identity == "lead"))
 
+    def test_disabled_session_without_managed_history_ignores_ordinary_child_start(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                environ = self.claude_environ if provider == "claude" else self.environ
+                session = f"ordinary-{provider}"
+                project = self.root / provider
+                project.mkdir()
+                state = ProjectState(enabled=False)
+                store = StateStore(self.state_root)
+                store.save(project, state)
+                base = {"session_id": session, "cwd": str(project)}
+                handle({**base, "hook_event_name": "SessionStart"}, environ)
+                handle({**base, "hook_event_name": "SubagentStart", "agent_id": "explore-child",
+                        "parent_thread_id": session, "agent_type": "Explore",
+                        "prompt_id": "ordinary-prompt"}, environ)
+                record = store.session_record(provider, session)
+                self.assertFalse(record and record["pending"])
+                stop = handle({**base, "hook_event_name": "Stop"}, environ)
+                self.assertNotEqual("block", self.output(stop).get("decision"))
+
     def test_new_child_alias_is_discovered_before_it_enters_root_roster(self):
         choice = route_choice()
         self.seed_run(RunState("root-run", "task", lead_identity="lead", status="active",
@@ -1728,6 +1748,39 @@ class RuntimeTests(unittest.TestCase):
         archived = store.load(self.project)
         self.assertIsNone(archived.active_run)
         self.assertEqual("completed", archived.recent_runs[-1].status)
+
+    def test_native_verification_exception_blocks_managed_stop_only(self):
+        for provider, evidence_function in (
+            ("codex", "codex_recovered_lead_event"),
+            ("codex", "codex_completing_lead_turn"),
+            ("claude", "claude_recovered_lead_event"),
+            ("claude", "claude_completing_lead_turn"),
+        ):
+            with self.subTest(provider=provider, evidence_function=evidence_function):
+                choice = route_choice(provider=provider)
+                self.seed_run(RunState(
+                    "run", "task", lead_identity="lead", status="completing",
+                    outcome={"status": "completed"},
+                    delegations=(Delegation("lead", "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                ), provider=provider)
+                environ = self.claude_environ if provider == "claude" else self.environ
+                stop = {**self.payload("", provider), "hook_event_name": "Stop"}
+                with patch.object(runtime_module, evidence_function, side_effect=TypeError("bad native row")):
+                    result = handle(stop, environ)
+                self.assertEqual("block", self.output(result).get("decision"))
+                self.assertEqual("completing", StateStore(self.state_root).load(self.project)
+                                 .active_runs[f"{provider}:{provider}-session"].status)
+
+        for provider, evidence_function in (("codex", "codex_recovered_lead_event"),
+                                            ("claude", "claude_recovered_lead_event")):
+            with self.subTest(provider=provider, disabled=True):
+                StateStore(self.state_root).save(self.project, ProjectState(enabled=False))
+                environ = self.claude_environ if provider == "claude" else self.environ
+                with patch.object(runtime_module, evidence_function, side_effect=TypeError("bad native row")):
+                    result = handle({**self.payload("", provider), "hook_event_name": "Stop"},
+                                    environ)
+                self.assertNotEqual("block", self.output(result).get("decision"))
 
     def test_restarted_worker_failure_after_lead_completion_requires_recovery(self):
         choice = route_choice()

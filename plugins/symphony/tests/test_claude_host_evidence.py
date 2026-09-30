@@ -181,6 +181,256 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         self.assertEqual("block", json.loads(stop.stdout)["decision"])
         self.assertEqual("completing", self.store.load(self.project).active_run.status)
 
+    def test_newer_native_prompt_blocks_stop_after_ordinary_hook_completion(self):
+        # The ordinary callback can arrive before Claude finishes writing its
+        # end_turn record, so no native recovery anchor is attached yet.
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        active = self.store.load(self.project).active_run
+        self.assertEqual("completing", active.status)
+        self.assertNotIn("_claude_native_recovery", active.assessment)
+        self.write_native(later_prompt=True)
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        accepted_at = datetime.fromisoformat(next(item.updated_at for item in active.delegations
+                                                   if item.identity == LEAD))
+        rows[-1]["timestamp"] = (accepted_at + timedelta(microseconds=1)).isoformat()
+        self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        self.assertEqual("original-run", self.store.load(self.project).active_run.run_id)
+
+    def test_accepted_claude_launch_intent_prevents_archive_before_child_start(self):
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        launched = handle({"session_id": SESSION, "cwd": str(self.project),
+                           "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                           "tool_input": {"subagent_type":
+                                          "symphony:symphony-worker-claude-sonnet-5-low",
+                                          "prompt": "SYMPHONY_ROLE: worker\nComplete the task."}},
+                          self.environ)
+        self.assertNotEqual("block", json.loads(launched.stdout).get("decision")
+                            if launched.stdout else None)
+        active = self.store.load(self.project).active_run
+        self.assertTrue(active.assessment.get("_pending_delegations"))
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout)["decision"])
+        self.assertEqual("original-run", self.store.load(self.project).active_run.run_id)
+
+    def test_ordinary_callback_archives_when_native_turn_has_no_later_prompt(self):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        self.assertNotIn("_claude_native_recovery", self.store.load(self.project).active_run.assessment)
+        self.write_native()
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        self.assertEqual("completed", self.store.load(self.project).recent_runs[-1].status)
+
+    def test_ordinary_callback_routes_newer_valid_native_completion_before_stop(self):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        active = self.store.load(self.project).active_run
+        self.write_native()
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        accepted_at = datetime.fromisoformat(next(item.updated_at for item in active.delegations
+                                                   if item.identity == LEAD))
+        started = accepted_at + timedelta(microseconds=1)
+        rows.extend([
+            {"type": "user", "uuid": "prompt-two", "sessionId": SESSION,
+             "agentId": LEAD, "isSidechain": True, "timestamp": started.isoformat(),
+             "message": {"content": "Continue the same task."}},
+            {"type": "assistant", "uuid": "terminal-two", "sessionId": SESSION,
+             "agentId": LEAD, "isSidechain": True,
+             "timestamp": (started + timedelta(microseconds=1)).isoformat(), "effort": "low",
+             "message": {"model": "claude-sonnet-5", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": REPORT}]}},
+        ])
+        self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        settled = self.store.load(self.project)
+        self.assertEqual("completed", settled.recent_runs[-1].status)
+        self.assertIn("prompt_id:prompt-two",
+                      settled.recent_runs[-1].assessment["_terminal_turns"][LEAD])
+
+    def test_delayed_old_callback_cannot_archive_newer_unfinished_native_turn(self):
+        self.write_native(later_prompt=True)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        self.assertNotIn("_claude_native_recovery", self.store.load(self.project).active_run.assessment)
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        self.assertEqual("original-run", self.store.load(self.project).active_run.run_id)
+
+    def test_partial_native_tail_does_not_erase_known_newer_turn(self):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        self.write_native(later_prompt=True)
+        with self.child.open("a") as stream:
+            stream.write('{"type":')
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        self.assertEqual("original-run", self.store.load(self.project).active_run.run_id)
+
+    def test_malformed_unrelated_parent_row_blocks_instead_of_crashing(self):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        self.write_native(later_prompt=True)
+        with self.parent.open("a") as stream:
+            stream.write(json.dumps({"type": "assistant", "sessionId": SESSION,
+                                     "message": "malformed unrelated row"}) + "\n")
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        self.write_native(later_prompt=True)
+        with self.parent.open("a") as stream:
+            stream.write(json.dumps({"type": "assistant", "sessionId": SESSION,
+                                     "message": {"content": 1}}) + "\n")
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+
+    def test_malformed_child_user_row_cannot_be_skipped_as_single_turn(self):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        for later_prompt in (False, True):
+            with self.subTest(later_prompt=later_prompt):
+                self.write_native(later_prompt=later_prompt)
+                with self.child.open("a") as stream:
+                    stream.write(json.dumps({"type": "user", "sessionId": SESSION,
+                                             "agentId": LEAD, "isSidechain": True,
+                                             "message": "malformed new prompt"}) + "\n")
+                stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                               "hook_event_name": "Stop"}, self.environ)
+                self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+
+    def test_child_user_block_list_cannot_hide_a_new_prompt(self):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        for content in ([None], [{"type": "text", "text": "Do more work."}]):
+            with self.subTest(content=content):
+                self.write_native()
+                with self.child.open("a") as stream:
+                    stream.write(json.dumps({"type": "user", "sessionId": SESSION,
+                                             "agentId": LEAD, "isSidechain": True,
+                                             "message": {"content": content}}) + "\n")
+                stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                               "hook_event_name": "Stop"}, self.environ)
+                self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+
+    def test_malformed_newer_assistant_text_blocks_stop_without_hook_exception(self):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        self.write_native(later_prompt=True)
+        with self.child.open("a") as stream:
+            stream.write(json.dumps({"type": "assistant", "uuid": "terminal-two",
+                                     "sessionId": SESSION, "agentId": LEAD,
+                                     "isSidechain": True, "timestamp": "2026-09-29T02:04:00Z",
+                                     "effort": "low", "message": {
+                                         "model": "claude-sonnet-5", "stop_reason": "end_turn",
+                                         "content": [{"type": "text", "text": 123}]}}) + "\n")
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        self.assertEqual("original-run", self.store.load(self.project).active_run.run_id)
+
+    def test_ordinary_callback_without_native_transcript_keeps_hook_authority(self):
+        self.child.unlink()
+        self.meta.unlink()
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+        self.assertEqual("completed", self.store.load(self.project).recent_runs[-1].status)
+
+    def test_new_lead_invocation_after_archive_needs_a_fresh_run(self):
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": REPORT, "status": "completed"}, self.environ)
+        settled = handle({"session_id": SESSION, "cwd": str(self.project),
+                          "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", json.loads(settled.stdout or "{}").get("decision"))
+        original = self.store.load(self.project).recent_runs[-1]
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStart", "agent_id": "ordinary-explore",
+                "parent_thread_id": SESSION, "agent_type": "Explore",
+                "prompt_id": "ordinary-prompt"}, self.environ)
+        self.assertFalse(self.store.session_record("claude", SESSION)["pending"])
+        sibling_lead = "b1234567890123456"
+        sibling = replace(self.run, run_id="sibling-run", session_id="sibling-root",
+                          lead_identity=sibling_lead,
+                          delegations=(Delegation(sibling_lead, "lead", "other task", "working",
+                                                  "claude-sonnet-5", "low"),))
+        self.store.save(self.project, replace(self.store.load(self.project),
+                        active_run=sibling, active_runs={"claude:sibling-root": sibling}))
+        launch = handle({"session_id": SESSION, "cwd": str(self.project),
+                         "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                         "tool_input": {"subagent_type": TYPE,
+                                        "prompt": "SYMPHONY_ROLE: lead\n"
+                                                  'SYMPHONY_ROUTE: {"size":"medium",'
+                                                  '"complexity":"complex","risk":"normal"}'}},
+                        self.environ)
+        self.assertEqual("deny", json.loads(launch.stdout or "{}").get(
+            "hookSpecificOutput", {}).get("permissionDecision"))
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStart", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "prompt_id": "new-root-prompt"}, self.environ)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "prompt_id": "new-root-prompt",
+                "last_assistant_message": "A markerless new result.",
+                "status": "completed"}, self.environ)
+        state = self.store.load(self.project)
+        self.assertEqual("sibling-run", state.active_runs["claude:sibling-root"].run_id)
+        self.assertEqual("working", state.active_runs["claude:sibling-root"].delegations[0].state)
+        self.assertNotIn(f"claude:{SESSION}", state.active_runs)
+        self.assertEqual(original.run_id, state.recent_runs[-1].run_id)
+        self.assertEqual(original.outcome, state.recent_runs[-1].outcome)
+        held = self.store.session_record("claude", SESSION)
+        self.assertEqual(2, len(held["pending"]))
+        blocked = handle({"session_id": SESSION, "cwd": str(self.project),
+                          "hook_event_name": "Stop"}, self.environ)
+        self.assertEqual("block", json.loads(blocked.stdout or "{}").get("decision"))
+
     def test_delayed_first_callback_replays_after_newer_completed_native_turn(self):
         first_report = "First result.\n" + REPORT
         second_report = "Second result.\n" + REPORT

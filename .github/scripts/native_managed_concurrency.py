@@ -26,7 +26,8 @@ import uuid
 GATE = '''import pathlib, sys, time
 root = pathlib.Path(__file__).resolve().parent
 name = sys.argv[1]
-(root / (name + ".ready")).touch()
+with (root / (name + ".ready")).open("x"):
+    pass
 print("GATE_STARTED", flush=True)
 deadline = time.monotonic() + 900
 while not (root / "release").exists():
@@ -37,7 +38,7 @@ while not (root / "release").exists():
 print("GATE_RELEASED", flush=True)
 '''
 
-CODEX_HOOK_CAPTURE = '''import hashlib, json, os, pathlib, sys, time, uuid
+CODEX_HOOK_CAPTURE = '''import hashlib, json, os, pathlib, re, sys, time, uuid
 destination = pathlib.Path(sys.argv[2])
 destination.mkdir(parents=True, exist_ok=True)
 invocation = str(uuid.uuid4())
@@ -60,11 +61,34 @@ record = {"invocation_id": invocation, "event": event,
                                         else "CLAUDE_CONFIG_DIR"),
           "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
           "started_ns": time.time_ns()}
+if event == "PreToolUse":
+    tool = str(payload.get("tool_name") or "")
+    record["tool_name"] = tool if tool in {"Agent", "Task"} else "other"
+    record["tool_use_id_hash"] = (hashlib.sha256(str(payload["tool_use_id"]).encode()).hexdigest()[:12]
+                                  if payload.get("tool_use_id") else None)
+    details = payload.get("tool_input")
+    if record["tool_name"] in {"Agent", "Task"} and isinstance(details, dict):
+        agent_type = str(details.get("subagent_type") or "")
+        record["agent_type"] = (agent_type if re.fullmatch(
+            r"symphony:symphony-[a-z0-9-]{1,96}", agent_type) else None)
+        record["isolation"] = details.get("isolation") in {"worktree"}
+        record["background"] = details.get("run_in_background") is True
 if event == "UserPromptSubmit":
     prompt = str(payload.get("prompt") or "").strip()
     record["control"] = ("stop" if prompt == "$symphony:symphony stop" else
                          "status" if prompt == "$symphony:symphony status" else
                          "other")
+if event == "Stop":
+    background = payload.get("background_tasks")
+    record["background_tasks_type"] = type(background).__name__
+    record["background_tasks_count"] = (len(background) if isinstance(
+        background, (dict, list)) else None)
+    values = background.values() if isinstance(background, dict) else (
+        background if isinstance(background, list) else ())
+    record["background_task_states"] = sorted({
+        state for item in values if isinstance(item, dict)
+        if isinstance((state := item.get("status")), str)
+        and state in {"pending", "running", "completed", "failed", "cancelled", "canceled"}})
 (destination / (invocation + "-entry.json")).write_text(json.dumps(record))
 (destination / (invocation + "-exit.json")).write_text(json.dumps({"invocation_id": invocation,
                                                                     "exit_code": 0,
@@ -106,40 +130,60 @@ def prompt(provider, label, recover, project):
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
     route = '{"size":"small","complexity":"simple","risk":"normal","rationale":"disposable native CI gate","topology":"direct"}'
     recovery = (
-        'The lead MUST finish its first turn after the gate with exactly '
+        'The lead MUST finish its first turn after the gate with the observed gate '
+        'markers and exit code, followed by the exact line '
         'SYMPHONY_OUTCOME: {"status":"blocked"}. Await that result. '
         'Then use followup_task on the SAME lead identity, passing the exact task_name '
         'used in spawn_agent as target (lowercase letters, digits, and underscores; '
-        'do not pass a /root/ path or agent UUID), asking it to return exactly '
+        'do not pass a /root/ path or agent UUID), asking it to report the gate '
+        'markers and exit code from its existing command result without rerunning '
+        'the gate, followed by the exact line '
         'SYMPHONY_OUTCOME: {"status":"completed"}; await the follow-up. '
         if recover else 'After the gate returns, return SYMPHONY_OUTCOME: {"status":"completed"}. '
     )
-    codex_route = (
-        "For this fixture's base profile the selected lead is gpt-6-luna at low effort. "
-        "In spawn_agent pass model=gpt-6-luna, reasoning_effort=low, and fork_turns=none "
-        "so the lead does not inherit this root's effort. "
-        if provider == "codex" else ""
-    )
+    if provider == "codex":
+        recovery = (
+            'Await the lead\'s deliberately blocked first turn. Use followup_task with '
+            'its original task_name as target on the SAME lead: report the existing '
+            'gate markers and exit code, then SYMPHONY_OUTCOME: {"status":"completed"}. '
+            'Await that follow-up. '
+            if recover else 'Await the lead\'s completed gate report. '
+        )
     claude_isolation = (
         "Use Agent run_in_background=true for the lead, and omit isolation=worktree; "
         "the fixture checkout is already disposable and its shared state must observe this lead. "
         if provider == "claude" else ""
     )
     gate = str(project / "gate.py").replace("\\", "/")
+    lead_task = (
+        "FIRST-TURN CONTRACT: End your gate evidence report with this exact standalone line:\n"
+        + ('SYMPHONY_OUTCOME: {"status":"blocked"}' if recover else
+           'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
+        + ("This recovery fixture is deliberately blocked even when the gate exits zero; "
+           "the root will resume this same lead for completion.\n" if recover else "") +
+        f"Run `python '{gate}' {label}` exactly once. "
+        "Use the native command tool; if it returns a running session, wait for that same "
+        "process. Report its observed GATE_STARTED, GATE_RELEASED and exit code zero "
+        "only after it finishes, then the contract line above. "
+        "Do not delegate, rerun the gate, or create another checkout/worktree."
+    )
+    lead_relay = (
+        "Pass LEAD_SPAWN_PACKET verbatim as spawn_agent arguments, including message. "
+        "The child has no root context; do not expand, paraphrase, or omit its contract. "
+        "Never replace the lead or rerun the gate.\n"
+        "LEAD_SPAWN_PACKET: " + json.dumps({
+            "task_name": "symphony_lead_gpt_6_luna_low", "model": "gpt-6-luna",
+            "reasoning_effort": "low", "fork_turns": "none",
+            "message": f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n" + lead_task,
+        }) + "\n"
+        if provider == "codex" else lead_task
+    )
     return (
         f"{control} Disposable native CI lifecycle {label}. "
         "Use Symphony and the native agent tools. Spawn one assessor that returns exactly "
         f"SYMPHONY_ASSESSMENT: {route}. Await it. Spawn one lead with "
         f"SYMPHONY_ROUTE: {route} and the exact model and effort selected by Symphony. "
-        + codex_route + claude_isolation +
-        f"The lead's entire task is to run `python '{gate}' {label}` exactly once. "
-        f"That absolute script path writes `{label}.ready` next to itself. Do not create "
-        "another checkout or worktree. The gate prints GATE_STARTED "
-        "before blocking and GATE_RELEASED only after the harness releases it. "
-        "Use the native command tool to run it; report success only after observing "
-        "GATE_RELEASED and exit code zero from that command. If the command tool returns "
-        "a running process/session, wait for that same process to finish. Include both "
-        "observed gate markers in the lead's report with its required outcome. " + recovery +
+        + claude_isolation + lead_relay + recovery +
         "Await all children, then finish briefly so the native Stop hook can finalize "
         "the run. A completing run awaits that hook: do not poll for completed before "
         "ending the turn, print status/stop controls as prose, or ask a completed lead "
@@ -181,19 +225,31 @@ def codex_session(logs, label):
     return match.group(1)
 
 
-def resume_claude(env, project, session, budget, deadline):
+def resume_claude(env, project, session, budget, deadline, logs, label):
     executable = shutil.which("claude")
     if not executable:
         raise RuntimeError("claude CLI is missing")
-    completed = subprocess.run(
-        [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
-         "--permission-mode", "bypassPermissions", "--resume", session,
-         "--output-format", "json",
-         "Continue this exact Symphony session after the background lead result. "
-         "Reconcile its outcome and finish. Do not start a new task."],
-        cwd=project, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        shell=False, timeout=max(1, min(90, deadline - time.monotonic())),
-    )
+    receipt = {"session_id": session, "started_ns": time.time_ns(),
+               "status": "started"}
+    receipt_path = logs / f"{label}.resume.phase.json"
+    receipt_path.write_text(json.dumps(receipt))
+    try:
+        completed = subprocess.run(
+            [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
+             "--permission-mode", "bypassPermissions", "--resume", session,
+             "--output-format", "json",
+             "Continue this exact Symphony session after the background lead result. "
+             "Reconcile its outcome and finish. Do not start a new task."],
+            cwd=project, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            shell=False, timeout=max(1, min(90, deadline - time.monotonic())),
+        )
+    except subprocess.TimeoutExpired:
+        receipt.update(status="timed_out", finished_ns=time.time_ns())
+        receipt_path.write_text(json.dumps(receipt))
+        raise
+    receipt.update(status="returned", finished_ns=time.time_ns(),
+                   returncode=completed.returncode)
+    receipt_path.write_text(json.dumps(receipt))
     if completed.returncode:
         raise RuntimeError(f"Claude resume for session {session} exited {completed.returncode}")
 
@@ -242,7 +298,7 @@ def codex_resume_phase(env, session, logs):
 
 
 def resume_codex(env, project, session, logs, deadline, already_completed=False,
-                 direct_stop=False):
+                 direct_stop=False, *, lead_id, lead_task_name):
     """Resume the original native root so newly installed candidate hooks load."""
     executable = shutil.which("codex")
     if not executable:
@@ -255,12 +311,19 @@ def resume_codex(env, project, session, logs, deadline, already_completed=False,
         if already_completed else
         "$symphony:symphony stop"
         if direct_stop else
-        "Resume the original Symphony run in this session. Reconcile its registered lead "
-        "from the native host result; if a retry is needed, call followup_task with the "
-        "exact original spawn_agent task_name, without a /root/ prefix or UUID, and await "
-        "the same lead. Preserve the original run and gate evidence. When the lead and "
-        "all tracked work are reconciled, invoke the normal $symphony:symphony stop "
-        "control and check durable status. Do not force stop or rerun the gate.")
+        f"Resume the original Symphony run in this session. Its original lead identity "
+        f"is {lead_id!r}, with spawn task_name {lead_task_name!r}. Preserve that identity "
+        "and the original run. Reconcile its completed native host result. "
+        "If gate markers or exit code are missing from its report, use followup_task "
+        f"with target {lead_task_name!r}, without a /root/ prefix or UUID, and await "
+        "that SAME lead. Ask it to report only evidence from its existing command "
+        "result with its outcome; never invent missing evidence. Do not spawn a replacement "
+        "or another assessor, even if the old lead is absent from list_agents. If the "
+        "host cannot resume that lead or its evidence is unavailable, report the "
+        "limitation and end the turn without changing ownership. Do not rerun the gate "
+        "or force stop. Once reconciled, finish the root turn so the native Stop hook "
+        "can finalize the original run; do not print stop/status controls as prose "
+        "or poll a completing run before ending the turn.")
     command = [executable, "exec", "resume", "--dangerously-bypass-hook-trust",
                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
                "--model", "gpt-6-luna", session, prompt]
@@ -380,7 +443,8 @@ def install_hook_capture(provider, root, home):
         settings_path = home / "settings.json"
         settings = json.loads(settings_path.read_text())
         hooks = settings.setdefault("hooks", {})
-        for event in ("SessionStart", "SubagentStart", "SubagentStop", "Stop"):
+        for event in ("SessionStart", "UserPromptSubmit", "PreToolUse",
+                      "SubagentStart", "SubagentStop", "Stop"):
             command = (f'python -I "{script.as_posix()}" {event} '
                        f'"{capture.as_posix()}" claude')
             hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command}]})
@@ -671,6 +735,15 @@ def event_counts(document):
                                document.get("event_history", [])).items()))
 
 
+def require_recovered_lead_events(document, lead_id):
+    """Transport metadata cannot substitute for ordered durable child outcomes."""
+    kinds = [event.get("kind") for event in document.get("event_history", [])
+             if event.get("payload", {}).get("identity") == lead_id]
+    if ("lead_failed" not in kinds or "lead_completed" not in kinds
+            or kinds.index("lead_failed") >= kinds.index("lead_completed")):
+        raise RuntimeError("recovered lead lacks ordered durable failed and completed events")
+
+
 def codex_pre_resume_state(document, session, run_id, lead_id):
     """Accept only the original recovering run or its durable completed archive."""
     key = f"codex:{session}"
@@ -703,11 +776,12 @@ def codex_host_trace(home, session, lead_id, error_log):
     def records(path):
         if not path:
             return
-        for line in path.open(errors="replace"):
-            try:
-                yield json.loads(line)
-            except ValueError:
-                continue
+        with path.open(errors="replace") as stream:
+            for line in stream:
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    continue
 
     def output_summary(payload):
         value = payload.get("output")
@@ -850,7 +924,22 @@ def codex_host_trace(home, session, lead_id, error_log):
                 task_name = arguments.get("task_name")
                 spawns[call_id] = {"call_hash": fingerprint(call_id),
                                    "task_name": task_name if isinstance(task_name, str)
-                                   and re.fullmatch(r"[a-z0-9_]{1,128}", task_name) else None}
+                                   and re.fullmatch(r"[a-z0-9_]{1,128}", task_name) else None,
+                                   "argument_keys": sorted(key for key in arguments
+                                       if re.fullmatch(r"[A-Za-z0-9_]{1,64}", key))[:16],
+                                   "task_text_fields": {field: {
+                                       "type": type(arguments[field]).__name__,
+                                       "chars": len(arguments[field]) if isinstance(arguments[field], str) else None,
+                                   } for field in ("message", "prompt", "task") if field in arguments},
+                                   # Native messages can be encrypted at rest. This is
+                                   # transport metadata, not proof of child semantics.
+                                   "lead_packet_metadata_matches":
+                                   isinstance(arguments.get("message"), str) and
+                                   bool(arguments["message"].strip()) and
+                                   task_name == "symphony_lead_gpt_6_luna_low" and
+                                   arguments.get("model") == "gpt-6-luna" and
+                                   arguments.get("reasoning_effort") == "low" and
+                                   arguments.get("fork_turns") == "none"}
             if call_id and name == "followup_task":
                 target = arguments.get("target")
                 calls[call_id] = {"call_hash": fingerprint(call_id),
@@ -990,7 +1079,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
            "SYMPHONY_STATE_DIR": str(state_dir),
            "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
            "SYMPHONY_HOOK_DECISIONS_DIR": str(case / "hook decisions"),
-           "SYMPHONY_PROFILE": "base" if provider == "codex" else "sonnet"}
+           "SYMPHONY_PROFILE": "base" if provider == "codex" else "sonnet-5-5"}
     if provider == "claude":
         env.pop("CLAUDE_PLUGIN_ROOT", None)
     logs = case / "logs"
@@ -1079,6 +1168,13 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                               for label, session in sessions.items()}
         observed_run_ids = {label: docs[label]["active_runs"][f"{provider}:{session}"]["run_id"]
                             for label, session in sessions.items()}
+        if provider == "codex":
+            for label in sessions:
+                host = codex_host_trace(Path(env.get("CODEX_HOME", Path.home() / ".codex")),
+                                        sessions[label], observed_leads[label], logs / f"{label}.errors")
+                if not any(item["same_lead_id"] and item["lead_packet_metadata_matches"]
+                           for item in host["spawn_calls"]):
+                    raise RuntimeError(f"{label}: native original lead spawn lacks required transport metadata")
         gate_evidence = {label: {
             "ready": (first if label == "a" else second).joinpath(f"{label}.ready").is_file(),
             "owner_active": bool(docs[label]["active_runs"].get(f"{provider}:{session}")),
@@ -1141,9 +1237,14 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 snapshot["pre_candidate_recovery_probe"] = codex_recovery_probe(
                     before_resume, sessions["a"], update["home"])
                 snapshot_file.write_text(json.dumps(snapshot))
+                lead_task_name = next((item["task_name"] for item in host["spawn_calls"]
+                                       if item["same_lead_id"] and item.get("task_name")), None)
+                if not lead_task_name:
+                    raise RuntimeError("native host lacks the original lead's spawn task_name")
                 resume_codex(env, first, sessions["a"], logs, deadline,
                              already_completed=pre_resume_state == "completed",
-                             direct_stop=direct_stop_resume)
+                             direct_stop=direct_stop_resume, lead_id=observed_leads["a"],
+                             lead_task_name=lead_task_name)
                 starts = [record for record in codex_hook_capture_summary(root)["records"]
                           if record.get("event") == "SessionStart"
                           and record.get("session_id") == sessions["a"]
@@ -1207,7 +1308,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                             }
                             snapshot_file.write_text(json.dumps(snapshot))
                         resume_claude(env, first if label == "a" else second,
-                                      sessions[label], budget, deadline)
+                                      sessions[label], budget, deadline, logs, label)
                         resumed.add(label)
                 if (len(resumed) == len(processes)
                         and all(any(run.get("session_id") == sessions[label]
@@ -1295,11 +1396,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                              for item in records):
                     raise RuntimeError(f"{label}: same-session Claude resume did not load the candidate")
             if label == "a" and provider == "codex":
-                events = [event for event in doc.get("event_history", [])
-                          if event.get("payload", {}).get("identity") == completed_run.get("lead_identity")]
-                kinds = [event.get("kind") for event in events]
-                if "lead_failed" not in kinds or "lead_completed" not in kinds:
-                    raise RuntimeError("recovered lead lacks durable failed and completed events")
+                require_recovered_lead_events(doc, observed_leads[label])
         capture = codex_hook_capture_summary(root, provider)
         return {"case": "live-update" if update else
                 "different-branch-worktrees" if separate else "same-worktree",
@@ -1356,13 +1453,18 @@ def codex_hook_capture_summary(root, provider="codex"):
             marker = json.loads(exit_path.read_text()) if exit_path.is_file() else {}
         except (OSError, ValueError):
             continue
-        if entry.get("event") not in {"SessionStart", "UserPromptSubmit",
-                                      "SubagentStart", "SubagentStop", "Stop"}:
+        if (entry.get("event") not in {"SessionStart", "UserPromptSubmit",
+                                       "PreToolUse", "SubagentStart", "SubagentStop", "Stop"}
+                or entry.get("event") == "PreToolUse"
+                and entry.get("tool_name") not in {"Agent", "Task"}):
             continue
         records.append({key: entry.get(key) for key in
                         ("invocation_id", "event", "session_id", "agent_id", "turn_id",
                          "parent_id", "prompt_id_hash", "message_hash", "cwd",
-                         "started_ns", "payload_keys", "control")}
+                         "started_ns", "payload_keys", "control", "tool_name",
+                         "tool_use_id_hash", "agent_type", "isolation", "background",
+                         "background_tasks_type", "background_tasks_count",
+                         "background_task_states")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
                           "finished_ns": marker.get("finished_ns"),
                           "native_home_matches_expected": (
@@ -1649,6 +1751,112 @@ def claude_recovery_probe(document, session, project, home):
         return {"result": "probe_error", "error_type": type(error).__name__}
 
 
+def claude_host_trace(home, session, lead_id):
+    """Join native Agent calls and child turns without exporting transcript text."""
+    plugin = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
+    if str(plugin) not in sys.path:
+        sys.path.insert(0, str(plugin))
+    from symphony.host_evidence import _native_jsonl
+
+    def digest(value):
+        return sha256(str(value).encode()).hexdigest()[:12] if value else None
+
+    paths = tuple((home / "projects").glob(f"*/{session}"))
+    if len(paths) != 1:
+        return {"native_session_path_count": len(paths)}
+    directory = paths[0]
+    parent = _native_jsonl(directory.with_suffix(".jsonl"))
+    child_path = directory / "subagents" / f"agent-{lead_id}.jsonl"
+    child = _native_jsonl(child_path)
+    meta_path = child_path.with_suffix(".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text()) if meta_path.stat().st_size <= 65536 else {}
+    except (OSError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    result = {"root_transcript_readable": parent is not None,
+              "child_transcript_readable": child is not None,
+              "meta_launch_id_hash": digest(meta.get("toolUseId")),
+              "meta_agent_type": meta.get("agentType") if re.fullmatch(
+                  r"symphony:symphony-[a-z0-9-]{1,96}", str(meta.get("agentType") or ""))
+                  else None,
+              "root_agent_calls": [], "child_turns": []}
+    if parent is not None:
+        prompt = None
+        results = {}
+        for row in parent:
+            message = row.get("message") or {}
+            content = message.get("content") if isinstance(message, dict) else None
+            if row.get("type") == "user" and isinstance(content, str):
+                prompt = {"root_prompt_id_hash": digest(row.get("uuid")),
+                          "root_prompt_at": row.get("timestamp")}
+            if row.get("type") == "user" and isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "tool_result":
+                        results.setdefault(digest(item.get("tool_use_id")), []).append(
+                            {"at": row.get("timestamp"),
+                             "is_error": item.get("is_error") is True})
+            if row.get("type") != "assistant" or not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "tool_use" or item.get("name") != "Agent":
+                    continue
+                details = item.get("input") or {}
+                if not isinstance(details, dict):
+                    details = {}
+                agent_type = details.get("subagent_type")
+                result["root_agent_calls"].append({
+                    "tool_use_id_hash": digest(item.get("id")),
+                    "matches_lead_meta": item.get("id") == meta.get("toolUseId"),
+                    "root_assistant_id_hash": digest(row.get("uuid")),
+                    "called_at": row.get("timestamp"),
+                    **(prompt or {}),
+                    "agent_type": agent_type if isinstance(agent_type, str) and re.fullmatch(
+                        r"symphony:symphony-[a-z0-9-]{1,96}", agent_type) else None,
+                    "resume_id_hash": digest(details.get("resume")),
+                    "run_in_background": details.get("run_in_background") is True,
+                    "isolation_worktree": details.get("isolation") == "worktree",
+                })
+        for call in result["root_agent_calls"]:
+            call["results"] = results.get(call["tool_use_id_hash"], [])
+    if child is not None:
+        turn = None
+        for row in child:
+            message = row.get("message") or {}
+            content = message.get("content") if isinstance(message, dict) else None
+            if row.get("type") == "user" and isinstance(content, str):
+                turn = {"child_prompt_id_hash": digest(row.get("uuid")),
+                        "child_prompt_at": row.get("timestamp"),
+                        "last_assistant_at": None,
+                        "last_assistant_id_hash": None,
+                        "last_stop_reason": None,
+                        "marker": None,
+                        "handback_count": 0}
+                result["child_turns"].append(turn)
+            elif row.get("type") == "assistant" and turn is not None:
+                turn["last_assistant_at"] = row.get("timestamp")
+                turn["last_assistant_id_hash"] = digest(row.get("uuid"))
+                turn["last_stop_reason"] = message.get("stop_reason")
+                if isinstance(content, list):
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "text":
+                            match = re.findall(r"^SYMPHONY_OUTCOME:\s*(\{[^\n]*\})",
+                                               str(item.get("text") or ""), re.MULTILINE)
+                            if len(match) == 1:
+                                try:
+                                    marker = json.loads(match[0]).get("status")
+                                    turn["marker"] = (marker if marker in {
+                                        "completed", "blocked", "failed", "abandoned"} else "invalid")
+                                except (ValueError, AttributeError):
+                                    turn["marker"] = "invalid"
+                        if item.get("type") == "tool_use" and item.get("name") == "SubagentHandback":
+                            turn["handback_count"] += 1
+    return result
+
+
 def failure_state(root, provider):
     def short_hash(value):
         return sha256(str(value).encode()).hexdigest()[:12] if value else None
@@ -1871,6 +2079,10 @@ def failure_state(root, provider):
                       "candidate_recovery_probes": recovery_probes,
                       "codex_completion_probes": completion_probes,
                       "event_counts": event_counts(document),
+                      "native_resume_phases": {label: json.loads(phase.read_text())
+                                               for label in labels
+                                               if (phase := case_root / "logs" /
+                                                   f"{label}.resume.phase.json").is_file()},
                       "update_event_counts": snapshots})
     host = {}
     if provider == "codex":
@@ -1894,6 +2106,16 @@ def failure_state(root, provider):
                     trace["replacement_lead_turns"] = replacement["lead_turns"]
                     trace["replacement_parent_matches_root"] = replacement["lead_parent_matches_root"]
                 host[f"{case['case']}:{label}"] = trace
+    elif provider == "claude":
+        for case in cases:
+            home = (root / "claude-live-update-home" if case["case"] == "live-update" else
+                    root / "claude-baseline-home")
+            runs = [*case["active_runs"], *case["recent_runs"]]
+            for label, session in case["cli_session_ids"].items():
+                lead = next((run.get("lead_id") for run in runs
+                             if run.get("session_id") == session), None)
+                if lead:
+                    host[f"{case['case']}:{label}"] = claude_host_trace(home, session, lead)
     resume_status_file = root / "live-update" / "logs" / "a.resume.status.json"
     resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
     phase_file = root / "live-update" / "logs" / "a.resume.phase90.json"

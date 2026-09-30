@@ -139,6 +139,17 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     # A callback retried after archive cannot complete a
                     # newer run that reused the same child identity.
                     continue
+                if (expected_owner and event.kind in {"subagent_started", "subagent_stopped"}
+                        and f"{provider}:{expected_owner}" not in state.active_runs
+                        and not (event.kind == "subagent_started"
+                                 and _observed_role(event.payload) == "assessor")
+                        and _archived_managed_child(state, event, provider, expected_owner)):
+                    # A non-replay child turn after archive has no run to own
+                    # it. Retain the Start as well as its terminal, so a
+                    # later root task cannot silently inherit either one.
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    unresolved = True
+                    continue
                 if (expected_owner and _prior_child_terminal_conflict(
                         state, event, provider, expected_owner)):
                     store.queue_session_event(provider, session, event, ambiguous_owner=True)
@@ -172,14 +183,28 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         if (not unresolved and provider == "claude"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"claude:{session}", session, provider)
-            recovered = claude_recovered_lead_event(scoped, session, project, environ)
+            try:
+                recovered = claude_recovered_lead_event(scoped, session, project, environ)
+            except Exception:
+                if source.kind == "stop_requested" and scoped.active_run is not None:
+                    return state, ((Action("block_stop", {"reason":
+                        "Symphony could not verify the tracked lead's native Claude result. "
+                        "Return to this session after its result is available."}),), acknowledged)
+                recovered = None
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, recovered)
             if source.kind == "stop_requested":
                 scoped = _scope_state(state, f"claude:{session}", session, provider)
-                freshness, native_turn = claude_completing_lead_turn(
-                    scoped, session, project, environ)
+                try:
+                    freshness, native_turn = claude_completing_lead_turn(
+                        scoped, session, project, environ)
+                except Exception:
+                    if scoped.active_run is not None:
+                        return state, ((Action("block_stop", {"reason":
+                            "Symphony could not verify the tracked lead's latest native Claude turn. "
+                            "Return to this session after its result is available."}),), acknowledged)
+                    freshness, native_turn = "none", None
                 if freshness == "unknown":
                     return state, ((Action("block_stop", {"reason":
                         "Symphony could not verify the tracked lead's latest native Claude turn. "
@@ -190,13 +215,27 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         if (not unresolved and provider == "codex"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"codex:{session}", session, provider)
-            recovered = codex_recovered_lead_event(scoped, session, environ)
+            try:
+                recovered = codex_recovered_lead_event(scoped, session, environ)
+            except Exception:
+                if source.kind == "stop_requested" and scoped.active_run is not None:
+                    return state, ((Action("block_stop", {"reason":
+                        "Symphony could not verify the tracked lead's native Codex result. "
+                        "Return to this session after its result is available."}),), acknowledged)
+                recovered = None
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, recovered)
             if source.kind == "stop_requested":
                 scoped = _scope_state(state, f"codex:{session}", session, provider)
-                freshness, native_turn = codex_completing_lead_turn(scoped, session, environ)
+                try:
+                    freshness, native_turn = codex_completing_lead_turn(scoped, session, environ)
+                except Exception:
+                    if scoped.active_run is not None:
+                        return state, ((Action("block_stop", {"reason":
+                            "Symphony could not verify the tracked lead's latest native Codex turn. "
+                            "Return to this session after its result is available."}),), acknowledged)
+                    freshness, native_turn = "none", None
                 if freshness in {"running", "unknown"}:
                     reason = ("The tracked lead has a newer native turn still running. "
                               "Wait for its result before completing this run."
@@ -577,6 +616,24 @@ def _committed_child_start_replay(
                 and event.event_id in item.assessment.get("_start_event_ids", ())
                 for item in state.recent_runs
             ))
+
+
+def _archived_managed_child(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """An old managed owner or role must exist before retaining a late child."""
+    archived = tuple(run for run in state.recent_runs
+                     if run.provider == provider and run.session_id == session)
+    receipts = tuple(item for item in state.terminal_receipts
+                     if item.get("provider") == provider and item.get("session") == session)
+    if not archived and not receipts:
+        return False
+    identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
+    return bool(_observed_role(event.payload) in ROLES
+                or identity and (any(identity in {run.lead_identity,
+                                                   *(item.identity for item in run.delegations)}
+                                     for run in archived)
+                                 or any(item.get("agent") == identity for item in receipts)))
 
 
 def _prior_child_terminal_conflict(

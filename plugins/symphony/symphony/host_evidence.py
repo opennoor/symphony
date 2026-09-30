@@ -267,6 +267,113 @@ def claude_recovered_lead_event(
         state, session, project, environ, require_missing=True)
 
 
+def _claude_native_prompt_activity(
+    state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
+) -> tuple[str, str | None]:
+    """Classify child turns without using callback arrival as native turn order."""
+    run = state.active_run
+    lead_id = run.lead_identity if run else None
+    if (not run or run.session_id != session or not isinstance(lead_id, str)
+            or not _CLAUDE_ID.fullmatch(lead_id)):
+        return "absent", None
+    lead = next((item for item in run.delegations
+                 if item.identity == lead_id and item.role == "lead"), None)
+    started_at = _instant(run.started_at)
+    if not lead or not lead.requested_tier or not lead.requested_effort or started_at is None:
+        return "absent", None
+    home = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    projects = home / "projects"
+    if projects.is_symlink() or not projects.is_dir():
+        return "absent", None
+    paths = tuple(projects.glob(f"*/{session}/subagents/agent-{lead_id}.jsonl"))
+    if not paths:
+        return "absent", None
+    if len(paths) != 1:
+        return "unknown", None
+    child_path = paths[0]
+    root_dir = child_path.parent.parent
+    meta_path = child_path.with_suffix(".meta.json")
+    try:
+        if (root_dir.name != session or root_dir.is_symlink()
+                or root_dir.parent.is_symlink() or child_path.parent.is_symlink()
+                or meta_path.is_symlink() or not meta_path.is_file()
+                or meta_path.stat().st_size > 64 * 1024):
+            return "unknown", None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return "unknown", None
+    if (not isinstance(meta, dict) or meta.get("spawnDepth") != 1
+            or not isinstance(meta.get("agentType"), str)
+            or not meta["agentType"].endswith(
+                f"symphony-lead-{lead.requested_tier}-{lead.requested_effort}")
+            or not isinstance(meta.get("toolUseId"), str) or not meta["toolUseId"]):
+        return "unknown", None
+    parent_rows = _native_jsonl(root_dir.with_suffix(".jsonl"))
+    child_rows = _native_jsonl(child_path)
+    if parent_rows is None or child_rows is None:
+        return "unknown", None
+    launches = []
+    for row in parent_rows:
+        if row.get("type") != "assistant" or row.get("sessionId") != session:
+            continue
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or any(not isinstance(item, dict) for item in content):
+            return "unknown", None
+        launches.extend((row, item) for item in content
+                        if item.get("id") == meta["toolUseId"])
+    if len(launches) != 1:
+        return "unknown", None
+    parent, launch = launches[0]
+    details = launch.get("input")
+    if (launch.get("type") != "tool_use" or launch.get("name") != "Agent"
+            or not isinstance(details, dict)
+            or details.get("subagent_type") != meta["agentType"]):
+        return "unknown", None
+    try:
+        if Path(str(parent.get("cwd") or "")).resolve() != project.resolve():
+            return "unknown", None
+    except (OSError, ValueError):
+        return "unknown", None
+    launched_at = _instant(parent.get("timestamp"))
+    if launched_at is None or launched_at < started_at:
+        return "unknown", None
+    prompts = []
+    for row in child_rows:
+        if (row.get("sessionId") != session or row.get("agentId") != lead_id
+                or row.get("isSidechain") is not True):
+            return "unknown", None
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if (row.get("type") == "user" and not isinstance(content, (str, list))
+                or row.get("type") == "assistant" and
+                (not isinstance(content, list) or any(not isinstance(item, dict)
+                                                      for item in content))):
+            return "unknown", None
+        if (row.get("type") == "assistant" and any(
+                item.get("type") == "text" and not isinstance(item.get("text"), str)
+                for item in content)):
+            return "unknown", None
+        if row.get("type") == "user" and isinstance(content, list):
+            if (not content or any(not isinstance(item, dict)
+                                   or item.get("type") != "tool_result"
+                                   or not isinstance(item.get("tool_use_id"), str)
+                                   for item in content)):
+                # A textual prompt may also use a block list. The existing
+                # terminal reader cannot identify that turn, so keep Stop.
+                return "unknown", None
+        if row.get("type") == "user" and isinstance(content, str):
+            prompt_id = row.get("uuid")
+            when = _instant(row.get("timestamp"))
+            if (not isinstance(prompt_id, str) or not prompt_id or when is None
+                    or when < launched_at or prompts and when <= prompts[-1][1]):
+                return "unknown", None
+            prompts.append((prompt_id, when))
+    if not prompts:
+        return "unknown", None
+    return ("multiple" if len(prompts) > 1 else "single"), prompts[-1][0]
+
+
 def claude_completing_lead_turn(
     state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
 ) -> tuple[str, Event | None]:
@@ -276,9 +383,25 @@ def claude_completing_lead_turn(
         return "none", None
     anchor = run.assessment.get("_claude_native_recovery")
     if not isinstance(anchor, str) or not anchor:
-        return "none", None
-    event = _claude_native_lead_event(
-        state, session, project, environ, require_missing=False)
+        activity, latest = _claude_native_prompt_activity(
+            state, session, project, environ)
+        if activity in {"absent", "single"}:
+            return "none", None
+        if activity != "multiple":
+            return "unknown", None
+        try:
+            event = _claude_native_lead_event(
+                state, session, project, environ, require_missing=False)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return "unknown", None
+        if event is None or event.payload["prompt_id"] != latest:
+            return "unknown", None
+        return "completed", event
+    try:
+        event = _claude_native_lead_event(
+            state, session, project, environ, require_missing=False)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return "unknown", None
     if event is None:
         return "unknown", None
     token = f"prompt_id:{event.payload['prompt_id']}"
