@@ -248,16 +248,23 @@ def prompt(project):
     route = ('{"size":"small","complexity":"simple","risk":"normal",'
              '"rationale":"disposable native worktree hook check","topology":"direct"}')
     gate = str(project / "gate.py").replace("\\", "/")
+    lead_packet = {"subagent_type": LEAD_AGENT,
+                   "description": "Check isolated Symphony lead gate",
+                   "run_in_background": True,
+                   "isolation": "worktree",
+                   "prompt": (f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n"
+                              f"Run `python '{gate}' isolated` once, wait for GATE_RELEASED, "
+                              'then return exactly SYMPHONY_OUTCOME: {"status":"completed"}.')}
     return (
         "/symphony:start Disposable native Claude isolated Agent hook check. "
         "Spawn one Symphony assessor and await its assessment: SYMPHONY_ASSESSMENT: "
         + route + ". Spawn one Symphony lead with SYMPHONY_ROUTE: " + route +
-        f" using native Agent with subagent_type={LEAD_AGENT}, "
-        "run_in_background=true, and isolation=worktree. This isolation choice is required "
-        "for the regression. The lead must run `python '" + gate + "' isolated` once, "
-        "wait for GATE_RELEASED from that command, and return exactly "
-        "SYMPHONY_OUTCOME: {\"status\":\"completed\"}. Await the background lead "
-        "and finish after its result. Do not make other worktrees or edit the fixture."
+        " using native Agent. Pass the following exact Agent tool arguments. "
+        "LEAD_AGENT_PACKET: " + json.dumps(lead_packet) +
+        ". The isolation=worktree field is required. "
+        "If Agent rejects that packet, report the error without retrying without isolation. "
+        "Await the background lead and finish after its result. Do not make other "
+        "worktrees or edit the fixture."
     )
 
 

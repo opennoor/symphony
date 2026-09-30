@@ -238,7 +238,7 @@ def codex_fixture_roles(profile_id="base"):
                            "profiles.json").read_text(encoding="utf-8"))
     profile = next(item for item in profiles["providers"]["codex"]["profiles"]
                    if item["id"] == profile_id)
-    route = "small/simple" if profile_id == "base" else "medium/complex"
+    route = "small/simple" if profile_id == "base" else "small/complex"
     lead = profile["matrix"][route]
     assessor = {"model": profile["tiers"]["strongest"], "effort": "high"}
     for role in (assessor, lead):
@@ -254,7 +254,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
            codex_profile="base"):
     assessor_role, lead_role = codex_fixture_roles(codex_profile) if provider == "codex" else ({}, {})
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
-    route = ('{"size":"medium","complexity":"complex","risk":"normal",'
+    route = ('{"size":"small","complexity":"complex","risk":"normal",'
              '"rationale":"disposable native CI upgrade gate","topology":"direct"}'
              if provider == "codex" and codex_profile != "base" else
              '{"size":"small","complexity":"simple","risk":"normal",'

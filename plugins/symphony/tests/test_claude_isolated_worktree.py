@@ -37,9 +37,19 @@ class ClaudeIsolatedWorktreeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "launch captured"):
                     isolated.run_case(root, Path(__file__).parents[1], 300, 3)
             profile = launch.call_args.kwargs["env"]["SYMPHONY_PROFILE"]
-            agent = re.search(r"subagent_type=([^, ]+)", launch.call_args.args[0][-1]).group(1)
+            root_prompt = launch.call_args.args[0][-1]
+            packet = json.loads(re.search(r"LEAD_AGENT_PACKET: (\{[^\n]+\})",
+                                          root_prompt).group(1))
+            agent = packet["subagent_type"]
             self.assertEqual((profile, agent),
                              ("sonnet-5-5", "symphony:symphony-lead-claude-sonnet-5-5-low"))
+            self.assertEqual(packet["isolation"], "worktree")
+            self.assertEqual(packet["description"], "Check isolated Symphony lead gate")
+            self.assertIs(packet["run_in_background"], True)
+            self.assertIn("SYMPHONY_ROLE: lead", packet["prompt"])
+            self.assertIn("SYMPHONY_ROUTE:", packet["prompt"])
+            self.assertIn("gate.py", packet["prompt"])
+            self.assertIn("without retrying without isolation", root_prompt)
             for selected, label, blocked in ((profile, agent, False),
                                              ("sonnet", "symphony:symphony-lead-claude-sonnet-5-low", True)):
                 state = ProjectState(activation={"claude": {"profile": selected}},

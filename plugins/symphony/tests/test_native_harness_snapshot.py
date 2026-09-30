@@ -65,14 +65,14 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 profile = next(item for item in profiles if item["id"] == profile_id)
                 assessor, lead = native.codex_fixture_roles(profile_id)
                 self.assertEqual((lead["model"], lead["effort"]),
-                                 (profile["matrix"]["medium/complex"]["model"],
-                                  profile["matrix"]["medium/complex"]["effort"]))
+                                 (profile["matrix"]["small/complex"]["model"],
+                                  profile["matrix"]["small/complex"]["effort"]))
                 self.assertEqual((assessor["model"], assessor["effort"]),
                                  (profile["tiers"]["strongest"], "high"))
                 fixture_prompt = native.prompt("codex", label, label == "a", project,
                                                defer_recovery=label == "a",
                                                codex_profile=profile_id)
-                self.assertIn('"size":"medium","complexity":"complex"', fixture_prompt)
+                self.assertIn('"size":"small","complexity":"complex"', fixture_prompt)
                 for marker, role in (("ASSESSOR_SPAWN_PACKET", assessor),
                                      ("LEAD_SPAWN_PACKET", lead)):
                     packet = json.loads(re.search(marker + r": (\{[^\n]+\})", fixture_prompt).group(1))
@@ -950,7 +950,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                                     time.monotonic() + 30, lead_id=lead,
                                     lead_task_name=task, native_status_nonce="nonce123")
             command = popen.call_args.args[0]
-            self.assertEqual("gpt-6-sol", command[command.index("--model") + 1])
+            self.assertEqual("gpt-6-astra", command[command.index("--model") + 1])
             self.assertIn("target 'original_lead_custom_name'", command[-1])
             self.assertIn("read NATIVE_STATUS.txt", command[-1])
             self.assertIn("READY nonce123", command[-1])
