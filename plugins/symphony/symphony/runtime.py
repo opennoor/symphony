@@ -63,7 +63,7 @@ def _retained_activation_command(retained: str, original: str) -> str:
         return ""
     code = (
         "import hashlib,pathlib,runpy,sys;"
-        "r=pathlib.Path(sys.argv[1]);f=sorted(r.rglob(\"*\"));"
+        "r=pathlib.Path(sys.argv[1]);f=sorted(r.rglob(\"*\"),key=lambda p:p.relative_to(r).as_posix());"
         "assert r.is_dir() and not r.is_symlink() and not any(p.is_symlink() for p in f);"
         "d=hashlib.sha256(b\"\".join(p.relative_to(r).as_posix().encode()+bytes(1)"
         "+hashlib.sha256(p.read_bytes()).digest() for p in f if p.is_file())).hexdigest();"
