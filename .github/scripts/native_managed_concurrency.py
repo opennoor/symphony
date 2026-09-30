@@ -2002,11 +2002,6 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                      if item.get("role") == "assessor"}
         if first_start.get("session_id") != sessions["a"] or first_start.get("agent_id") not in assessors:
             raise RuntimeError("old first native child was not the original assessor")
-        old_host = codex_host_trace(update["home"], sessions["a"], leads["a"],
-                                    logs / "a.errors")
-        if not any(call["same_lead_id"] and call["lead_packet_metadata_matches"]
-                   for call in old_host["spawn_calls"]):
-            raise RuntimeError("old native original lead spawn lacked route metadata")
         # The independent capture hook can run before the product Start hook.
         # Release it only when necessary, then require the exact old owner.
         released_before_registration = not native_lead_registered(
@@ -2099,11 +2094,6 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                                           update["candidate_cache"],
                                           Path(env["SYMPHONY_RUNTIME_DIR"])):
             raise RuntimeError("candidate B did not use its guarded installed runtime")
-        candidate_host = codex_host_trace(update["home"], sessions["b"], leads["b"],
-                                          logs / "b.errors")
-        if not any(call["same_lead_id"] and call["lead_packet_metadata_matches"]
-                   for call in candidate_host["spawn_calls"]):
-            raise RuntimeError("candidate B native lead spawn lacked route metadata")
         snapshot["original_owners"]["b"] = {"session_id": sessions["b"],
                                                "run_id": runs["b"], "lead_id": leads["b"]}
         snapshot["candidate_b_native_start_ns"] = json.loads(
@@ -2201,6 +2191,17 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
             document, "codex", sessions["a"], leads["a"],
             codex_host_trace(update["home"], sessions["a"], leads["a"],
                              logs / "a.errors", strict=True), update["old_source_removed_ns"])
+        for label in ("a", "b"):
+            host = codex_host_trace(update["home"], sessions[label], leads[label],
+                                    logs / f"{label}.errors", strict=True)
+            original_calls = [call for call in host["spawn_calls"]
+                              if call["same_lead_id"]]
+            if (len(original_calls) != 1
+                    or not original_calls[0]["lead_packet_metadata_matches"]):
+                (case / "spawn_probe.json").write_text(json.dumps({
+                    "label": label, "session_id": sessions[label],
+                    "lead_id": leads[label], "spawn_calls": host["spawn_calls"][:8]}))
+                raise RuntimeError(f"{label}: original native lead spawn lacks transport metadata")
         if not any(item.get("kind") == "lead_completed"
                    and item.get("payload", {}).get("identity") == leads["a"]
                    and timestamp_ns(item.get("observed_at"))
@@ -2247,6 +2248,7 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                 "old_terminal_callback_held_until_candidate_registration": True,
                 "old_source_removed_ns": update["old_source_removed_ns"],
                 "post_removal_original_completions": {"a": proof},
+                "native_spawn_metadata_checked": ["a", "b"],
                 "original_owners": snapshot["original_owners"],
                 "pre_candidate_resume_state": pre_resume_state,
                 "old_root_interruption": interruption,
@@ -2999,10 +3001,16 @@ def failure_state(root, provider):
             gate_timeouts[snapshot.parent.name] = json.loads(snapshot.read_text())
         except (OSError, ValueError):
             gate_timeouts[snapshot.parent.name] = {"snapshot_unreadable": True}
+    spawn_probes = {}
+    for path in root.glob("*/spawn_probe.json"):
+        try:
+            spawn_probes[path.parent.name] = json.loads(path.read_text())
+        except (OSError, ValueError):
+            spawn_probes[path.parent.name] = {"snapshot_unreadable": True}
     return {"provider": provider, "cases": cases, "native_host_trace": host,
             "native_resume_status": resume_status,
             "native_resume_phase90": resume_phase,
-            "gate_timeouts": gate_timeouts,
+            "gate_timeouts": gate_timeouts, "native_spawn_probes": spawn_probes,
             "native_hook_capture": codex_hook_capture_summary(root, provider)}
 
 
