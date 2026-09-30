@@ -404,6 +404,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         before = "2026-09-30T12:00:00+00:00"
         removed = native.timestamp_ns("2026-09-30T12:00:05+00:00")
         after = "2026-09-30T12:00:10+00:00"
+        later = "2026-09-30T12:00:11+00:00"
         document = {"event_history": [{"kind": "lead_completed", "observed_at": after,
                                        "payload": {"identity": "lead-a"}}]}
         codex = {"lead_turns": [
@@ -414,7 +415,13 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         claude = {"child_prompt_shape_supported": True, "child_turns": [
             {"child_prompt_at": before, "last_assistant_at": after,
              "last_stop_reason": "end_turn", "marker": "completed"}]}
-        for provider, trace in (("codex", codex), ("claude", claude)):
+        claude_continued = {"child_prompt_shape_supported": True, "child_turns": [
+            {"child_prompt_at": before, "last_assistant_at": after,
+             "last_stop_reason": None, "marker": "completed"},
+            {"child_prompt_at": later, "last_assistant_at": later,
+             "last_stop_reason": "end_turn", "marker": "completed"}]}
+        for provider, trace in (("codex", codex), ("claude", claude),
+                                ("claude", claude_continued)):
             with self.subTest(provider=provider):
                 evidence = native.require_post_removal_lead_completion(
                     document, provider, "root-a", "lead-a", trace, removed)
@@ -440,11 +447,44 @@ class CandidateRetainedProfileTests(unittest.TestCase):
              "last_stop_reason": "end_turn", "marker": "completed"},
             {"child_prompt_at": before, "last_assistant_at": after,
              "last_stop_reason": "tool_use", "marker": "completed"},
+            {"child_prompt_at": before, "last_assistant_at": after,
+             "last_stop_reason": None, "marker": "completed"},
         ):
             with self.subTest(changed=changed), self.assertRaises(RuntimeError):
                 native.require_post_removal_lead_completion(
                     document, "claude", "root-a", "lead-a",
                     {"child_prompt_shape_supported": True, "child_turns": [changed]}, removed)
+        for first in (
+            {"child_prompt_at": before, "last_assistant_at": after,
+             "last_stop_reason": None, "marker": None},
+            {"child_prompt_at": before, "last_assistant_at": after,
+             "last_stop_reason": "tool_use", "marker": "completed"},
+            {"child_prompt_at": after, "last_assistant_at": after,
+             "last_stop_reason": None, "marker": "completed"},
+        ):
+            with self.subTest(first=first), self.assertRaises(RuntimeError):
+                native.require_post_removal_lead_completion(
+                    document, "claude", "root-a", "lead-a",
+                    {"child_prompt_shape_supported": True,
+                     "child_turns": [first, claude_continued["child_turns"][1]]},
+                    removed)
+        with self.assertRaisesRegex(RuntimeError, "did not span"):
+            native.require_post_removal_lead_completion(
+                document, "claude", "root-a", "lead-a",
+                {"child_prompt_shape_supported": True, "child_turns": [
+                    {"child_prompt_at": before, "last_assistant_at": later,
+                     "last_stop_reason": None, "marker": "completed"},
+                    {"child_prompt_at": after, "last_assistant_at": after,
+                     "last_stop_reason": "end_turn", "marker": "completed"}]},
+                removed)
+        with self.assertRaisesRegex(RuntimeError, "did not span"):
+            native.require_post_removal_lead_completion(
+                document, "claude", "root-a", "lead-a",
+                {"child_prompt_shape_supported": True, "child_turns": [
+                    claude_continued["child_turns"][0],
+                    {"child_prompt_at": later, "last_assistant_at": after,
+                     "last_stop_reason": "end_turn", "marker": "completed"}]},
+                removed)
         with self.assertRaisesRegex(RuntimeError, "invalid timestamp"):
             native.timestamp_ns("not-a-timestamp")
 

@@ -1089,14 +1089,23 @@ def require_post_removal_lead_completion(document, provider, session, lead_id,
     elif provider == "claude":
         if native_trace.get("child_prompt_shape_supported") is not True:
             raise RuntimeError("native Claude child prompt shape is unsupported")
-        straddled = any(turn.get("last_stop_reason") == "end_turn"
-                        and timestamp_ns(turn.get("child_prompt_at")) < removed_ns
-                        < timestamp_ns(turn.get("last_assistant_at"))
-                        for turn in turns if turn.get("last_stop_reason") == "end_turn")
-        completed_after = any(turn.get("marker") == "completed"
-                              and turn.get("last_stop_reason") == "end_turn"
-                              and timestamp_ns(turn.get("last_assistant_at")) > removed_ns
-                              for turn in turns if turn.get("marker") == "completed")
+        terminal = [turn for turn in turns
+                    if turn.get("marker") == "completed"
+                    and turn.get("last_stop_reason") == "end_turn"
+                    and timestamp_ns(turn.get("last_assistant_at")) > removed_ns]
+        completed_after = bool(terminal)
+        straddled = any(
+            timestamp_ns(turn.get("child_prompt_at")) < removed_ns
+            < timestamp_ns(turn.get("last_assistant_at"))
+            and (turn.get("last_stop_reason") == "end_turn"
+                 or turn.get("last_stop_reason") is None and any(
+                     timestamp_ns(final.get("child_prompt_at"))
+                     > timestamp_ns(turn.get("last_assistant_at"))
+                     and timestamp_ns(final.get("last_assistant_at"))
+                     >= timestamp_ns(final.get("child_prompt_at"))
+                     for final in terminal))
+            for turn in turns if turn.get("marker") == "completed"
+            and turn.get("last_stop_reason") in {None, "end_turn"})
     else:
         raise RuntimeError("unsupported native provider")
     if not straddled or not completed_after:
