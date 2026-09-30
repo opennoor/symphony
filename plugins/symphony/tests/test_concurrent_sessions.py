@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import re
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -38,11 +39,14 @@ MARKER = json.dumps(
 )
 
 
-def _foreign_heartbeats(project: str, state_dir: str, provider: str, profile: str, session: str):
+def _foreign_heartbeats(project: str, state_dir: str, provider: str, profile: str,
+                        session: str, progress=None):
     env = {"SYMPHONY_STATE_DIR": state_dir, "SYMPHONY_PROFILE": profile}
     for index in range(105):
         handle({"provider": provider, "session_id": session, "cwd": project,
                 "hook_event_name": "SessionStart", "turn_id": str(index)}, env)
+        if progress is not None:
+            progress.value = index + 1
 
 
 class ActionCoverageTests(unittest.TestCase):
@@ -398,17 +402,22 @@ class ConcurrentSessionTests(unittest.TestCase):
                 self.assertEqual({"status": "completed"}, store.load(self.project).active_runs[f"{provider}:root-a"].outcome)
 
                 context = multiprocessing.get_context("spawn")
+                progresses = [context.Value("i", 0, lock=False) for _ in range(2)]
                 processes = [context.Process(target=_foreign_heartbeats, args=(
-                    str(self.project), env["SYMPHONY_STATE_DIR"], provider, profile, session
-                )) for session in ("root-b", "root-c")]
+                    str(self.project), env["SYMPHONY_STATE_DIR"], provider, profile,
+                    session, progress
+                )) for session, progress in zip(("root-b", "root-c"), progresses)]
+                started = time.monotonic()
                 for process in processes:
                     process.start()
-                for process in processes:
+                for session, process, progress in zip(("root-b", "root-c"), processes, progresses):
                     process.join(timeout=20)
                     if process.is_alive():
                         process.terminate()
                         process.join()
-                    self.assertEqual(0, process.exitcode)
+                    self.assertEqual(0, process.exitcode,
+                                     f"{provider}/{session}: {progress.value}/105 heartbeats completed "
+                                     f"in {time.monotonic() - started:.1f}s")
                 handle({**failed, "stop_hook_active": True}, env)
                 handle(self.payload("root-a", "SubagentStop", provider=provider,
                                     agent_id="worker-a", status="completed"), env)
