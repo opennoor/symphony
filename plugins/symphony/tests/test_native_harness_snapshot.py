@@ -28,12 +28,52 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_codex_native_spawn_packets_follow_packaged_base_matrix(self):
+        base = next(item for item in json.loads((PLUGIN / "profiles.json").read_text())
+                    ["providers"]["codex"]["profiles"] if item["id"] == "base")
+        assessor, lead = native.codex_fixture_roles()
+        self.assertEqual((lead["model"], lead["effort"]),
+                         (base["matrix"]["small/simple"]["model"],
+                          base["matrix"]["small/simple"]["effort"]))
+        self.assertEqual((assessor["model"], assessor["effort"]),
+                         (base["tiers"]["strongest"], "high"))
+        prompt = native.prompt("codex", "a", True, Path("/tmp/native-project"))
+        for marker, selected in (("ASSESSOR_SPAWN_PACKET", assessor),
+                                 ("LEAD_SPAWN_PACKET", lead)):
+            packet = json.loads(re.search(marker + r": (\{[^\n]+\})", prompt).group(1))
+            self.assertEqual(packet["task_name"], selected["task_name"])
+            self.assertEqual(packet["model"], selected["model"])
+            self.assertEqual(packet["reasoning_effort"], selected["effort"])
+            self.assertRegex(packet["task_name"], r"^[a-z0-9_]+$")
+        self.assertIn("Do not call followup_task until spawn_agent has returned success", prompt)
+
+    def test_windows_native_observer_retries_only_bounded_lock_contention(self):
+        before = native.OBSERVER_SNAPSHOT_LOCK_RETRIES
+        reader = Mock(side_effect=[TimeoutError("writer owns lock"), '{"active_runs": {}}'])
+        with patch.object(native.time, "sleep"):
+            self.assertEqual(native.observer_locked_read(reader), '{"active_runs": {}}')
+        self.assertEqual(reader.call_count, 2)
+        self.assertEqual(native.OBSERVER_SNAPSHOT_LOCK_RETRIES, before + 1)
+        with self.assertRaisesRegex(TimeoutError, "observer remained locked"):
+            native.observer_locked_read(Mock(side_effect=TimeoutError("writer owns lock")),
+                                        timeout=0)
+        with self.assertRaises(ValueError):
+            native.observer_locked_read(Mock(side_effect=ValueError("invalid state")))
+
     def test_codex_native_hook_gate_holds_second_distinct_default_agent(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "capture.py"
             script.write_text(native.CODEX_HOOK_CAPTURE)
             gate, capture = root / "gate", root / "capture"
+            root_start = subprocess.run(
+                [sys.executable, "-I", str(script), "SessionStart", str(capture), "codex"],
+                input=json.dumps({"session_id": "root-a"}),
+                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                     "SYMPHONY_NATIVE_GATE_LABEL": "a"},
+                text=True, capture_output=True, timeout=5)
+            self.assertEqual(root_start.returncode, 0)
+            self.assertEqual(json.loads((gate / "a.root.json").read_text())["session_id"], "root-a")
             first = subprocess.run(
                 [sys.executable, "-I", str(script), "SubagentStart", str(capture), "codex"],
                 input=json.dumps({"session_id": "root-a", "agent_id": "assessor-a",
@@ -87,6 +127,24 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 text=True, capture_output=True, timeout=5)
             self.assertEqual(assessor.returncode, 0)
             self.assertFalse(gate.exists())
+            for label in ("a", "b"):
+                started = subprocess.run(
+                    [sys.executable, "-I", str(script), "SessionStart", str(capture), "claude"],
+                    input=json.dumps({"session_id": f"root-{label}"}),
+                    env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                         "SYMPHONY_NATIVE_GATE_LABEL": label},
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(started.returncode, 0)
+            foreign = subprocess.run(
+                [sys.executable, "-I", str(script), "SubagentStart", str(capture), "claude"],
+                input=json.dumps({"session_id": "foreign-root", "agent_id": "foreign-lead",
+                                  "agent_type": "symphony:symphony-lead-claude-sonnet-5-low"}),
+                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                     "SYMPHONY_NATIVE_GATE_LABEL": "a"},
+                text=True, capture_output=True, timeout=5)
+            self.assertEqual(foreign.returncode, 0)
+            self.assertFalse((gate / "a.ready").exists())
+            self.assertFalse((gate / "b.ready").exists())
             processes = {}
             try:
                 for label in ("a", "b"):
@@ -95,7 +153,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True,
                         env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
-                             "SYMPHONY_NATIVE_GATE_LABEL": label})
+                             "SYMPHONY_NATIVE_GATE_LABEL": "b" if label == "a" else "a"})
                     processes[label].stdin.write(json.dumps({
                         "session_id": f"root-{label}", "agent_id": f"lead-{label}",
                         "agent_type": "symphony:symphony-lead-claude-sonnet-5-low"}))
@@ -108,6 +166,11 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     self.assertEqual(json.loads((gate / f"{label}.ready").read_text())
                                      ["session_id"], f"root-{label}")
+                starts = [json.loads(path.read_text()) for path in capture.glob("*-entry.json")]
+                self.assertEqual({(record["session_id"], record["native_gate_label"],
+                                   record["native_gate_env_label"])
+                                  for record in starts if record.get("native_gate_label")},
+                                 {("root-a", "a", "b"), ("root-b", "b", "a")})
                 (gate / "release").touch()
                 for process in processes.values():
                     self.assertEqual(process.wait(timeout=5), 0)

@@ -23,6 +23,9 @@ import time
 import uuid
 
 
+OBSERVER_SNAPSHOT_LOCK_RETRIES = 0
+
+
 # The isolated-worktree harness still uses a shell gate to prove child cwd.
 # Managed concurrency below uses the native SubagentStart hook gate instead.
 GATE = '''import pathlib, sys, time
@@ -66,7 +69,29 @@ record = {"invocation_id": invocation, "event": event,
           "started_ns": time.time_ns()}
 gate_dir = pathlib.Path(os.environ["SYMPHONY_NATIVE_GATE_DIR"]) if os.environ.get(
     "SYMPHONY_NATIVE_GATE_DIR") else None
-gate_label = os.environ.get("SYMPHONY_NATIVE_GATE_LABEL")
+env_label = os.environ.get("SYMPHONY_NATIVE_GATE_LABEL")
+gate_label = None
+if gate_dir and event == "SessionStart" and env_label in {"a", "b"}:
+    gate_dir.mkdir(parents=True, exist_ok=True)
+    root_file = gate_dir / (env_label + ".root.json")
+    root_session = payload.get("session_id")
+    if not isinstance(root_session, str) or not root_session:
+        raise SystemExit("native root SessionStart lacked a session ID")
+    if root_file.exists():
+        if json.loads(root_file.read_text()).get("session_id") != root_session:
+            raise SystemExit("native gate root session changed")
+    else:
+        temporary = gate_dir / (env_label + "." + invocation + ".tmp")
+        temporary.write_text(json.dumps({"session_id": root_session}))
+        temporary.replace(root_file)
+if gate_dir and event == "SubagentStart":
+    owners = [label for label in ("a", "b")
+              if (gate_dir / (label + ".root.json")).is_file()
+              and json.loads((gate_dir / (label + ".root.json")).read_text()).get(
+                  "session_id") == payload.get("session_id")]
+    if len(owners) > 1:
+        raise SystemExit("native child matches multiple root gate sessions")
+    gate_label = owners[0] if owners else None
 agent_type = payload.get("agent_type")
 is_lead_start = (event == "SubagentStart" and provider == "claude"
                  and isinstance(agent_type, str) and re.fullmatch(
@@ -89,6 +114,7 @@ if (gate_dir and gate_label in {"a", "b"} and event == "SubagentStart"
         is_lead_start = original.get("agent_id") != payload.get("agent_id")
 if gate_dir and gate_label in {"a", "b"} and is_lead_start:
     record["native_gate_label"] = gate_label
+    record["native_gate_env_label"] = env_label if env_label in {"a", "b"} else None
     record["native_gate_session_id"] = payload.get("session_id")
     record["agent_type"] = payload["agent_type"]
     gate_dir.mkdir(parents=True, exist_ok=True)
@@ -169,7 +195,24 @@ def state_file(state_dir, project):
     return state_dir / (key + ".v2.json")
 
 
+def codex_fixture_roles():
+    profiles = json.loads((Path(__file__).resolve().parents[2] / "plugins" / "symphony" /
+                           "profiles.json").read_text(encoding="utf-8"))
+    base = next(item for item in profiles["providers"]["codex"]["profiles"]
+                if item["id"] == "base")
+    lead = base["matrix"]["small/simple"]
+    assessor = {"model": base["tiers"]["strongest"], "effort": "high"}
+    for role in (assessor, lead):
+        if role["effort"] not in base["efforts"][role["model"]]:
+            raise RuntimeError("native fixture route is unsupported by the packaged base profile")
+    def with_name(role_name, route):
+        model_slug = re.sub(r"[^a-z0-9]+", "_", route["model"]).strip("_")
+        return {**route, "task_name": f"symphony_{role_name}_{model_slug}_{route['effort']}"}
+    return with_name("assessor", assessor), with_name("lead", lead)
+
+
 def prompt(provider, label, recover, project):
+    assessor_role, lead_role = codex_fixture_roles() if provider == "codex" else ({}, {})
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
     route = '{"size":"small","complexity":"simple","risk":"normal","rationale":"disposable native CI gate","topology":"direct"}'
     recovery = (
@@ -212,8 +255,10 @@ def prompt(provider, label, recover, project):
         "The child has no root context; do not expand, paraphrase, or omit its contract. "
         "Never replace the lead or rerun the gate.\n"
         "LEAD_SPAWN_PACKET: " + json.dumps({
-            "task_name": "symphony_lead_gpt_6_luna_low", "model": "gpt-6-luna",
-            "reasoning_effort": "low", "fork_turns": "none",
+            "task_name": lead_role["task_name"],
+            "model": lead_role["model"],
+            "reasoning_effort": lead_role["effort"],
+            "fork_turns": "none",
             "message": f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n" + lead_task,
         }) + "\n"
         if provider == "codex" else
@@ -221,12 +266,25 @@ def prompt(provider, label, recover, project):
         "LEAD_TASK_TEXT: " + json.dumps(
             f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n" + lead_task) + "\n"
     )
+    assessor_relay = ("Pass ASSESSOR_SPAWN_PACKET verbatim to spawn_agent before the lead packet. "
+                      "Both task_name values use only lowercase letters, digits, and underscores. "
+                      "ASSESSOR_SPAWN_PACKET: " + json.dumps({
+                          "task_name": assessor_role["task_name"],
+                          "model": assessor_role["model"],
+                          "reasoning_effort": assessor_role["effort"],
+                          "fork_turns": "none",
+                          "message": f"SYMPHONY_ROLE: assessor\nReturn exactly SYMPHONY_ASSESSMENT: {route}",
+                      }) + "\n" if provider == "codex" else "")
+    codex_spawn_note = (
+        "Do not call followup_task until spawn_agent has returned success for the exact lead task_name. "
+        "If a spawn name is rejected, retry the exact underscore name from its packet. "
+        if provider == "codex" else "")
     return (
         f"{control} Disposable native CI lifecycle {label}. "
         "Use Symphony and the native agent tools. Spawn one assessor that returns exactly "
         f"SYMPHONY_ASSESSMENT: {route}. Await it. Spawn one lead with "
         f"SYMPHONY_ROUTE: {route} and the exact model and effort selected by Symphony. "
-        + claude_isolation + lead_relay + recovery +
+        + claude_isolation + assessor_relay + lead_relay + recovery + codex_spawn_note +
         "Await all children, then finish briefly so the native Stop hook can finalize "
         "the run. A completing run awaits that hook: do not poll for completed before "
         "ending the turn, print status/stop controls as prose, or ask a completed lead "
@@ -244,9 +302,10 @@ def launch(provider, project, label, recover, env, log_dir, budget, session):
     output = log_dir / f"{label}.output"
     errors = log_dir / f"{label}.errors"
     if provider == "codex":
+        _, lead_role = codex_fixture_roles()
         command = [executable, "exec", "--dangerously-bypass-hook-trust",
                    "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-                   "--model", "gpt-6-luna", "-C", str(project),
+                   "--model", lead_role["model"], "-C", str(project),
                    "--output-last-message", str(output), prompt(provider, label, recover, project)]
     else:
         command = [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
@@ -393,7 +452,7 @@ def resume_codex(env, project, session, logs, deadline, already_completed=False,
         "or poll a completing run before ending the turn.")
     command = [executable, "exec", "resume", "--dangerously-bypass-hook-trust",
                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-               "--model", "gpt-6-luna", session, prompt]
+               "--model", codex_fixture_roles()[1]["model"], session, prompt]
     status_file = logs / "a.resume.status.json"
     started = time.monotonic()
     budget = max(1, deadline - started - 15)
@@ -761,6 +820,23 @@ def candidate_retained_profile(records, session, version, source, runtime_base):
                for item in records)
 
 
+def observer_locked_read(reader, timeout=5):
+    """Let the test observer yield to native Windows state writers."""
+    global OBSERVER_SNAPSHOT_LOCK_RETRIES
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    while True:
+        try:
+            return reader()
+        except TimeoutError:
+            attempts += 1
+            OBSERVER_SNAPSHOT_LOCK_RETRIES += 1
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"native state observer remained locked after {attempts} short reads") from None
+            time.sleep(.02)
+
+
 def read_state_snapshot(path):
     if os.name == "nt":
         # The reducer replaces state atomically; Windows readers must share its
@@ -771,9 +847,11 @@ def read_state_snapshot(path):
         from plugins.symphony.symphony.store import _locked, _read_owner_snapshot
         if path.name.startswith(".session-") and path.suffix == ".json":
             # Session ACKs use the stem lock, unlike project state writes.
-            with _locked(path.with_suffix(""), timeout=.1):
-                return json.loads(path.read_text(encoding="utf-8"))
-        return json.loads(_read_owner_snapshot(path))
+            def session_read():
+                with _locked(path.with_suffix(""), timeout=.1):
+                    return path.read_text(encoding="utf-8")
+            return json.loads(observer_locked_read(session_read))
+        return json.loads(observer_locked_read(lambda: _read_owner_snapshot(path)))
     return json.loads(path.read_text())
 
 
@@ -1008,6 +1086,7 @@ def require_post_removal_lead_completion(document, provider, session, lead_id,
 
 def codex_host_trace(home, session, lead_id, error_log, *, strict=False):
     """Extract only tool and turn metadata from disposable Codex JSONL."""
+    _, lead_role = codex_fixture_roles()
     def fingerprint(value):
         return sha256(str(value).encode()).hexdigest()[:12] if value else None
 
@@ -1169,6 +1248,15 @@ def codex_host_trace(home, session, lead_id, error_log, *, strict=False):
                 spawns[call_id] = {"call_hash": fingerprint(call_id),
                                    "task_name": task_name if isinstance(task_name, str)
                                    and re.fullmatch(r"[a-z0-9_]{1,128}", task_name) else None,
+                                   "invalid_task_name_shape": {
+                                       "length": len(task_name),
+                                       "hash": fingerprint(task_name),
+                                       "hyphen": "-" in task_name,
+                                       "slash": "/" in task_name,
+                                       "dot": "." in task_name,
+                                       "uppercase": any(char.isupper() for char in task_name),
+                                   } if isinstance(task_name, str) and not re.fullmatch(
+                                       r"[a-z0-9_]{1,128}", task_name) else None,
                                    "argument_keys": sorted(key for key in arguments
                                        if re.fullmatch(r"[A-Za-z0-9_]{1,64}", key))[:16],
                                    "task_text_fields": {field: {
@@ -1180,9 +1268,9 @@ def codex_host_trace(home, session, lead_id, error_log, *, strict=False):
                                    "lead_packet_metadata_matches":
                                    isinstance(arguments.get("message"), str) and
                                    bool(arguments["message"].strip()) and
-                                   task_name == "symphony_lead_gpt_6_luna_low" and
-                                   arguments.get("model") == "gpt-6-luna" and
-                                   arguments.get("reasoning_effort") == "low" and
+                                   task_name == lead_role["task_name"] and
+                                   arguments.get("model") == lead_role["model"] and
+                                   arguments.get("reasoning_effort") == lead_role["effort"] and
                                    arguments.get("fork_turns") == "none"}
             if call_id and name == "followup_task":
                 target = arguments.get("target")
@@ -2599,6 +2687,7 @@ def main():
                               "logs": str(root)}), file=sys.stderr)
             diagnostics = failure_state(root, args.provider)
             diagnostics["failure"] = {"type": type(error).__name__, "message": str(error)[:300]}
+            diagnostics["observer_snapshot_lock_retries"] = OBSERVER_SNAPSHOT_LOCK_RETRIES
             destination = os.environ.get("SYMPHONY_NATIVE_DIAGNOSTICS_DIR")
             if destination:
                 directory = Path(destination)
@@ -2619,7 +2708,8 @@ def main():
         finally:
             if update:
                 shutil.rmtree(update["home"], ignore_errors=True)
-    receipt = {"provider": args.provider, "native_managed": results}
+    receipt = {"provider": args.provider, "native_managed": results,
+               "observer_snapshot_lock_retries": OBSERVER_SNAPSHOT_LOCK_RETRIES}
     destination = os.environ.get("SYMPHONY_NATIVE_DIAGNOSTICS_DIR")
     if destination:
         directory = Path(destination)
