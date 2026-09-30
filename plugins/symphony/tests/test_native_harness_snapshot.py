@@ -639,7 +639,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                         self.assertIn("even after the native hook releases", child_message)
                     self.assertNotIn('SYMPHONY_OUTCOME: {"status":"completed"}' if recover
                                      else 'SYMPHONY_OUTCOME: {"status":"blocked"}', child_message)
-                    self.assertIn("native SubagentStart hook holds your first turn", child_message)
+                    self.assertIn("native SubagentStart hook may briefly hold your first turn", child_message)
                     self.assertIn("GATE_RELEASED\nSYMPHONY_OUTCOME", child_message)
                     self.assertIn("There is no gate command or file to find or run", child_message)
                     self.assertIn("GATE_RELEASED is a report line, not an operation", child_message)

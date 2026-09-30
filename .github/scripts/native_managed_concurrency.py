@@ -248,8 +248,8 @@ def prompt(provider, label, recover, project):
            'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
         + ("This recovery fixture is deliberately blocked even after the native hook releases; "
            "the root will resume this same lead for completion.\n" if recover else "") +
-        "The test-only native SubagentStart hook holds your first turn until both "
-        "lead starts are recorded. GATE_RELEASED is a report line, not an operation. "
+        "The test-only native SubagentStart hook may briefly hold your first turn. "
+        "GATE_RELEASED is a report line, not an operation. "
         "Do not inspect files, run tools, delegate, or create a worktree."
     )
     lead_relay = (
@@ -291,7 +291,7 @@ def prompt(provider, label, recover, project):
         "the run. A completing run awaits that hook: do not poll for completed before "
         "ending the turn, print status/stop controls as prose, or ask a completed lead "
         "for extra confirmation. Only the external harness releases the test-only native "
-        "start hooks after both leads are active; neither root nor child controls that gate. "
+        "start hook; neither root nor child controls that gate. "
         "The harness verifies durable completion after Stop. "
         "Never force stop. Do not edit files or inspect other projects."
     )
@@ -1929,6 +1929,290 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     process.wait()
 
 
+def check_codex_mixed_live_update(root, timeout, budget, update,
+                                  direct_stop_resume=False):
+    """Keep one released root in flight while a second root loads the candidate.
+
+    Released 1.5.1 can reject a second simultaneous Windows root before it
+    delegates. Candidate parallelism is exercised by the two baseline cases;
+    this case tests continuity across the cache swap without depending on that
+    immutable pre-update checker.
+    """
+    case = root / "live-update"
+    case.mkdir()
+    first, second = projects(case, False)
+    gate_dir = case / "native-gate"
+    gate_dir.mkdir()
+    state_dir = case / "state"
+    state_dir.mkdir()
+    logs = case / "logs"
+    logs.mkdir()
+    env = {**os.environ, **update["env"], "SYMPHONY_STATE_DIR": str(state_dir),
+           "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
+           "SYMPHONY_HOOK_DECISIONS_DIR": str(case / "hook decisions"),
+           "SYMPHONY_PROFILE": "base"}
+    state_path = state_file(state_dir, first)
+    deadline = time.monotonic() + timeout
+    processes = {}
+    sessions = {}
+    leads = {}
+    runs = {}
+    interruption = None
+    try:
+        processes["a"] = launch("codex", first, "a", True,
+                                {**env, "SYMPHONY_NATIVE_GATE_DIR": str(gate_dir),
+                                 "SYMPHONY_NATIVE_GATE_LABEL": "a"}, logs, budget, "")
+        while time.monotonic() < deadline:
+            if processes["a"].poll() is not None:
+                raise RuntimeError("old native CLI exited before original lead gate")
+            if (gate_dir / "a.ready").is_file() and state_path.is_file():
+                sessions["a"] = codex_session(logs, "a")
+                ready = json.loads((gate_dir / "a.ready").read_text())
+                if ready.get("session_id") != sessions["a"]:
+                    raise RuntimeError("old lead gate belongs to another root")
+                document = read_state_snapshot(state_path)
+                run = document.get("active_runs", {}).get(f"codex:{sessions['a']}") or {}
+                if run.get("run_id"):
+                    runs["a"] = run["run_id"]
+                    leads["a"] = ready["agent_id"]
+                    break
+            time.sleep(.1)
+        else:
+            raise RuntimeError("old original lead did not reach native start gate")
+        first_start = json.loads((gate_dir / "a.first.json").read_text())
+        assessors = {item.get("identity") for item in run.get("delegations", [])
+                     if item.get("role") == "assessor"}
+        if first_start.get("session_id") != sessions["a"] or first_start.get("agent_id") not in assessors:
+            raise RuntimeError("old first native child was not the original assessor")
+        old_host = codex_host_trace(update["home"], sessions["a"], leads["a"],
+                                    logs / "a.errors")
+        if not any(call["same_lead_id"] and call["lead_packet_metadata_matches"]
+                   for call in old_host["spawn_calls"]):
+            raise RuntimeError("old native original lead spawn lacked route metadata")
+        # The independent capture hook can run before the product Start hook.
+        # Release it only when necessary, then require the exact old owner.
+        released_before_registration = not native_lead_registered(
+            document, "codex", sessions["a"], runs["a"], leads["a"])
+        if released_before_registration:
+            (gate_dir / "release").touch()
+        while time.monotonic() < deadline:
+            document = read_state_snapshot(state_path)
+            if native_lead_registered(document, "codex", sessions["a"], runs["a"], leads["a"]):
+                break
+            if processes["a"].poll() is not None:
+                raise RuntimeError("old root exited before original lead registration")
+            time.sleep(.1)
+        else:
+            raise RuntimeError("old original lead Start never registered")
+        require_inflight_update_leads({"a": document}, "codex", sessions, runs, leads)
+        activation = document.get("activation", {}).get("codex", {})
+        profiles = [activation, *activation.get("session_profiles", [])]
+        if not any(item.get("session_id") == sessions["a"]
+                   and item.get("plugin_version") == update["old_version"]
+                   for item in profiles):
+            raise RuntimeError("old A did not use its guarded 1.5.1 runtime")
+        snapshot = {"original_owners": {"a": {"session_id": sessions["a"],
+                                               "run_id": runs["a"], "lead_id": leads["a"]}},
+                    "gate_release_before_update": released_before_registration,
+                    "pre_update": {"a": event_counts(document)}}
+        snapshot_file = case / "update_event_counts.json"
+        snapshot_file.write_text(json.dumps(snapshot))
+        old_records = update_while_gated(update, env, {"a": document}, sessions,
+                                         {"a": first}, deadline)
+        snapshot["old_source_removed_ns"] = update["old_source_removed_ns"]
+        snapshot_file.write_text(json.dumps(snapshot))
+        if not released_before_registration:
+            (gate_dir / "release").touch()
+
+        # B starts under the installed candidate while A's original run still
+        # owns the project. The baseline cases separately require two roots to
+        # start together under that candidate.
+        current = read_state_snapshot(state_path)
+        if not current.get("active_runs", {}).get(f"codex:{sessions['a']}"):
+            raise RuntimeError("old original run ended before candidate B launch")
+        processes["b"] = launch("codex", second, "b", False,
+                                {**env, "SYMPHONY_NATIVE_GATE_DIR": str(gate_dir),
+                                 "SYMPHONY_NATIVE_GATE_LABEL": "b"}, logs, budget, "")
+        while time.monotonic() < deadline:
+            if (gate_dir / "b.ready").is_file():
+                sessions["b"] = codex_session(logs, "b")
+                ready = json.loads((gate_dir / "b.ready").read_text())
+                if ready.get("session_id") != sessions["b"]:
+                    raise RuntimeError("candidate lead gate belongs to another root")
+                leads["b"] = ready["agent_id"]
+                current = read_state_snapshot(state_path)
+                owned = current.get("active_runs", {}).get(f"codex:{sessions['b']}")
+                archived = [item for item in current.get("recent_runs", [])
+                            if item.get("session_id") == sessions["b"]]
+                candidate_run = owned or (archived[0] if len(archived) == 1 else None)
+                if candidate_run and candidate_run.get("lead_identity") == leads["b"]:
+                    if not current.get("active_runs", {}).get(f"codex:{sessions['a']}"):
+                        raise RuntimeError("candidate B lead did not overlap old A's active run")
+                    runs["b"] = candidate_run["run_id"]
+                    break
+            if processes["b"].poll() is not None:
+                raise RuntimeError("candidate B exited before managed lead registration")
+            time.sleep(.1)
+        else:
+            raise RuntimeError("candidate B did not register its native original lead")
+        if sessions["a"] == sessions["b"] or leads["a"] == leads["b"] or runs["a"] == runs["b"]:
+            raise RuntimeError("old and candidate roots reused an owner identity")
+        activation = current.get("activation", {}).get("codex", {})
+        profiles = [activation, *activation.get("session_profiles", [])]
+        if not candidate_retained_profile(profiles, sessions["b"],
+                                          update["candidate_version"],
+                                          update["candidate_cache"],
+                                          Path(env["SYMPHONY_RUNTIME_DIR"])):
+            raise RuntimeError("candidate B did not use its guarded installed runtime")
+        candidate_host = codex_host_trace(update["home"], sessions["b"], leads["b"],
+                                          logs / "b.errors")
+        if not any(call["same_lead_id"] and call["lead_packet_metadata_matches"]
+                   for call in candidate_host["spawn_calls"]):
+            raise RuntimeError("candidate B native lead spawn lacked route metadata")
+        snapshot["original_owners"]["b"] = {"session_id": sessions["b"],
+                                               "run_id": runs["b"], "lead_id": leads["b"]}
+        snapshot["candidate_b_native_start_ns"] = json.loads(
+            (gate_dir / "b.ready").read_text())["started_ns"]
+        snapshot["post_update"] = {"a": event_counts(current), "b": event_counts(current)}
+        snapshot_file.write_text(json.dumps(snapshot))
+
+        exit_code, interruption = wait_for_old_codex_root(
+            processes["a"], root, update, state_path, sessions["a"], runs["a"],
+            leads["a"], logs / "a.errors", deadline)
+        if interruption:
+            (case / "old_root_interruption.json").write_text(json.dumps(interruption))
+        if exit_code and not interruption:
+            raise RuntimeError(f"old A native CLI exited {exit_code}")
+        if processes["b"].wait(timeout=max(1, deadline - time.monotonic())):
+            raise RuntimeError("candidate B native CLI exited unsuccessfully")
+        before_resume = read_state_snapshot(state_path)
+        pre_resume_state = codex_pre_resume_state(
+            before_resume, sessions["a"], runs["a"], leads["a"])
+        old_activation = before_resume.get("activation", {}).get("codex", {})
+        old_profiles = [old_activation, *old_activation.get("session_profiles", [])]
+        if not retained_profile(old_profiles, sessions["a"], update["old_version"],
+                                old_records["a"]["runtime_root"],
+                                old_records["a"]["plugin_root"]):
+            raise RuntimeError("old retained runtime was lost before candidate resume")
+        host = codex_host_trace(update["home"], sessions["a"], leads["a"], logs / "a.errors")
+        stops = [item for item in codex_hook_capture_summary(root)["records"]
+                 if item.get("event") == "SubagentStop"
+                 and item.get("session_id") == sessions["a"]
+                 and item.get("agent_id") == leads["a"] and item.get("exit_marker_written")]
+        branch = require_codex_old_lead_terminal(pre_resume_state, stops, host["lead_turns"])
+        original_spawn_calls = {item["call_hash"] for item in host["spawn_calls"]}
+        lead_task_name = next((item["task_name"] for item in host["spawn_calls"]
+                               if item["same_lead_id"] and item.get("task_name")), None)
+        if not lead_task_name:
+            raise RuntimeError("old lead lacks native task name for same-session resume")
+        snapshot["pre_candidate_resume_run_state"] = pre_resume_state
+        snapshot["pre_candidate_terminal_branch"] = branch
+        snapshot["pre_candidate_recovery_probe"] = codex_recovery_probe(
+            before_resume, sessions["a"], update["home"])
+        snapshot_file.write_text(json.dumps(snapshot))
+        resume_codex(env, first, sessions["a"], logs, deadline,
+                     already_completed=pre_resume_state == "completed",
+                     direct_stop=direct_stop_resume, lead_id=leads["a"],
+                     lead_task_name=lead_task_name)
+        after_resume = read_state_snapshot(state_path)
+        resumed_activation = after_resume.get("activation", {}).get("codex", {})
+        resumed_profiles = [resumed_activation,
+                            *resumed_activation.get("session_profiles", [])]
+        if not candidate_retained_profile(resumed_profiles, sessions["a"],
+                                          update["candidate_version"],
+                                          update["candidate_cache"],
+                                          Path(env["SYMPHONY_RUNTIME_DIR"])):
+            raise RuntimeError("original A resume did not activate the candidate runtime")
+        starts = [item for item in codex_hook_capture_summary(root)["records"]
+                  if item.get("event") == "SessionStart"
+                  and item.get("session_id") == sessions["a"]
+                  and item.get("exit_marker_written")]
+        if len(starts) < 2:
+            raise RuntimeError("original A lacked candidate native SessionStart")
+        resumed_host = codex_host_trace(update["home"], sessions["a"], leads["a"],
+                                        logs / "a.resume.errors", strict=True)
+        if any(item["call_hash"] not in original_spawn_calls
+               for item in resumed_host["spawn_calls"]):
+            raise RuntimeError("candidate A resume attempted an extra native spawn")
+        final = wait_for_completed_docs({"a": state_path, "b": state_path},
+                                        "codex", sessions, runs, deadline)
+        document = final["a"]
+        for label in ("a", "b"):
+            matching = [item for item in document.get("recent_runs", [])
+                        if item.get("session_id") == sessions[label]]
+            if (len(matching) != 1 or matching[0].get("status") != "completed"
+                    or matching[0].get("run_id") != runs[label]
+                    or (matching[0].get("outcome") or {}).get("status") != "completed"
+                    or matching[0].get("lead_identity") != leads[label]):
+                raise RuntimeError(f"{label}: original managed run did not archive completed")
+            durable_leads = {item.get("identity") for item in matching[0].get("delegations", [])
+                             if item.get("role") == "lead"}
+            if durable_leads != {leads[label]}:
+                raise RuntimeError(f"{label}: managed run changed its lead set")
+            if not any(item.get("kind") == "lead_completed"
+                       and item.get("payload", {}).get("identity") == leads[label]
+                       for item in document.get("event_history", [])):
+                raise RuntimeError(f"{label}: original lead lacks durable completion")
+        if any(item.get("session_id") in set(sessions.values())
+               for item in document.get("active_runs", {}).values()):
+            raise RuntimeError("mixed update left an original run active")
+        require_case_recovery_events(document, leads["a"], "codex", update,
+                                     "a", pre_resume_state)
+        for record_path in state_dir.glob(".session-*.json"):
+            pending = read_state_snapshot(record_path)
+            if pending.get("pending") or pending.get("overflow"):
+                raise RuntimeError("mixed update retained unresolved child callbacks")
+        proof = require_post_removal_lead_completion(
+            document, "codex", sessions["a"], leads["a"],
+            codex_host_trace(update["home"], sessions["a"], leads["a"],
+                             logs / "a.errors", strict=True), update["old_source_removed_ns"])
+        candidate_start = snapshot["candidate_b_native_start_ns"]
+        if candidate_start <= update["old_source_removed_ns"]:
+            raise RuntimeError("candidate B started before old source removal")
+        capture = codex_hook_capture_summary(root)
+        for label in ("a", "b"):
+            gate_starts = [item for item in capture["records"]
+                           if item.get("event") == "SubagentStart"
+                           and item.get("native_gate_label") == label
+                           and item.get("session_id") == sessions[label]
+                           and item.get("agent_id") == leads[label]]
+            if (len(gate_starts) != 1 or not gate_starts[0]["exit_marker_written"]
+                    or gate_starts[0].get("finished_ns", 0)
+                    < (gate_dir / "release").stat().st_mtime_ns):
+                raise RuntimeError(f"{label}: native lead start gate did not release in order")
+            if not any(item.get("event") == "Stop" and item.get("session_id") == sessions[label]
+                       and item.get("exit_marker_written")
+                       and item.get("script_exit_marker_code") == 0
+                       for item in capture["records"]):
+                raise RuntimeError(f"{label}: native root Stop was not captured")
+        return {"case": "live-update", "observed_overlap": True,
+                "completed": ["a", "b"], "pending_callbacks": 0,
+                "live_update": f"{update['old_version']}->{update['candidate_version']}",
+                "gate_version": {"a": update["old_version"],
+                                 "b": update["candidate_version"]},
+                "candidate_version": update["candidate_version"],
+                "gate_release_before_update": released_before_registration,
+                "old_source_removed_ns": update["old_source_removed_ns"],
+                "post_removal_original_completions": {"a": proof},
+                "original_owners": snapshot["original_owners"],
+                "pre_candidate_resume_state": pre_resume_state,
+                "old_root_interruption": interruption,
+                "native_resumed": ["a"],
+                "native_hook_capture": {"configured": capture["configured"],
+                                        "records": [item for item in capture["records"]
+                                                    if item.get("session_id") in set(sessions.values())]}}
+    finally:
+        (gate_dir / "release").touch()
+        for process in processes.values():
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
 def codex_hook_capture_summary(root, provider="codex"):
     """Read independent user hooks without collecting native transcripts or payload bodies."""
     directory = root / f"{provider}-hook-capture"
@@ -2720,9 +3004,14 @@ def main():
             if args.live_update:
                 update = prepare_live_update(args.provider, root, args.old_plugin_root,
                                              args.candidate_plugin_root)
-                results.append(check_case(args.provider, root, False, args.timeout,
-                                          args.claude_budget_usd, update,
-                                          direct_stop_resume=args.direct_stop_resume))
+                results.append(
+                    check_codex_mixed_live_update(
+                        root, args.timeout, args.claude_budget_usd, update,
+                        direct_stop_resume=args.direct_stop_resume)
+                    if args.provider == "codex" else
+                    check_case(args.provider, root, False, args.timeout,
+                               args.claude_budget_usd, update,
+                               direct_stop_resume=args.direct_stop_resume))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(json.dumps({"provider": args.provider, "error": str(error),
                               "logs": str(root)}), file=sys.stderr)
