@@ -28,53 +28,6 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
-    def test_codex_old_lead_terminal_gate_holds_only_exact_owned_callback(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            script = root / "capture.py"
-            script.write_text(native.CODEX_HOOK_CAPTURE)
-            gate, capture = root / "gate", root / "capture"
-            gate.mkdir()
-            (gate / "hold-a-stop").touch()
-            (gate / "a.root.json").write_text(json.dumps({"session_id": "root-a"}))
-            (gate / "a.ready").write_text(json.dumps({"session_id": "root-a",
-                                                       "agent_id": "lead-a"}))
-            env = {**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate)}
-            command = [sys.executable, "-I", str(script), "SubagentStop",
-                       str(capture), "codex"]
-            for session, agent in (("root-a", "assessor-a"),
-                                   ("root-b", "lead-a"), ("root-a", "lead-b")):
-                foreign = subprocess.run(command, input=json.dumps({
-                    "session_id": session, "agent_id": agent}), env=env,
-                    text=True, capture_output=True, timeout=5)
-                self.assertEqual(foreign.returncode, 0)
-            self.assertFalse((gate / "a.stop.waiting").exists())
-            process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True)
-            try:
-                process.stdin.write(json.dumps({"session_id": "root-a",
-                                                "agent_id": "lead-a"}))
-                process.stdin.close()
-                deadline = time.monotonic() + 5
-                while not (gate / "a.stop.waiting").is_file():
-                    self.assertLess(time.monotonic(), deadline)
-                    time.sleep(.01)
-                held = json.loads((gate / "a.stop.waiting").read_text())
-                self.assertEqual((held["session_id"], held["agent_id"]),
-                                 ("root-a", "lead-a"))
-                self.assertTrue(held["invocation_id"])
-                self.assertIsNone(process.poll())
-                (gate / "stop-release").touch()
-                self.assertEqual(process.wait(timeout=5), 0)
-            finally:
-                (gate / "stop-release").touch()
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-                process.stdout.close()
-                process.stderr.close()
-
     def test_codex_native_spawn_packets_follow_packaged_base_matrix(self):
         base = next(item for item in json.loads((PLUGIN / "profiles.json").read_text())
                     ["providers"]["codex"]["profiles"] if item["id"] == "base")
@@ -93,6 +46,11 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertEqual(packet["reasoning_effort"], selected["effort"])
             self.assertRegex(packet["task_name"], r"^[a-z0-9_]+$")
         self.assertIn("Do not call followup_task until spawn_agent has returned success", prompt)
+        deferred = native.prompt("codex", "a", True, Path("/tmp/native-project"),
+                                 defer_recovery=True)
+        self.assertIn("End this root turn with the original run recovering", deferred)
+        self.assertIn("Do not call followup_task or spawn another lead", deferred)
+        self.assertNotIn("Use followup_task with its original task_name", deferred)
 
     def test_windows_native_observer_retries_only_bounded_lock_contention(self):
         before = native.OBSERVER_SNAPSHOT_LOCK_RETRIES
@@ -112,7 +70,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             root = Path(temporary)
             script = root / "capture.py"
             script.write_text(native.CODEX_HOOK_CAPTURE)
-            gate, capture = root / "gate", root / "capture"
+            gate, capture = root / "gate", root / "codex-hook-capture"
             root_start = subprocess.run(
                 [sys.executable, "-I", str(script), "SessionStart", str(capture), "codex"],
                 input=json.dumps({"session_id": "root-a"}),
@@ -153,6 +111,64 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 self.assertEqual(process.wait(timeout=5), 0)
             finally:
                 (gate / "release").touch()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                process.stdout.close()
+                process.stderr.close()
+
+    def test_codex_old_root_stop_hold_is_one_shot_and_session_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "capture.py"
+            script.write_text(native.CODEX_HOOK_CAPTURE)
+            gate, capture = root / "gate", root / "codex-hook-capture"
+            env = {**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                   "SYMPHONY_NATIVE_GATE_LABEL": "a",
+                   "SYMPHONY_NATIVE_HOLD_OLD_STOP": "1"}
+            command = [sys.executable, "-I", str(script)]
+            started = subprocess.run(
+                [*command, "SessionStart", str(capture), "codex"],
+                input=json.dumps({"session_id": "root-a"}), env=env,
+                text=True, capture_output=True, timeout=5)
+            self.assertEqual(started.returncode, 0)
+            foreign = subprocess.run(
+                [*command, "Stop", str(capture), "codex"],
+                input=json.dumps({"session_id": "root-b"}), env=env,
+                text=True, capture_output=True, timeout=5)
+            self.assertEqual(foreign.returncode, 0)
+            self.assertFalse((gate / "a.stop-ready.json").exists())
+            process = subprocess.Popen(
+                [*command, "Stop", str(capture), "codex"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, text=True)
+            try:
+                process.stdin.write(json.dumps({"session_id": "root-a"}))
+                process.stdin.close()
+                deadline = time.monotonic() + 5
+                while not (gate / "a.stop-ready.json").is_file():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                held = json.loads((gate / "a.stop-ready.json").read_text())
+                self.assertEqual(held["session_id"], "root-a")
+                self.assertIsNone(process.poll())
+                second = subprocess.run(
+                    [*command, "Stop", str(capture), "codex"],
+                    input=json.dumps({"session_id": "root-a"}), env=env,
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(second.returncode, 0)
+                self.assertIsNone(process.poll())
+                (gate / "a.stop-release").touch()
+                self.assertEqual(process.wait(timeout=5), 0)
+                markers = native.codex_hook_capture_summary(root)["records"]
+                held_record = [item for item in markers
+                               if item["invocation_id"] == held["invocation_id"]]
+                self.assertEqual(len(held_record), 1)
+                self.assertTrue(held_record[0]["exit_marker_written"])
+                self.assertGreaterEqual(held_record[0]["finished_ns"],
+                                        (gate / "a.stop-release").stat().st_mtime_ns)
+            finally:
+                (gate / "a.stop-release").touch()
                 if process.poll() is None:
                     process.kill()
                     process.wait(timeout=5)
@@ -392,21 +408,88 @@ class CandidateRetainedProfileTests(unittest.TestCase):
     def test_codex_old_terminal_branches_require_native_proof(self):
         first = {"turn_id": "first"}
         second = {"turn_id": "second"}
-        blocked = {"completed": True, "reported_outcome": "blocked"}
-        completed = {"completed": True, "reported_outcome": "completed"}
+        blocked = {"turn_hash": native.sha256(b"first").hexdigest()[:12],
+                   "completed": True, "reported_outcome": "blocked"}
+        completed = {"turn_hash": native.sha256(b"second").hexdigest()[:12],
+                     "completed": True, "reported_outcome": "completed"}
+        markerless = {**completed, "reported_outcome": "other"}
         self.assertEqual("original_completed", native.require_codex_old_lead_terminal(
             "completed", [first], [completed]))
         self.assertEqual("same_id_recovered", native.require_codex_old_lead_terminal(
             "recovering", [first, second], [blocked, completed]))
+        self.assertEqual("same_id_unreconciled", native.require_codex_old_lead_terminal(
+            "recovering", [first, second], [blocked, markerless]))
+        self.assertEqual("same_id_unreconciled", native.require_codex_old_lead_terminal(
+            "recovering", [first, second], [blocked, {**markerless,
+                                                    "reported_outcome": "missing"}]))
+        self.assertEqual("same_id_unreconciled", native.require_codex_old_lead_terminal(
+            "recovering", [first, second], [blocked, {**blocked,
+                                                    "turn_hash": completed["turn_hash"]}]))
         for state, stops, turns in (
             ("completed", [first], [blocked]),
             ("completed", [first], [{**completed, "completed": False}]),
             ("recovering", [first], [blocked, completed]),
-            ("recovering", [first, second], [blocked, blocked]),
+            ("recovering", [first, second], [blocked, {**markerless,
+                                                    "turn_hash": "foreign"}]),
+            ("recovering", [first, second], [blocked, {**markerless,
+                                                    "completed": False}]),
             ("unknown", [first, second], [blocked, completed]),
         ):
             with self.subTest(state=state, stops=stops, turns=turns), self.assertRaises(RuntimeError):
                 native.require_codex_old_lead_terminal(state, stops, turns)
+
+    def test_native_markerless_parse_requires_new_latest_hooked_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            (sessions / "root-a.jsonl").write_text("{}\n")
+            child_rows = [
+                {"type": "event_msg", "timestamp": "2026-09-30T00:00:01+00:00",
+                 "payload": {"type": "task_started", "turn_id": "blocked"}},
+                {"type": "event_msg", "timestamp": "2026-09-30T00:00:02+00:00",
+                 "payload": {"type": "task_complete", "turn_id": "blocked",
+                             "last_agent_message": 'SYMPHONY_OUTCOME: {"status":"blocked"}'}},
+                {"type": "event_msg", "timestamp": "2026-09-30T00:00:03+00:00",
+                 "payload": {"type": "task_started", "turn_id": "markerless"}},
+                {"type": "event_msg", "timestamp": "2026-09-30T00:00:04+00:00",
+                 "payload": {"type": "task_complete", "turn_id": "markerless",
+                             "last_agent_message": "The work is done."}},
+            ]
+            child = sessions / "lead-a.jsonl"
+            child.write_text("".join(json.dumps(row) + "\n" for row in child_rows))
+            turns = native.codex_host_trace(home, "root-a", "lead-a",
+                                            home / "errors", strict=True)["lead_turns"]
+            self.assertEqual([turn["reported_outcome"] for turn in turns],
+                             ["blocked", "missing"])
+            stops = [{"turn_id": "blocked"}, {"turn_id": "markerless"}]
+            self.assertEqual("same_id_unreconciled", native.require_codex_old_lead_terminal(
+                "recovering", stops, turns))
+            stale = {"turn_hash": native.sha256(b"completed-middle").hexdigest()[:12],
+                     "completed": True, "completed_at": "2026-09-30T00:00:03+00:00",
+                     "started_at": "2026-09-30T00:00:02+00:00",
+                     "reported_outcome": "completed"}
+            with self.assertRaisesRegex(RuntimeError, "new original-lead turn"):
+                native.require_codex_unreconciled_recovery(
+                    [turns[0], stale, turns[1]], [turns[0], stale, turns[1]],
+                    {stale["turn_hash"]})
+            latest = {"turn_hash": native.sha256(b"candidate-latest").hexdigest()[:12],
+                      "completed": True, "completed_at": "2026-09-30T00:00:06+00:00",
+                      "started_at": "2026-09-30T00:00:05+00:00",
+                      "reported_outcome": "completed"}
+            native.require_codex_unreconciled_recovery(turns, [*turns, latest],
+                                                     {latest["turn_hash"]})
+            for changed, hashes in (({**latest, "reported_outcome": "missing"},
+                                     {latest["turn_hash"]}),
+                                    (latest, set()),
+                                    ({**latest, "started_at": turns[1]["completed_at"]},
+                                     {latest["turn_hash"]}),
+                                    ({**latest, "completed_at": "2026-09-30T00:00:03+00:00"},
+                                     {latest["turn_hash"]})):
+                with self.subTest(changed=changed, hashes=hashes), \
+                        self.assertRaisesRegex(RuntimeError, "new original-lead turn"):
+                    native.require_codex_unreconciled_recovery(
+                        turns, [*turns, changed], hashes)
 
     def test_native_gate_can_release_before_product_start_but_update_requires_working_leads(self):
         sessions = {"a": "root-a", "b": "root-b"}
@@ -642,6 +725,32 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             child.write_text('{"payload": {}}\n{broken\n')
             with self.assertRaisesRegex(ValueError, "invalid"):
                 native.codex_host_trace(home, "root-a", "lead-a", home / "errors", strict=True)
+
+    def test_codex_trace_keeps_early_followup_beyond_tool_call_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            rows = [{"type": "response_item", "timestamp": "2026-09-30T00:00:01+00:00",
+                     "payload": {"type": "function_call", "name": "followup_task",
+                                 "call_id": "early-followup",
+                                 "arguments": json.dumps({"target": "original_lead"})}}]
+            rows.extend({"type": "response_item",
+                         "timestamp": f"2026-09-30T00:00:{second:02d}+00:00",
+                         "payload": {"type": "function_call", "name": "wait_agent",
+                                     "call_id": f"later-{second}", "arguments": "{}"}}
+                        for second in range(2, 16))
+            (sessions / "root-a.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows))
+            (sessions / "lead-a.jsonl").write_text("{}\n")
+            trace = native.codex_host_trace(home, "root-a", "lead-a",
+                                            home / "errors", strict=True)
+            self.assertFalse(any(item["name"] == "followup_task"
+                                 for item in trace["root_tool_calls_tail"]))
+            self.assertEqual(trace["followup_calls"][0]["called_at"],
+                             "2026-09-30T00:00:01+00:00")
+            self.assertLess(native.timestamp_ns(trace["followup_calls"][0]["called_at"]),
+                            native.timestamp_ns("2026-09-30T00:00:20+00:00"))
 
     def test_native_launch_pins_current_provider_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
