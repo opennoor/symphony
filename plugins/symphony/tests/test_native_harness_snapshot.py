@@ -28,6 +28,53 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_codex_old_lead_terminal_gate_holds_only_exact_owned_callback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "capture.py"
+            script.write_text(native.CODEX_HOOK_CAPTURE)
+            gate, capture = root / "gate", root / "capture"
+            gate.mkdir()
+            (gate / "hold-a-stop").touch()
+            (gate / "a.root.json").write_text(json.dumps({"session_id": "root-a"}))
+            (gate / "a.ready").write_text(json.dumps({"session_id": "root-a",
+                                                       "agent_id": "lead-a"}))
+            env = {**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate)}
+            command = [sys.executable, "-I", str(script), "SubagentStop",
+                       str(capture), "codex"]
+            for session, agent in (("root-a", "assessor-a"),
+                                   ("root-b", "lead-a"), ("root-a", "lead-b")):
+                foreign = subprocess.run(command, input=json.dumps({
+                    "session_id": session, "agent_id": agent}), env=env,
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(foreign.returncode, 0)
+            self.assertFalse((gate / "a.stop.waiting").exists())
+            process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True)
+            try:
+                process.stdin.write(json.dumps({"session_id": "root-a",
+                                                "agent_id": "lead-a"}))
+                process.stdin.close()
+                deadline = time.monotonic() + 5
+                while not (gate / "a.stop.waiting").is_file():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                held = json.loads((gate / "a.stop.waiting").read_text())
+                self.assertEqual((held["session_id"], held["agent_id"]),
+                                 ("root-a", "lead-a"))
+                self.assertTrue(held["invocation_id"])
+                self.assertIsNone(process.poll())
+                (gate / "stop-release").touch()
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                (gate / "stop-release").touch()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                process.stdout.close()
+                process.stderr.close()
+
     def test_codex_native_spawn_packets_follow_packaged_base_matrix(self):
         base = next(item for item in json.loads((PLUGIN / "profiles.json").read_text())
                     ["providers"]["codex"]["profiles"] if item["id"] == "base")
