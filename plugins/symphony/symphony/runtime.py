@@ -1447,6 +1447,11 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             receipt["native_agent_type"] = str(source.payload.get("agent_type") or "")
             receipt["native_model"] = str(source.payload.get("model") or "")
             receipt["native_effort"] = str(source.payload.get("model_reasoning_effort") or "")
+            if (source.payload.get("provider") == "claude"
+                    and str(identity) == state.active_run.lead_identity
+                    and state.active_run.assessment.get("_claude_lead_start_identity") == str(identity)):
+                receipt["native_launch_prompt_hash"] = str(
+                    state.active_run.assessment.get("_claude_lead_start_prompt_hash") or "")
         state = replace(state, terminal_receipts=(*state.terminal_receipts, receipt))
         assessment = dict(state.active_run.assessment)
         assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
@@ -1468,6 +1473,19 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     terminal = source.kind == "subagent_stopped"
     status = str(source.payload.get("status") or ("completed" if terminal else "working"))
     role = str(pending.get("role") or _observed_role(source.payload) or (current.role if current else "worker"))
+    if current and current.role == "rejected_lead":
+        role = "rejected_lead"
+    elif (role == "lead" and source.kind == "subagent_started"
+            and state.active_run.status == "completing"
+            and state.active_run.lead_identity
+            and state.active_run.lead_identity != str(identity)):
+        # A Codex SubagentStart can arrive without PreToolUse after the root
+        # completed its lead. The child already exists: track it until its
+        # terminal without letting it replace the accepted lead or outcome.
+        role = "rejected_lead"
+        opening += (
+            Action("reject_lead_replacement", {"identity": str(identity)}),
+        )
     if role == "lead" and (source.kind == "subagent_started" or not state.active_run.lead_identity):
         owner_generation = state.active_run.owner_generation
         if (
@@ -1545,6 +1563,15 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                         expected["approval_required"] = blocked.payload["reason"]
                 assessment["_lead_expected_route"] = expected
                 state = replace(state, active_run=replace(state.active_run, assessment=assessment))
+        if (source.kind == "subagent_started" and source.payload.get("provider") == "claude"
+                and state.active_run and state.active_run.lead_identity == str(identity)
+                and isinstance(source.payload.get("prompt_id"), str)
+                and source.payload["prompt_id"]):
+            assessment = dict(state.active_run.assessment)
+            assessment["_claude_lead_start_identity"] = str(identity)
+            assessment["_claude_lead_start_prompt_hash"] = hashlib.sha256(
+                source.payload["prompt_id"].encode()).hexdigest()
+            state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     else:
         actions = opening
     update = {
@@ -2621,8 +2648,8 @@ def _render_actions(
             lead = state.active_run.lead_identity if state.active_run else "the registered lead"
             rendered.append(Action("inject_context", {"text":
                 f"Symphony refused to register {action.payload.get('identity')} as lead: this run already "
-                f"has one ({lead}). Stop the extra agent and let the registered lead finish. Symphony is "
-                "not tracking the extra agent's work, so anything it does will go unreconciled."}))
+                f"has one ({lead}). Stop the extra agent and let the registered lead finish. "
+                "The extra child is tracked until it ends but cannot replace the accepted lead or outcome."}))
         elif action.kind == "ignore_stale_owner":
             rendered.append(Action("inject_context", {"text":
                 f"Symphony ignored a lifecycle report from {action.payload.get('identity')}, which is not "

@@ -1,6 +1,7 @@
 """Native Claude recovery must prove the original lead's latest terminal."""
 
 import json
+import hashlib
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,7 @@ from plugins.symphony.symphony.host_evidence import (
 )
 from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.runtime import handle
+from plugins.symphony.symphony.runtime import _observe_delegation, handle
 from plugins.symphony.symphony.store import StateStore
 
 
@@ -106,7 +107,8 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         self.write_root_prompt()
         stop = handle({"session_id": SESSION, "cwd": str(self.project),
                        "hook_event_name": "Stop"}, self.environ)
-        self.assertNotEqual("block", json.loads(stop.stdout).get("decision") if stop.stdout else None)
+        self.assertNotEqual("block", json.loads(stop.stdout).get("decision") if stop.stdout else None,
+                            stop.stdout)
         archived = self.store.load(self.project)
         self.assertIsNone(archived.active_run)
         self.assertEqual("original-run", archived.recent_runs[-1].run_id)
@@ -156,6 +158,128 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                            {**source.payload, "_symphony_owner_conflict": True})
         self.assertFalse(claude_committed_native_terminal_replay(
             archived, conflicted, SESSION, self.project, self.environ))
+
+    def test_archived_native_result_accepts_exact_lead_start_hook_prompt(self):
+        self.write_root_prompt()
+        launch = {"session_id": SESSION, "cwd": str(self.project),
+                  "hook_event_name": "SubagentStart", "agent_id": LEAD,
+                  "agent_type": TYPE, "prompt_id": "shared-hook-prompt",
+                  "status": "working"}
+        # The native launch precedes the child terminal. Hook arrival time in
+        # this fixture must reflect that ordering for Stop freshness checks.
+        started = replace(event_from_payload("claude", launch),
+                          observed_at="2026-09-29T02:01:02+00:00")
+        state, _ = _observe_delegation(self.store.load(self.project), started)
+        self.assertIn("_claude_lead_start_prompt_hash", state.active_run.assessment,
+                      state.active_run.assessment)
+        self.store.save(self.project, replace(state, active_runs={f"claude:{SESSION}": state.active_run}))
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "$symphony:symphony status"}, self.environ)
+        stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                       "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", json.loads(stop.stdout).get("decision") if stop.stdout else None,
+                            stop.stdout)
+        archived = self.store.load(self.project)
+        self.assertIsNone(archived.active_run)
+        self.assertEqual("completed", archived.recent_runs[-1].status)
+        self.assertEqual(1, len(archived.terminal_receipts))
+        self.assertIn("native_launch_prompt_hash", archived.terminal_receipts[0],
+                      archived.terminal_receipts)
+        self.assertEqual(
+            archived.recent_runs[-1].assessment["_claude_lead_start_prompt_hash"],
+            archived.terminal_receipts[0]["native_launch_prompt_hash"],
+        )
+        callback = {**launch, "hook_event_name": "SubagentStop", "status": "completed",
+                    "agent_transcript_path": str(self.child),
+                    "last_assistant_message": REPORT}
+        source = event_from_payload("claude", callback)
+        self.assertTrue(claude_committed_native_terminal_replay(
+            replace(archived, recent_runs=()), source, SESSION,
+            self.project, self.environ))
+        handle(callback, self.environ)
+        record = self.store.session_record("claude", SESSION)
+        self.assertFalse(record and record["pending"])
+        for prompt in ("assessor-only-prompt", "newer-hook-prompt"):
+            with self.subTest(prompt=prompt):
+                source = event_from_payload("claude", {**callback, "prompt_id": prompt})
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    archived, source, SESSION, self.project, self.environ))
+        original_source = event_from_payload("claude", callback)
+        conflicted = replace(original_source, payload={**original_source.payload,
+                                              "_symphony_owner_conflict": True})
+        self.assertTrue(claude_committed_native_terminal_replay(
+            archived, conflicted, SESSION, self.project, self.environ))
+        with self.store.session_lock("claude", SESSION):
+            self.store.queue_session_event("claude", SESSION, original_source,
+                                           ambiguous_owner=True)
+        stop_again = handle({"session_id": SESSION, "cwd": str(self.project),
+                             "hook_event_name": "Stop"}, self.environ)
+        self.assertNotEqual("block", json.loads(stop_again.stdout).get("decision")
+                            if stop_again.stdout else None, stop_again.stdout)
+        self.assertFalse(self.store.session_record("claude", SESSION)["pending"])
+        for foreign in ({"session_id": "foreign-root"},
+                        {"parent_thread_id": "foreign-root"}):
+            with self.subTest(foreign=foreign):
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    archived, event_from_payload("claude", {**callback, **foreign}),
+                    SESSION, self.project, self.environ))
+        other = replace(self.run, session_id="foreign-root", status="active")
+        shared_identity = replace(archived, active_runs={"claude:foreign-root": other})
+        foreign_path = self.root / "foreign-child.jsonl"
+        foreign_path.write_text(self.child.read_text() + json.dumps({
+            "type": "user", "uuid": "foreign-newer-prompt", "sessionId": "foreign-root",
+            "agentId": LEAD, "isSidechain": True,
+            "timestamp": "2026-09-29T02:04:00Z",
+            "message": {"content": "New work in another root."}}) + "\n")
+        ambiguous_foreign = event_from_payload("claude", {
+            **callback, "session_id": LEAD, "parent_thread_id": "",
+            "agent_transcript_path": str(foreign_path),
+        })
+        ambiguous_foreign = replace(ambiguous_foreign, payload={
+            **ambiguous_foreign.payload, "_symphony_owner_conflict": True})
+        self.assertFalse(claude_committed_native_terminal_replay(
+            shared_identity, ambiguous_foreign, SESSION, self.project,
+            self.environ))
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        rows.append({"type": "user", "uuid": "prompt-two", "sessionId": SESSION,
+                     "agentId": LEAD, "isSidechain": True,
+                     "timestamp": "2026-09-29T02:03:00Z",
+                     "message": {"content": "A newer turn is running."}})
+        self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        self.assertFalse(claude_committed_native_terminal_replay(
+            archived, event_from_payload("claude", callback), SESSION,
+            self.project, self.environ))
+
+    def test_replacement_lead_receipt_uses_its_own_launch_prompt(self):
+        replacement_id = "b9c4054c282207da0"
+        original = replace(
+            self.run, status="recovering",
+            assessment={**self.run.assessment,
+                        "_claude_lead_start_identity": LEAD,
+                        "_claude_lead_start_prompt_hash": hashlib.sha256(
+                            b"old-lead-hook-prompt").hexdigest()})
+        state = ProjectState(active_run=original)
+        launch = {"session_id": SESSION, "cwd": str(self.project),
+                  "hook_event_name": "SubagentStart", "agent_id": replacement_id,
+                  "agent_type": TYPE, "prompt_id": "replacement-hook-prompt",
+                  "status": "working"}
+        state, _ = _observe_delegation(state, event_from_payload("claude", launch))
+        self.assertEqual(replacement_id, state.active_run.lead_identity)
+        self.assertEqual(replacement_id,
+                         state.active_run.assessment["_claude_lead_start_identity"])
+        replacement_hash = hashlib.sha256(b"replacement-hook-prompt").hexdigest()
+        self.assertEqual(replacement_hash,
+                         state.active_run.assessment["_claude_lead_start_prompt_hash"])
+        state, _ = _observe_delegation(state, event_from_payload("claude", {
+            **launch, "hook_event_name": "SubagentStop", "status": "completed",
+            "prompt_id": "new-native-child-prompt",
+            "model": "claude-sonnet-5", "model_reasoning_effort": "low",
+            "last_assistant_message": REPORT,
+            "_symphony_native_recovery": True,
+        }))
+        self.assertEqual(replacement_hash,
+                         state.terminal_receipts[-1]["native_launch_prompt_hash"])
 
     def test_malformed_parent_prompt_with_queued_callback_blocks_stop(self):
         self.write_root_prompt()

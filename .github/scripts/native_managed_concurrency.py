@@ -441,8 +441,11 @@ def resume_codex(env, project, session, logs, deadline, already_completed=False,
         if direct_stop else
         f"Resume the original Symphony run in this session. Its original lead identity "
         f"is {lead_id!r}, with spawn task_name {lead_task_name!r}. Preserve that identity "
-        "and the original run. Reconcile its completed native host result. "
-        "If gate markers or exit code are missing from its report, use followup_task "
+        "and the original run. Let the candidate SessionStart reconcile its completed "
+        "native host result first. If the injected status says this run is completing "
+        "with its original lead done, make no agent calls: finish this root turn so "
+        "native Stop archives it. Only if the run is still recovering because gate "
+        "markers or exit code are missing from its report, use followup_task "
         f"with target {lead_task_name!r}, without a /root/ prefix or UUID, and await "
         "that SAME lead. Ask it to report only evidence from its existing command "
         "result with its outcome; never invent missing evidence. Do not spawn a replacement "
@@ -1628,6 +1631,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                                   and record.get("exit_marker_written")]
                 host = codex_host_trace(update["home"], sessions["a"], observed_leads["a"],
                                         logs / "a.errors")
+                pre_resume_spawn_calls = {call["call_hash"] for call in host["spawn_calls"]}
                 terminal_branch = require_codex_old_lead_terminal(
                     pre_resume_state, captured_stops, host["lead_turns"])
                 snapshot["pre_candidate_resume"] = event_counts(before_resume)
@@ -1650,6 +1654,14 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                           and record.get("exit_marker_written")]
                 if len(starts) < 2:
                     raise RuntimeError("candidate resume lacked a second native SessionStart")
+                resumed_host = codex_host_trace(
+                    update["home"], sessions["a"], observed_leads["a"],
+                    logs / "a.resume.errors", strict=True)
+                if any(call["call_hash"] not in pre_resume_spawn_calls
+                       for call in resumed_host["spawn_calls"]):
+                    # A rejected native child may be absent from the durable
+                    # lead set; the native launch attempt still fails this gate.
+                    raise RuntimeError("candidate resume attempted an extra native spawn")
                 if direct_stop_resume and pre_resume_state != "completed":
                     controls = [record for record in codex_hook_capture_summary(root)["records"]
                                 if record.get("event") == "UserPromptSubmit"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping
@@ -441,9 +442,7 @@ def _claude_callback_matches_native(
     report = payload.get("last_assistant_message")
     return bool(
         source.kind == "subagent_stopped" and payload.get("provider") == "claude"
-        and (not payload.get("_symphony_owner_conflict") or
-             (allow_conflict and payload.get("prompt_id")
-              == native.payload.get("_symphony_root_prompt_id")))
+        and (not payload.get("_symphony_owner_conflict") or allow_conflict)
         and (payload.get("agent_id") or payload.get("subagent_id")) == identity
         and payload.get("parent_thread_id") in {None, "", session}
         and payload.get("session_id") in {session, identity}
@@ -494,6 +493,13 @@ def claude_committed_native_terminal_replay(
     if (source.payload.get("parent_thread_id") not in {None, "", session}
             or source.payload.get("session_id") not in {session, identity}):
         return False
+    if (source.payload.get("_symphony_owner_conflict")
+            and source.payload.get("session_id") != session
+            and source.payload.get("parent_thread_id") != session
+            and source.payload.get("_symphony_verified_alias") is not True):
+        # A child-session alias that could belong to another live root is not
+        # owned by this archive merely because the agent ID and prompt match.
+        return False
     report = source.payload.get("last_assistant_message")
     if _reported_status(report) != "completed":
         return False
@@ -523,7 +529,10 @@ def claude_committed_native_terminal_replay(
             str(receipt["run_id"]), "", status="completed", session_id=session,
             provider="claude", lead_identity=str(identity),
             started_at="1970-01-01T00:00:00+00:00",
-            assessment={"_claude_native_recovery": receipt["turn"]},
+            assessment={"_claude_native_recovery": receipt["turn"],
+                        "_claude_lead_start_identity": str(identity),
+                        "_claude_lead_start_prompt_hash": receipt.get(
+                            "native_launch_prompt_hash", "")},
             delegations=(Delegation(str(identity), "lead", "", "completed",
                                     str(receipt["native_model"]),
                                     str(receipt["native_effort"])),),
@@ -542,9 +551,20 @@ def claude_committed_native_terminal_replay(
             continue
         root_prompt = native.payload.get("_symphony_root_prompt_id")
         root_callback = bool(root_prompt and source.payload.get("prompt_id") == root_prompt)
-        if root_callback:
+        launch_owner = (source.payload.get("session_id") == session
+                        or source.payload.get("parent_thread_id") == session
+                        or source.payload.get("_symphony_verified_alias") is True)
+        launch_hash = (run.assessment.get("_claude_lead_start_prompt_hash")
+                       if run.assessment.get("_claude_lead_start_identity") == identity
+                       else None)
+        launch_callback = bool(
+            launch_owner and isinstance(launch_hash, str) and len(launch_hash) == 64
+            and isinstance(source.payload.get("prompt_id"), str)
+            and hashlib.sha256(source.payload["prompt_id"].encode()).hexdigest() == launch_hash
+        )
+        if root_callback or launch_callback:
             # A later native child prompt may be an unfinished new turn. The
-            # root prompt identifies the launch, not which child turn ended.
+            # parent hook prompt identifies the launch, not which child turn ended.
             try:
                 activity, latest = _claude_native_prompt_activity(
                     ProjectState(active_run=run), session, project, environ)
@@ -552,8 +572,15 @@ def claude_committed_native_terminal_replay(
                 continue
             if activity not in {"single", "multiple"} or latest != native.payload["prompt_id"]:
                 continue
+        callback = source
+        if launch_callback and not root_callback:
+            # The hook's launch prompt can differ from both native transcript
+            # prompts. It is accepted only from this run's own lead Start.
+            callback = replace(source, payload={**source.payload,
+                                                "prompt_id": native.payload["prompt_id"]})
         if _claude_callback_matches_native(
-                source, native, session, allow_conflict=root_callback):
+                callback, native, session,
+                allow_conflict=root_callback or launch_callback):
             return True
     return False
 

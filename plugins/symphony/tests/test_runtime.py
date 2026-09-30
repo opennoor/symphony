@@ -1855,6 +1855,121 @@ class RuntimeTests(unittest.TestCase):
                                 "tool_name": "followup_task", "tool_input": {"target": "lead-1"}}
                     self.assertNotEqual("block", self.output(handle(followup, environ)).get("decision"))
 
+    def test_rejected_native_lead_start_and_stop_do_not_join_completing_run(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                original = RunState(
+                    "original", "task", session_id="owner", provider=provider,
+                    lead_identity="lead-1", status="completing", outcome={"status": "completed"},
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(Delegation("lead-1", "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                )
+                sibling = replace(original, run_id="sibling", session_id="other",
+                                  status="assessed", lead_identity=None, outcome=None,
+                                  delegations=())
+                state = ProjectState(active_run=original, active_runs={
+                    f"{provider}:owner": original, f"{provider}:other": sibling})
+                extra = {"provider": provider, "session_id": "owner", "agent_id": "lead-2",
+                         "agent_type": (codex_agent_type("lead", choice["model"], choice["effort"])
+                                        if provider == "codex" else claude_agent_type("lead", choice)),
+                         "parent_thread_id": "owner", "turn_id": "new-turn"}
+                for event, status in (("SubagentStart", "working"),
+                                      ("SubagentStop", "completed")):
+                    state, actions = runtime_module._observe_delegation(
+                        state, event_from_payload(provider, {**extra, "hook_event_name": event,
+                                                            "status": status,
+                                                            "last_assistant_message":
+                                                            'SYMPHONY_OUTCOME: {"status":"completed"}'}))
+                    run = state.active_run
+                    self.assertEqual("completing", run.status)
+                    self.assertEqual(original.outcome, run.outcome)
+                    self.assertEqual("lead-1", run.lead_identity)
+                    self.assertEqual(["lead-1"], [item.identity for item in run.delegations
+                                                  if item.role == "lead"])
+                    rejected = next(item for item in run.delegations if item.identity == "lead-2")
+                    self.assertEqual("rejected_lead", rejected.role)
+                    self.assertEqual(status, rejected.state)
+                    if event == "SubagentStart":
+                        self.assertIn("reject_lead_replacement",
+                                      {action.kind for action in actions})
+                        self.assertIsNotNone(runtime_module._stop_block_reason(run))
+                    else:
+                        self.assertIsNone(runtime_module._stop_block_reason(run))
+                        self.assertEqual("lead-2", state.terminal_receipts[-1]["agent"])
+                    self.assertEqual(sibling, state.active_runs[f"{provider}:other"])
+                same, same_actions = runtime_module._observe_delegation(
+                    state, event_from_payload(provider, {**extra, "agent_id": "lead-1",
+                                                        "turn_id": "followup-turn",
+                                                        "hook_event_name": "SubagentStart"}))
+                self.assertNotIn("reject_lead_replacement",
+                                 {action.kind for action in same_actions})
+                self.assertEqual("lead-1", same.active_run.lead_identity)
+                recovering = replace(original, status="recovering", outcome=None)
+                replaced, recovery_actions = runtime_module._observe_delegation(
+                    replace(state, active_run=recovering),
+                    event_from_payload(provider, {**extra, "hook_event_name": "SubagentStart"}))
+                self.assertNotIn("reject_lead_replacement",
+                                 {action.kind for action in recovery_actions})
+                self.assertEqual("lead-2", replaced.active_run.lead_identity)
+
+    def test_rejected_inflight_lead_consumes_pending_launch_and_unblocks_after_terminal(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                pending = {"role": "lead", "model": choice["model"],
+                           "effort": choice["effort"], "objective": "second launch"}
+                run = RunState(
+                    "run", "task", session_id="owner", provider=provider,
+                    lead_identity="lead-1", status="completing", outcome={"status": "completed"},
+                    assessment={"size": "small", "complexity": "simple",
+                                "_pending_delegations": (pending,)},
+                    delegations=(Delegation("lead-1", "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                )
+                state = ProjectState(active_run=run)
+                base = {"provider": provider, "session_id": "owner", "agent_id": "late-lead",
+                        "agent_type": ("default" if provider == "codex"
+                                       else claude_agent_type("lead", choice)),
+                        "parent_thread_id": "owner"}
+                for event, status in (("SubagentStart", "working"),
+                                      ("SubagentStop", "completed")):
+                    state, _ = runtime_module._observe_delegation(
+                        state, event_from_payload(provider, {**base, "hook_event_name": event,
+                                                            "status": status}))
+                    self.assertNotIn("_pending_delegations", state.active_run.assessment)
+                    self.assertEqual("lead-1", state.active_run.lead_identity)
+                    self.assertEqual({"status": "completed"}, state.active_run.outcome)
+                self.assertIsNone(runtime_module._stop_block_reason(state.active_run))
+
+    def test_rejected_native_lead_failure_does_not_invalidate_original_outcome(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                run = RunState(
+                    "original", "task", session_id="owner", provider=provider,
+                    lead_identity="lead-1", status="completing", outcome={"status": "completed"},
+                    delegations=(Delegation("lead-1", "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                )
+                state = ProjectState(active_run=run)
+                base = {"provider": provider, "session_id": "owner", "agent_id": "lead-2",
+                        "agent_type": "symphony-lead-gpt-6-luna-low" if provider == "codex"
+                                      else "symphony:symphony-lead-claude-sonnet-5-low",
+                        "parent_thread_id": "owner"}
+                for name, status in (("SubagentStart", "working"),
+                                     ("SubagentStop", "failed")):
+                    state, _ = runtime_module._observe_delegation(
+                        state, event_from_payload(provider, {**base, "hook_event_name": name,
+                                                            "status": status}))
+                self.assertEqual("completing", state.active_run.status)
+                self.assertEqual({"status": "completed"}, state.active_run.outcome)
+                self.assertEqual("lead-1", state.active_run.lead_identity)
+                self.assertEqual("failed", next(item.state for item in state.active_run.delegations
+                                                if item.identity == "lead-2"))
+                self.assertIsNone(runtime_module._stop_block_reason(state.active_run))
+
     def test_native_verification_exception_blocks_managed_stop_only(self):
         for provider, evidence_function in (
             ("codex", "codex_recovered_lead_event"),

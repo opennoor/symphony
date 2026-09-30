@@ -280,7 +280,7 @@ def _delegation_updated(state: ProjectState, event: Event):
         return _archive(state, updated, "disabled", event.observed_at), (
             Action("archive_run", {"run_id": updated.run_id}),
         )
-    if item.role != "lead" and item.state.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}:
+    if item.role not in {"lead", "rejected_lead"} and item.state.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}:
         if updated.status == "recovering" and updated.assessment.get("_retryable_lead"):
             updated = replace(updated, assessment={**updated.assessment, "_retryable_lead": ""})
         if updated.status == "completing" or updated.assessment.get("_pending_lead_completion"):
