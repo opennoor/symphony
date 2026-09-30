@@ -12,7 +12,6 @@ import unittest
 
 from plugins.symphony.scripts.generate_hooks import bootstrap, generated
 from plugins.symphony.scripts.package_smoke import _payload
-from plugins.symphony.symphony.runtime import _retained_activation_command
 
 
 PLUGIN = Path(__file__).resolve().parents[1]
@@ -29,10 +28,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                                          "session_id": "original-session", "cwd": str(directory)})
             self.assertEqual(0, result.returncode, result.stderr)
             retained = next((directory / "retained runtimes").iterdir())
-            command = _retained_activation_command(str(retained), str(root))
+            context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+            command = context.split("Check activation through the verified launcher: ", 1)[1]
             self.assertLess(len(command), 1200)
             self.assertNotIn("base64", command)
-            self.assertIn(command, json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"])
             shutil.rmtree(root)
             env["CODEX_SESSION_ID"] = "original-session"
             def check():
