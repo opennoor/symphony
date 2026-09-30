@@ -1,10 +1,14 @@
 """The native upgrade receipt accepts only the reviewed retained candidate."""
 
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,6 +27,142 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_codex_native_hook_gate_holds_second_distinct_default_agent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "capture.py"
+            script.write_text(native.CODEX_HOOK_CAPTURE)
+            gate, capture = root / "gate", root / "capture"
+            first = subprocess.run(
+                [sys.executable, "-I", str(script), "SubagentStart", str(capture), "codex"],
+                input=json.dumps({"session_id": "root-a", "agent_id": "assessor-a",
+                                  "agent_type": "default"}),
+                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                     "SYMPHONY_NATIVE_GATE_LABEL": "a"},
+                text=True, capture_output=True, timeout=5)
+            self.assertEqual(first.returncode, 0)
+            self.assertFalse((gate / "a.ready").exists())
+            self.assertEqual(json.loads((gate / "a.first.json").read_text())["agent_id"],
+                             "assessor-a")
+            process = subprocess.Popen(
+                [sys.executable, "-I", str(script), "SubagentStart", str(capture), "codex"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                     "SYMPHONY_NATIVE_GATE_LABEL": "a"})
+            try:
+                process.stdin.write(json.dumps({
+                    "session_id": "root-a", "agent_id": "lead-a",
+                    "agent_type": "default"}))
+                process.stdin.close()
+                deadline = time.monotonic() + 5
+                while not (gate / "a.ready").is_file():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                self.assertIsNone(process.poll())
+                self.assertEqual(json.loads((gate / "a.ready").read_text())["agent_id"], "lead-a")
+                (gate / "release").touch()
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                (gate / "release").touch()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                process.stdout.close()
+                process.stderr.close()
+
+    def test_native_hook_gate_holds_distinct_leads_until_external_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "capture.py"
+            script.write_text(native.CODEX_HOOK_CAPTURE)
+            gate, capture = root / "gate", root / "capture"
+            assessor = subprocess.run(
+                [sys.executable, "-I", str(script), "SubagentStart", str(capture), "claude"],
+                input=json.dumps({"session_id": "root-a", "agent_id": "assessor",
+                                  "agent_type": "symphony:symphony-assessor-claude-sonnet-5-high"}),
+                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                     "SYMPHONY_NATIVE_GATE_LABEL": "a"},
+                text=True, capture_output=True, timeout=5)
+            self.assertEqual(assessor.returncode, 0)
+            self.assertFalse(gate.exists())
+            processes = {}
+            try:
+                for label in ("a", "b"):
+                    processes[label] = subprocess.Popen(
+                        [sys.executable, "-I", str(script), "SubagentStart", str(capture), "claude"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True,
+                        env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                             "SYMPHONY_NATIVE_GATE_LABEL": label})
+                    processes[label].stdin.write(json.dumps({
+                        "session_id": f"root-{label}", "agent_id": f"lead-{label}",
+                        "agent_type": "symphony:symphony-lead-claude-sonnet-5-low"}))
+                    processes[label].stdin.close()
+                deadline = time.monotonic() + 5
+                while not all((gate / f"{label}.ready").is_file() for label in processes):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                for label, process in processes.items():
+                    self.assertIsNone(process.poll())
+                    self.assertEqual(json.loads((gate / f"{label}.ready").read_text())
+                                     ["session_id"], f"root-{label}")
+                (gate / "release").touch()
+                for process in processes.values():
+                    self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                (gate / "release").touch()
+                for process in processes.values():
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+                    process.stdout.close()
+                    process.stderr.close()
+
+    def test_claude_second_wake_requires_original_reconciled_run_and_empty_inbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            run = {"run_id": "original", "lead_identity": "lead-1", "status": "completing",
+                   "outcome": {"status": "completed"},
+                   "delegations": [{"role": "lead", "identity": "lead-1", "state": "completed"}]}
+            document = {"active_runs": {"claude:root-a": run}}
+            ready = lambda doc: native.claude_finalization_ready(
+                doc, "root-a", "original", "lead-1", state_dir)
+            self.assertTrue(ready(document))
+            self.assertFalse(ready({"active_runs": {"claude:root-a":
+                                    {**run, "status": "active"}}}))
+            self.assertFalse(ready({"active_runs": {"claude:root-a":
+                                    {**run, "delegations": [{"role": "lead", "identity": "lead-1",
+                                                           "state": "working"}]}}}))
+            pending = state_dir / ".session-child.json"
+            pending.write_text(json.dumps({"pending": [{"kind": "subagent_stopped"}],
+                                           "overflow": False}))
+            self.assertFalse(ready(document))
+            pending.write_text(json.dumps({"pending": [], "overflow": False}))
+            self.assertTrue(ready(document))
+            for changed in ({**run, "run_id": "new-run"},
+                            {**run, "lead_identity": "new-lead"},
+                            {**run, "delegations": [*run["delegations"],
+                                                      {"role": "lead", "identity": "replacement",
+                                                       "state": "completed"}]}):
+                with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                    ready({"active_runs": {"claude:root-a": changed}})
+
+    def test_failure_keeps_full_artifact_without_flooding_ci_stderr(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = {"provider": "claude", "cases": [{"native_trace": "x" * 100000}]}
+            stderr = io.StringIO()
+            with patch.object(native, "prepare_baseline_capture",
+                              side_effect=RuntimeError("native case failed")), \
+                 patch.object(native, "failure_state", return_value=report), \
+                 patch.object(sys, "argv", ["native_managed_concurrency.py", "--provider", "claude"]), \
+                 patch.object(sys, "stderr", stderr), \
+                 patch.dict(native.os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
+                self.assertEqual(native.main(), 1)
+            saved = json.loads((Path(temporary) / "native-managed-claude-failure.json").read_text())
+            self.assertEqual(len(saved["cases"][0]["native_trace"]), 100000)
+            self.assertLess(len(stderr.getvalue()), 1000)
+
     def test_opaque_transport_cannot_replace_durable_recovery_events(self):
         def document(kinds, identity="original"):
             return {"event_history": [{"kind": kind, "payload": {"identity": identity}}
@@ -71,15 +211,16 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertIn('SYMPHONY_ROLE: lead\n', child_message)
                     self.assertIn(f'SYMPHONY_OUTCOME: {{"status":"{status}"}}', child_message)
                     self.assertLess(child_message.index(f'SYMPHONY_OUTCOME: {{"status":"{status}"}}'),
-                                    child_message.index("Run `python"))
+                                    child_message.index("native SubagentStart hook"))
                     self.assertNotIn("report success", child_message)
                     if recover:
                         self.assertIn("deliberately blocked", child_message)
-                        self.assertIn("even when the gate exits zero", child_message)
+                        self.assertIn("even after the native hook releases", child_message)
                     self.assertNotIn('SYMPHONY_OUTCOME: {"status":"completed"}' if recover
                                      else 'SYMPHONY_OUTCOME: {"status":"blocked"}', child_message)
-                    self.assertIn(f"python '{project.as_posix()}/gate.py' a", child_message)
-                    self.assertIn("GATE_RELEASED and exit code zero", child_message)
+                    self.assertIn("native SubagentStart hook holds your first turn", child_message)
+                    self.assertIn("GATE_RELEASED\nSYMPHONY_OUTCOME", child_message)
+                    self.assertNotIn("gate.py", child_message)
                     self.assertEqual("none", packet["fork_turns"])
                     self.assertEqual(("gpt-6-luna", "low"),
                                      (packet["model"], packet["reasoning_effort"]))
@@ -209,6 +350,10 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                                           "input": {"subagent_type": agent_type,
                                                     "resume": lead,
                                                     "prompt": "private follow-up"}}]}},
+                {"type": "assistant", "uuid": "assistant-three", "timestamp": "2026-09-30T00:00:05Z",
+                 "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                                          "id": "message-tool", "input": {"to": lead,
+                                          "message": "private recovery instructions"}}]}},
             ]
             child_rows = [
                 {"type": "user", "uuid": "child-prompt-one", "timestamp": "2026-09-30T00:00:01Z",
@@ -234,9 +379,19 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertNotEqual(trace["root_agent_calls"][0]["root_prompt_id_hash"],
                                 trace["root_agent_calls"][1]["root_prompt_id_hash"])
             self.assertIsNotNone(trace["root_agent_calls"][1]["resume_id_hash"])
+            self.assertEqual(1, len(trace["root_message_calls"]))
+            self.assertTrue(trace["root_message_calls"][0]["to_matches_original_lead"])
             self.assertEqual("completed", trace["child_turns"][0]["marker"])
             self.assertIsNone(trace["child_turns"][1]["marker"])
             self.assertNotIn("private", json.dumps(trace))
+            for malformed, shape in (("[]", "list"), ("{}", "dict")):
+                with self.subTest(malformed=malformed):
+                    child_rows[-1]["message"]["content"][0]["text"] = (
+                        'SYMPHONY_OUTCOME: {"status":' + malformed + "}")
+                    child.write_text("\n".join(map(json.dumps, child_rows)) + "\n")
+                    invalid = native.claude_host_trace(home, session, lead)
+                    self.assertEqual("invalid", invalid["child_turns"][1]["marker"])
+                    self.assertEqual(shape, invalid["child_turns"][1]["marker_status_shape"])
 
     def test_source_and_exact_retained_profiles_and_rejections(self):
         files, digest, constants = native.reviewed_snapshot_spec(PLUGIN)

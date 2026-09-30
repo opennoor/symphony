@@ -1726,6 +1726,28 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("codex:codex-session", archived.active_runs)
         self.assertEqual("completed", archived.recent_runs[-1].status)
 
+    def test_claude_resume_guides_same_agent_message_for_unreconciled_lead(self):
+        choice = route_choice(provider="claude")
+        run = self.seed_run(RunState(
+            "original", "task", lead_identity="lead-1", status="active",
+            assessment={"size": "small", "complexity": "simple"},
+            delegations=(Delegation("lead-1", "lead", "task", "working",
+                                    choice["model"], choice["effort"]),)), provider="claude")
+        resumed = handle({**self.payload("", "claude"), "hook_event_name": "SessionStart",
+                          "source": "resume"}, self.claude_environ)
+        guidance = self.context(resumed)
+        self.assertIn("SendMessage", guidance)
+        self.assertIn("to: lead-1", guidance)
+        self.assertIn("same agent", guidance)
+        self.assertIn("SYMPHONY_OUTCOME", guidance)
+        self.assertEqual(run.run_id, StateStore(self.state_root).load(self.project)
+                         .active_runs["claude:claude-session"].run_id)
+
+        completed = replace(run, status="completing", outcome={"status": "completed"},
+                            delegations=(replace(run.delegations[0], state="completed"),))
+        self.assertNotIn("SendMessage", runtime_module._recovery_guidance(
+            ProjectState(active_run=completed), "claude"))
+
     def test_explicit_graceful_stop_shares_native_freshness_gate(self):
         choice = route_choice()
         run = RunState("run", "task", lead_identity="lead", status="completing",
@@ -1748,6 +1770,81 @@ class RuntimeTests(unittest.TestCase):
         archived = store.load(self.project)
         self.assertIsNone(archived.active_run)
         self.assertEqual("completed", archived.recent_runs[-1].status)
+
+    def test_completing_run_denies_new_lead_spawn_but_preserves_other_work(self):
+        marker = ('SYMPHONY_ROUTE: {"size":"small","complexity":"simple",'
+                  '"risk":"normal","rationale":"test","topology":"direct"}')
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                choice = route_choice(provider=provider)
+                original = RunState(
+                    "original", "task", session_id=f"{provider}-session", provider=provider,
+                    lead_identity="lead-1", status="completing", outcome={"status": "completed"},
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(Delegation("lead-1", "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                )
+                sibling = replace(original, run_id="sibling", session_id="other-session",
+                                  status="assessed", lead_identity=None, outcome=None,
+                                  delegations=())
+                StateStore(self.state_root).save(self.project, ProjectState(
+                    enabled=True, active_run=original,
+                    activation={provider: {"profile": (CLAUDE_FULL if provider == "claude"
+                                                       else CODEX_FULL)["id"]}},
+                    active_runs={f"{provider}:{original.session_id}": original,
+                                 f"{provider}:other-session": sibling}))
+                environ = self.claude_environ if provider == "claude" else self.environ
+
+                def spawn(session):
+                    hook = {**self.payload("", provider), "session_id": session,
+                            "hook_event_name": "PreToolUse",
+                            "tool_name": "Agent" if provider == "claude" else "spawn_agent"}
+                    if provider == "claude":
+                        hook["tool_input"] = {"subagent_type":
+                            f"symphony-lead-{choice['model']}-{choice['effort']}",
+                            "prompt": f"SYMPHONY_ROLE: lead\n{marker}\nDo task"}
+                    else:
+                        hook["tool_input"] = {"message": f"SYMPHONY_ROLE: lead\n{marker}\nDo task",
+                                              "model": choice["model"],
+                                              "reasoning_effort": choice["effort"]}
+                    if provider == "claude":
+                        with patch.object(runtime_module, "_snapshot",
+                                          return_value=snapshot_for(provider, CLAUDE_FULL["id"])), \
+                             patch.object(runtime_module, "_clamp_actions", return_value=()):
+                            return handle(hook, environ)
+                    return handle(hook, environ)
+
+                denied = spawn(original.session_id)
+                decision = self.output(denied)
+                if provider == "claude":
+                    self.assertEqual("deny", decision["hookSpecificOutput"]["permissionDecision"])
+                    reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+                    sibling_decision = self.output(spawn("other-session"))
+                    self.assertNotEqual("deny", sibling_decision.get("hookSpecificOutput", {})
+                                        .get("permissionDecision"))
+                else:
+                    self.assertEqual("block", decision.get("decision"))
+                    reason = decision.get("reason", "")
+                    self.assertNotEqual("block", self.output(spawn("other-session")).get("decision"))
+                self.assertIn("stop", reason.lower())
+                stored = StateStore(self.state_root).load(self.project)
+                self.assertEqual("completing", stored.active_runs[f"{provider}:{original.session_id}"].status)
+                self.assertEqual("assessed", stored.active_runs[f"{provider}:other-session"].status)
+
+                recovering = replace(original, status="recovering", outcome=None)
+                StateStore(self.state_root).save(self.project, ProjectState(
+                    enabled=True, active_run=recovering,
+                    activation={provider: {"profile": (CLAUDE_FULL if provider == "claude"
+                                                       else CODEX_FULL)["id"]}},
+                    active_runs={f"{provider}:{original.session_id}": recovering}))
+                recovery_decision = self.output(spawn(original.session_id))
+                self.assertNotEqual("block", recovery_decision.get("decision"))
+                self.assertNotEqual("deny", recovery_decision.get("hookSpecificOutput", {})
+                                    .get("permissionDecision"))
+                if provider == "codex":
+                    followup = {**self.payload("", provider), "hook_event_name": "PreToolUse",
+                                "tool_name": "followup_task", "tool_input": {"target": "lead-1"}}
+                    self.assertNotEqual("block", self.output(handle(followup, environ)).get("decision"))
 
     def test_native_verification_exception_blocks_managed_stop_only(self):
         for provider, evidence_function in (
@@ -1781,6 +1878,30 @@ class RuntimeTests(unittest.TestCase):
                     result = handle({**self.payload("", provider), "hook_event_name": "Stop"},
                                     environ)
                 self.assertNotEqual("block", self.output(result).get("decision"))
+
+    def test_claude_unknown_latest_turn_guides_same_lead_continuation(self):
+        choice = route_choice(provider="claude")
+        self.seed_run(RunState(
+            "run", "task", lead_identity="original-lead", status="completing",
+            outcome={"status": "completed"},
+            delegations=(Delegation("original-lead", "lead", "task", "completed",
+                                    choice["model"], choice["effort"]),),
+        ), provider="claude")
+        stop = {**self.payload("", "claude"), "hook_event_name": "Stop"}
+        with patch.object(runtime_module, "claude_recovered_lead_event", return_value=None), \
+             patch.object(runtime_module, "claude_completing_lead_turn",
+                          return_value=("unknown", None)):
+            decision = self.output(handle(stop, self.claude_environ))
+        self.assertEqual("block", decision.get("decision"))
+        reason = decision.get("reason", "")
+        self.assertIn("latest native Claude turn", reason)
+        self.assertIn("SendMessage", reason)
+        self.assertIn("to: original-lead", reason)
+        self.assertIn("at most one", reason)
+        self.assertIn("do not repeat SendMessage or Stop", reason)
+        self.assertIn("/symphony:stop", reason)
+        self.assertEqual("completing", StateStore(self.state_root).load(self.project)
+                         .active_runs["claude:claude-session"].status)
 
     def test_restarted_worker_failure_after_lead_completion_requires_recovery(self):
         choice = route_choice()

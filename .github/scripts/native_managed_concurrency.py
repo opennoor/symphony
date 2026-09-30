@@ -23,6 +23,8 @@ import time
 import uuid
 
 
+# The isolated-worktree harness still uses a shell gate to prove child cwd.
+# Managed concurrency below uses the native SubagentStart hook gate instead.
 GATE = '''import pathlib, sys, time
 root = pathlib.Path(__file__).resolve().parent
 name = sys.argv[1]
@@ -37,6 +39,7 @@ while not (root / "release").exists():
 (root / (name + ".released")).touch()
 print("GATE_RELEASED", flush=True)
 '''
+
 
 CODEX_HOOK_CAPTURE = '''import hashlib, json, os, pathlib, re, sys, time, uuid
 destination = pathlib.Path(sys.argv[2])
@@ -61,6 +64,40 @@ record = {"invocation_id": invocation, "event": event,
                                         else "CLAUDE_CONFIG_DIR"),
           "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
           "started_ns": time.time_ns()}
+gate_dir = pathlib.Path(os.environ["SYMPHONY_NATIVE_GATE_DIR"]) if os.environ.get(
+    "SYMPHONY_NATIVE_GATE_DIR") else None
+gate_label = os.environ.get("SYMPHONY_NATIVE_GATE_LABEL")
+agent_type = payload.get("agent_type")
+is_lead_start = (event == "SubagentStart" and provider == "claude"
+                 and isinstance(agent_type, str) and re.fullmatch(
+                     r"symphony:symphony-lead-[a-z0-9-]{1,96}", agent_type) is not None)
+if (gate_dir and gate_label in {"a", "b"} and event == "SubagentStart"
+        and provider == "codex" and agent_type == "default"):
+    # Codex 0.159 reports both assessor and lead as agent_type=default.
+    # This fixture awaits one assessor before launching one lead, so hold
+    # the second distinct native child and verify its durable lead ID below.
+    gate_dir.mkdir(parents=True, exist_ok=True)
+    first = gate_dir / (gate_label + ".first.json")
+    try:
+        with first.open("x") as stream:
+            json.dump({"session_id": payload.get("session_id"),
+                       "agent_id": payload.get("agent_id")}, stream)
+    except FileExistsError:
+        original = json.loads(first.read_text())
+        if original.get("session_id") != payload.get("session_id"):
+            raise SystemExit("native gate root session changed")
+        is_lead_start = original.get("agent_id") != payload.get("agent_id")
+if gate_dir and gate_label in {"a", "b"} and is_lead_start:
+    record["native_gate_label"] = gate_label
+    record["native_gate_session_id"] = payload.get("session_id")
+    record["agent_type"] = payload["agent_type"]
+    gate_dir.mkdir(parents=True, exist_ok=True)
+    ready = gate_dir / (gate_label + ".ready")
+    temporary = gate_dir / (gate_label + "." + invocation + ".tmp")
+    temporary.write_text(json.dumps({
+        "session_id": payload.get("session_id"), "agent_id": payload.get("agent_id"),
+        "started_ns": record["started_ns"]}))
+    temporary.replace(ready)
 if event == "PreToolUse":
     tool = str(payload.get("tool_name") or "")
     record["tool_name"] = tool if tool in {"Agent", "Task"} else "other"
@@ -90,6 +127,12 @@ if event == "Stop":
         if isinstance((state := item.get("status")), str)
         and state in {"pending", "running", "completed", "failed", "cancelled", "canceled"}})
 (destination / (invocation + "-entry.json")).write_text(json.dumps(record))
+if record.get("native_gate_label"):
+    deadline = time.monotonic() + 600
+    while not (gate_dir / "release").is_file():
+        if time.monotonic() >= deadline:
+            raise SystemExit("native lead start gate timed out")
+        time.sleep(.1)
 (destination / (invocation + "-exit.json")).write_text(json.dumps({"invocation_id": invocation,
                                                                     "exit_code": 0,
                                                                     "finished_ns": time.time_ns()}))
@@ -130,42 +173,39 @@ def prompt(provider, label, recover, project):
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
     route = '{"size":"small","complexity":"simple","risk":"normal","rationale":"disposable native CI gate","topology":"direct"}'
     recovery = (
-        'The lead MUST finish its first turn after the gate with the observed gate '
-        'markers and exit code, followed by the exact line '
+        'The lead MUST finish its first turn after its native start hook is released, '
+        'followed by the exact line '
         'SYMPHONY_OUTCOME: {"status":"blocked"}. Await that result. '
         'Then use followup_task on the SAME lead identity, passing the exact task_name '
         'used in spawn_agent as target (lowercase letters, digits, and underscores; '
         'do not pass a /root/ path or agent UUID), asking it to report the gate '
-        'markers and exit code from its existing command result without rerunning '
-        'the gate, followed by the exact line '
+        'release from its existing native start without starting another task, '
+        'followed by the exact line '
         'SYMPHONY_OUTCOME: {"status":"completed"}; await the follow-up. '
-        if recover else 'After the gate returns, return SYMPHONY_OUTCOME: {"status":"completed"}. '
+        if recover else 'After the native start hook releases, return SYMPHONY_OUTCOME: {"status":"completed"}. '
     )
     if provider == "codex":
         recovery = (
             'Await the lead\'s deliberately blocked first turn. Use followup_task with '
             'its original task_name as target on the SAME lead: report the existing '
-            'gate markers and exit code, then SYMPHONY_OUTCOME: {"status":"completed"}. '
+            'native start release, then SYMPHONY_OUTCOME: {"status":"completed"}. '
             'Await that follow-up. '
-            if recover else 'Await the lead\'s completed gate report. '
+            if recover else 'Await the lead\'s completed native start report. '
         )
     claude_isolation = (
         "Use Agent run_in_background=true for the lead, and omit isolation=worktree; "
         "the fixture checkout is already disposable and its shared state must observe this lead. "
         if provider == "claude" else ""
     )
-    gate = str(project / "gate.py").replace("\\", "/")
     lead_task = (
-        "FIRST-TURN CONTRACT: End your gate evidence report with this exact standalone line:\n"
+        "FIRST-TURN CONTRACT: After your native start hook releases, reply with exactly "
+        "these two lines (no Markdown):\nGATE_RELEASED\n"
         + ('SYMPHONY_OUTCOME: {"status":"blocked"}' if recover else
            'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
-        + ("This recovery fixture is deliberately blocked even when the gate exits zero; "
+        + ("This recovery fixture is deliberately blocked even after the native hook releases; "
            "the root will resume this same lead for completion.\n" if recover else "") +
-        f"Run `python '{gate}' {label}` exactly once. "
-        "Use the native command tool; if it returns a running session, wait for that same "
-        "process. Report its observed GATE_STARTED, GATE_RELEASED and exit code zero "
-        "only after it finishes, then the contract line above. "
-        "Do not delegate, rerun the gate, or create another checkout/worktree."
+        "The test-only native SubagentStart hook holds your first turn until both "
+        "lead starts are recorded. Do not run tools, delegate, or create a worktree."
     )
     lead_relay = (
         "Pass LEAD_SPAWN_PACKET verbatim as spawn_agent arguments, including message. "
@@ -176,7 +216,10 @@ def prompt(provider, label, recover, project):
             "reasoning_effort": "low", "fork_turns": "none",
             "message": f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n" + lead_task,
         }) + "\n"
-        if provider == "codex" else lead_task
+        if provider == "codex" else
+        "Pass LEAD_TASK_TEXT verbatim as the Agent prompt; do not summarize it. "
+        "LEAD_TASK_TEXT: " + json.dumps(
+            f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n" + lead_task) + "\n"
     )
     return (
         f"{control} Disposable native CI lifecycle {label}. "
@@ -187,7 +230,9 @@ def prompt(provider, label, recover, project):
         "Await all children, then finish briefly so the native Stop hook can finalize "
         "the run. A completing run awaits that hook: do not poll for completed before "
         "ending the turn, print status/stop controls as prose, or ask a completed lead "
-        "for extra confirmation. The harness verifies durable completion after Stop. "
+        "for extra confirmation. Only the external harness releases the test-only native "
+        "start hooks after both leads are active; neither root nor child controls that gate. "
+        "The harness verifies durable completion after Stop. "
         "Never force stop. Do not edit files or inspect other projects."
     )
 
@@ -225,11 +270,12 @@ def codex_session(logs, label):
     return match.group(1)
 
 
-def resume_claude(env, project, session, budget, deadline, logs, label):
+def resume_claude(env, project, session, budget, deadline, logs, label, *, finalize=False):
     executable = shutil.which("claude")
     if not executable:
         raise RuntimeError("claude CLI is missing")
     receipt = {"session_id": session, "started_ns": time.time_ns(),
+               "phase": "finalize" if finalize else "reconcile",
                "status": "started"}
     receipt_path = logs / f"{label}.resume.phase.json"
     receipt_path.write_text(json.dumps(receipt))
@@ -238,8 +284,12 @@ def resume_claude(env, project, session, budget, deadline, logs, label):
             [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
              "--permission-mode", "bypassPermissions", "--resume", session,
              "--output-format", "json",
-             "Continue this exact Symphony session after the background lead result. "
-             "Reconcile its outcome and finish. Do not start a new task."],
+             ("The original lead has reconciled and this same Symphony run is completing. "
+              "Invoke the normal /symphony:stop control now, then check durable status. "
+              "Do not start another task or agent." if finalize else
+              "Continue this exact Symphony session after the background lead result. "
+              "Follow the injected Symphony recovery guidance, reconcile the original "
+              "agent's outcome, and finish. Do not start a new task.")],
             cwd=project, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
             shell=False, timeout=max(1, min(90, deadline - time.monotonic())),
         )
@@ -252,6 +302,23 @@ def resume_claude(env, project, session, budget, deadline, logs, label):
     receipt_path.write_text(json.dumps(receipt))
     if completed.returncode:
         raise RuntimeError(f"Claude resume for session {session} exited {completed.returncode}")
+
+
+def claude_finalization_ready(document, session, run_id, lead_id, state_dir):
+    """Wake the same root only after its original lead and inbox reconcile."""
+    owned = document.get("active_runs", {}).get(f"claude:{session}")
+    if not owned or owned.get("status") != "completing":
+        return False
+    if (owned.get("run_id") != run_id or owned.get("lead_identity") != lead_id
+            or (owned.get("outcome") or {}).get("status") != "completed"
+            or any(item.get("role") == "lead" and item.get("identity") != lead_id
+                   for item in owned.get("delegations", []))):
+        raise RuntimeError("candidate changed the original Claude run")
+    if any(item.get("state") in {"working", "pending", "running", "active"}
+           for item in owned.get("delegations", [])):
+        return False
+    return not any((record := read_state_snapshot(path)).get("pending") or record.get("overflow")
+                   for path in state_dir.glob(".session-*.json"))
 
 
 def codex_resume_phase(env, session, logs):
@@ -437,7 +504,8 @@ def install_hook_capture(provider, root, home):
             command = f"python3 -I {script.as_posix()} {event} {capture.as_posix()} codex"
             windows = f"python.exe -I {script.as_posix()} {event} {capture.as_posix()} codex"
             hooks["hooks"][event] = [{"hooks": [{"type": "command", "command": command,
-                                                  "command_windows": windows, "timeout": 10}]}]
+                                                  "command_windows": windows,
+                                                  "timeout": 600 if event == "SubagentStart" else 10}]}]
         (home / "hooks.json").write_text(json.dumps(hooks))
     else:
         settings_path = home / "settings.json"
@@ -447,7 +515,9 @@ def install_hook_capture(provider, root, home):
                       "SubagentStart", "SubagentStop", "Stop"):
             command = (f'python -I "{script.as_posix()}" {event} '
                        f'"{capture.as_posix()}" claude')
-            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command}]})
+            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command,
+                                                             "timeout": 600 if event == "SubagentStart"
+                                                             else 10}]})
         settings_path.write_text(json.dumps(settings))
 
 
@@ -458,6 +528,10 @@ def prepare_baseline_capture(provider, root, candidate_source):
     home = root / f"{provider}-baseline-home"
     home.mkdir()
     env = {"CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR": str(home)}
+    if provider == "claude":
+        # Claude --print otherwise may begin a turn before a newly installed
+        # plugin has finished its background load.
+        env["CLAUDE_CODE_SYNC_PLUGIN_INSTALL"] = "1"
     native_env = {**os.environ, **env}
     market = marketplace(root, "symphony-baseline", candidate_source, version)
     if provider == "codex":
@@ -498,6 +572,8 @@ def prepare_live_update(provider, root, old_source, candidate_source):
     home = root / f"{provider}-live-update-home"
     home.mkdir()
     env = {**os.environ, "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR": str(home)}
+    if provider == "claude":
+        env["CLAUDE_CODE_SYNC_PLUGIN_INSTALL"] = "1"
     old_market = marketplace(root, "symphony-old", old_source, old_version)
     candidate_market = marketplace(root, "symphony-candidate", candidate_source, candidate_version)
     if provider == "codex":
@@ -1069,8 +1145,8 @@ def check_case(provider, root, separate, timeout, budget, update=None,
     case = root / ("live-update" if update else "worktrees" if separate else "same-worktree")
     case.mkdir()
     first, second = projects(case, separate)
-    for project in {first, second}:
-        (project / "gate.py").write_text(GATE)
+    gate_dir = case / "native-gate"
+    gate_dir.mkdir()
     state_dir = case / "state"
     state_dir.mkdir()
     candidate_version = (update["candidate_version"] if update else
@@ -1088,10 +1164,10 @@ def check_case(provider, root, separate, timeout, budget, update=None,
     sessions = {}
     try:
         for label, project in (("a", first), ("b", second)):
-            # Keep gate files outside Git; each checkout sees only its own gate.
-            (project / "release").unlink(missing_ok=True)
             sessions[label] = str(uuid.uuid4()) if provider == "claude" else ""
-            processes[label] = launch(provider, project, label, label == "a" and provider == "codex", env, logs,
+            launch_env = {**env, "SYMPHONY_NATIVE_GATE_DIR": str(gate_dir),
+                          "SYMPHONY_NATIVE_GATE_LABEL": label}
+            processes[label] = launch(provider, project, label, label == "a" and provider == "codex", launch_env, logs,
                                       budget, sessions[label])
         deadline = time.monotonic() + timeout
         paths = {label: state_file(state_dir, project) for label, project in (("a", first), ("b", second))}
@@ -1102,10 +1178,13 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             if exited:
                 exits = ",".join(f"{label}={code}" for label, code in sorted(exited.items()))
                 raise RuntimeError(f"native CLI exited before both managed leads reached the gate: {exits}")
-            if all((project / f"{label}.ready").exists()
-                   for label, project in (("a", first), ("b", second))):
+            if all((gate_dir / f"{label}.ready").exists() for label in processes):
                 if provider == "codex" and not sessions["a"]:
                     sessions = {label: codex_session(logs, label) for label in processes}
+                for label in processes:
+                    gate_record = json.loads((gate_dir / f"{label}.ready").read_text())
+                    if gate_record.get("session_id") != sessions[label]:
+                        raise RuntimeError(f"{label}: native lead gate belongs to another root session")
                 if all(path.exists() for path in paths.values()):
                     docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
                     expected_gate_version = update["old_version"] if update else candidate_version
@@ -1134,7 +1213,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 archived = [run for run in document.get("recent_runs", [])
                             if run.get("session_id") == sessions[label]]
                 gate_timeout[label] = {
-                    "ready": (project / f"{label}.ready").exists(),
+                    "ready": (gate_dir / f"{label}.ready").exists(),
                     "state_exists": path.is_file(),
                     "owner_status": owned.get("status") if owned else "missing",
                     "lead_present": bool(owned and owned.get("lead_identity")),
@@ -1170,17 +1249,28 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                             for label, session in sessions.items()}
         if provider == "codex":
             for label in sessions:
+                first_start = json.loads((gate_dir / f"{label}.first.json").read_text())
+                own_run = docs[label]["active_runs"][f"codex:{sessions[label]}"]
+                assessors = {item.get("identity") for item in own_run.get("delegations", [])
+                             if item.get("role") == "assessor"}
+                if (first_start.get("session_id") != sessions[label]
+                        or first_start.get("agent_id") not in assessors):
+                    raise RuntimeError(f"{label}: first native child was not this run's assessor")
                 host = codex_host_trace(Path(env.get("CODEX_HOME", Path.home() / ".codex")),
                                         sessions[label], observed_leads[label], logs / f"{label}.errors")
                 if not any(item["same_lead_id"] and item["lead_packet_metadata_matches"]
                            for item in host["spawn_calls"]):
                     raise RuntimeError(f"{label}: native original lead spawn lacks required transport metadata")
         gate_evidence = {label: {
-            "ready": (first if label == "a" else second).joinpath(f"{label}.ready").is_file(),
+            "ready": (gate_dir / f"{label}.ready").is_file(),
+            "start_matches_original_lead": json.loads((gate_dir / f"{label}.ready").read_text())
+                                           ["agent_id"] == observed_leads[label],
             "owner_active": bool(docs[label]["active_runs"].get(f"{provider}:{session}")),
             "lead_matches_original": docs[label]["active_runs"][f"{provider}:{session}"]
                                      ["lead_identity"] == observed_leads[label],
         } for label, session in sessions.items()}
+        if not all(item["start_matches_original_lead"] for item in gate_evidence.values()):
+            raise RuntimeError("native gate lead identity differs from durable original lead")
         old_records = {}
         if update:
             snapshot_file = case / "update_event_counts.json"
@@ -1195,8 +1285,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             snapshot["post_update"] = {label: event_counts(json.loads(paths[label].read_text()))
                                        for label in sessions}
             snapshot_file.write_text(json.dumps(snapshot))
-        for project in {first, second}:
-            (project / "release").touch()
+        (gate_dir / "release").touch()
         if provider == "codex":
             for label, process in processes.items():
                 remaining = max(1, deadline - time.monotonic())
@@ -1271,6 +1360,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 snapshot_file.write_text(json.dumps(snapshot))
         else:
             resumed = set()
+            finalized = set()
             while time.monotonic() < deadline:
                 if any(process.poll() not in (None, 0) for process in processes.values()):
                     raise RuntimeError("native Claude CLI exited unsuccessfully")
@@ -1310,6 +1400,14 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                         resume_claude(env, first if label == "a" else second,
                                       sessions[label], budget, deadline, logs, label)
                         resumed.add(label)
+                    elif update and label in resumed and label not in finalized:
+                        if claude_finalization_ready(
+                                current[label], sessions[label], observed_run_ids[label],
+                                observed_leads[label], state_dir):
+                            resume_claude(env, first if label == "a" else second,
+                                          sessions[label], budget, deadline, logs,
+                                          f"{label}.finalize", finalize=True)
+                            finalized.add(label)
                 if (len(resumed) == len(processes)
                         and all(any(run.get("session_id") == sessions[label]
                                 and run.get("status") == "completed"
@@ -1344,13 +1442,13 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             if record.get("pending") or record.get("overflow"):
                 raise RuntimeError("native session retained unresolved child callbacks after completion")
         for label, doc in final_docs.items():
-            released = (first if label == "a" else second) / f"{label}.released"
+            released = gate_dir / "release"
             terminals = [event for event in doc.get("event_history", ())
                          if event.get("kind") == "lead_completed"
                          and event.get("payload", {}).get("identity") == observed_leads[label]]
             # ponytail: allow 1s filesystem clock granularity; use host monotonic receipts if subsecond ordering matters.
             if (not released.is_file() or not terminals
-                    or max(datetime.fromisoformat(event["observed_at"]).timestamp()
+                    or min(datetime.fromisoformat(event["observed_at"]).timestamp()
                            for event in terminals) < released.stat().st_mtime - 1):
                 raise RuntimeError(f"{label}: lead completed before the gate released")
             runs = [run for run in doc.get("recent_runs", []) if run.get("provider") == provider]
@@ -1398,6 +1496,42 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             if label == "a" and provider == "codex":
                 require_recovered_lead_events(doc, observed_leads[label])
         capture = codex_hook_capture_summary(root, provider)
+        for label, session in sessions.items():
+            gate_starts = [record for record in capture["records"]
+                           if record.get("event") == "SubagentStart"
+                           and record.get("native_gate_label") == label
+                           and record.get("session_id") == session
+                           and record.get("agent_id") == observed_leads[label]]
+            if (len(gate_starts) != 1 or not gate_starts[0]["exit_marker_written"]
+                    or (gate_starts[0].get("finished_ns") or 0)
+                    < (gate_dir / "release").stat().st_mtime_ns):
+                raise RuntimeError(f"{label}: native lead start gate did not release in order")
+        claude_continuation = {}
+        if update and provider == "claude":
+            for label, session in sessions.items():
+                trace = claude_host_trace(update["home"], session, observed_leads[label])
+                messages = trace.get("root_message_calls", [])
+                if any(not call["to_matches_original_lead"] for call in messages):
+                    raise RuntimeError(f"{label}: native SendMessage targeted another lead")
+                # A completed native callback may arrive before or during the
+                # candidate wake. Record which continuation actually occurred.
+                claude_continuation[label] = {
+                    "original_lead_message_count": len(messages),
+                    "original_lead_message_accepted": any(
+                        any(not result["is_error"] for result in call["results"])
+                        for call in messages),
+                    "original_lead_completed_native_turns": sum(
+                        turn["marker"] == "completed" for turn in trace.get("child_turns", [])),
+                    "finalize_wake": label in finalized,
+                }
+                if messages and not claude_continuation[label]["original_lead_message_accepted"]:
+                    raise RuntimeError(f"{label}: native SendMessage was not accepted")
+                if not any(record.get("event") == "Stop"
+                           and record.get("session_id") == session
+                           and record.get("exit_marker_written")
+                           and record.get("script_exit_marker_code") == 0
+                           for record in capture["records"]):
+                    raise RuntimeError(f"{label}: native root Stop was not delivered")
         return {"case": "live-update" if update else
                 "different-branch-worktrees" if separate else "same-worktree",
                 "observed_overlap": True, "completed": ["a", "b"],
@@ -1416,8 +1550,11 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     label: snapshot["pre_candidate_resume"][label]["candidate_recovery_probe"]
                     for label in sessions}}
                    if update and provider == "claude" else {}),
-                **({"native_resumed": sorted(resumed)} if provider == "claude" else
+                **({"native_resumed": sorted(resumed), "native_finalize_wakes": sorted(finalized)}
+                   if provider == "claude" else
                    {"native_resumed": ["a"]} if update and provider == "codex" else {}),
+                **({"native_claude_continuation": claude_continuation}
+                   if update and provider == "claude" else {}),
                 **({"native_resume_mode": "status-version" if pre_resume_state == "completed"
                     else "direct-stop" if direct_stop_resume else "reconcile"}
                    if update and provider == "codex" else {}),
@@ -1428,8 +1565,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 },
                 **({"live_update": f"{update['old_version']}->{update['candidate_version']}"} if update else {})}
     finally:
-        for project in {first, second}:
-            (project / "release").touch()
+        (gate_dir / "release").touch()
         for process in processes.values():
             if process.poll() is None:
                 process.terminate()
@@ -1463,6 +1599,7 @@ def codex_hook_capture_summary(root, provider="codex"):
                          "parent_id", "prompt_id_hash", "message_hash", "cwd",
                          "started_ns", "payload_keys", "control", "tool_name",
                          "tool_use_id_hash", "agent_type", "isolation", "background",
+                         "native_gate_label", "native_gate_session_id",
                          "background_tasks_type", "background_tasks_count",
                          "background_task_states")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
@@ -1781,7 +1918,7 @@ def claude_host_trace(home, session, lead_id):
               "meta_agent_type": meta.get("agentType") if re.fullmatch(
                   r"symphony:symphony-[a-z0-9-]{1,96}", str(meta.get("agentType") or ""))
                   else None,
-              "root_agent_calls": [], "child_turns": []}
+              "root_agent_calls": [], "root_message_calls": [], "child_turns": []}
     if parent is not None:
         prompt = None
         results = {}
@@ -1800,11 +1937,24 @@ def claude_host_trace(home, session, lead_id):
             if row.get("type") != "assistant" or not isinstance(content, list):
                 continue
             for item in content:
-                if not isinstance(item, dict) or item.get("type") != "tool_use" or item.get("name") != "Agent":
+                if not isinstance(item, dict) or item.get("type") != "tool_use":
                     continue
                 details = item.get("input") or {}
                 if not isinstance(details, dict):
                     details = {}
+                if item.get("name") == "SendMessage":
+                    result["root_message_calls"].append({
+                        "tool_use_id_hash": digest(item.get("id")),
+                        "called_at": row.get("timestamp"),
+                        **(prompt or {}),
+                        "to_matches_original_lead": details.get("to") == lead_id,
+                        "to_hash": digest(details.get("to")),
+                        "requests_outcome_marker": "SYMPHONY_OUTCOME" in str(
+                            details.get("message") or ""),
+                    })
+                    continue
+                if item.get("name") != "Agent":
+                    continue
                 agent_type = details.get("subagent_type")
                 result["root_agent_calls"].append({
                     "tool_use_id_hash": digest(item.get("id")),
@@ -1819,6 +1969,8 @@ def claude_host_trace(home, session, lead_id):
                     "isolation_worktree": details.get("isolation") == "worktree",
                 })
         for call in result["root_agent_calls"]:
+            call["results"] = results.get(call["tool_use_id_hash"], [])
+        for call in result["root_message_calls"]:
             call["results"] = results.get(call["tool_use_id_hash"], [])
     if child is not None:
         turn = None
@@ -1847,11 +1999,20 @@ def claude_host_trace(home, session, lead_id):
                                                str(item.get("text") or ""), re.MULTILINE)
                             if len(match) == 1:
                                 try:
-                                    marker = json.loads(match[0]).get("status")
-                                    turn["marker"] = (marker if marker in {
-                                        "completed", "blocked", "failed", "abandoned"} else "invalid")
+                                    decoded = json.loads(match[0])
+                                    marker = decoded.get("status") if isinstance(decoded, dict) else None
+                                    turn["marker"] = (marker if isinstance(marker, str)
+                                                      and marker in {
+                                                          "completed", "blocked", "failed",
+                                                          "abandoned"} else "invalid")
+                                    if turn["marker"] == "invalid":
+                                        turn["marker_status_shape"] = (
+                                            marker if isinstance(marker, str) and re.fullmatch(
+                                                r"[a-z_]{1,32}", marker) else
+                                            type(marker).__name__)
                                 except (ValueError, AttributeError):
                                     turn["marker"] = "invalid"
+                                    turn["marker_status_shape"] = "invalid_json"
                         if item.get("type") == "tool_use" and item.get("name") == "SubagentHandback":
                             turn["handback_count"] += 1
     return result
@@ -2193,13 +2354,15 @@ def main():
                               "logs": str(root)}), file=sys.stderr)
             diagnostics = failure_state(root, args.provider)
             diagnostics["failure"] = {"type": type(error).__name__, "message": str(error)[:300]}
-            print(json.dumps(diagnostics), file=sys.stderr)
             destination = os.environ.get("SYMPHONY_NATIVE_DIAGNOSTICS_DIR")
             if destination:
                 directory = Path(destination)
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / f"native-managed-{args.provider}-failure.json").write_text(
                     json.dumps(diagnostics, indent=2), encoding="utf-8")
+            print(json.dumps({"provider": args.provider, "failure": diagnostics["failure"],
+                              "case_count": len(diagnostics.get("cases", [])),
+                              "diagnostics_dir": destination}), file=sys.stderr)
             # Preserve command output as CI diagnostics before TemporaryDirectory removes it.
             for path in root.rglob("*.errors"):
                 print(f"{path}: {path.read_text(errors='replace')[-4000:]}", file=sys.stderr)

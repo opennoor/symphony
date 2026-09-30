@@ -202,13 +202,11 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 except Exception:
                     if scoped.active_run is not None:
                         return state, ((Action("block_stop", {"reason":
-                            "Symphony could not verify the tracked lead's latest native Claude turn. "
-                            "Return to this session after its result is available."}),), acknowledged)
+                            _claude_unknown_turn_guidance(scoped.active_run)}),), acknowledged)
                     freshness, native_turn = "none", None
                 if freshness == "unknown":
                     return state, ((Action("block_stop", {"reason":
-                        "Symphony could not verify the tracked lead's latest native Claude turn. "
-                        "Return to this session after its result is available."}),), acknowledged)
+                        _claude_unknown_turn_guidance(scoped.active_run)}),), acknowledged)
                 if native_turn is not None:
                     state = _hold_pending_batch(state, provider, session)
                     state, _ = dispatch(state, native_turn)
@@ -1936,6 +1934,12 @@ def _prepare_delegation(
     if role == "assessor" and not state.active_run:
         state, actions = _open_run(state, source, objective)
     if role == "lead":
+        if state.active_run.status == "completing" and state.active_run.lead_identity:
+            return state, (_block_tool(
+                "The tracked lead has already completed this run. Invoke the normal "
+                f"`{_control_name('stop', provider)}` control to verify and archive it "
+                "before starting another task."
+            ),)
         if state.active_run.assessment.get("_boost_assessment_pending"):
             return state, (_block_tool("A valid boosted assessor result is required before selecting the lead."),)
         assessment = _assessment_from_marker(values, "SYMPHONY_ROUTE:")
@@ -2735,6 +2739,21 @@ def _governance(state: ProjectState) -> str:
     return "enabled" if state.enabled else "transactional"
 
 
+def _claude_unknown_turn_guidance(run: RunState) -> str:
+    lead = run.lead_identity
+    return (
+        "Symphony could not verify the tracked lead's latest native Claude turn. "
+        f"Inspect the latest result for original lead `{lead}`. If it has ended without "
+        "a standalone SYMPHONY_OUTCOME marker, make at most one native SendMessage "
+        f"repair request to `to: {lead}` for its actual final result and exact marker. "
+        "Await that same agent's response, then invoke normal `/symphony:stop` once. "
+        "If this repair was already attempted or its response is still unverifiable, "
+        "do not repeat SendMessage or Stop in this turn. Report the unresolved result "
+        "and ask for direction while keeping this run open. Do not start a new lead "
+        "or force stop."
+    )
+
+
 def _completion_ready_guidance(run: RunState, provider: str) -> str:
     if run.status != "completing" or _stop_block_reason(run) is not None:
         return ""
@@ -2795,11 +2814,21 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
              "replace it only if the host confirms it is unavailable. "
              if run.provider == "codex" and run.lead_identity
              and run.assessment.get("_retryable_lead") == run.lead_identity else "")
+    claude_retry = (
+        f"For this Claude lead, await an active background result. If its native turn has ended "
+        f"without a reconciled outcome, use SendMessage with `to: {run.lead_identity}` to resume "
+        "that same agent and ask it to report its observed result with one exact "
+        "SYMPHONY_OUTCOME JSON line. Await its returned result before normal Stop. "
+        "Do not start another task or invent a missing outcome. "
+        if run.provider == "claude" and run.lead_identity and run.status in {"active", "recovering"}
+        and any(item.identity == run.lead_identity and item.state in {"working", "pending", "failed"}
+                for item in run.delegations) else ""
+    )
     return (
         f"Symphony run {run.run_id} remains {run.status}.{lead} "
         f"Observed agents: {records or 'none'}. "
         + (f"Awaiting host launch confirmation: {awaiting}. " if awaiting else "")
-        + retry + "Reconcile returned or interrupted results, preserve ownership, and continue unfinished work. "
+        + retry + claude_retry + "Reconcile returned or interrupted results, preserve ownership, and continue unfinished work. "
         "An ended host turn does not complete this run; report completion only when durable status confirms it."
     )
 
@@ -2990,6 +3019,7 @@ def _record_hook_decision(payload: Mapping[str, object], result: HookResult,
             ("child start has no invocation ID", "ambiguous_start"),
             ("active work remains", "active_work"),
             ("newer native turn still running", "native_running"),
+            ("latest native Claude turn", "native_unknown"),
             ("latest native turn", "native_unknown"),
             ("interrupted work still requires reconciliation", "interrupted_work"),
             ("waiting for host launch confirmation", "launch_pending"),

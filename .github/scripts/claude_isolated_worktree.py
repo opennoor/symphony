@@ -338,7 +338,8 @@ def run_case(root, package, timeout, budget):
                           and item.get("agent_id") == lead_id
                           and item.get("cwd") == lead_start["cwd"] for item in records)
             if stopped and process.poll() == 0 and not resumed:
-                native.resume_claude(env, project, session, budget, deadline)
+                native.resume_claude(env, project, session, budget, deadline,
+                                     logs, "isolated")
                 resumed = True
             if resumed and state_path.exists():
                 document = json.loads(state_path.read_text())
