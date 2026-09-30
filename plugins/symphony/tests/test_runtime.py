@@ -1029,9 +1029,88 @@ class RuntimeTests(unittest.TestCase):
         state = StateStore(self.state_root).load(self.project)
         self.assertEqual(state.active_run.status, "recovering")
         self.assertEqual(state.active_run.delegations[-1].state, "failed")
-        self.assertIn("original task_name", self.flush())
+        self.assertIn("safe replacement", self.flush())
         stop = {**self.payload(""), "hook_event_name": "Stop"}
         self.assertEqual(self.output(handle(stop, self.environ))["decision"], "block")
+
+    def test_delayed_failed_terminal_cannot_replace_a_newer_working_lead_turn(self):
+        run = RunState(
+            "run-1", "task", session_id="codex-session", provider="codex",
+            lead_identity="lead-1", assessment={
+                "size": "small", "complexity": "simple",
+                "_terminal_turns": {"lead-1": ("turn_id:old",)},
+            },
+            delegations=(Delegation("lead-1", "lead", "task", "working",
+                                    self.simple["model"], self.simple["effort"]),),
+        )
+        state = ProjectState(active_run=run, active_runs={"codex:codex-session": run})
+        common = {"provider": "codex", "session_id": "codex-session",
+                  "agent_id": "lead-1", "agent_type": codex_agent_type(
+                      "lead", self.simple["model"], self.simple["effort"]),
+                  "model": self.simple["model"],
+                  "model_reasoning_effort": self.simple["effort"]}
+        for new_token, old_already_terminal in (("new", True), ("", True),
+                                                  ("new", False)):
+            with self.subTest(new_token=new_token, old_already_terminal=old_already_terminal):
+                prior = state if old_already_terminal else replace(
+                    state, active_run=replace(state.active_run,
+                        assessment={"size": "small", "complexity": "simple"}))
+                started, _ = runtime_module._observe_delegation(prior, Event(
+                    f"new-start-{new_token}-{old_already_terminal}", "subagent_started",
+                    "2026-09-30T00:00:02+00:00",
+                    {**common, **({"turn_id": new_token} if new_token else {})},
+                ))
+                guarded, actions = runtime_module._observe_delegation(started, Event(
+                    f"late-failed-{new_token}-{old_already_terminal}", "subagent_stopped",
+                    "2026-09-30T00:00:03+00:00",
+                    {**common, "turn_id": "old", "status": "failed",
+                     "last_assistant_message": "changed retry metadata"},
+                ))
+                self.assertEqual((), actions)
+                self.assertEqual("working", guarded.active_run.delegations[0].state)
+                self.assertEqual("lead-1", guarded.active_run.lead_identity)
+                self.assertEqual("active", guarded.active_run.status)
+                if old_already_terminal:
+                    self.assertEqual(started, guarded)
+                else:
+                    self.assertEqual(("lead-1",), guarded.active_run.assessment[
+                        "_ambiguous_child_stops"])
+                    untagged, _ = runtime_module._observe_delegation(guarded, Event(
+                        "untagged-complete", "subagent_stopped",
+                        "2026-09-30T00:00:04+00:00",
+                        {**common, "status": "completed",
+                         "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'},
+                    ))
+                    self.assertEqual("active", untagged.active_run.status)
+                    self.assertEqual(("lead-1",), untagged.active_run.assessment[
+                        "_ambiguous_child_stops"])
+
+    def test_codex_followup_terminal_can_arrive_without_another_start_hook(self):
+        self.seed_run(RunState(
+            "run-1", "task", session_id="codex-session", provider="codex",
+            lead_identity="lead-1", assessment={"size": "small", "complexity": "simple"},
+            delegations=(Delegation("lead-1", "lead", "task", "working",
+                                    self.simple["model"], self.simple["effort"]),),
+        ))
+        packet = {**self.payload(""), "agent_id": "lead-1",
+                  "agent_type": codex_agent_type("lead", self.simple["model"],
+                                                 self.simple["effort"]),
+                  "model": self.simple["model"],
+                  "model_reasoning_effort": self.simple["effort"]}
+        handle({**packet, "hook_event_name": "SubagentStart", "turn_id": "old"},
+               self.environ)
+        handle({**packet, "hook_event_name": "SubagentStop", "turn_id": "old",
+                "status": "completed", "last_assistant_message":
+                'SYMPHONY_OUTCOME: {"status":"blocked"}'}, self.environ)
+        first = StateStore(self.state_root).load(self.project).active_run
+        self.assertEqual("recovering", first.status)
+        self.assertNotIn("lead-1", first.assessment.get("_active_turns", {}))
+        handle({**packet, "hook_event_name": "SubagentStop", "turn_id": "new",
+                "status": "completed", "last_assistant_message":
+                'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+        second = StateStore(self.state_root).load(self.project).active_run
+        self.assertEqual("completing", second.status)
+        self.assertEqual("lead-1", second.lead_identity)
 
     def test_same_text_result_after_a_new_start_is_a_new_lifecycle(self):
         for provider in ("codex", "claude"):
@@ -1384,6 +1463,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(run.outcome)
         self.assertEqual("working", next(item.state for item in run.delegations
                                           if item.identity == "lead"))
+
+    def test_queued_old_failed_terminal_cannot_replace_newer_same_lead_turn(self):
+        choice = route_choice()
+        for old_already_terminal in (True, False):
+            with self.subTest(old_already_terminal=old_already_terminal):
+                assessment = {"size": "small", "complexity": "simple"}
+                if old_already_terminal:
+                    assessment["_terminal_turns"] = {"lead": ("turn_id:old",)}
+                self.seed_run(RunState(
+                    "root-run", "task", lead_identity="lead", status="active",
+                    assessment=assessment,
+                    delegations=(Delegation("lead", "lead", "task", "working",
+                                            choice["model"], choice["effort"]),),
+                ))
+                store = StateStore(self.state_root)
+                handle({**self.payload(""), "hook_event_name": "SubagentStart",
+                        "agent_id": "lead", "turn_id": "new", "agent_type":
+                        codex_agent_type("lead", choice["model"], choice["effort"])}, self.environ)
+                failed = event_from_payload("codex", {
+                    **self.payload(""), "hook_event_name": "SubagentStop",
+                    "agent_id": "lead", "turn_id": "old", "status": "failed",
+                    "last_assistant_message": "different retry result",
+                })
+                with store.session_lock("codex", "codex-session"):
+                    store.queue_session_event("codex", "codex-session", failed)
+                    if not old_already_terminal:
+                        untagged = event_from_payload("codex", {
+                            **self.payload(""), "hook_event_name": "SubagentStop",
+                            "agent_id": "lead", "turn_id": "", "status": "completed",
+                            "last_assistant_message":
+                            'SYMPHONY_OUTCOME: {"status":"completed"}',
+                        })
+                        store.queue_session_event("codex", "codex-session", untagged)
+                stop = handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ)
+                run = store.load(self.project).active_run
+                self.assertEqual("block", self.output(stop).get("decision"))
+                self.assertEqual("lead", run.lead_identity)
+                self.assertEqual("active", run.status)
+                self.assertEqual("working", run.delegations[0].state)
+                self.assertEqual("turn_id:new", run.assessment["_active_turns"]["lead"])
+                self.assertEqual(bool(run.assessment.get("_ambiguous_child_stops")),
+                                 not old_already_terminal)
 
     def test_disabled_session_without_managed_history_ignores_ordinary_child_start(self):
         for provider in ("codex", "claude"):
@@ -1913,6 +2034,56 @@ class RuntimeTests(unittest.TestCase):
                 self.assertNotIn("reject_lead_replacement",
                                  {action.kind for action in recovery_actions})
                 self.assertEqual("lead-2", replaced.active_run.lead_identity)
+
+                if provider == "codex":
+                    retryable = replace(
+                        recovering,
+                        assessment={**recovering.assessment, "_retryable_lead": "lead-1"},
+                    )
+                    guarded, guarded_actions = runtime_module._observe_delegation(
+                        replace(state, active_run=retryable),
+                        event_from_payload(provider, {**extra, "hook_event_name": "SubagentStart",
+                                                      "turn_id": "replacement-turn"}),
+                    )
+                    self.assertEqual("lead-1", guarded.active_run.lead_identity)
+                    self.assertEqual(retryable.owner_generation, guarded.active_run.owner_generation)
+                    self.assertEqual("recovering", guarded.active_run.status)
+                    self.assertEqual("lead-1", guarded.active_run.assessment["_retryable_lead"])
+                    self.assertEqual("rejected_lead", next(
+                        item.role for item in guarded.active_run.delegations
+                        if item.identity == "lead-2"
+                    ))
+                    self.assertIn("reject_lead_replacement",
+                                  {action.kind for action in guarded_actions})
+                    self.assertIsNotNone(runtime_module._stop_block_reason(guarded.active_run))
+                    settled, _ = runtime_module._observe_delegation(
+                        guarded,
+                        event_from_payload(provider, {**extra, "hook_event_name": "SubagentStop",
+                                                      "turn_id": "replacement-turn",
+                                                      "status": "failed"}),
+                    )
+                    self.assertEqual("lead-1", settled.active_run.lead_identity)
+                    self.assertEqual("recovering", settled.active_run.status)
+                    self.assertEqual("lead-1", settled.active_run.assessment["_retryable_lead"])
+                    self.assertEqual("failed", next(
+                        item.state for item in settled.active_run.delegations
+                        if item.identity == "lead-2"
+                    ))
+                    self.assertEqual(sibling, settled.active_runs["codex:other"])
+
+    def test_route_mismatch_guidance_does_not_retry_same_claude_lead(self):
+        run = RunState(
+            "run", "task", session_id="owner", provider="claude",
+            lead_identity="lead-1", status="recovering", owner_generation=2,
+            assessment={
+                "_lead_route_mismatch": "wrong route",
+                "_lead_route_mismatch_owner": {"identity": "lead-1", "generation": 2},
+            },
+            delegations=(Delegation("lead-1", "lead", "task", "failed", "wrong", "low"),),
+        )
+        guidance = runtime_module._recovery_guidance(ProjectState(active_run=run), "claude")
+        self.assertIn("spawn one replacement", guidance)
+        self.assertNotIn("SendMessage", guidance)
 
     def test_rejected_inflight_lead_consumes_pending_launch_and_unblocks_after_terminal(self):
         for provider in ("codex", "claude"):
@@ -3048,7 +3219,7 @@ class RuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "recovering")
-        self.assertIn("replacement", self.flush().lower())
+        self.assertIn("safe replacement", self.flush().lower())
 
     def test_claude_pending_spawns_match_native_roles_out_of_order(self):
         self.seed_run(RunState("run-1", "task", lead_identity="lead-1"), "claude")

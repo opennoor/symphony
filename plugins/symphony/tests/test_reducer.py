@@ -156,6 +156,108 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertEqual(replaced.active_run.owner_generation, 2)
         self.assertEqual(replacement_actions, ())
 
+    def test_retryable_lead_cannot_be_replaced_by_recovery_status_alone(self):
+        original = running_state(status="recovering")
+        run = replace(original.active_run, provider="codex",
+                      assessment={"_retryable_lead": "lead-1"})
+        state = replace(original, active_run=run)
+        for extra in ({}, {"safe_boundary": True}, {"original_unavailable": True}):
+            with self.subTest(extra=extra):
+                guarded, actions = reduce(state, event(
+                    "lead_started", identity="lead-2", owner_generation=run.owner_generation + 1,
+                    **extra,
+                ))
+                self.assertEqual(run, guarded.active_run)
+                self.assertEqual(actions, (Action("reject_lead_replacement", {"identity": "lead-2"}),))
+
+    def test_native_host_failed_lead_allows_replacement_but_blocked_result_does_not(self):
+        original = running_state(status="active")
+        original = replace(original, active_run=replace(original.active_run, provider="codex"))
+        for host_failed in (False, True):
+            with self.subTest(host_failed=host_failed):
+                failed, _ = reduce(original, event(
+                    "lead_failed", identity="lead-1", native_host_failed=host_failed,
+                ))
+                self.assertEqual("recovering", failed.active_run.status)
+                self.assertEqual("" if host_failed else "lead-1",
+                                 failed.active_run.assessment["_retryable_lead"])
+                replaced, actions = reduce(failed, event(
+                    "lead_started", event_id=f"host-failed-{host_failed}",
+                    identity="lead-2", owner_generation=2,
+                ))
+                self.assertEqual("lead-2" if host_failed else "lead-1",
+                                 replaced.active_run.lead_identity)
+                self.assertEqual(
+                    () if host_failed else (Action("reject_lead_replacement", {"identity": "lead-2"}),),
+                    actions,
+                )
+
+    def test_route_mismatch_allows_one_owner_scoped_replacement(self):
+        original = running_state(status="recovering")
+        run = replace(original.active_run, provider="codex", assessment={
+            "_retryable_lead": "lead-1", "_lead_route_mismatch": "wrong route",
+            "_lead_route_mismatch_owner": {"identity": "lead-1", "generation": 1},
+        })
+        state = replace(original, active_run=run)
+        replaced, actions = reduce(state, event(
+            "lead_started", event_id="replacement-lead-2",
+            identity="lead-2", owner_generation=2,
+        ))
+        self.assertEqual((), actions)
+        self.assertEqual("lead-2", replaced.active_run.lead_identity)
+        self.assertNotIn("_lead_route_mismatch", replaced.active_run.assessment)
+        self.assertNotIn("_lead_route_mismatch_owner", replaced.active_run.assessment)
+        failed, _ = reduce(replaced, event("lead_failed", identity="lead-2"))
+        third, actions = reduce(failed, event(
+            "lead_started", event_id="replacement-lead-3",
+            identity="lead-3", owner_generation=3,
+        ))
+        self.assertEqual(failed.active_run, third.active_run)
+        self.assertEqual(actions, (Action("reject_lead_replacement", {"identity": "lead-3"}),))
+
+    def test_retryable_replacement_consumes_matching_native_unavailability_proof(self):
+        original = running_state(status="recovering")
+        proof = {"digest": "native-proof", "session_id": "owner", "run_id": "run-1",
+                 "original_lead": "lead-1", "owner_generation": 1,
+                 "replacement_identity": "lead-2"}
+        run = replace(original.active_run, provider="codex", session_id="owner",
+                      assessment={"_retryable_lead": "lead-1",
+                                  "_codex_unavailable_proof": proof})
+        state = replace(original, active_run=run)
+        for identity, digest in (("lead-2", "wrong"), ("lead-3", "native-proof")):
+            with self.subTest(identity=identity, digest=digest):
+                guarded, actions = reduce(state, event(
+                    "lead_started", event_id=f"unavailable-{identity}-{digest}",
+                    identity=identity, owner_generation=2,
+                    unavailability_digest=digest,
+                ))
+                self.assertEqual(run, guarded.active_run)
+                self.assertEqual(actions, (Action("reject_lead_replacement", {"identity": identity}),))
+        for field, value in (("session_id", "foreign"), ("run_id", "other-run"),
+                             ("original_lead", "foreign-lead"), ("owner_generation", 0)):
+            with self.subTest(field=field):
+                foreign = replace(run, assessment={**run.assessment,
+                    "_codex_unavailable_proof": {**proof, field: value}})
+                guarded, actions = reduce(replace(state, active_run=foreign), event(
+                    "lead_started", event_id=f"foreign-{field}", identity="lead-2",
+                    owner_generation=2, unavailability_digest="native-proof",
+                ))
+                self.assertEqual(foreign, guarded.active_run)
+                self.assertEqual(actions, (Action("reject_lead_replacement", {"identity": "lead-2"}),))
+        accepted, actions = reduce(state, event(
+            "lead_started", event_id="unavailable-accepted", identity="lead-2",
+            owner_generation=2, unavailability_digest="native-proof",
+        ))
+        self.assertEqual((), actions)
+        self.assertEqual("lead-2", accepted.active_run.lead_identity)
+        self.assertNotIn("_codex_unavailable_proof", accepted.active_run.assessment)
+        replayed, actions = reduce(accepted, event(
+            "lead_started", event_id="unavailable-replayed", identity="lead-3",
+            owner_generation=3, unavailability_digest="native-proof",
+        ))
+        self.assertEqual(accepted.active_run, replayed.active_run)
+        self.assertEqual(actions, (Action("reject_lead_replacement", {"identity": "lead-3"}),))
+
     def test_delegation_updates_replace_the_identity_latest_record(self):
         original = running_state(delegations=[delegation("worker-1", "working")])
 

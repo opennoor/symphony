@@ -239,7 +239,24 @@ def _lead_started(state: ProjectState, event: Event):
         safe = run.status in {"interrupted", "recovering"} or bool(
             event.payload.get("safe_boundary")
         )
-        if replacing and (not safe or requested_generation != run.owner_generation + 1):
+        proof = run.assessment.get("_codex_unavailable_proof")
+        native_unavailable = (isinstance(proof, Mapping)
+                              and proof.get("digest") == event.payload.get("unavailability_digest")
+                              and proof.get("session_id") == run.session_id
+                              and proof.get("run_id") == run.run_id
+                              and proof.get("original_lead") == run.lead_identity
+                              and proof.get("owner_generation") == run.owner_generation
+                              and proof.get("replacement_identity") == identity)
+        retryable_original = (
+            run.provider == "codex"
+            and run.assessment.get("_retryable_lead") == run.lead_identity
+            and run.assessment.get("_lead_route_mismatch_owner") != {
+                "identity": run.lead_identity,
+                "generation": run.owner_generation,
+            }
+        )
+        if replacing and ((retryable_original and not native_unavailable) or not safe
+                          or requested_generation != run.owner_generation + 1):
             return state, (Action("reject_lead_replacement", {"identity": identity}),)
         if not replacing and requested_generation != run.owner_generation:
             return state, (Action("ignore_stale_owner", {"identity": identity}),)
@@ -251,7 +268,9 @@ def _lead_started(state: ProjectState, event: Event):
         owner_generation=generation,
         status="active",
         outcome=None,
-        assessment={key: value for key, value in run.assessment.items() if key != "_retryable_lead"},
+        assessment={key: value for key, value in run.assessment.items()
+                    if key not in {"_retryable_lead", "_lead_route_mismatch",
+                                   "_lead_route_mismatch_owner", "_codex_unavailable_proof"}},
         updated_at=event.observed_at,
     )
     return replace(state, active_run=run), ()
@@ -365,7 +384,7 @@ def _lead_failed(state: ProjectState, event: Event):
         return state, ()
     assessment = dict(run.assessment)
     assessment.pop("_pending_lead_completion", None)
-    if event.kind == "lead_failed":
+    if event.kind == "lead_failed" and event.payload.get("native_host_failed") is not True:
         assessment["_retryable_lead"] = run.lead_identity
         token = event.payload.get("turn_token")
         if isinstance(token, str) and token:
@@ -434,6 +453,10 @@ def _stop_block_reason(run: RunState) -> dict | None:
     if ambiguous:
         return {"reason": "child start has no invocation ID and matches an earlier start; "
                 "inspect or recover: " + ", ".join(map(str, ambiguous))}
+    ambiguous_stops = run.assessment.get("_ambiguous_child_stops", ())
+    if ambiguous_stops:
+        return {"reason": "child terminal does not match the latest native turn; "
+                "inspect or recover: " + ", ".join(map(str, ambiguous_stops))}
     active = _active_identities(run)
     if active:
         return {"active": active}

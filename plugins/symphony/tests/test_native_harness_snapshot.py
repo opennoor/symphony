@@ -51,6 +51,11 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         self.assertIn("End this root turn with the original run recovering", deferred)
         self.assertIn("Do not call followup_task or spawn another lead", deferred)
         self.assertNotIn("Use followup_task with its original task_name", deferred)
+        deferred_packet = json.loads(re.search(
+            r"LEAD_SPAWN_PACKET: (\{[^\n]+\})", deferred).group(1))
+        self.assertIn("native hook holds the unfinished task", deferred_packet["message"])
+        self.assertIn("WAIT", deferred_packet["message"])
+        self.assertIn("only READY permits", deferred_packet["message"])
 
     def test_windows_native_observer_retries_only_bounded_lock_contention(self):
         before = native.OBSERVER_SNAPSHOT_LOCK_RETRIES
@@ -418,6 +423,8 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         self.assertEqual("same_id_recovered", native.require_codex_old_lead_terminal(
             "recovering", [first, second], [blocked, completed]))
         self.assertEqual("same_id_unreconciled", native.require_codex_old_lead_terminal(
+            "recovering", [first], [blocked]))
+        self.assertEqual("same_id_unreconciled", native.require_codex_old_lead_terminal(
             "recovering", [first, second], [blocked, markerless]))
         self.assertEqual("same_id_unreconciled", native.require_codex_old_lead_terminal(
             "recovering", [first, second], [blocked, {**markerless,
@@ -429,6 +436,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             ("completed", [first], [blocked]),
             ("completed", [first], [{**completed, "completed": False}]),
             ("recovering", [first], [blocked, completed]),
+            ("recovering", [], [blocked]),
             ("recovering", [first, second], [blocked, {**markerless,
                                                     "turn_hash": "foreign"}]),
             ("recovering", [first, second], [blocked, {**markerless,
@@ -437,6 +445,17 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         ):
             with self.subTest(state=state, stops=stops, turns=turns), self.assertRaises(RuntimeError):
                 native.require_codex_old_lead_terminal(state, stops, turns)
+
+    def test_held_codex_stop_waits_for_exact_capture_entry(self):
+        receipt = {"event": "Stop", "session_id": "root-a",
+                   "invocation_id": "held-1", "native_stop_hold_label": "a",
+                   "native_task_wait": True}
+        with patch.object(native, "codex_hook_capture_summary", side_effect=[
+                {"records": []}, {"records": [{**receipt, "session_id": "root-b"}]},
+                {"records": [receipt]}]) as capture, patch.object(native.time, "sleep"):
+            self.assertEqual(receipt, native.held_codex_stop_capture(
+                Path("/tmp/native"), "root-a", "held-1", native.time.monotonic() + 1))
+        self.assertEqual(3, capture.call_count)
 
     def test_native_markerless_parse_requires_new_latest_hooked_completion(self):
         with tempfile.TemporaryDirectory() as temporary:

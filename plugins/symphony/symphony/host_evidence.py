@@ -62,6 +62,24 @@ def _native_jsonl(path: Path) -> list[dict] | None:
         return None
 
 
+def _complete_native_jsonl(path: Path) -> list[dict] | None:
+    """Read one bounded newline-terminated transcript as a single snapshot."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("rb") as stream:
+            data = stream.read(_MAX_TRANSCRIPT_BYTES + 1)
+        if not data or len(data) > _MAX_TRANSCRIPT_BYTES or not data.endswith(b"\n"):
+            return None
+        rows = [json.loads(line) for line in data.decode("utf-8").splitlines()]
+        if not rows or any(not isinstance(row, dict)
+                           or not isinstance(row.get("payload"), dict) for row in rows):
+            return None
+        return rows
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return None
+
+
 def _claude_native_lead_event(
     state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
     *, require_missing: bool, target_prompt: str | None = None,
@@ -654,6 +672,197 @@ def _native_lead_turns(
     except (OSError, TypeError, ValueError, json.JSONDecodeError, AttributeError):
         return None
     return run, turns, turn_order, latest_started, started_at
+
+
+def codex_unavailable_lead_proof(
+    state: ProjectState, session: str, environ: Mapping[str, str], replacement_identity: str,
+) -> dict[str, object] | None:
+    """Bind an unavailable response to the original retryable native lead.
+
+    Codex 0.158 returns a plain function_call_output string, not an error flag.
+    Only its exact, paired host output can authorize a different lead; model
+    prose, roster absence, and a failure for another task name cannot.
+    """
+    run = state.active_run
+    if not run or run.provider != "codex" or run.session_id != session:
+        return None
+    lead_id = run.lead_identity or ""
+    started_at = _instant(run.started_at)
+    if (run.status != "recovering" or run.assessment.get("_retryable_lead") != lead_id
+            or not _CODEX_ID.fullmatch(lead_id) or started_at is None
+            or not isinstance(replacement_identity, str) or not replacement_identity
+            or replacement_identity == lead_id):
+        return None
+    lead = next((item for item in run.delegations
+                 if item.identity == lead_id and item.role == "lead"), None)
+    if lead is None or not lead.requested_tier or not lead.requested_effort:
+        return None
+    sessions = Path(environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    if sessions.is_symlink() or not sessions.is_dir():
+        return None
+    child_paths = tuple(sessions.glob(f"*/*/*/*{lead_id}.jsonl"))
+    paths = tuple(sessions.glob(f"*/*/*/*{session}.jsonl"))
+    if len(paths) != 1 or len(child_paths) != 1:
+        return None
+    path, child_path = paths[0], child_paths[0]
+    if (path.is_symlink() or child_path.is_symlink()
+            or any(parent.is_symlink() for candidate in (path, child_path)
+                   for parent in candidate.parents if sessions in parent.parents)):
+        return None
+    # Read both files once. A second child read used only for completeness can
+    # observe a newer native turn while the parsed lineage remains stale.
+    rows = _complete_native_jsonl(path)
+    child_rows = _complete_native_jsonl(child_path)
+    if (not rows or rows[0].get("type") != "session_meta"
+            or rows[0]["payload"].get("id") != session
+            or not child_rows or child_rows[0].get("type") != "session_meta"
+            or child_rows[0]["payload"].get("id") != lead_id):
+        return None
+    source = child_rows[0]["payload"].get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    if not isinstance(spawn, dict) or spawn.get("parent_thread_id") != session:
+        return None
+    turns: dict[str, dict] = {}
+    turn_order: list[str] = []
+    latest_started = ""
+    observed_turn_ids: set[str] = set()
+    for row in child_rows[1:]:
+        payload = row["payload"]
+        when = _instant(row.get("timestamp"))
+        if when is None:
+            return None
+        turn_id = payload.get("turn_id")
+        if turn_id is not None:
+            if not isinstance(turn_id, str) or not turn_id:
+                return None
+            observed_turn_ids.add(turn_id)
+        if row.get("type") == "turn_context":
+            if not turn_id:
+                return None
+            turn = turns.setdefault(turn_id, {})
+            if "model" in turn or "effort" in turn:
+                return None
+            turn["model"], turn["effort"] = payload.get("model"), payload.get("effort")
+        elif row.get("type") == "event_msg" and payload.get("type") == "task_started":
+            if not turn_id or turn_id in turn_order:
+                return None
+            turn = turns.setdefault(turn_id, {})
+            turn["started"], turn["started_at"] = True, when
+            turn_order.append(turn_id)
+            latest_started = turn_id
+        elif row.get("type") == "event_msg" and payload.get("type") == "task_complete":
+            if not turn_id:
+                return None
+            turn = turns.setdefault(turn_id, {})
+            if "completed_at" in turn:
+                return None
+            turn["completed_at"] = when
+            turn["outcome"] = _reported_status(payload.get("last_agent_message"))
+    failed_token = run.assessment.get("_retryable_lead_turn")
+    if not isinstance(failed_token, str) or not failed_token.startswith("turn_id:"):
+        return None
+    failed_turn = failed_token.removeprefix("turn_id:")
+    terminal_turns = run.assessment.get("_terminal_turns", {})
+    failed = turns.get(failed_turn, {})
+    if (latest_started != failed_turn or not turn_order
+            or observed_turn_ids != set(turn_order)
+            or failed_token not in terminal_turns.get(lead_id, ())
+            or not failed.get("started") or failed.get("outcome") == "completed"
+            or failed.get("started_at") is None or failed.get("completed_at") is None
+            or failed["started_at"] < started_at
+            or failed["completed_at"] < failed["started_at"]):
+        return None
+    for index, turn_id in enumerate(turn_order[:-1]):
+        earlier = turns[turn_id]
+        next_start = turns[turn_order[index + 1]].get("started_at")
+        if (not earlier.get("started") or earlier.get("started_at") is None
+                or earlier.get("completed_at") is None or next_start is None
+                or earlier.get("model") != lead.requested_tier
+                or earlier.get("effort") != lead.requested_effort
+                or earlier["completed_at"] < earlier["started_at"]
+                or earlier["completed_at"] >= next_start):
+            return None
+    if (failed.get("model") != lead.requested_tier
+            or failed.get("effort") != lead.requested_effort):
+        return None
+
+    calls: dict[str, tuple[str, dict, datetime]] = {}
+    outputs: dict[str, tuple[object, datetime]] = {}
+    activity: list[tuple[str, str, datetime]] = []
+    for row in rows[1:]:
+        payload = row.get("payload")
+        when = _instant(row.get("timestamp"))
+        if not isinstance(payload, dict) or when is None:
+            return None
+        kind = payload.get("type")
+        if row.get("type") == "response_item" and kind == "function_call":
+            call_id = payload.get("call_id")
+            if not isinstance(call_id, str) or not call_id or call_id in calls:
+                return None
+            if payload.get("name") not in {"spawn_agent", "followup_task"}:
+                continue
+            try:
+                args = json.loads(payload.get("arguments"))
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(args, dict):
+                return None
+            calls[call_id] = (str(payload["name"]), args, when)
+        elif row.get("type") == "response_item" and kind == "function_call_output":
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                if call_id in outputs:
+                    return None
+                outputs[call_id] = (payload.get("output"), when)
+        elif row.get("type") == "event_msg" and kind == "item_completed":
+            item = payload.get("item")
+            if isinstance(item, dict) and item.get("type") == "SubAgentActivity":
+                call_id, agent_id = item.get("id"), item.get("agent_thread_id")
+                if isinstance(call_id, str) and isinstance(agent_id, str):
+                    activity.append((call_id, agent_id, when))
+
+    linked = [(call_id, args, when) for call_id, (name, args, when) in calls.items()
+              if name == "spawn_agent" and any(
+                  item_call == call_id and agent_id == lead_id
+                  for item_call, agent_id, _ in activity)]
+    if len(linked) != 1:
+        return None
+    spawn_id, spawn_args, spawn_at = linked[0]
+    task_name = spawn_args.get("task_name")
+    if (not isinstance(task_name, str) or not re.fullmatch(r"[a-z0-9_]{1,128}", task_name)
+            or spawn_args.get("model") != lead.requested_tier
+            or spawn_args.get("reasoning_effort") != lead.requested_effort
+            or spawn_args.get("fork_turns") != "none"
+            or not isinstance(spawn_args.get("message"), str)
+            or spawn_at < started_at):
+        return None
+    matched = [(call_id, when, outputs.get(call_id))
+               for call_id, (name, args, when) in calls.items()
+               if name == "followup_task" and args.get("target") == task_name]
+    if not matched:
+        return None
+    call_id, called_at, response = matched[-1]
+    expected = f"live agent path `/root/{task_name}` not found"
+    if (response is None or response[0] != expected
+            or spawn_at >= failed.get("started_at", started_at)
+            or called_at <= failed["completed_at"]
+            or response[1] < called_at
+            or any(agent_id == lead_id and when > response[1]
+                   for _, agent_id, when in activity)):
+        return None
+    # Another invocation for that task after the exact error makes it unclear
+    # whether the host restored the original child before this replacement.
+    if any(name == "followup_task" and args.get("target") == task_name
+           and when > called_at for name, args, when in calls.values()):
+        return None
+    digest = hashlib.sha256(
+        f"{session}\0{run.run_id}\0{run.owner_generation}\0{lead_id}\0"
+        f"{failed_turn}\0{spawn_id}\0{call_id}\0{replacement_identity}".encode()
+    ).hexdigest()
+    return {"digest": digest, "session_id": session, "run_id": run.run_id,
+            "original_lead": lead_id, "owner_generation": run.owner_generation,
+            "replacement_identity": replacement_identity}
 
 
 def _released_failed_turn(

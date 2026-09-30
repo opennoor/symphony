@@ -142,6 +142,13 @@ if event == "UserPromptSubmit":
                          "status" if prompt == "$symphony:symphony status" else
                          "other")
 if event == "Stop":
+    status_path = os.environ.get("SYMPHONY_NATIVE_TASK_STATUS_FILE")
+    expected_status = os.environ.get("SYMPHONY_NATIVE_TASK_STATUS_WAIT")
+    if provider == "codex" and status_path and expected_status:
+        try:
+            record["native_task_wait"] = pathlib.Path(status_path).read_text() == expected_status
+        except OSError:
+            record["native_task_wait"] = False
     background = payload.get("background_tasks")
     record["background_tasks_type"] = type(background).__name__
     record["background_tasks_count"] = (len(background) if isinstance(
@@ -157,20 +164,19 @@ if event == "Stop":
             and (gate_dir / "a.root.json").is_file()
             and json.loads((gate_dir / "a.root.json").read_text()).get("session_id")
             == payload.get("session_id")):
-        ready = gate_dir / "a.stop-ready.json"
         try:
             with (gate_dir / "a.stop-claim").open("x"):
                 pass
-            temporary = gate_dir / ("a.stop-" + invocation + ".tmp")
-            temporary.write_text(json.dumps({"session_id": payload.get("session_id"),
-                                             "invocation_id": invocation,
-                                             "started_ns": record["started_ns"]}))
-            temporary.replace(ready)
             record["native_stop_hold_label"] = "a"
         except FileExistsError:
             pass
 (destination / (invocation + "-entry.json")).write_text(json.dumps(record))
 if record.get("native_stop_hold_label"):
+    temporary = gate_dir / ("a.stop-" + invocation + ".tmp")
+    temporary.write_text(json.dumps({"session_id": payload.get("session_id"),
+                                     "invocation_id": invocation,
+                                     "started_ns": record["started_ns"]}))
+    temporary.replace(gate_dir / "a.stop-ready.json")
     deadline = time.monotonic() + 600
     while not (gate_dir / "a.stop-release").is_file():
         if time.monotonic() >= deadline:
@@ -269,16 +275,22 @@ def prompt(provider, label, recover, project, *, defer_recovery=False):
         if provider == "claude" else ""
     )
     lead_task = (
-        "FIRST-TURN CONTRACT: There is no gate command or file to find or run. "
-        "After your native start hook releases, your only action is to reply with "
-        "exactly these two literal lines (no Markdown):\nGATE_RELEASED\n"
-        + ('SYMPHONY_OUTCOME: {"status":"blocked"}' if recover else
-           'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
-        + ("This recovery fixture is deliberately blocked even after the native hook releases; "
-           "the root will resume this same lead for completion.\n" if recover else "") +
-        "The test-only native SubagentStart hook may briefly hold your first turn. "
-        "GATE_RELEASED is a report line, not an operation. "
-        "Do not inspect files, run tools, delegate, or create a worktree."
+        ("FIRST-TURN CONTRACT: The test-only native hook holds the unfinished task while "
+         "NATIVE_STATUS.txt says WAIT. Do not edit that file. On the first turn "
+         "report exactly GATE_RELEASED and SYMPHONY_OUTCOME: {\"status\":\"blocked\"}, each "
+         "on its own line. On a later same-agent followup, read the file again: only READY permits "
+         "SYMPHONY_OUTCOME: {\"status\":\"completed\"}. Do not delegate or create a worktree."
+         if provider == "codex" and recover and defer_recovery else
+         "FIRST-TURN CONTRACT: There is no gate command or file to find or run. "
+         "After your native start hook releases, your only action is to reply with "
+         "exactly these two literal lines (no Markdown):\nGATE_RELEASED\n"
+         + ('SYMPHONY_OUTCOME: {"status":"blocked"}' if recover else
+            'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
+         + ("This recovery fixture is deliberately blocked even after the native hook releases; "
+            "the root will resume this same lead for completion.\n" if recover else "") +
+         "The test-only native SubagentStart hook may briefly hold your first turn. "
+         "GATE_RELEASED is a report line, not an operation. "
+         "Do not inspect files, run tools, delegate, or create a worktree.")
     )
     lead_relay = (
         "Pass LEAD_SPAWN_PACKET verbatim as spawn_agent arguments, including message. "
@@ -970,7 +982,7 @@ def codex_pre_resume_state(document, session, run_id, lead_id):
 
 
 def require_codex_old_lead_terminal(pre_resume_state, captured_stops, lead_turns):
-    """A completed original run needs one turn; recovery needs a later same-ID turn."""
+    """Require every old turn's terminal; candidate may finish a blocked first turn."""
     completed = [turn for turn in lead_turns if turn.get("completed")
                  and turn.get("reported_outcome") == "completed"]
     if pre_resume_state == "completed":
@@ -981,9 +993,7 @@ def require_codex_old_lead_terminal(pre_resume_state, captured_stops, lead_turns
         raise RuntimeError("old original lead has no supported resume state")
     terminal_hashes = {sha256(str(record["turn_id"]).encode()).hexdigest()[:12]
                        for record in captured_stops if record.get("turn_id")}
-    if len(terminal_hashes) < 2:
-        raise RuntimeError("native host did not deliver a repeated same-lead terminal")
-    if (len(lead_turns) < 2 or lead_turns[0].get("reported_outcome") != "blocked"
+    if (not lead_turns or lead_turns[0].get("reported_outcome") != "blocked"
             or not all(turn.get("completed") and turn.get("turn_hash") in terminal_hashes
                        for turn in lead_turns)):
         raise RuntimeError("native original lead lacks a completed blocked-to-followup lineage")
@@ -995,6 +1005,22 @@ def require_codex_old_lead_terminal(pre_resume_state, captured_stops, lead_turns
         # follow-up. Only candidate's later exact outcome may finish it.
         return "same_id_unreconciled"
     raise RuntimeError("native original lead follow-up has no recoverable outcome")
+
+
+def held_codex_stop_capture(root, session, invocation, deadline):
+    """Wait for the exact native Stop capture after its readiness is published."""
+    while time.monotonic() < deadline:
+        matches = [item for item in codex_hook_capture_summary(root)["records"]
+                   if item.get("event") == "Stop"
+                   and item.get("session_id") == session
+                   and item.get("invocation_id") == invocation
+                   and item.get("native_stop_hold_label") == "a"]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            break
+        time.sleep(.05)
+    raise RuntimeError("held old Stop capture did not publish its exact invocation")
 
 
 def require_codex_unreconciled_recovery(previous_turns, resumed_turns, terminal_hashes):
@@ -2002,6 +2028,9 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
     case = root / "live-update"
     case.mkdir()
     first, second = projects(case, False)
+    native_status = first / "NATIVE_STATUS.txt"
+    status_nonce = uuid.uuid4().hex
+    native_status.write_text(f"WAIT {status_nonce}\n")
     gate_dir = case / "native-gate"
     gate_dir.mkdir()
     state_dir = case / "state"
@@ -2023,6 +2052,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
         processes["a"] = launch("codex", first, "a", True,
                                 {**env, "SYMPHONY_NATIVE_GATE_DIR": str(gate_dir),
                                  "SYMPHONY_NATIVE_GATE_LABEL": "a",
+                                 "SYMPHONY_NATIVE_TASK_STATUS_FILE": str(native_status),
+                                 "SYMPHONY_NATIVE_TASK_STATUS_WAIT": f"WAIT {status_nonce}\n",
                                  "SYMPHONY_NATIVE_HOLD_OLD_STOP": "1"}, logs, budget, "",
                                 defer_recovery=True)
         while time.monotonic() < deadline:
@@ -2091,11 +2122,25 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                     and old_run.get("lead_identity") == leads["a"]
                     and old_run.get("status") == "recovering"
                     and (gate_dir / "a.stop-ready.json").is_file()):
+                old_turns = codex_host_trace(
+                    update["home"], sessions["a"], leads["a"], logs / "a.errors"
+                ).get("lead_turns", [])
                 held = json.loads((gate_dir / "a.stop-ready.json").read_text())
                 if held.get("session_id") != sessions["a"] or not held.get("invocation_id"):
                     raise RuntimeError("held old Stop belongs to another native root")
+                held_stop = held_codex_stop_capture(
+                    root, sessions["a"], held.get("invocation_id"), deadline)
+                if (native_status.read_text() != f"WAIT {status_nonce}\n" or not old_turns
+                        or old_turns[0].get("reported_outcome") != "blocked"
+                        or held_stop.get("native_task_wait") is not True):
+                    raise RuntimeError("old original lead did not report its unfinished WAIT task")
                 break
             if not old_run:
+                old_turns = codex_host_trace(
+                    update["home"], sessions["a"], leads["a"], logs / "a.errors"
+                ).get("lead_turns", [])
+                if old_turns and old_turns[0].get("reported_outcome") == "completed":
+                    raise RuntimeError("old original lead ignored the unfinished WAIT task before candidate B")
                 raise RuntimeError("old original run archived before candidate B launch")
             if time.monotonic() >= deadline:
                 raise RuntimeError("old original lead did not become recovering before B launch")
@@ -2130,6 +2175,9 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
             raise RuntimeError("candidate B did not register its native original lead")
         if sessions["a"] == sessions["b"] or leads["a"] == leads["b"] or runs["a"] == runs["b"]:
             raise RuntimeError("old and candidate roots reused an owner identity")
+        if native_status.read_text() != f"WAIT {status_nonce}\n":
+            raise RuntimeError("old original task status changed before native overlap")
+        native_status.write_text(f"READY {status_nonce}\n")
         activation = current.get("activation", {}).get("codex", {})
         profiles = [activation, *activation.get("session_profiles", [])]
         if not candidate_retained_profile(profiles, sessions["b"],
@@ -2364,7 +2412,8 @@ def codex_hook_capture_summary(root, provider="codex"):
                          "tool_use_id_hash", "agent_type", "isolation", "background",
                          "native_gate_label", "native_gate_session_id",
                          "background_tasks_type", "background_tasks_count",
-                         "background_task_states")}
+                         "background_task_states", "native_task_wait",
+                         "native_stop_hold_label")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
                           "finished_ns": marker.get("finished_ns"),
                           "native_home_matches_expected": (

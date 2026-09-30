@@ -6,8 +6,10 @@ from tempfile import TemporaryDirectory
 
 from plugins.symphony.symphony.host_evidence import (
     codex_completing_lead_turn, codex_recovered_lead_event,
+    codex_unavailable_lead_proof,
 )
 from plugins.symphony.symphony.adapters import event_from_payload
+from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony.reducer import reduce
 from plugins.symphony.symphony.runtime import handle
@@ -71,6 +73,155 @@ class HostEvidenceTests(unittest.TestCase):
                                 "payload": {"type": "task_complete", "turn_id": turn_id,
                                             "last_agent_message": outcome}})
         self.transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    def write_unavailable_root(self, *, target="symphony_lead_gpt_6_luna_low",
+                               spawned_lead=LEAD_ID, output=None, extra=()):
+        root = self.transcript.with_name(f"rollout-2026-09-29-{ROOT_ID}.jsonl")
+        output = output if output is not None else (
+            f"live agent path `/root/{target}` not found")
+        records = [
+            {"timestamp": "2026-09-29T02:00:00Z", "type": "session_meta",
+             "payload": {"id": ROOT_ID}},
+            {"timestamp": "2026-09-29T02:00:10Z", "type": "response_item",
+             "payload": {"type": "function_call", "name": "spawn_agent", "call_id": "spawn-1",
+                         "arguments": json.dumps({"task_name": "symphony_lead_gpt_6_luna_low",
+                                                  "model": "gpt-6-luna", "reasoning_effort": "low",
+                                                  "fork_turns": "none", "message": "Task"})}},
+            {"timestamp": "2026-09-29T02:00:30Z", "type": "event_msg",
+             "payload": {"type": "item_completed", "item": {"type": "SubAgentActivity",
+                 "id": "spawn-1", "kind": "started", "agent_thread_id": spawned_lead}}},
+            {"timestamp": "2026-09-29T02:01:05Z", "type": "response_item",
+             "payload": {"type": "function_call", "name": "followup_task", "call_id": "followup-1",
+                         "arguments": json.dumps({"target": target, "message": "Continue"})}},
+            {"timestamp": "2026-09-29T02:01:06Z", "type": "response_item",
+             "payload": {"type": "function_call_output", "call_id": "followup-1",
+                         "output": output}},
+            *extra,
+        ]
+        root.write_text("".join(json.dumps(record) + "\n" for record in records))
+        return root
+
+    def test_codex_unavailable_proof_requires_exact_native_error_and_original_lineage(self):
+        # The pinned 0.158 host emits this exact output without an is_error
+        # flag. Its call ID and original spawn activity are the authority.
+        self.write_turns(latest_complete=False)
+        rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in rows
+                                          if row.get("payload", {}).get("turn_id") != NEW_TURN))
+        self.write_unavailable_root()
+        state = self.store.load(self.project)
+        proof = codex_unavailable_lead_proof(state, ROOT_ID, self.environ, "replacement")
+        self.assertIsNotNone(proof)
+        self.assertEqual(LEAD_ID, proof["original_lead"])
+        self.assertEqual("replacement", proof["replacement_identity"])
+
+        for changes in (
+            {"target": "another_lead"},
+            {"spawned_lead": "01a0ec7a-bc3b-73a2-97ad-cb75564f6898"},
+            {"output": "agent unavailable"},
+            {"output": "live agent path `/root/symphony_lead_gpt_6_luna_low` not found later"},
+        ):
+            with self.subTest(changes=changes):
+                self.write_unavailable_root(**changes)
+                self.assertIsNone(codex_unavailable_lead_proof(
+                    state, ROOT_ID, self.environ, "replacement"))
+
+        later_activity = {"timestamp": "2026-09-29T02:01:07Z", "type": "event_msg",
+                          "payload": {"type": "item_completed", "item": {
+                              "type": "SubAgentActivity", "id": "later-call",
+                              "kind": "started", "agent_thread_id": LEAD_ID}}}
+        self.write_unavailable_root(extra=(later_activity,))
+        self.assertIsNone(codex_unavailable_lead_proof(
+            state, ROOT_ID, self.environ, "replacement"))
+
+        self.write_turns(latest_complete=False)
+        child_rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        child_rows = [row for row in child_rows
+                      if row.get("payload", {}).get("turn_id") != NEW_TURN]
+        child_rows.append({"timestamp": "2026-09-29T02:01:08Z", "type": "turn_context",
+                           "payload": {"turn_id": NEW_TURN, "model": "gpt-6-luna", "effort": "low"}})
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in child_rows))
+        self.write_unavailable_root()
+        self.assertIsNone(codex_unavailable_lead_proof(
+            state, ROOT_ID, self.environ, "replacement"))
+        self.write_turns(latest_complete=False)
+        child_rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in child_rows
+                                          if row.get("payload", {}).get("turn_id") != NEW_TURN))
+        root = self.write_unavailable_root()
+        rows = [json.loads(line) for line in root.read_text().splitlines()]
+        root.write_text("".join(json.dumps(row) + "\n" for row in rows
+                                if row.get("payload", {}).get("type") != "function_call_output"))
+        self.assertIsNone(codex_unavailable_lead_proof(
+            state, ROOT_ID, self.environ, "replacement"))
+        self.write_unavailable_root()
+        child_rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        child_rows.append({"timestamp": "2026-09-29T02:01:08Z", "type": "event_msg",
+                           "payload": {"type": "task_started", "turn_id": NEW_TURN}})
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in child_rows))
+        self.assertIsNone(codex_unavailable_lead_proof(
+            state, ROOT_ID, self.environ, "replacement"))
+
+        self.write_turns(latest_complete=False, old_complete_time="2026-09-29T02:01:10Z")
+        child_rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in child_rows
+                                          if row.get("payload", {}).get("turn_id") != NEW_TURN))
+        self.write_unavailable_root()
+        self.assertIsNone(codex_unavailable_lead_proof(
+            state, ROOT_ID, self.environ, "replacement"))
+
+        self.write_turns(latest_complete=False)
+        child_rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in child_rows
+                                          if row.get("payload", {}).get("turn_id") != NEW_TURN))
+        root = self.write_unavailable_root()
+        root.write_text(root.read_text().rstrip("\n"))
+        self.transcript.write_text(self.transcript.read_text().rstrip("\n"))
+        self.assertIsNone(codex_unavailable_lead_proof(
+            state, ROOT_ID, self.environ, "replacement"))
+
+    def test_codex_unavailable_original_allows_one_owned_replacement(self):
+        self.write_turns(latest_complete=False)
+        rows = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in rows
+                                          if row.get("payload", {}).get("turn_id") != NEW_TURN))
+        self.write_unavailable_root()
+        source = event_from_payload("codex", {
+            "hook_event_name": "SubagentStart", "session_id": ROOT_ID,
+            "agent_id": "replacement", "agent_type": "symphony_lead_gpt_6_luna_low",
+            "turn_id": "replacement-turn", "model": "gpt-6-luna",
+            "model_reasoning_effort": "low",
+        })
+        state = self.store.load(self.project)
+        accepted, actions = runtime_module._observe_delegation(state, source, self.environ)
+        self.assertEqual("replacement", accepted.active_run.lead_identity)
+        self.assertEqual(self.run.owner_generation + 1, accepted.active_run.owner_generation)
+        self.assertNotIn("_codex_unavailable_proof", accepted.active_run.assessment)
+        self.assertNotIn("reject_lead_replacement", {item.kind for item in actions})
+
+        self.write_unavailable_root(output="live agent path `/root/other` not found")
+        guarded, actions = runtime_module._observe_delegation(state, source, self.environ)
+        self.assertEqual(LEAD_ID, guarded.active_run.lead_identity)
+        self.assertEqual("rejected_lead", next(item.role for item in guarded.active_run.delegations
+                                               if item.identity == "replacement"))
+        self.assertIn("reject_lead_replacement", {item.kind for item in actions})
+
+    def test_codex_unavailable_proof_uses_latest_failed_turn_after_multiple_turns(self):
+        self.write_turns(message='SYMPHONY_OUTCOME: {"status":"blocked"}')
+        root = self.write_unavailable_root()
+        rows = [json.loads(line) for line in root.read_text().splitlines()]
+        for row in rows:
+            if row.get("payload", {}).get("name") == "followup_task":
+                row["timestamp"] = "2026-09-29T02:03:05Z"
+            elif row.get("payload", {}).get("type") == "function_call_output":
+                row["timestamp"] = "2026-09-29T02:03:06Z"
+        root.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        run = replace(self.run, assessment={**self.run.assessment,
+            "_retryable_lead_turn": f"turn_id:{NEW_TURN}",
+            "_terminal_turns": {LEAD_ID: [f"turn_id:{OLD_TURN}", f"turn_id:{NEW_TURN}"]}})
+        state = ProjectState(active_run=run)
+        self.assertIsNotNone(codex_unavailable_lead_proof(
+            state, ROOT_ID, self.environ, "replacement"))
 
     def load_released_recovering_state(self):
         # Generated with v1.5.1 event_from_payload, _observe_delegation, and

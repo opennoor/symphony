@@ -20,6 +20,7 @@ from .host_evidence import (
     claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
     codex_completing_lead_turn, codex_recovered_lead_event,
+    codex_unavailable_lead_proof,
 )
 from .model import Action, Delegation, Event, ProjectState, RunState
 from .reducer import _stop_block_reason, reduce
@@ -928,7 +929,7 @@ def _transition(
         if source.kind == "subagent_started":
             state, deferred = _consume_parent_actions(state)
             actions += deferred
-        state, observed_actions = _observe_delegation(state, source)
+        state, observed_actions = _observe_delegation(state, source, environ)
         if source.kind == "subagent_stopped":
             # Neither host accepts injected context on a subagent-stop result,
             # so corrective guidance waits for the next event that does. Render
@@ -1361,7 +1362,9 @@ def _child_turn_token(payload: Mapping[str, object]) -> str:
     return ""
 
 
-def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectState, tuple[Action, ...]]:
+def _observe_delegation(
+    state: ProjectState, source: Event, environ: Mapping[str, str] | None = None,
+) -> tuple[ProjectState, tuple[Action, ...]]:
     identity = source.payload.get("agent_id") or source.payload.get("subagent_id")
     if not identity:
         return state, ()
@@ -1380,6 +1383,7 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     )
     assessment = state.active_run.assessment
     token = _child_turn_token(source.payload)
+    terminal_matches_active_start = False
     if source.kind == "subagent_started":
         if source.event_id in assessment.get("_start_event_ids", ()):
             if not token and current and current.state.lower() not in {"working", "pending", "interrupted"}:
@@ -1401,12 +1405,34 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             return state, opening
         updated = dict(assessment)
         updated["_start_event_ids"] = (*assessment.get("_start_event_ids", ()), source.event_id)
+        if source.payload.get("provider") == "codex":
+            active_turns = dict(assessment.get("_active_turns", {}))
+            # An accepted start without a native turn ID is still a new epoch.
+            # Never inherit the prior turn's identity for a later failure.
+            active_turns[str(identity)] = token
+            updated["_active_turns"] = active_turns
         if current and current.state.lower() not in {"working", "pending"}:
             epochs = dict(assessment.get("_terminal_epochs", {}))
             epochs[str(identity)] = epochs.get(str(identity), 0) + 1
             updated["_terminal_epochs"] = epochs
         state = replace(state, active_run=replace(state.active_run, assessment=updated))
     if source.kind == "subagent_stopped":
+        # A terminal with a different native turn from the latest accepted
+        # start cannot fail that working turn or authorize replacement.
+        terminal_turns = assessment.get("_terminal_turns", {})
+        active_turn = assessment.get("_active_turns", {}).get(str(identity))
+        terminal_matches_active_start = bool(
+            source.payload.get("provider") == "codex" and token and active_turn == token)
+        if (source.payload.get("provider") == "codex" and current
+                and str(identity) in assessment.get("_active_turns", {})
+                and token != active_turn):
+            if token not in terminal_turns.get(str(identity), ()):
+                updated = dict(assessment)
+                ambiguous = tuple(updated.get("_ambiguous_child_stops", ()))
+                if str(identity) not in ambiguous:
+                    updated["_ambiguous_child_stops"] = (*ambiguous, str(identity))
+                    state = replace(state, active_run=replace(state.active_run, assessment=updated))
+            return state, opening
         seen = assessment.get("_terminal_event_ids", ())
         epoch = assessment.get("_terminal_epochs", {}).get(str(identity), 0)
         base_result_id = _terminal_result_id(source)
@@ -1456,12 +1482,26 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         assessment = dict(state.active_run.assessment)
         assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
                                               result_id)
+        if source.payload.get("provider") == "codex":
+            active_turns = dict(assessment.get("_active_turns", {}))
+            if str(identity) in active_turns and active_turns[str(identity)] == token:
+                active_turns.pop(str(identity), None)
+                if active_turns:
+                    assessment["_active_turns"] = active_turns
+                else:
+                    assessment.pop("_active_turns", None)
         ambiguous = tuple(item for item in assessment.get("_ambiguous_child_starts", ())
                           if item != str(identity))
         if ambiguous:
             assessment["_ambiguous_child_starts"] = ambiguous
         else:
             assessment.pop("_ambiguous_child_starts", None)
+        ambiguous_stops = tuple(item for item in assessment.get("_ambiguous_child_stops", ())
+                                if item != str(identity))
+        if ambiguous_stops:
+            assessment["_ambiguous_child_stops"] = ambiguous_stops
+        else:
+            assessment.pop("_ambiguous_child_stops", None)
         if token:
             terminal_turns = dict(assessment.get("_terminal_turns", {}))
             terminal_turns[str(identity)] = (*terminal_turns.get(str(identity), ()), token)
@@ -1473,20 +1513,48 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     terminal = source.kind == "subagent_stopped"
     status = str(source.payload.get("status") or ("completed" if terminal else "working"))
     role = str(pending.get("role") or _observed_role(source.payload) or (current.role if current else "worker"))
+    retryable_replacement = (
+        role == "lead" and source.kind == "subagent_started"
+        and state.active_run.provider == "codex"
+        and state.active_run.status == "recovering"
+        and state.active_run.lead_identity
+        and state.active_run.lead_identity != str(identity)
+        and state.active_run.assessment.get("_retryable_lead")
+            == state.active_run.lead_identity
+        and state.active_run.assessment.get("_lead_route_mismatch_owner") != {
+            "identity": state.active_run.lead_identity,
+            "generation": state.active_run.owner_generation,
+        }
+    )
+    unavailable_proof = None
+    if retryable_replacement and environ is not None and current is None:
+        try:
+            unavailable_proof = codex_unavailable_lead_proof(
+                state, state.active_run.session_id, environ, str(identity))
+        except Exception:
+            # A malformed or partial native transcript cannot transfer an
+            # owner; the already-created child is still tracked below.
+            unavailable_proof = None
     if current and current.role == "rejected_lead":
         role = "rejected_lead"
     elif (role == "lead" and source.kind == "subagent_started"
-            and state.active_run.status == "completing"
             and state.active_run.lead_identity
-            and state.active_run.lead_identity != str(identity)):
+            and state.active_run.lead_identity != str(identity)
+            and (state.active_run.status == "completing"
+                 or (retryable_replacement and unavailable_proof is None))):
         # A Codex SubagentStart can arrive without PreToolUse after the root
-        # completed its lead. The child already exists: track it until its
-        # terminal without letting it replace the accepted lead or outcome.
+        # completed its lead, or while the original lead is retryable. The
+        # child already exists: track it until terminal without transferring
+        # the original lead's ownership or outcome.
         role = "rejected_lead"
         opening += (
             Action("reject_lead_replacement", {"identity": str(identity)}),
         )
     if role == "lead" and (source.kind == "subagent_started" or not state.active_run.lead_identity):
+        if unavailable_proof is not None:
+            assessment = dict(state.active_run.assessment)
+            assessment["_codex_unavailable_proof"] = unavailable_proof
+            state = replace(state, active_run=replace(state.active_run, assessment=assessment))
         owner_generation = state.active_run.owner_generation
         if (
             state.active_run.status in {"interrupted", "recovering"}
@@ -1500,7 +1568,9 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                 state,
                 source,
                 "lead_started",
-                {"identity": str(identity), "owner_generation": owner_generation},
+                {"identity": str(identity), "owner_generation": owner_generation,
+                 **({"unavailability_digest": unavailable_proof["digest"]}
+                    if unavailable_proof is not None else {})},
                 "lead",
             ),
         )
@@ -1785,6 +1855,10 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                 mismatch += f". {approval_required}"
             updated_assessment = dict(state.active_run.assessment)
             updated_assessment["_lead_route_mismatch"] = mismatch
+            updated_assessment["_lead_route_mismatch_owner"] = {
+                "identity": str(identity),
+                "generation": state.active_run.owner_generation,
+            }
             updated_assessment.pop("_pending_lead_completion", None)
             state = replace(
                 state, active_run=replace(state.active_run, assessment=updated_assessment)
@@ -1812,6 +1886,7 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         if successful and state.active_run.lead_identity == str(identity) and assessment.get("_lead_route_mismatch"):
             updated_assessment = dict(assessment)
             updated_assessment.pop("_lead_route_mismatch", None)
+            updated_assessment.pop("_lead_route_mismatch_owner", None)
             state = replace(state, active_run=replace(state.active_run, assessment=updated_assessment))
         # 1.5.0 persisted lead failures without the retry marker. Its latest
         # recovery event still distinguishes a failed lead from a later failed
@@ -1871,6 +1946,10 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                     "owner_generation": state.active_run.owner_generation,
                     "outcome": outcome,
                     **({"turn_token": token} if completion_kind == "lead_failed" and token else {}),
+                    **({"native_host_failed": True} if completion_kind == "lead_failed"
+                        and terminal_matches_active_start
+                        and status.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}
+                        else {}),
                 },
                 "lead-completion",
             ),
@@ -2626,12 +2705,20 @@ def _render_actions(
             run = state.active_run
             if (provider == "codex" and run and run.lead_identity
                     and run.assessment.get("_retryable_lead") == run.lead_identity):
-                rendered.append(Action("inject_context", {"text":
+                mismatch_owner = run.assessment.get("_lead_route_mismatch_owner") == {
+                    "identity": run.lead_identity, "generation": run.owner_generation}
+                rendered.append(Action("inject_context", {"text": (
+                    "The registered lead used the wrong route. Spawn one replacement with the recorded "
+                    "model and effort; the prior lead cannot change its native route."
+                    if mismatch_owner else
                     "The registered lead ended a retryable turn. Continue that same lead first with "
                     "followup_task using the original task_name from spawn_agent (lowercase letters, "
-                    "digits, and underscores), not a /root/ path or agent UUID. Await its new result. "
-                    "Spawn a replacement at the recorded owner generation only if the host confirms "
-                    "the original lead is unavailable."}))
+                    "digits, and underscores), not a /root/ path or agent UUID. A completed host roster "
+                    "entry alone does not prove the agent unavailable; do not call spawn_agent for the same "
+                    "task_name. Await the original lead's new result. Only if followup_task returns an "
+                    "explicit unavailable error may you spawn one replacement at the recorded route; "
+                    "Symphony verifies the original spawn, exact error, and turn lineage before accepting it."
+                )}))
             else:
                 rendered.append(Action("inject_context", {"text":
                     "The observed lead is unavailable. Spawn one safe replacement at the recorded owner generation."}))
@@ -2877,11 +2964,19 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     pending = run.assessment.get("_pending_delegations", ())
     awaiting = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
     lead = f" Lead {run.lead_identity} [{_governance(state)}]." if run.lead_identity else " Lead not yet observed."
-    retry = ("For a retryable Codex lead, use followup_task with the original spawn_agent "
-             "task_name (lowercase letters, digits, and underscores), not its /root/ path or UUID; "
-             "replace it only if the host confirms it is unavailable. "
+    route_mismatch = run.assessment.get("_lead_route_mismatch_owner") == {
+        "identity": run.lead_identity, "generation": run.owner_generation}
+    retry = ("For this retryable Codex lead, call followup_task on the original spawn_agent "
+             "task_name (lowercase letters, digits, and underscores), not its /root/ path or UUID. "
+             "A completed host roster entry alone does not prove the agent unavailable; do not spawn "
+             "another lead for that name. Only an explicit unavailable error from followup_task can "
+             "authorize one replacement; Symphony verifies the original spawn, exact error, and native "
+             "turn lineage at the new child's Start. If verification fails, the extra child stays rejected. "
              if run.provider == "codex" and run.lead_identity
-             and run.assessment.get("_retryable_lead") == run.lead_identity else "")
+             and run.assessment.get("_retryable_lead") == run.lead_identity
+             and not route_mismatch else "")
+    if route_mismatch:
+        retry = "The registered lead used the wrong native route; spawn one replacement at the required model and effort. "
     claude_retry = (
         f"For this Claude lead, await an active background result. If its native turn has ended "
         f"without a reconciled outcome, use SendMessage with `to: {run.lead_identity}` to resume "
@@ -2889,6 +2984,7 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
         "SYMPHONY_OUTCOME JSON line. Await its returned result before normal Stop. "
         "Do not start another task or invent a missing outcome. "
         if run.provider == "claude" and run.lead_identity and run.status in {"active", "recovering"}
+        and not route_mismatch
         and any(item.identity == run.lead_identity and item.state in {"working", "pending", "failed"}
                 for item in run.delegations) else ""
     )

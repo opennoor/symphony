@@ -396,7 +396,8 @@ class ConcurrentSessionTests(unittest.TestCase):
                 store = StateStore(Path(env["SYMPHONY_STATE_DIR"]))
                 store.save(self.project, ProjectState(active_run=run, active_runs={f"{provider}:root-a": run}))
                 failed = self.payload("root-a", "SubagentStop", provider=provider,
-                                      agent_id="lead-a", status="failed")
+                                      agent_id="lead-a", status="completed",
+                                      last_assistant_message='SYMPHONY_OUTCOME: {"status":"blocked"}')
                 handle(failed, env)
                 handle({**failed, "status": "completed", "last_assistant_message": "recovered"}, env)
                 self.assertEqual({"status": "completed"}, store.load(self.project).active_runs[f"{provider}:root-a"].outcome)
