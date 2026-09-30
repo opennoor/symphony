@@ -104,7 +104,8 @@ class HostEvidenceTests(unittest.TestCase):
                            "hook_event_name": "UserPromptSubmit", "turn_id": "root-turn",
                            "prompt": "$symphony:symphony status"}, self.environ)
         context = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Invoke the normal `$symphony:symphony stop`", context)
+        self.assertIn("Finish this root turn now so the native Stop hook", context)
+        self.assertNotIn("Invoke the normal `$symphony:symphony stop`", context)
         self.assertNotIn("tracked work still requires reconciliation", context)
         self.assertEqual("completing", self.store.load(self.project).active_run.status)
 

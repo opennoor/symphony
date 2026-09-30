@@ -2757,7 +2757,16 @@ def _claude_unknown_turn_guidance(run: RunState) -> str:
 def _completion_ready_guidance(run: RunState, provider: str) -> str:
     if run.status != "completing" or _stop_block_reason(run) is not None:
         return ""
-    stop = _control_name("stop", provider or run.provider or "codex")
+    host = provider or run.provider or "codex"
+    if host == "codex":
+        return (
+            "The lead outcome and tracked work are reconciled. Finish this root turn "
+            "now so the native Stop hook can verify and archive the run, then check "
+            "durable status. Do not type a stop control as assistant prose, call "
+            "list_agents, or spawn or follow up a completed lead solely because this "
+            "run remains completing."
+        )
+    stop = _control_name("stop", host)
     return (
         "The lead outcome and tracked work are reconciled. Invoke the normal "
         f"`{stop}` control in this same session now, then check durable status. "

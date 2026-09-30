@@ -321,7 +321,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("guarded", self.context(result).lower())
         self.assertNotIn("unarmed", self.context(result).lower())
 
-    def test_reconciled_completing_run_guides_normal_stop_on_both_hosts(self):
+    def test_reconciled_completing_run_guides_provider_native_finalization(self):
         for provider, control in (("codex", "$symphony:symphony"),
                                   ("claude", "/symphony:")):
             with self.subTest(provider=provider):
@@ -333,17 +333,26 @@ class RuntimeTests(unittest.TestCase):
                 environ = self.claude_environ if provider == "claude" else self.environ
                 text = self.context(handle(self.payload(f"{control}status" if provider == "claude"
                                                         else f"{control} status", provider), environ))
-                self.assertIn(f"`{control}stop`" if provider == "claude"
-                              else f"`{control} stop`", text)
+                if provider == "claude":
+                    self.assertIn(f"`{control}stop`", text)
+                    self.assertIn("Invoke the normal", text)
+                else:
+                    self.assertIn("Finish this root turn now so the native Stop hook", text)
+                    self.assertIn("Do not type a stop control as assistant prose", text)
+                    self.assertNotIn("Invoke the normal", text)
                 self.assertIn("then check durable status", text)
-                self.assertIn("Do not follow up or replace a completed lead", text)
+                if provider == "claude":
+                    self.assertIn("Do not follow up or replace a completed lead", text)
+                else:
+                    self.assertIn("or spawn or follow up a completed lead", text)
                 self.assertNotIn("tracked work still requires reconciliation", text)
                 self.assertEqual("completing", StateStore(self.state_root).load(self.project)
                                  .active_runs[f"{provider}:{run.session_id}"].status)
 
                 guidance = runtime_module._recovery_guidance(
                     ProjectState(active_run=run), provider)
-                self.assertIn("Invoke the normal", guidance)
+                self.assertIn("Invoke the normal" if provider == "claude" else
+                              "Finish this root turn", guidance)
                 self.assertNotIn("continue unfinished work", guidance)
 
     def test_completing_run_with_unfinished_work_does_not_guide_stop(self):

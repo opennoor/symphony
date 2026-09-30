@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -204,14 +205,274 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             with self.subTest(provider=provider, update=bool(update), label=label):
                 native.require_case_recovery_events(
                     plain_completion, "original", provider, update, label)
+        native.require_case_recovery_events(
+            plain_completion, "original", "codex", {"old_version": "1.5.1"},
+            "a", "completed")
         with self.assertRaisesRegex(RuntimeError, "ordered durable failed and completed"):
             native.require_case_recovery_events(
-                plain_completion, "original", "codex", {"old_version": "1.5.1"}, "a")
+                plain_completion, "original", "codex", {"old_version": "1.5.1"},
+                "a", "recovering")
         native.require_case_recovery_events(
             {"event_history": [
                 {"kind": "lead_failed", "payload": {"identity": "original"}},
                 {"kind": "lead_completed", "payload": {"identity": "original"}}]},
-            "original", "codex", {"old_version": "1.5.1"}, "a")
+            "original", "codex", {"old_version": "1.5.1"}, "a", "recovering")
+        with self.assertRaisesRegex(RuntimeError, "original recovering or completed"):
+            native.require_case_recovery_events(
+                plain_completion, "original", "codex", {"old_version": "1.5.1"},
+                "a", None)
+
+    def test_old_codex_wait_interruption_requires_latest_hooked_completion(self):
+        from hashlib import sha256
+        run = {"provider": "codex", "session_id": "root-a", "run_id": "run-a",
+               "lead_identity": "lead-a", "status": "recovering",
+               "delegations": [{"identity": "assessor-a", "state": "completed"}]}
+        document = {"active_runs": {"codex:root-a": run}, "recent_runs": []}
+        captured = {"records": [
+            {"event": "SubagentStop", "session_id": "root-a", "agent_id": "lead-a",
+             "turn_id": turn, "exit_marker_written": True, "script_exit_marker_code": 0}
+            for turn in ("blocked-turn", "completed-turn")]}
+        terminal = sha256(b"completed-turn").hexdigest()[:12]
+        host = {"lead_turns": [{"turn_hash": terminal, "completed": True,
+                                "reported_outcome": "completed"}],
+                "last_root_function_call": {"name": "wait_agent", "return_recorded": False},
+                "root_tool_calls_tail": [{"name": "wait_agent", "wait_timeout_ms": 3600000,
+                                          "call_hash": "wait-a"}]}
+        proof = native.verified_old_codex_wait(
+            document, "root-a", "run-a", "lead-a", captured, host)
+        self.assertEqual("old_runtime_wait_after_hooked_completed_turn", proof["reason"])
+        for changed_doc, changed_capture, changed_host in (
+            ({"active_runs": {"codex:root-a": {**run, "lead_identity": "other"}},
+              "recent_runs": []}, captured, host),
+            (document, {"records": captured["records"][:1]}, host),
+            (document, captured, {**host, "lead_turns": [
+                {"turn_hash": terminal, "completed": False, "reported_outcome": "completed"}]}),
+            (document, captured, {**host, "lead_turns": [
+                {"turn_hash": "foreign-turn", "completed": True,
+                 "reported_outcome": "completed"}]}),
+            (document, captured, {**host, "last_root_function_call":
+                                   {"name": "wait_agent", "return_recorded": True}}),
+            ({"active_runs": {"codex:root-a": {**run, "delegations": [
+                {"identity": "worker-a", "state": "working"}]}}, "recent_runs": []},
+             captured, host),
+        ):
+            with self.subTest(changed_doc=changed_doc, changed_capture=changed_capture,
+                              changed_host=changed_host), self.assertRaises(RuntimeError):
+                native.verified_old_codex_wait(
+                    changed_doc, "root-a", "run-a", "lead-a", changed_capture, changed_host)
+
+    def test_codex_update_preserves_original_completed_or_recovering_run(self):
+        original = {"provider": "codex", "session_id": "root-a", "run_id": "run-a",
+                    "lead_identity": "lead-a", "status": "recovering"}
+        recovering = {"active_runs": {"codex:root-a": original}, "recent_runs": []}
+        self.assertEqual("recovering", native.codex_pre_resume_state(
+            recovering, "root-a", "run-a", "lead-a"))
+        completed = {"active_runs": {}, "recent_runs": [
+            {**original, "status": "completed", "outcome": {"status": "completed"}}]}
+        self.assertEqual("completed", native.codex_pre_resume_state(
+            completed, "root-a", "run-a", "lead-a"))
+        for changed in ({**completed, "recent_runs": [
+                            {**completed["recent_runs"][0], "lead_identity": "replacement"}]},
+                        {**completed, "recent_runs": [
+                            {**completed["recent_runs"][0], "run_id": "new-run"}]},
+                        {**completed, "active_runs": {"codex:root-b": original}}):
+            with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                native.codex_pre_resume_state(changed, "root-a", "run-a", "lead-a")
+
+    def test_native_gate_can_release_before_product_start_but_update_requires_working_leads(self):
+        sessions = {"a": "root-a", "b": "root-b"}
+        run_ids = {"a": "run-a", "b": "run-b"}
+        leads = {"a": "lead-a", "b": "lead-b"}
+        runs = {label: {"provider": "codex", "session_id": sessions[label],
+                        "run_id": run_ids[label], "lead_identity": leads[label],
+                        "status": "active", "delegations": [
+                            {"role": "lead", "identity": leads[label], "state": "working"}]}
+                for label in sessions}
+        docs = {label: {"active_runs": {f"codex:{sessions[label]}": runs[label]}}
+                for label in sessions}
+        assessing = {"active_runs": {"codex:root-b":
+                     {**runs["b"], "lead_identity": None, "status": "assessing",
+                      "delegations": []}}}
+        self.assertFalse(native.native_lead_registered(
+            assessing, "codex", "root-b", "run-b", "lead-b"))
+        with self.assertRaisesRegex(RuntimeError, "before in-flight update"):
+            native.require_inflight_update_leads(
+                {**docs, "b": assessing}, "codex", sessions, run_ids, leads)
+        native.require_inflight_update_leads(docs, "codex", sessions, run_ids, leads)
+        completed_b = {"active_runs": {"codex:root-b": {**runs["b"], "status": "completing",
+                       "delegations": [{"role": "lead", "identity": "lead-b",
+                                        "state": "completed"}]}}}
+        with self.assertRaisesRegex(RuntimeError, "before in-flight update"):
+            native.require_inflight_update_leads(
+                {**docs, "b": completed_b}, "codex", sessions, run_ids, leads)
+        with self.assertRaisesRegex(RuntimeError, "before in-flight update"):
+            native.require_inflight_update_leads(
+                docs, "codex", sessions, run_ids, {**leads, "b": "foreign-lead"})
+
+    def test_registration_wait_allows_only_successful_claude_background_exit(self):
+        processes = {"a": Mock(), "b": Mock()}
+        processes["a"].poll.return_value = 0
+        processes["b"].poll.return_value = None
+        self.assertFalse(native.registration_cli_exited("claude", processes))
+        self.assertTrue(native.registration_cli_exited("codex", processes))
+        processes["a"].poll.return_value = 1
+        self.assertTrue(native.registration_cli_exited("claude", processes))
+
+    def test_live_update_requires_original_native_turn_to_span_source_removal(self):
+        before = "2026-09-30T12:00:00+00:00"
+        removed = native.timestamp_ns("2026-09-30T12:00:05+00:00")
+        after = "2026-09-30T12:00:10+00:00"
+        document = {"event_history": [{"kind": "lead_completed", "observed_at": after,
+                                       "payload": {"identity": "lead-a"}}]}
+        codex = {"lead_turns": [
+            {"started_at": before, "completed_at": after, "completed": True,
+             "reported_outcome": "blocked"},
+            {"started_at": after, "completed_at": after, "completed": True,
+             "reported_outcome": "completed"}]}
+        claude = {"child_prompt_shape_supported": True, "child_turns": [
+            {"child_prompt_at": before, "last_assistant_at": after,
+             "last_stop_reason": "end_turn", "marker": "completed"}]}
+        for provider, trace in (("codex", codex), ("claude", claude)):
+            with self.subTest(provider=provider):
+                evidence = native.require_post_removal_lead_completion(
+                    document, provider, "root-a", "lead-a", trace, removed)
+                self.assertTrue(evidence["native_turn_spanned_removal"])
+        for changed_doc, changed_trace in (
+            ({"event_history": [{"kind": "lead_completed", "observed_at": after,
+                                 "payload": {"identity": "foreign"}}]}, codex),
+            (document, {"lead_turns": [{"started_at": before, "completed_at": before,
+                                        "completed": True, "reported_outcome": "completed"}]}),
+            (document, {"lead_turns": [{"started_at": after, "completed_at": after,
+                                        "completed": True, "reported_outcome": "completed"}]}),
+            (document, {"lead_turns": [{"started_at": before, "completed_at": after,
+                                        "completed": True, "reported_outcome": "blocked"}]}),
+        ):
+            with self.subTest(changed_doc=changed_doc, changed_trace=changed_trace), \
+                 self.assertRaises(RuntimeError):
+                native.require_post_removal_lead_completion(
+                    changed_doc, "codex", "root-a", "lead-a", changed_trace, removed)
+        for changed in (
+            {"child_prompt_at": before, "last_assistant_at": before,
+             "last_stop_reason": "end_turn", "marker": "completed"},
+            {"child_prompt_at": after, "last_assistant_at": after,
+             "last_stop_reason": "end_turn", "marker": "completed"},
+            {"child_prompt_at": before, "last_assistant_at": after,
+             "last_stop_reason": "tool_use", "marker": "completed"},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                native.require_post_removal_lead_completion(
+                    document, "claude", "root-a", "lead-a",
+                    {"child_prompt_shape_supported": True, "child_turns": [changed]}, removed)
+        with self.assertRaisesRegex(RuntimeError, "invalid timestamp"):
+            native.timestamp_ns("not-a-timestamp")
+
+    def test_claude_text_list_prompt_starts_new_turn_after_old_one_completed(self):
+        before = "2026-09-30T12:00:00+00:00"
+        removed = native.timestamp_ns("2026-09-30T12:00:05+00:00")
+        after = "2026-09-30T12:00:10+00:00"
+        self.assertEqual("prompt", native.claude_child_user_kind([{"type": "text", "text": "next"}]))
+        self.assertEqual("tool_result", native.claude_child_user_kind(
+            [{"type": "tool_result", "tool_use_id": "tool-a", "content": "done"}]))
+        self.assertEqual("unsupported", native.claude_child_user_kind([{"type": "image"}]))
+        child = [
+            {"type": "user", "timestamp": before, "uuid": "first",
+             "message": {"content": "first"}},
+            {"type": "assistant", "timestamp": before, "uuid": "first-answer",
+             "message": {"stop_reason": "end_turn", "content": [
+                 {"type": "text", "text": 'SYMPHONY_OUTCOME: {"status":"completed"}'}]}},
+            {"type": "user", "timestamp": after, "uuid": "second",
+             "message": {"content": [{"type": "text", "text": "next"}]}},
+            {"type": "assistant", "timestamp": after, "uuid": "second-answer",
+             "message": {"stop_reason": "end_turn", "content": [
+                 {"type": "text", "text": 'SYMPHONY_OUTCOME: {"status":"completed"}'}]}},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            directory = home / "projects" / "project" / "root-a"
+            directory.mkdir(parents=True)
+            with patch.object(sys, "path", [str(PLUGIN), *sys.path]), \
+                 patch("symphony.host_evidence._native_jsonl",
+                       side_effect=lambda path: child if path.name == "agent-lead-a.jsonl" else []):
+                trace = native.claude_host_trace(home, "root-a", "lead-a")
+            self.assertEqual(len(trace["child_turns"]), 2)
+            self.assertTrue(trace["child_prompt_shape_supported"])
+            document = {"event_history": [{"kind": "lead_completed", "observed_at": after,
+                                           "payload": {"identity": "lead-a"}}]}
+            with self.assertRaisesRegex(RuntimeError, "did not span"):
+                native.require_post_removal_lead_completion(
+                    document, "claude", "root-a", "lead-a", trace, removed)
+            with self.assertRaisesRegex(RuntimeError, "prompt shape"):
+                native.require_post_removal_lead_completion(
+                    document, "claude", "root-a", "lead-a",
+                    {**trace, "child_prompt_shape_supported": False}, removed)
+
+    def test_old_codex_wait_interrupts_only_after_stable_verified_wait(self):
+        root, home, state, errors = (Path("/tmp/root"), Path("/tmp/home"),
+                                      Path("/tmp/state"), Path("/tmp/errors"))
+        process = Mock(args=["codex", "exec"])
+        process.wait.side_effect = [subprocess.TimeoutExpired(process.args, 5),
+                                    subprocess.TimeoutExpired(process.args, 5),
+                                    subprocess.TimeoutExpired(process.args, 5),
+                                    subprocess.TimeoutExpired(process.args, 5), -15]
+        proof = {"reason": "old_runtime_wait_after_hooked_completed_turn",
+                 "latest_turn_hash": "turn-a", "wait_call_hash": "wait-a"}
+        changed_wait = {**proof, "wait_call_hash": "wait-b"}
+        with patch.object(native, "os", SimpleNamespace(name="posix")), \
+             patch.object(native.time, "monotonic",
+                          side_effect=(0, 5, 10, 20, 25, 30, 35, 36)), \
+             patch.object(native, "read_state_snapshot", return_value={}), \
+             patch.object(native, "codex_hook_capture_summary", return_value={}), \
+             patch.object(native, "codex_host_trace", return_value={}), \
+             patch.object(native, "verified_old_codex_wait",
+                          side_effect=(proof, changed_wait, changed_wait, changed_wait)):
+            exit_code, observed = native.wait_for_old_codex_root(
+                process, root, {"home": home}, state, "root-a", "run-a", "lead-a",
+                errors, 100)
+        self.assertEqual(-15, exit_code)
+        self.assertEqual("old_runtime_wait_after_hooked_completed_turn", observed["reason"])
+        self.assertEqual("wait-b", observed["wait_call_hash"])
+        process.terminate.assert_called_once()
+
+        unfinished = Mock(args=["codex", "exec"])
+        unfinished.wait.side_effect = subprocess.TimeoutExpired(unfinished.args, 5)
+        with patch.object(native, "os", SimpleNamespace(name="posix")), \
+             patch.object(native.time, "monotonic", side_effect=(0, 10)), \
+             patch.object(native, "read_state_snapshot", return_value={}), \
+             patch.object(native, "codex_hook_capture_summary", return_value={}), \
+             patch.object(native, "codex_host_trace", return_value={}), \
+             patch.object(native, "verified_old_codex_wait", side_effect=RuntimeError("unfinished")), \
+             self.assertRaises(subprocess.TimeoutExpired):
+            native.wait_for_old_codex_root(
+                unfinished, root, {"home": home}, state, "root-a", "run-a", "lead-a",
+                errors, 8)
+        unfinished.terminate.assert_not_called()
+
+        windows = Mock(args=["codex.cmd", "exec"])
+        windows.wait.return_value = 0
+        with patch.object(native, "os", SimpleNamespace(name="nt")), \
+             patch.object(native.time, "monotonic", return_value=0), \
+             patch.object(native, "verified_old_codex_wait") as verify:
+            self.assertEqual((0, None), native.wait_for_old_codex_root(
+                windows, root, {"home": home}, state, "root-a", "run-a", "lead-a",
+                errors, 100))
+        verify.assert_not_called()
+        windows.terminate.assert_not_called()
+
+    def test_strict_codex_trace_rejects_partial_or_missing_native_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            (sessions / "root-a.jsonl").write_text('{"payload": {}}\n')
+            with self.assertRaisesRegex(ValueError, "missing"):
+                native.codex_host_trace(home, "root-a", "lead-a", home / "errors", strict=True)
+            child = sessions / "lead-a.jsonl"
+            child.write_text('{"payload": {}}')
+            with self.assertRaisesRegex(ValueError, "partial"):
+                native.codex_host_trace(home, "root-a", "lead-a", home / "errors", strict=True)
+            child.write_text('{"payload": {}}\n{broken\n')
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                native.codex_host_trace(home, "root-a", "lead-a", home / "errors", strict=True)
 
     def test_native_launch_pins_current_provider_profile(self):
         with tempfile.TemporaryDirectory() as temporary:

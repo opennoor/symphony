@@ -643,6 +643,7 @@ def update_while_gated(update, env, docs, sessions, projects_by_label, deadline)
         change_plugin("plugin", "remove", "symphony@symphony-old")
         if old_root.exists():
             old_root.rename(update["home"] / "removed-old-cache")
+        update["old_source_removed_ns"] = time.time_ns()
         change_plugin("plugin", "marketplace", "add", str(update["candidate_market"]))
         change_plugin("plugin", "add", "symphony@symphony-candidate")
     else:
@@ -650,6 +651,7 @@ def update_while_gated(update, env, docs, sessions, projects_by_label, deadline)
         old_root.rename(update["home"] / "removed-old-source")
         if update["old_cache"].exists():
             update["old_cache"].rename(update["home"] / "removed-old-cache")
+        update["old_source_removed_ns"] = time.time_ns()
         change_plugin("plugin", "marketplace", "add", str(update["candidate_market"]))
         change_plugin("plugin", "install", "-y", "symphony@symphony-candidate")
     if old_root.exists():
@@ -820,9 +822,12 @@ def require_recovered_lead_events(document, lead_id):
         raise RuntimeError("recovered lead lacks ordered durable failed and completed events")
 
 
-def require_case_recovery_events(document, lead_id, provider, update, label):
-    if provider == "codex" and update and label == "a":
+def require_case_recovery_events(document, lead_id, provider, update, label,
+                                 pre_resume_state=None):
+    if provider == "codex" and update and label == "a" and pre_resume_state == "recovering":
         require_recovered_lead_events(document, lead_id)
+    elif provider == "codex" and update and label == "a" and pre_resume_state != "completed":
+        raise RuntimeError("Codex update lacks an original recovering or completed run")
 
 
 def codex_pre_resume_state(document, session, run_id, lead_id):
@@ -849,19 +854,177 @@ def codex_pre_resume_state(document, session, run_id, lead_id):
     raise RuntimeError("old native run is neither the original recovering lead nor a durable completed archive")
 
 
-def codex_host_trace(home, session, lead_id, error_log):
+def verified_old_codex_wait(document, session, run_id, lead_id, capture, host):
+    """Prove an old CLI is only waiting after its original lead's completed turn."""
+    if codex_pre_resume_state(document, session, run_id, lead_id) != "recovering":
+        raise RuntimeError("old Codex root is not recovering its original lead")
+    run = document["active_runs"][f"codex:{session}"]
+    if any(item.get("state") != "completed"
+           for item in run.get("delegations", []) if item.get("identity") != lead_id):
+        raise RuntimeError("old Codex root still owns another active child")
+    stops = [record for record in capture.get("records", [])
+             if record.get("event") == "SubagentStop"
+             and record.get("session_id") == session
+             and record.get("agent_id") == lead_id
+             and record.get("exit_marker_written")
+             and record.get("script_exit_marker_code") == 0]
+    turn_hashes = {sha256(str(record.get("turn_id")).encode()).hexdigest()[:12]
+                   for record in stops if record.get("turn_id")}
+    turns = host.get("lead_turns", [])
+    if (len(turn_hashes) < 2 or not turns
+            or not turns[-1].get("completed")
+            or turns[-1].get("reported_outcome") != "completed"
+            or turns[-1].get("turn_hash") not in turn_hashes):
+        raise RuntimeError("old Codex lead lacks a hooked latest completed native turn")
+    last_call = host.get("last_root_function_call") or {}
+    calls = host.get("root_tool_calls_tail") or []
+    if (last_call.get("name") != "wait_agent" or last_call.get("return_recorded")
+            or not calls or calls[-1].get("name") != "wait_agent"
+            or not calls[-1].get("call_hash")
+            or (calls[-1].get("wait_timeout_ms") or 0) < 600000):
+        raise RuntimeError("old Codex root is not in a long native wait")
+    return {"reason": "old_runtime_wait_after_hooked_completed_turn",
+            "latest_turn_hash": turns[-1]["turn_hash"],
+            "wait_call_hash": calls[-1].get("call_hash")}
+
+
+def wait_for_old_codex_root(process, root, update, state_path, session, run_id,
+                            lead_id, error_log, deadline):
+    """Let the old CLI exit, or end only a proven stale native wait."""
+    waiting_since = None
+    waiting_identity = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, 0)
+        if os.name == "nt":
+            # Terminating an npm .cmd wrapper does not establish that its
+            # native Codex descendant exited; never overlap a candidate root.
+            return process.wait(timeout=remaining), None
+        try:
+            return process.wait(timeout=min(5, remaining)), None
+        except subprocess.TimeoutExpired:
+            try:
+                proof = verified_old_codex_wait(
+                    read_state_snapshot(state_path), session, run_id, lead_id,
+                    codex_hook_capture_summary(root),
+                    codex_host_trace(update["home"], session, lead_id, error_log,
+                                     strict=True))
+            except (OSError, TimeoutError, ValueError, RuntimeError):
+                waiting_since = None
+                waiting_identity = None
+                continue
+            identity = (proof["latest_turn_hash"], proof["wait_call_hash"])
+            if identity != waiting_identity:
+                waiting_since = time.monotonic()
+                waiting_identity = identity
+                continue
+            if time.monotonic() - waiting_since < 15:
+                continue
+            # The released 1.5.1 hook cannot be changed after install. End
+            # only its stuck CLI wait; candidate resume keeps root/run/lead IDs.
+            process.terminate()
+            exit_code = process.wait(timeout=5)
+            proof["old_cli_exit_code"] = exit_code
+            return exit_code, proof
+
+
+def native_lead_registered(document, provider, session, run_id, lead_id):
+    run = document.get("active_runs", {}).get(f"{provider}:{session}") or {}
+    return run.get("run_id") == run_id and run.get("lead_identity") == lead_id
+
+
+def registration_cli_exited(provider, processes):
+    # Claude --print can exit successfully while background agents still run.
+    return any((code := process.poll()) is not None
+               and (provider == "codex" or code != 0)
+               for process in processes.values())
+
+
+def require_inflight_update_leads(documents, provider, sessions, run_ids, lead_ids):
+    for label, session in sessions.items():
+        run = documents[label].get("active_runs", {}).get(f"{provider}:{session}") or {}
+        if (not native_lead_registered(documents[label], provider, session,
+                                       run_ids[label], lead_ids[label])
+                or run.get("status") != "active"
+                or not any(item.get("identity") == lead_ids[label]
+                           and item.get("role") == "lead" and item.get("state") == "working"
+                           for item in run.get("delegations", []))):
+            raise RuntimeError(f"{label}: native lead finished before in-flight update began")
+
+
+def timestamp_ns(value):
+    if not isinstance(value, str):
+        raise RuntimeError("native or durable completion lacks a timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise RuntimeError("native or durable completion has an invalid timestamp") from None
+    if parsed.tzinfo is None:
+        raise RuntimeError("native or durable completion timestamp lacks a timezone")
+    return int(parsed.timestamp() * 1_000_000_000)
+
+
+def require_post_removal_lead_completion(document, provider, session, lead_id,
+                                         native_trace, removed_ns):
+    """Prove an original child turn spans old-source removal and later reconciles."""
+    if not isinstance(removed_ns, int) or removed_ns <= 0:
+        raise RuntimeError("old plugin removal boundary is missing")
+    events = [event for event in document.get("event_history", ())
+              if event.get("kind") == "lead_completed"
+              and event.get("payload", {}).get("identity") == lead_id]
+    if not events or not any(timestamp_ns(event.get("observed_at")) > removed_ns
+                             for event in events):
+        raise RuntimeError("original lead lacked durable completion after old plugin removal")
+    turns = native_trace.get("lead_turns" if provider == "codex" else "child_turns", ())
+    if provider == "codex":
+        straddled = any(turn.get("completed") is True
+                        and timestamp_ns(turn.get("started_at")) < removed_ns
+                        < timestamp_ns(turn.get("completed_at"))
+                        for turn in turns if turn.get("completed") is True)
+        completed_after = any(turn.get("reported_outcome") == "completed"
+                              and turn.get("completed") is True
+                              and timestamp_ns(turn.get("completed_at")) > removed_ns
+                              for turn in turns if turn.get("reported_outcome") == "completed")
+    elif provider == "claude":
+        if native_trace.get("child_prompt_shape_supported") is not True:
+            raise RuntimeError("native Claude child prompt shape is unsupported")
+        straddled = any(turn.get("last_stop_reason") == "end_turn"
+                        and timestamp_ns(turn.get("child_prompt_at")) < removed_ns
+                        < timestamp_ns(turn.get("last_assistant_at"))
+                        for turn in turns if turn.get("last_stop_reason") == "end_turn")
+        completed_after = any(turn.get("marker") == "completed"
+                              and turn.get("last_stop_reason") == "end_turn"
+                              and timestamp_ns(turn.get("last_assistant_at")) > removed_ns
+                              for turn in turns if turn.get("marker") == "completed")
+    else:
+        raise RuntimeError("unsupported native provider")
+    if not straddled or not completed_after:
+        raise RuntimeError("original native lead turn did not span and complete after old plugin removal")
+    return {"session_id": session, "lead_id": lead_id,
+            "durable_completion_after_removal": True,
+            "native_turn_spanned_removal": True}
+
+
+def codex_host_trace(home, session, lead_id, error_log, *, strict=False):
     """Extract only tool and turn metadata from disposable Codex JSONL."""
     def fingerprint(value):
         return sha256(str(value).encode()).hexdigest()[:12] if value else None
 
     def records(path):
         if not path:
+            if strict:
+                raise ValueError("native Codex transcript is missing")
             return
         with path.open(errors="replace") as stream:
             for line in stream:
+                if strict and not line.endswith("\n"):
+                    raise ValueError("native Codex transcript ends with a partial row")
                 try:
                     yield json.loads(line)
                 except ValueError:
+                    if strict:
+                        raise ValueError("native Codex transcript has an invalid row") from None
                     continue
 
     def output_summary(payload):
@@ -1100,7 +1263,9 @@ def codex_host_trace(home, session, lead_id, error_log):
         elif record.get("type") == "event_msg" and payload.get("type") == "task_started":
             turn_id = payload.get("turn_id")
             if turn_id:
-                turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})["started"] = True
+                turn = turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})
+                turn["started"] = True
+                turn["started_at"] = record.get("timestamp")
         elif record.get("type") == "turn_context":
             turn_id = payload.get("turn_id")
             if turn_id:
@@ -1112,6 +1277,7 @@ def codex_host_trace(home, session, lead_id, error_log):
             if turn_id:
                 turn = turns.setdefault(turn_id, {"turn_hash": fingerprint(turn_id)})
                 turn["completed"] = True
+                turn["completed_at"] = record.get("timestamp")
                 message = str(payload.get("last_agent_message") or "")
                 markers = re.findall(r"^SYMPHONY_OUTCOME:\s*(\{[^\n]*\})", message, re.MULTILINE)
                 if markers:
@@ -1167,6 +1333,8 @@ def check_case(provider, root, separate, timeout, budget, update=None,
     logs.mkdir()
     processes = {}
     sessions = {}
+    old_root_interruption = None
+    pre_resume_state = None
     try:
         for label, project in (("a", first), ("b", second)):
             sessions[label] = str(uuid.uuid4()) if provider == "claude" else ""
@@ -1202,7 +1370,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                             raise RuntimeError(
                                 f"{label}: native lead used another Symphony plugin version at gate")
                     if all(docs[label].get("active_runs", {}).get(
-                            f"{provider}:{session}", {}).get("lead_identity")
+                            f"{provider}:{session}", {}).get("run_id")
                             for label, session in sessions.items()):
                         break
             time.sleep(.25)
@@ -1226,16 +1394,17 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     "cli_exit_code": processes[label].poll(),
                 }
             (case / "gate_timeout.json").write_text(json.dumps(gate_timeout))
-            raise RuntimeError("native lead ownership did not overlap before deadline")
-        observed_leads = {}
+            raise RuntimeError("native lead starts did not overlap before deadline")
+        observed_leads = {label: json.loads((gate_dir / f"{label}.ready").read_text())["agent_id"]
+                          for label in sessions}
+        if len(set(observed_leads.values())) != 2:
+            raise RuntimeError("native start gate reused one lead identity across roots")
         if separate:
             for label, doc in docs.items():
                 owned = [run for key, run in doc.get("active_runs", {}).items()
                          if key.startswith(provider + ":")]
-                if (len(owned) != 1 or owned[0].get("session_id") != sessions[label]
-                        or not owned[0].get("lead_identity")):
-                    raise RuntimeError(f"{label}: expected one owned lead in its worktree")
-                observed_leads[label] = owned[0]["lead_identity"]
+                if len(owned) != 1 or owned[0].get("session_id") != sessions[label]:
+                    raise RuntimeError(f"{label}: expected one owned run in its worktree")
             if paths["a"] == paths["b"]:
                 raise RuntimeError("different worktrees shared a state key")
         else:
@@ -1243,13 +1412,9 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                      if key.startswith(provider + ":")]
             if len(owned) != 2 or len({run.get("session_id") for run in owned}) != 2:
                 raise RuntimeError("same worktree did not preserve two independent owner sessions")
-            if len({run.get("lead_identity") for run in owned}) != 2:
-                raise RuntimeError("same worktree did not preserve two independent leads")
             by_session = {run.get("session_id"): run for run in owned}
             if set(by_session) != set(sessions.values()):
                 raise RuntimeError("same worktree owner sessions differ from native CLI sessions")
-            observed_leads = {label: by_session[session]["lead_identity"]
-                              for label, session in sessions.items()}
         observed_run_ids = {label: docs[label]["active_runs"][f"{provider}:{session}"]["run_id"]
                             for label, session in sessions.items()}
         if provider == "codex":
@@ -1266,6 +1431,27 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 if not any(item["same_lead_id"] and item["lead_packet_metadata_matches"]
                            for item in host["spawn_calls"]):
                     raise RuntimeError(f"{label}: native original lead spawn lacks required transport metadata")
+        # Native hosts may invoke the test hook before the package's Start
+        # hook. Release only that barrier, then require the exact product
+        # registration before a live update can begin.
+        gate_release_before_update = not all(
+            native_lead_registered(docs[label], provider, sessions[label],
+                                   observed_run_ids[label], observed_leads[label])
+            for label in sessions)
+        if gate_release_before_update:
+            (gate_dir / "release").touch()
+        while not all(native_lead_registered(docs[label], provider, sessions[label],
+                                             observed_run_ids[label], observed_leads[label])
+                      for label in sessions):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("native lead Start never registered after gate release")
+            if registration_cli_exited(provider, processes):
+                raise RuntimeError("native CLI exited before both lead Starts registered")
+            time.sleep(.1)
+            docs = {label: read_state_snapshot(path) for label, path in paths.items()}
+        if update:
+            require_inflight_update_leads(docs, provider, sessions,
+                                          observed_run_ids, observed_leads)
         gate_evidence = {label: {
             "ready": (gate_dir / f"{label}.ready").is_file(),
             "start_matches_original_lead": json.loads((gate_dir / f"{label}.ready").read_text())
@@ -1273,6 +1459,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             "owner_active": bool(docs[label]["active_runs"].get(f"{provider}:{session}")),
             "lead_matches_original": docs[label]["active_runs"][f"{provider}:{session}"]
                                      ["lead_identity"] == observed_leads[label],
+            "registered_before_release": not gate_release_before_update,
         } for label, session in sessions.items()}
         if not all(item["start_matches_original_lead"] for item in gate_evidence.values()):
             raise RuntimeError("native gate lead identity differs from durable original lead")
@@ -1280,6 +1467,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
         if update:
             snapshot_file = case / "update_event_counts.json"
             snapshot = {"pre_update": {label: event_counts(docs[label]) for label in sessions},
+                        "gate_release_before_update": gate_release_before_update,
                         "original_owners": {label: {"session_id": sessions[label],
                                                     "run_id": observed_run_ids[label],
                                                     "lead_id": observed_leads[label]}
@@ -1287,15 +1475,27 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             snapshot_file.write_text(json.dumps(snapshot))
             old_records = update_while_gated(update, env, docs, sessions,
                                              {"a": first, "b": second}, deadline)
+            snapshot["old_source_removed_ns"] = update["old_source_removed_ns"]
             snapshot["post_update"] = {label: event_counts(json.loads(paths[label].read_text()))
                                        for label in sessions}
             snapshot_file.write_text(json.dumps(snapshot))
-        (gate_dir / "release").touch()
+        if not gate_release_before_update:
+            (gate_dir / "release").touch()
         if provider == "codex":
             for label, process in processes.items():
                 remaining = max(1, deadline - time.monotonic())
-                if process.wait(timeout=remaining):
-                    raise RuntimeError(f"{label}: native CLI exited {process.returncode}")
+                if update and label == "a":
+                    exit_code, old_root_interruption = wait_for_old_codex_root(
+                        process, root, update, paths[label], sessions[label],
+                        observed_run_ids[label], observed_leads[label],
+                        logs / f"{label}.errors", deadline)
+                    if old_root_interruption:
+                        (case / "old_root_interruption.json").write_text(
+                            json.dumps(old_root_interruption))
+                else:
+                    exit_code = process.wait(timeout=remaining)
+                if exit_code and not (label == "a" and old_root_interruption):
+                    raise RuntimeError(f"{label}: native CLI exited {exit_code}")
             if update:
                 before_resume = json.loads(paths["a"].read_text())
                 pre_resume_state = codex_pre_resume_state(
@@ -1446,6 +1646,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             record = read_state_snapshot(record_path)
             if record.get("pending") or record.get("overflow"):
                 raise RuntimeError("native session retained unresolved child callbacks after completion")
+        post_removal_evidence = {}
         for label, doc in final_docs.items():
             released = gate_dir / "release"
             terminals = [event for event in doc.get("event_history", ())
@@ -1467,6 +1668,16 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 raise RuntimeError(f"{label}: completed run changed lead identity")
             if completed_run.get("run_id") != observed_run_ids[label]:
                 raise RuntimeError(f"{label}: active run was restarted during the native session")
+            if update:
+                native_trace = (codex_host_trace(update["home"], sessions[label],
+                                                 observed_leads[label], logs / f"{label}.errors",
+                                                 strict=True)
+                                if provider == "codex" else
+                                claude_host_trace(update["home"], sessions[label],
+                                                  observed_leads[label]))
+                post_removal_evidence[label] = require_post_removal_lead_completion(
+                    doc, provider, sessions[label], observed_leads[label], native_trace,
+                    update["old_source_removed_ns"])
             if not update:
                 activation = doc.get("activation", {}).get(provider, {})
                 profiles = [activation, *activation.get("session_profiles", [])]
@@ -1498,7 +1709,8 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                              == update["candidate_source"].resolve()
                              for item in records):
                     raise RuntimeError(f"{label}: same-session Claude resume did not load the candidate")
-            require_case_recovery_events(doc, observed_leads[label], provider, update, label)
+            require_case_recovery_events(doc, observed_leads[label], provider, update,
+                                         label, pre_resume_state)
         capture = codex_hook_capture_summary(root, provider)
         for label, session in sessions.items():
             gate_starts = [record for record in capture["records"]
@@ -1541,7 +1753,11 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 "observed_overlap": True, "completed": ["a", "b"],
                 "candidate_version": candidate_version, "pending_callbacks": 0,
                 "gate_version": update["old_version"] if update else candidate_version,
+                "gate_release_before_update": gate_release_before_update,
                 "gate_evidence": gate_evidence,
+                **({"old_source_removed_ns": update["old_source_removed_ns"],
+                    "post_removal_original_completions": post_removal_evidence}
+                   if update else {}),
                 "original_owners": {label: {"session_id": sessions[label],
                                              "run_id": observed_run_ids[label],
                                              "lead_id": observed_leads[label]}
@@ -1561,6 +1777,10 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                    if update and provider == "claude" else {}),
                 **({"native_resume_mode": "status-version" if pre_resume_state == "completed"
                     else "direct-stop" if direct_stop_resume else "reconcile"}
+                   if update and provider == "codex" else {}),
+                **({"pre_candidate_resume_state": pre_resume_state}
+                   if update and provider == "codex" else {}),
+                **({"old_root_interruption": old_root_interruption}
                    if update and provider == "codex" else {}),
                 "native_hook_capture": {
                     "configured": capture["configured"],
@@ -1892,6 +2112,18 @@ def claude_recovery_probe(document, session, project, home):
         return {"result": "probe_error", "error_type": type(error).__name__}
 
 
+def claude_child_user_kind(content):
+    if isinstance(content, str):
+        return "prompt"
+    if isinstance(content, list) and content and all(isinstance(item, dict) for item in content):
+        kinds = {item.get("type") for item in content}
+        if kinds == {"text"} and all(isinstance(item.get("text"), str) for item in content):
+            return "prompt"
+        if kinds == {"tool_result"}:
+            return "tool_result"
+    return "unsupported"
+
+
 def claude_host_trace(home, session, lead_id):
     """Join native Agent calls and child turns without exporting transcript text."""
     plugin = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
@@ -1918,6 +2150,7 @@ def claude_host_trace(home, session, lead_id):
         meta = {}
     result = {"root_transcript_readable": parent is not None,
               "child_transcript_readable": child is not None,
+              "child_prompt_shape_supported": child is not None,
               "meta_launch_id_hash": digest(meta.get("toolUseId")),
               "meta_agent_type": meta.get("agentType") if re.fullmatch(
                   r"symphony:symphony-[a-z0-9-]{1,96}", str(meta.get("agentType") or ""))
@@ -1981,15 +2214,20 @@ def claude_host_trace(home, session, lead_id):
         for row in child:
             message = row.get("message") or {}
             content = message.get("content") if isinstance(message, dict) else None
-            if row.get("type") == "user" and isinstance(content, str):
-                turn = {"child_prompt_id_hash": digest(row.get("uuid")),
-                        "child_prompt_at": row.get("timestamp"),
-                        "last_assistant_at": None,
-                        "last_assistant_id_hash": None,
-                        "last_stop_reason": None,
-                        "marker": None,
-                        "handback_count": 0}
-                result["child_turns"].append(turn)
+            if row.get("type") == "user":
+                kind = claude_child_user_kind(content)
+                if kind == "unsupported":
+                    result["child_prompt_shape_supported"] = False
+                    turn = None
+                elif kind == "prompt":
+                    turn = {"child_prompt_id_hash": digest(row.get("uuid")),
+                            "child_prompt_at": row.get("timestamp"),
+                            "last_assistant_at": None,
+                            "last_assistant_id_hash": None,
+                            "last_stop_reason": None,
+                            "marker": None,
+                            "handback_count": 0}
+                    result["child_turns"].append(turn)
             elif row.get("type") == "assistant" and turn is not None:
                 turn["last_assistant_at"] = row.get("timestamp")
                 turn["last_assistant_id_hash"] = digest(row.get("uuid"))
@@ -2248,6 +2486,9 @@ def failure_state(root, provider):
                                                for label in labels
                                                if (phase := case_root / "logs" /
                                                    f"{label}.resume.phase.json").is_file()},
+                      "old_root_interruption": json.loads(interruption.read_text())
+                      if (interruption := case_root / "old_root_interruption.json").is_file()
+                      else None,
                       "update_event_counts": snapshots})
     host = {}
     if provider == "codex":
