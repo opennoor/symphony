@@ -213,7 +213,7 @@ def main():
             if checked.returncode or "guarded: matching current-session heartbeat" not in checked.stdout:
                 raise RuntimeError("hook-supplied absolute checker failed after native activation")
             evidence.append({"environment": label, "old_checker_exit": failed.returncode,
-                "old_launch_error": failed.stderr.strip().splitlines()[0][:200] if failed.stderr.strip() else "native launch failed",
+                "old_launch_error_categories": error_categories(failed.stderr or ""),
                 "new_checker_exit": checked.returncode, "native_heartbeat": "guarded", "standard_user": True})
         env["CODEX_SESSION_ID"] = "foreign-session"
         rejected = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command", command],

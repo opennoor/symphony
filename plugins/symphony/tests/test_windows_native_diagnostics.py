@@ -1,5 +1,5 @@
 """Private native launcher diagnostics preserve the command and export fixed facts."""
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import base64
 import importlib.util
 import io
@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import sys
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -21,6 +22,43 @@ spec.loader.exec_module(native)
 
 
 class WindowsNativeDiagnosticsTests(unittest.TestCase):
+    def test_checker_receipt_exports_categories_without_private_stderr(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'project'
+            project.mkdir()
+            failed = subprocess.CompletedProcess([], 1, '',
+                'python.exe not recognized C:\\PRIVATE_PATH\\config token=PRIVATE_SECRET')
+            checked = subprocess.CompletedProcess([], 0, 'guarded: matching current-session heartbeat', '')
+            rejected = subprocess.CompletedProcess([], 1, '', 'PRIVATE_FOREIGN_SESSION')
+            output = io.StringIO()
+            environment = SimpleNamespace(name='nt', environ={'SystemRoot': 'C:\\Windows'})
+            windows = SimpleNamespace(shell32=SimpleNamespace(IsUserAnAdmin=lambda: False))
+            with patch.object(native, 'os', environment), \
+                    patch.object(native.ctypes, 'windll', windows, create=True), \
+                    patch.object(native.tempfile, 'TemporaryDirectory', return_value=nullcontext(str(root))), \
+                    patch.object(native, 'prepare_baseline_capture', return_value={'CODEX_HOME': str(root / 'home')}), \
+                    patch.object(native, 'prepare_private_native_clock'), \
+                    patch.object(native, 'projects', return_value=(project, None)), \
+                    patch.object(native.shutil, 'which', return_value='codex.exe'), \
+                    patch.object(native, 'original_native_activation', return_value=(checked, 'session', {'plugin_root': str(root)})), \
+                    patch.object(native, 'native_session_rows', return_value=[{'payload': {'content': [{'text':
+                        'Check activation through the verified launcher: PRIVATE_CHECKER_COMMAND'}]}}]), \
+                    patch.object(native.subprocess, 'run', side_effect=[failed, checked, failed, checked, rejected]), \
+                    redirect_stdout(output):
+                self.assertEqual(native.main(), 0)
+            receipt = json.loads(output.getvalue())
+            self.assertTrue(receipt['foreign_session_rejected'])
+            self.assertEqual(len(receipt['windows_native_activation']), 2)
+            for evidence in receipt['windows_native_activation']:
+                self.assertEqual(evidence['old_checker_exit'], 1)
+                self.assertEqual(evidence['new_checker_exit'], 0)
+                self.assertNotIn('old_launch_error', evidence)
+                self.assertEqual(evidence['old_launch_error_categories'], native.error_categories(failed.stderr))
+                self.assertTrue(evidence['old_launch_error_categories']['python_unavailable'])
+            self.assertNotIn('PRIVATE_', output.getvalue())
+            self.assertIn('PRIVATE_SECRET', failed.stderr, 'raw stderr remains private and unchanged')
+
     def test_native_jsonl_is_utf8_and_malformed_bytes_are_not_accepted(self):
         with TemporaryDirectory() as directory:
             home = Path(directory)
