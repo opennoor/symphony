@@ -42,9 +42,19 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
             self.assertEqual(accepted['freshness'], 'none')
             self.assertEqual(accepted['prompt_activity']['stage'], 'accepted')
             self.assertEqual(accepted['prompt_activity']['launch_minus_run_start_ms'], -1)
+            self.assertTrue(accepted['prompt_activity']['launch_hash_present'])
+            self.assertTrue(accepted['prompt_activity']['launch_hash_valid'])
+            self.assertTrue(accepted['prompt_activity']['launch_hash_matches_native_meta'])
+            self.assertTrue(accepted['prompt_activity']['genuine_fast_owner'])
             self.assertNotIn(SESSION, json.dumps(accepted))
             self.assertNotIn('toolu_launch', json.dumps(accepted))
             self.assertNotIn(str(fixture.project), json.dumps(accepted))
+            fixture.store.save(fixture.project, ProjectState(recent_runs=(replace(run, status='completed'),)))
+            archive_probe = smoke.claude_completion_probe(json.loads(
+                fixture.store._path(fixture.project).read_text()), SESSION, fixture.project, home)
+            self.assertTrue(archive_probe['from_completed_archive'])
+            self.assertEqual(archive_probe['freshness'], 'none')
+            self.assertEqual(archive_probe['prompt_activity']['launch_minus_run_start_ms'], -1)
             rows = [json.loads(line) for line in fixture.child.read_text().splitlines()]
             rows[-1]['message']['model'] = 'foreign-model'
             fixture.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
@@ -55,6 +65,29 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
             self.assertEqual(later_rejection['freshness'], 'unknown')
             self.assertTrue(later_rejection['native_reader']['accepted_fast_launch_anchor_matches'])
             self.assertEqual(later_rejection['native_reader']['stage'], 'terminal')
+            run = replace(run, assessment={**run.assessment,
+                '_claude_fast_root_prompt_hash': hashlib.sha256(b'foreign-root-prompt').hexdigest()})
+            fixture.store.save(fixture.project, ProjectState(active_run=run))
+            mismatch = smoke.claude_completion_probe(json.loads(
+                fixture.store._path(fixture.project).read_text()), SESSION, fixture.project, home)
+            components = mismatch['native_reader']
+            self.assertTrue(components['launch_hash_matches_native_meta'])
+            self.assertTrue(components['genuine_fast_owner'])
+            self.assertTrue(components['root_prompt_hash_present'])
+            self.assertFalse(components['root_prompt_hash_matches_selected_native_prompt'])
+            self.assertFalse(components['root_prompt_hash_matches_any_prior_native_prompt'])
+            parent = [json.loads(line) for line in fixture.parent.read_text().splitlines()]
+            parent.insert(1, {**parent[0], 'uuid': 'new-native-root-prompt',
+                              'timestamp': '2026-09-29T02:00:40Z'})
+            fixture.parent.write_text(''.join(json.dumps(row) + '\n' for row in parent), encoding='utf-8')
+            run = replace(run, assessment={**run.assessment,
+                '_claude_fast_root_prompt_hash': hashlib.sha256(b'root-prompt').hexdigest()})
+            fixture.store.save(fixture.project, ProjectState(active_run=run))
+            earlier_match = smoke.claude_completion_probe(json.loads(
+                fixture.store._path(fixture.project).read_text(encoding='utf-8')), SESSION, fixture.project, home)['native_reader']
+            self.assertEqual(earlier_match['prior_native_root_prompt_count'], 2)
+            self.assertFalse(earlier_match['root_prompt_hash_matches_selected_native_prompt'])
+            self.assertTrue(earlier_match['root_prompt_hash_matches_any_prior_native_prompt'])
         finally:
             fixture.doCleanups()
             fixture.tearDown()

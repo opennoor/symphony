@@ -53,8 +53,11 @@ def generated(root=PLUGIN):
         with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0, compresslevel=0) as archive:
             archive.write(source.replace('__SYMPHONY_PROVIDER__', provider).encode())
         payload = base64.b64encode(buffer.getvalue()).decode()
-        wrapper = ("$m=[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "'));"
-                   "iex ([IO.StreamReader]::new([IO.Compression.GZipStream]::new($m,"
+        # Codex can parse this command through an outer PowerShell before CMD.
+        # Inline the stream so its double-quoted argument has no $ variables
+        # for that outer shell to expand before the inner PowerShell starts.
+        wrapper = ("iex ([IO.StreamReader]::new([IO.Compression.GZipStream]::new("
+                   "[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "')),"
                    "[IO.Compression.CompressionMode]::Decompress))).ReadToEnd()")
         prefix = 'powershell.exe -NoProfile -NonInteractive -Command '
         windows = 'cmd.exe /c ' + prefix + '"' + wrapper + '"'

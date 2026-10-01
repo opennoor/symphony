@@ -2,11 +2,13 @@
 """Prove the installed Codex checker works without PATH under a standard user."""
 
 import ctypes
+import base64
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,7 @@ def instrument_installed_hooks(root, home, version):
     """Only this disposable installation gets stderr grouping and private payloads."""
     plugin = home / 'plugins/cache/symphony-baseline/symphony' / version
     manifest = plugin / 'hooks/codex.json'
-    document = json.loads(manifest.read_text())
+    document = json.loads(manifest.read_text(encoding="utf-8"))
     diagnostics = root / 'private-native-hook-diagnostics'
     diagnostics.mkdir()
     originals = {}
@@ -56,21 +58,28 @@ def instrument_installed_hooks(root, home, version):
 def prepare_private_native_clock(root, home):
     """Observe original native payloads without changing installed commands."""
     capture = root / 'capture_codex_hook.py'
-    source = capture.read_text()
+    source = capture.read_text(encoding="utf-8")
     marker = 'event = sys.argv[1]'
     if source.count(marker) != 1:
         raise RuntimeError('private native payload capture insertion is ambiguous')
     source = source.replace(marker, marker + "\n(destination / ('private-payload-' + event + '-' + invocation + '.json')).write_text(json.dumps(payload))")
-    capture.write_text(source)
+    capture.write_text(source, encoding="utf-8")
     clock_manifest = home / 'hooks.json'
-    clock = json.loads(clock_manifest.read_text())
+    clock = json.loads(clock_manifest.read_text(encoding="utf-8"))
     for groups in clock['hooks'].values():
         for handler in (hook for group in groups for hook in group['hooks']):
             command = handler.get('command_windows', '')
-            if not command.startswith('python.exe -I '):
+            arguments = shlex.split(command, posix=False)
+            if len(arguments) != 6 or arguments[:2] != ['python.exe', '-I'] or arguments[-1] != 'codex':
                 raise RuntimeError('native observation clock command is unexpected')
-            handler['command_windows'] = '"' + sys.executable + '" -I ' + command.removeprefix('python.exe -I ')
-    clock_manifest.write_text(json.dumps(clock))
+            arguments = [value[1:-1] if value.startswith('"') and value.endswith('"') else value
+                         for value in arguments[2:]]
+            literal = lambda value: "'" + value.replace("'", "''") + "'"
+            code = '& ' + literal(sys.executable) + ' -I ' + ' '.join(map(literal, arguments)) + ';exit $LASTEXITCODE'
+            # This small observer command must survive either outer PS or CMD;
+            # the product command remains original for the acceptance attempt.
+            handler['command_windows'] = 'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + base64.b64encode(code.encode('utf-16-le')).decode()
+    clock_manifest.write_text(json.dumps(clock), encoding="utf-8")
 
 
 def activation_failure_diagnostics(root, project, env, plugin, originals, diagnostics, result, instrumented=None, instrumented_error=None):
@@ -86,26 +95,31 @@ def activation_failure_diagnostics(root, project, env, plugin, originals, diagno
     payloads = list((root / 'codex-hook-capture').glob('private-payload-SessionStart-*.json'))
     session = re.search(r'^session id: ([0-9a-f-]+)[ \t]*\r?$', (result.stderr or ""), re.MULTILINE)
     if session:
-        payloads = [path for path in payloads if json.loads(path.read_text()).get('session_id') == session[1]]
+        payloads = [path for path in payloads if json.loads(path.read_text(encoding="utf-8")).get('session_id') == session[1]]
     else:
         payloads = []
     original = originals.get(('SessionStart', 0))
     if len(payloads) == 1 and original:
-        payload = payloads[0].read_text()
-        # Rust's native command runner uses COMSPEC /C with raw outer quotes.
-        # Compare its CREATE_NO_WINDOW flag using the original installed command.
-        command = subprocess.list2cmdline([env.get('COMSPEC', os.environ.get('COMSPEC', 'cmd.exe'))]) + ' /C "' + original + '"'
+        payload = payloads[0].read_text(encoding="utf-8")
+        # Pinned Codex uses the selected environment shell; Windows defaults
+        # to PowerShell. CMD remains a supported configured-shell fallback.
+        ps = (shutil.which('pwsh.exe', path=env.get('PATH')) or
+              str(Path(env.get('SystemRoot', os.environ.get('SystemRoot', 'C:\\Windows'))) /
+                  'System32/WindowsPowerShell/v1.0/powershell.exe'))
+        commands = (('powershell', [ps, '-NoProfile', '-Command', original]),
+                    ('cmd', subprocess.list2cmdline([env.get('COMSPEC', os.environ.get('COMSPEC', 'cmd.exe'))]) + ' /C "' + original + '"'))
         replay_env = {**env, 'PLUGIN_ROOT': str(plugin)}
-        for label, flags in (('normal', 0), ('no-window', 0x08000000)):
-            try:
-                replay = subprocess.run(command, cwd=project, env=replay_env, input=payload,
-                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, creationflags=flags)
-                evidence['original_command_replay'].append({'creation_mode': label, 'exit_code': replay.returncode,
-                    'categories': error_categories(replay.stderr), 'stdout_nonempty': bool(replay.stdout)})
-            except (OSError, subprocess.TimeoutExpired) as error:
-                evidence['original_command_replay'].append({'creation_mode': label,
-                    'launch_failed': isinstance(error, OSError), 'timed_out': isinstance(error, subprocess.TimeoutExpired),
-                    'categories': error_categories(str(error))})
+        for shell, command in commands:
+            for label, flags in (('normal', 0), ('no-window', 0x08000000)):
+                try:
+                    replay = subprocess.run(command, cwd=project, env=replay_env, input=payload,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, creationflags=flags)
+                    evidence['original_command_replay'].append({'shell': shell, 'creation_mode': label, 'exit_code': replay.returncode,
+                        'categories': error_categories(replay.stderr), 'stdout_nonempty': bool(replay.stdout)})
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    evidence['original_command_replay'].append({'shell': shell, 'creation_mode': label,
+                        'launch_failed': isinstance(error, OSError), 'timed_out': isinstance(error, subprocess.TimeoutExpired),
+                        'categories': error_categories(str(error))})
     evidence['native_payload_available'] = len(payloads) == 1
     print(json.dumps({'windows_native_activation_failure': evidence}), flush=True)
 
@@ -137,12 +151,18 @@ def original_native_activation(root, project, env, version, command):
     if not state.is_file():
         diagnose_original_failure(root, project, env, version, command, result)
         raise RuntimeError('installed native Codex produced no Symphony state; see fixed diagnostic categories')
-    document = json.loads(state.read_text())
+    document = json.loads(state.read_text(encoding="utf-8"))
     heartbeat = document.get('activation', {}).get('codex', {})
     if heartbeat.get("state") != "guarded" or heartbeat.get("session_id") != session:
         diagnose_original_failure(root, project, env, version, command, result)
         raise RuntimeError("installed standard-user heartbeat did not match this native session")
     return result, session, heartbeat
+
+
+def native_session_rows(home, session):
+    """Native JSONL is UTF-8 evidence; malformed bytes must remain a failure."""
+    return [json.loads(line) for path in (home / 'sessions').rglob(f'*{session}.jsonl')
+            for line in path.read_text(encoding='utf-8').splitlines()]
 
 
 def main():
@@ -155,7 +175,7 @@ def main():
         env.update(prepare_baseline_capture("codex", root, candidate))
         env.update(SYMPHONY_STATE_DIR=str(root / "state"), SYMPHONY_RUNTIME_DIR=str(root / "runtimes"),
                    SYMPHONY_HOOK_DECISIONS_DIR=str(root / "decisions"), SYMPHONY_PROFILE="latest")
-        version = json.loads((candidate / '.codex-plugin/plugin.json').read_text())['version']
+        version = json.loads((candidate / '.codex-plugin/plugin.json').read_text(encoding="utf-8"))['version']
         prepare_private_native_clock(root, Path(env['CODEX_HOME']))
         project, _ = projects(root, False)
         command = [shutil.which("codex"), "exec", "--dangerously-bypass-hook-trust",
@@ -163,8 +183,7 @@ def main():
             "-C", str(project), "$symphony:symphony help"]
         result, session, heartbeat = original_native_activation(root, project, env, version, command)
         # The actual native hook's returned context is captured in its transcript.
-        rows = [json.loads(line) for path in (Path(env["CODEX_HOME"]) / "sessions").rglob(f"*{session}.jsonl")
-                for line in path.read_text().splitlines()]
+        rows = native_session_rows(Path(env['CODEX_HOME']), session)
         texts = [block.get("text", "") for row in rows for block in row.get("payload", {}).get("content", [])
                  if isinstance(block, dict)]
         commands = []

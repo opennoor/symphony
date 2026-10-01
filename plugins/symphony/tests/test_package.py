@@ -73,7 +73,7 @@ class PackageContractTests(unittest.TestCase):
                 self.assertLess(len('cmd.exe /d /s /c ' + invocation), 8170)
                 tokens = shlex.split(whole_command)
                 self.assertEqual(tokens.count('SYMPHONY_CAPTURED_BOOTSTRAP=' + bootstrap() + ';'), 1)
-                command = next(token for token in tokens if token.startswith('$m='))
+                command = next(token for token in tokens if token.startswith('iex '))
                 provider = 'claude'
             payload = base64.b64decode(re.search(r"FromBase64String\('([^']+)'", command)[1])
             binding = ("$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
@@ -83,6 +83,59 @@ class PackageContractTests(unittest.TestCase):
             self.assertEqual(payload[:10], bytes.fromhex('1f8b08000000000000ff'))
             self.assertEqual((payload[10] >> 1) & 3, 0, 'DEFLATE must use stored blocks')
             self.assertEqual(len(payload), len(expected) + 23)
+
+    @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
+    def test_outer_powershell_preserves_exact_wrapper_and_reproduces_old_variable_expansion(self):
+        from plugins.symphony.scripts.generate_hooks import generated
+        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        document = json.loads(generated()[PLUGIN / 'hooks/codex.json'])
+        command = document['hooks']['SessionStart'][0]['hooks'][0]['commandWindows']
+        wrapper = command.split('-Command "', 1)[1][:-1]
+        self.assertNotIn('$', wrapper)
+        stream = re.search(r"\[IO.MemoryStream\]::new\(\[Convert\]::FromBase64String\('[^']+'\)\)", wrapper)[0]
+        old = '$m=' + stream + ';' + wrapper.replace(stream, '$m')
+        capture = ('function global:cmd.exe { $t=$null; $e=$null; '
+            '[void][Management.Automation.Language.Parser]::ParseInput($args[-1],[ref]$t,[ref]$e); '
+            '@{received=$args[-1];parse_error_ids=@($e | ForEach-Object ErrorId)} | ConvertTo-Json -Compress }; ')
+        for candidate, expected in ((wrapper, True), (old, False)):
+            result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                capture + command.replace(wrapper, candidate)], input='{}', capture_output=True,
+                text=True, encoding='utf-8', timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            value = json.loads(result.stdout)
+            self.assertEqual(value['received'] == candidate, expected)
+            self.assertEqual(not value['parse_error_ids'], expected)
+
+    @unittest.skipUnless(os.name == 'nt', 'runs actual Windows selected shells')
+    def test_native_selected_windows_shells_run_hooks_after_source_cache_removal(self):
+        from plugins.symphony.scripts.generate_hooks import generated
+        from plugins.symphony.symphony.store import StateStore
+        with tempfile.TemporaryDirectory(prefix='selected shell fixture ') as temporary:
+            directory = Path(temporary)
+            root = directory / 'Reviewed Plugin With Spaces'
+            shutil.copytree(PLUGIN, root)
+            project = directory / 'Project With Spaces'
+            project.mkdir()
+            command = json.loads(generated(root)[root / 'hooks/codex.json'])['hooks']['SessionStart'][0]['hooks'][0]['commandWindows']
+            env = {**os.environ, 'PLUGIN_ROOT': str(root), 'SYMPHONY_STATE_DIR': str(directory / 'state'),
+                'SYMPHONY_RUNTIME_DIR': str(directory / 'runtimes'), 'PSExecutionPolicyPreference': 'Restricted',
+                'PATH': str(Path(sys.executable).parent) + os.pathsep + os.environ.get('PATH', '')}
+            ps = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+            shells = ([ps, '-NoProfile', '-Command', command], env.get('COMSPEC', 'cmd.exe') + ' /C "' + command + '"')
+            for removed in (False, True):
+                if removed:
+                    shutil.rmtree(root)
+                for index, shell in enumerate(shells):
+                    for flags in (0, 0x08000000):
+                        session = f'native-shell-{removed}-{index}-{flags}'
+                        result = subprocess.run(shell, input=json.dumps({'hook_event_name': 'SessionStart',
+                            'session_id': session, 'cwd': str(project), 'note': '✓'}, ensure_ascii=False),
+                            cwd=project, env=env, capture_output=True, text=True, encoding='utf-8',
+                            timeout=30, creationflags=flags)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        activation = StateStore(directory / 'state').load(project).activation['codex']
+                        self.assertEqual(activation['state'], 'guarded')
+                        self.assertEqual(activation['session_id'], session)
 
     def test_windows_probe_deadline_starts_after_candidate_collection(self):
         source = (PLUGIN / 'scripts/codex_hook.ps1').read_text()

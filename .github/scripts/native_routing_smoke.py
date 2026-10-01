@@ -73,7 +73,7 @@ def failure_diagnostics(provider, root, document):
     counts = {event: 0 for event in ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop")}
     for path in (root / f"{provider}-hook-capture").glob("*.json"):
         try:
-            event = json.loads(path.read_text()).get("event")
+            event = json.loads(path.read_text(encoding="utf-8")).get("event")
             if event in counts:
                 counts[event] += 1
         except (OSError, ValueError, AttributeError):
@@ -97,7 +97,7 @@ def failure_diagnostics(provider, root, document):
     paths = (home / ("sessions" if provider == "codex" else "projects")).rglob("*.jsonl")
     for path in paths:
         try:
-            lines = path.read_text().splitlines()
+            lines = path.read_text(encoding="utf-8").splitlines()
             rows = [json.loads(line) for line in lines]
             header = rows[0].get('payload', {}) if provider == 'codex' and rows else {}
             identity = header.get('id') if provider == 'codex' else next(
@@ -133,7 +133,7 @@ def failure_diagnostics(provider, root, document):
     phases = []
     phase_path = root / 'logs' / 'phases.json'
     if phase_path.is_file():
-        for phase in json.loads(phase_path.read_text()):
+        for phase in json.loads(phase_path.read_text(encoding="utf-8")):
             if phase.get('phase') in {'enable', 'objective', 'reconcile', 'stop'}:
                 phases.append({'phase': phase['phase'], 'resume': phase.get('resume') is True,
                                'returned': phase.get('returned') is True,
@@ -155,10 +155,18 @@ def claude_completion_probe(document, session, project, home):
     """Trace completing freshness using fixed facts, never native IDs or text."""
     state = _state_from_dict(document)
     run = state.active_runs.get(f'claude:{session}')
+    archived = False
+    if run is None:
+        run = next((item for item in reversed(state.recent_runs)
+                    if item.provider == 'claude' and item.session_id == session), None)
+        archived = run is not None
     if run is None:
         return {'freshness': 'no_active_run'}
-    state = replace(state, active_run=run)
-    captured = {'has_recovery_anchor': bool(run.assessment.get('_claude_native_recovery'))}
+    # Read-only replay of freshness for a successfully archived receipt. This
+    # never dispatches lifecycle or restores the run in its durable store.
+    state = replace(state, active_run=replace(run, status='completing') if archived else run)
+    captured = {'has_recovery_anchor': bool(run.assessment.get('_claude_native_recovery')),
+                'from_completed_archive': archived}
     readers = {host_evidence._claude_native_lead_event.__code__: 'native_reader',
                host_evidence._claude_native_prompt_activity.__code__: 'prompt_activity'}
     def trace(frame, event, value):
@@ -179,6 +187,37 @@ def claude_completion_probe(document, session, project, home):
                 facts['accepted_fast_launch_anchor_matches'] = host_evidence._claude_observed_fast_launch(
                     run, str(meta.get('toolUseId') or ''),
                     values.get('root_prompt_id', values.get('root_prompt')))
+                launch_hash = run.assessment.get('_claude_fast_launch_hash')
+                prompt_hash = run.assessment.get('_claude_fast_root_prompt_hash')
+                prompt = values.get('root_prompt_id', values.get('root_prompt'))
+                fast = run.assessment.get('_fast_route')
+                fast = fast if isinstance(fast, dict) else {}
+                route = run.assessment.get('route', {})
+                route = route if isinstance(route, dict) else {}
+                lead = next((item for item in run.delegations
+                             if item.role == 'lead' and item.identity == run.lead_identity), None)
+                valid_hash = lambda value: isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
+                prior_prompts = values.get('root_prompts', ())
+                facts.update(launch_hash_present='_claude_fast_launch_hash' in run.assessment,
+                    launch_hash_valid=valid_hash(launch_hash),
+                    launch_hash_matches_native_meta=valid_hash(launch_hash) and isinstance(meta.get('toolUseId'), str)
+                        and hashlib.sha256(meta['toolUseId'].encode()).hexdigest() == launch_hash,
+                    root_prompt_hash_present='_claude_fast_root_prompt_hash' in run.assessment,
+                    root_prompt_hash_valid=valid_hash(prompt_hash),
+                    root_prompt_hash_matches_selected_native_prompt=valid_hash(prompt_hash) and isinstance(prompt, str)
+                        and hashlib.sha256(prompt.encode()).hexdigest() == prompt_hash,
+                    prior_native_root_prompt_count=len(prior_prompts),
+                    root_prompt_hash_matches_any_prior_native_prompt=valid_hash(prompt_hash) and any(
+                        isinstance(item, str) and hashlib.sha256(item.encode()).hexdigest() == prompt_hash
+                        for item in prior_prompts),
+                    selected_native_root_prompt_available=isinstance(prompt, str),
+                    genuine_fast_owner=host_evidence._archived_fast_owner(run), provider_matches=run.provider == 'claude',
+                    fast_metadata_present=bool(fast), prior_escalated=bool(run.assessment.get('_fast_escalated')),
+                    direct_topology=run.assessment.get('topology') in {None, '', 'direct'}, canonical_lead_present=lead is not None,
+                    lead_route_matches_fast=lead is not None and (lead.requested_tier, lead.requested_effort) ==
+                        (fast.get('model'), fast.get('effort')),
+                    accepted_route_matches_fast=route.get('lead_model', fast.get('model')) == fast.get('model')
+                        and route.get('lead_effort', fast.get('effort')) == fast.get('effort'))
             parent = values.get('parent')
             if isinstance(parent, dict):
                 facts['root_cwd_match'] = Path(str(parent.get('cwd') or '')).resolve() == project.resolve()
@@ -610,24 +649,24 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     run(setup_prompt(provider), phase='enable')
     state_path = state_file(state_dir, project)
     require(state_path.is_file(), "installed enable hook did not create durable state")
-    version = json.loads((candidate / ".codex-plugin" / "plugin.json").read_text())["version"]
-    assert_enabled_fixture(json.loads(state_path.read_text()), provider, profile, version)
+    version = json.loads((candidate / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"]
+    assert_enabled_fixture(json.loads(state_path.read_text(encoding="utf-8")), provider, profile, version)
     run(prompt, provider == "claude")
     if provider == "codex":
-        matches = re.findall(r"^session id: ([0-9a-f-]+)$", (logs / "stderr").read_text(), re.MULTILINE)
+        matches = re.findall(r"^session id: ([0-9a-f-]+)$", (logs / "stderr").read_text(encoding="utf-8"), re.MULTILINE)
         require(len(matches) == 2 and matches[0] != matches[1], "native enable/objective sessions are missing or reused")
         session = matches[-1]
     require(state_path.is_file(), "installed native hooks did not create durable state")
-    document = json.loads(state_path.read_text())
+    document = json.loads(state_path.read_text(encoding="utf-8"))
     owner = f"{provider}:{session}"
     active = lambda doc: doc.get("active_runs", {}).get(owner)
     if provider == "claude" and active(document):
         # Background native results may need a same-session root turn to reconcile.
         run("Continue this Symphony session after its background results; reconcile the existing work and finish.", True, 'reconcile')
-        document = json.loads(state_path.read_text())
+        document = json.loads(state_path.read_text(encoding="utf-8"))
         if (active(document) or {}).get("status") == "completing":
             run("/symphony:stop", True, 'stop')
-            document = json.loads(state_path.read_text())
+            document = json.loads(state_path.read_text(encoding="utf-8"))
     require(active(document) is None, "native Stop did not archive the run")
     runs = [item for item in document.get("recent_runs", []) if item.get("session_id") == session]
     require(len(runs) == 1 and runs[0]["status"] == "completed", "native run did not complete exactly once")
@@ -708,6 +747,8 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
             "assessment": {key: run_state["assessment"].get(key) for key in ("size", "complexity", "topology")},
             "workers": len(workers), "worker_edit_verified": case != "command", "pending_callbacks": 0,
             "worker_packet_role_marker_observed": provider == "claude" and case != "command",
+            **({'claude_completion': claude_completion_probe(document, session, project, home)}
+               if provider == 'claude' else {}),
             "status": "completed", "fixture_sha256": fingerprint(greeting)}
 
 
@@ -741,7 +782,7 @@ def main():
                                 shutil.copytree(source, destination / source.name)
                         receipt["private_failure_path"] = str(destination)
                     for path in (Path(scratch) / "state").glob("*.v2.json"):
-                        document = json.loads(path.read_text())
+                        document = json.loads(path.read_text(encoding="utf-8"))
                         receipt["fixture_diagnostics"] = failure_diagnostics(args.provider, Path(scratch), document)
                         runs = [*document.get("active_runs", {}).values(), *document.get("recent_runs", [])]
                         receipt["observed"] = [{"status": run.get("status"), "outcome": run.get("outcome"),

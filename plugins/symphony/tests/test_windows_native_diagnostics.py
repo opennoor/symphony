@@ -1,10 +1,13 @@
 """Private native launcher diagnostics preserve the command and export fixed facts."""
 from contextlib import redirect_stdout
+import base64
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -18,6 +21,42 @@ spec.loader.exec_module(native)
 
 
 class WindowsNativeDiagnosticsTests(unittest.TestCase):
+    def test_native_jsonl_is_utf8_and_malformed_bytes_are_not_accepted(self):
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / 'sessions').mkdir()
+            path = home / 'sessions/native-fixture.jsonl'
+            path.write_text(json.dumps({'note': '✓'}, ensure_ascii=False) + '\n', encoding='utf-8')
+            self.assertEqual(native.native_session_rows(home, 'fixture'), [{'note': '✓'}])
+            path.write_bytes(b'{"note":"\x9d"}\n')
+            with self.assertRaises(UnicodeDecodeError):
+                native.native_session_rows(home, 'fixture')
+
+    @unittest.skipUnless(shutil.which('pwsh') or sys.platform == 'win32', 'needs PowerShell')
+    def test_encoded_private_clock_preserves_input_with_literal_paths_and_utf8(self):
+        # A workspace temporary directory is also visible to snap-based pwsh.
+        with TemporaryDirectory(prefix="clock path ' ", dir=Path(__file__).parent) as directory:
+            root = Path(directory).resolve()
+            home = root / 'home'
+            home.mkdir()
+            destination = root / 'capture path'
+            destination.mkdir()
+            capture = root / 'capture_codex_hook.py'
+            capture.write_text("import json,pathlib,sys\npayload=json.load(sys.stdin)\n"
+                "destination=pathlib.Path(sys.argv[2]);invocation='fixture'\nevent = sys.argv[1]\n"
+                "print(json.dumps({'input_preserved':payload['note']=='✓'}))\n", encoding='utf-8')
+            (home / 'hooks.json').write_text(json.dumps({'hooks': {'SessionStart': [{'hooks': [
+                {'command_windows': f'python.exe -I "{capture}" SessionStart "{destination}" codex'}]}]}}), encoding='utf-8')
+            native.prepare_private_native_clock(root, home)
+            clock = json.loads((home / 'hooks.json').read_text(encoding='utf-8'))['hooks']['SessionStart'][0]['hooks'][0]['command_windows']
+            ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+            result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-EncodedCommand', clock.split()[-1]],
+                input=json.dumps({'note': '✓'}, ensure_ascii=False), capture_output=True, text=True,
+                encoding='utf-8', timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)['input_preserved'])
+            self.assertEqual(json.loads((destination / 'private-payload-SessionStart-fixture.json').read_text(encoding='utf-8')), {'note': '✓'})
+
     def test_native_capture_decodes_utf8_and_retains_malformed_bytes_safely(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -56,7 +95,10 @@ class WindowsNativeDiagnosticsTests(unittest.TestCase):
             self.assertNotIn('json.load', capture.read_text(), 'capture reuses already read payload without consuming stdin twice')
             self.assertIn('json.dumps(payload)', capture.read_text())
             clock = json.loads((home / 'hooks.json').read_text())['hooks']['SessionStart'][0]['hooks'][0]
-            self.assertEqual(clock['command_windows'], '"' + sys.executable + '" -I capture.py SessionStart private codex')
+            self.assertTrue(clock['command_windows'].startswith('powershell.exe -NoProfile -NonInteractive -EncodedCommand '))
+            code = base64.b64decode(clock['command_windows'].split()[-1]).decode('utf-16-le')
+            self.assertEqual(code, "& '" + sys.executable.replace("'", "''") + "' -I 'capture.py' 'SessionStart' 'private' 'codex';exit $LASTEXITCODE")
+            self.assertNotIn('$', clock['command_windows'])
 
     def test_failure_replay_uses_exact_original_payload_and_only_creation_flag_differs(self):
         with TemporaryDirectory() as directory:
@@ -73,8 +115,8 @@ class WindowsNativeDiagnosticsTests(unittest.TestCase):
             with patch.object(native.subprocess, 'run', return_value=completed) as run, redirect_stdout(output):
                 native.activation_failure_diagnostics(root, root, {'COMSPEC': 'C:\\Windows\\cmd.exe'}, root / 'plugin',
                     {('SessionStart', 0): 'powershell.exe -Command "original"'}, diagnostics, completed)
-            self.assertEqual(run.call_count, 2)
-            first, second = run.call_args_list
+            self.assertEqual(run.call_count, 4)
+            first, second, cmd, cmd_no_window = run.call_args_list
             self.assertEqual(first.args, second.args)
             self.assertEqual(first.kwargs['input'], payload)
             self.assertEqual(first.kwargs['env']['PLUGIN_ROOT'], str(root / 'plugin'))
@@ -82,7 +124,11 @@ class WindowsNativeDiagnosticsTests(unittest.TestCase):
             self.assertEqual(second.kwargs['creationflags'], 0x08000000)
             self.assertEqual(first.kwargs['encoding'], 'utf-8')
             self.assertEqual(first.kwargs['errors'], 'replace')
-            self.assertEqual(first.args[0], 'C:\\Windows\\cmd.exe /C "powershell.exe -Command "original""')
+            self.assertEqual(first.args[0][-3:], ['-NoProfile', '-Command', 'powershell.exe -Command "original"'])
+            self.assertEqual(cmd.args[0], 'C:\\Windows\\cmd.exe /C "powershell.exe -Command "original""')
+            self.assertEqual(cmd.args, cmd_no_window.args)
+            self.assertEqual(cmd.kwargs['creationflags'], 0)
+            self.assertEqual(cmd_no_window.kwargs['creationflags'], 0x08000000)
             self.assertNotIn('PRIVATE', output.getvalue())
             evidence = json.loads(output.getvalue())['windows_native_activation_failure']
             self.assertTrue(evidence['native_payload_available'])
