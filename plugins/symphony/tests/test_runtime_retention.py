@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,9 @@ class RuntimeRetentionTests(unittest.TestCase):
             command = context.split("Check activation through the verified launcher: ", 1)[1]
             self.assertLess(len(command), 1200)
             self.assertNotIn("base64", command)
-            self.assertIn(sys.executable, command)
+            executable = shlex.split(command)[1 if os.name == 'nt' else 0]
+            self.assertTrue(Path(executable).is_absolute())
+            self.assertTrue(os.path.samefile(sys.executable, executable))
             shutil.rmtree(root)
             env["CODEX_SESSION_ID"] = "original-session"
             def check():
@@ -76,13 +79,13 @@ class RuntimeRetentionTests(unittest.TestCase):
                "SYMPHONY_RUNTIME_DIR": str(directory / "retained runtimes"),
                "SYMPHONY_STATE_DIR": str(directory / "state"), "SYMPHONY_PROFILE": profile,
                "PYTHONPATH": str(directory),
+               "SYMPHONY_CAPTURED_BOOTSTRAP": "raise RuntimeError('inherited bootstrap executed')",
                "CODEX_HOME": str(directory / "empty codex home")}
         if (directory / "pin barrier" / "barrier.py").is_file():
             env["SYMPHONY_TEST_PIN_BARRIER"] = str(directory / "pin barrier" / "barrier.py")
-        if os.name == "nt":
-            # The VM invokes Python by absolute path and does not install it
-            # globally; provide that same interpreter to the captured hook.
-            env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+        # Give the hook this fixture's selected interpreter on every platform,
+        # including alternate Python/backend runs and the Windows VM.
+        env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
         result = subprocess.run(command, input=json.dumps(payload), capture_output=True,
                                 text=True, env=env, cwd=directory, timeout=20, check=False)
         return result, env

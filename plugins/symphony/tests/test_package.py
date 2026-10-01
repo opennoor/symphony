@@ -58,8 +58,7 @@ class PackageContractTests(unittest.TestCase):
         import shlex
         from plugins.symphony.scripts.generate_hooks import bootstrap, generated
 
-        relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace(
-            "$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + bootstrap().replace("'", "''") + "'")
+        relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text()
         for path, content in generated().items():
             handler = json.loads(content)['hooks']['SessionStart'][0]['hooks'][0]
             if path.name == 'codex.json':
@@ -67,14 +66,30 @@ class PackageContractTests(unittest.TestCase):
                 self.assertLess(len(command), 8170)
                 provider = 'codex'
             else:
-                command = next(token for token in shlex.split(handler['command']) if token.startswith('$m='))
+                whole_command = handler['command']
+                bash = (str(Path(os.environ['ProgramFiles']) / 'Git/bin/bash.exe')
+                        if os.name == 'nt' else r'C:\Program Files\Git\bin\bash.exe')
+                invocation = subprocess.list2cmdline([bash, '-c', whole_command])
+                self.assertLess(len('cmd.exe /d /s /c ' + invocation), 8170)
+                tokens = shlex.split(whole_command)
+                self.assertEqual(tokens.count('SYMPHONY_CAPTURED_BOOTSTRAP=' + bootstrap() + ';'), 1)
+                command = next(token for token in tokens if token.startswith('$m='))
                 provider = 'claude'
             payload = base64.b64decode(re.search(r"FromBase64String\('([^']+)'", command)[1])
-            expected = relay.replace('__SYMPHONY_PROVIDER__', provider).encode()
+            binding = ("$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
+                       if provider == 'claude' else "$b = '" + bootstrap().replace("'", "''") + "'")
+            expected = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", binding).replace('__SYMPHONY_PROVIDER__', provider).encode()
             self.assertEqual(gzip.decompress(payload), expected)
             self.assertEqual(payload[:10], bytes.fromhex('1f8b08000000000000ff'))
             self.assertEqual((payload[10] >> 1) & 3, 0, 'DEFLATE must use stored blocks')
             self.assertEqual(len(payload), len(expected) + 23)
+
+    def test_windows_probe_deadline_starts_after_candidate_collection(self):
+        source = (PLUGIN / 'scripts/codex_hook.ps1').read_text()
+        self.assertLess(source.index('$cs = @(Get-Command'), source.index('$until ='))
+        self.assertLess(source.index('$until ='), source.index('foreach ($c in $cs)'))
+        self.assertIn('Select-Object -First 6', source)
+        self.assertIn('$p.WaitForExit(700)', source)
 
     @unittest.skipUnless(Path('/usr/bin/python3').is_file(), 'needs a second system Python')
     def test_generated_launchers_match_system_python_compression_backend(self):
@@ -286,7 +301,8 @@ class PackageContractTests(unittest.TestCase):
             state_root = home / "state"
             handler = next(handlers("hooks/hooks.json"))
             env = {**os.environ, "CLAUDE_PLUGIN_ROOT": str(root),
-                   "SYMPHONY_STATE_DIR": str(state_root), "SYMPHONY_RUNTIME_DIR": str(home / "runtimes")}
+                   "SYMPHONY_STATE_DIR": str(state_root), "SYMPHONY_RUNTIME_DIR": str(home / "runtimes"),
+                   "SYMPHONY_CAPTURED_BOOTSTRAP": "raise RuntimeError('inherited bootstrap executed')"}
             env.pop("SYMPHONY_PROVIDER", None)
             if os.name == "nt":
                 bash = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
@@ -303,12 +319,14 @@ class PackageContractTests(unittest.TestCase):
                 env["PATH"] = str(bin_dir)
                 env["OS"] = ""
             result = subprocess.run(
-                [bash, "-c", handler["command"]],
+                [bash, "-c", handler["command"] + '; printf "\\n%s" "$SYMPHONY_CAPTURED_BOOTSTRAP"'],
                 input=json.dumps({"hook_event_name": "SessionStart", "session_id": "claude-session",
                                   "cwd": str(project), "model": "claude-sonnet"}),
                 capture_output=True, text=True, env=env, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.stdout.endswith(env['SYMPHONY_CAPTURED_BOOTSTRAP']),
+                            'captured bootstrap export escaped the hook subshell')
             activation = StateStore(state_root).load(project).activation
             self.assertEqual(activation["claude"]["state"], "guarded")
             self.assertEqual(activation["claude"]["session_id"], "claude-session")

@@ -103,6 +103,8 @@ def _profiles_generated_at() -> str:
 
 def route_for(assessment: Assessment) -> Route:
     """Return the literal matrix route, applying only risk safeguards."""
+    if not isinstance(assessment.risk, str) or assessment.risk not in {"normal", "high"}:
+        raise ValueError(f"unsupported assessment risk: {assessment.risk!r}")
     try:
         route = MATRIX[(assessment.size, assessment.complexity)]
     except KeyError as error:

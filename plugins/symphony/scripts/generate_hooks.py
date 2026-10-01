@@ -37,17 +37,21 @@ def generated(root=PLUGIN):
     # The reviewed Windows command embeds this source; execution policy never
     # needs to permit an unsigned file or a script from a disappeared cache.
     relay = (root / "scripts/codex_hook.ps1").read_text()
-    relay = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + code.replace("'", "''") + "'")
     documents = {}
     for provider, filename, variable in (("codex", "codex.json", "PLUGIN_ROOT"),
                                           ("claude", "hooks.json", "CLAUDE_PLUGIN_ROOT")):
         path = root / "hooks" / filename
         document = json.loads(path.read_text())
+        # Claude's Bash command captures this code once for both branches.
+        # Duplicating it in the Windows relay exceeds cmd.exe's command limit.
+        binding = ("$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
+                   if provider == 'claude' else "$b = '" + code.replace("'", "''") + "'")
+        source = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", binding)
         buffer = io.BytesIO()
         # Stored DEFLATE avoids differing zlib/zlib-ng compression heuristics.
         # The complete relay still fits cmd.exe's bounded command length.
         with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0, compresslevel=0) as archive:
-            archive.write(relay.replace('__SYMPHONY_PROVIDER__', provider).encode())
+            archive.write(source.replace('__SYMPHONY_PROVIDER__', provider).encode())
         payload = base64.b64encode(buffer.getvalue()).decode()
         wrapper = ("$m=[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "'));"
                    "iex ([IO.StreamReader]::new([IO.Compression.GZipStream]::new($m,"
@@ -58,7 +62,13 @@ def generated(root=PLUGIN):
             raise ValueError("Windows hook launcher exceeds cmd.exe's 8191-character limit")
         command = 'python3 -I -c "' + code + '" "${' + variable + '}" ' + provider
         if provider == "claude":
-            command = 'if [ "${OS:-}" = Windows_NT ]; then ' + prefix + shlex.quote(wrapper) + '; else ' + command + '; fi'
+            command = ('(export SYMPHONY_CAPTURED_BOOTSTRAP=' + shlex.quote(code)
+                       + '; if [ "${OS:-}" = Windows_NT ]; then ' + prefix + shlex.quote(wrapper)
+                       + '; else python3 -I -c "$SYMPHONY_CAPTURED_BOOTSTRAP" "${'
+                       + variable + '}" ' + provider + '; fi)')
+            # Reserve room for Bash's native invocation and escaped quotes.
+            if len(command) + 256 > 8170:
+                raise ValueError("Claude hook launcher exceeds the Windows native command limit")
         for groups in document["hooks"].values():
             for group in groups:
                 for hook in group["hooks"]:

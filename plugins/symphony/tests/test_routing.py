@@ -12,6 +12,12 @@ from plugins.symphony.symphony.routing import (
 
 
 class RoutingTests(unittest.TestCase):
+    def test_router_rejects_unknown_and_malformed_risk(self):
+        for risk in ('critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
+            with self.subTest(risk=risk), self.assertRaises(ValueError):
+                route_for(Assessment('small', 'simple', risk=risk))
+        self.assertEqual(route_for(Assessment('small', 'simple')).risk, 'normal')
+
     def test_model_comparison_uses_reviewed_capability_ranks(self):
         self.assertFalse(model_is_weaker("gpt-6-sol", "gpt-6-luna"))
         self.assertFalse(model_is_weaker("gpt-5.6-luna", "gpt-6-luna"))

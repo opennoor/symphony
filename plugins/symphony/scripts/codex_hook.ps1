@@ -5,9 +5,9 @@ $root = [Environment]::GetEnvironmentVariable($(if ($v -eq 'codex') { 'PLUGIN_RO
 $py = $null
 $why = 'No Python executable found'
 $began = [DateTime]::UtcNow
-$until = [DateTime]::UtcNow.AddSeconds(2)
 $cs = @(Get-Command python.exe,python3.exe,py.exe -All -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 6)
 $enumerationMs = [int]([DateTime]::UtcNow - $began).TotalMilliseconds
+$until = [DateTime]::UtcNow.AddSeconds(2)
 $attempts = 0
 foreach ($c in $cs) {
 if ([DateTime]::UtcNow -ge $until) { break }

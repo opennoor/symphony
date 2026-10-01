@@ -9,12 +9,21 @@ from unittest.mock import patch
 
 from plugins.symphony.scripts.generate_agents import BODIES
 from plugins.symphony.symphony.model import Event
-from plugins.symphony.symphony.runtime import handle
+from plugins.symphony.symphony.runtime import handle, _assessment_from_marker
 from plugins.symphony.symphony.routing import Assessment, fast_lead_selection, profiles_for, resolve_tier, route_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
 
 
 class FastRouteTests(unittest.TestCase):
+    def test_provider_assessment_markers_reject_invalid_risk_and_keep_legacy_default(self):
+        for provider in ('codex', 'claude'):
+            for risk in ('critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
+                with self.subTest(provider=provider, risk=risk):
+                    report = 'SYMPHONY_ASSESSMENT: ' + json.dumps({'size': 'small', 'complexity': 'simple', 'risk': risk})
+                    self.assertIsNone(_assessment_from_marker({'provider': provider, 'last_assistant_message': report}, 'SYMPHONY_ASSESSMENT:'))
+            report = 'SYMPHONY_ASSESSMENT: {"size":"small","complexity":"simple"}'
+            self.assertEqual(_assessment_from_marker({'provider': provider, 'last_assistant_message': report}, 'SYMPHONY_ASSESSMENT:').risk, 'normal')
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.project = Path(self.temp.name) / "project"
