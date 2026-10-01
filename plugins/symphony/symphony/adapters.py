@@ -69,6 +69,10 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     if not transcript:
         return {}
     found: dict[str, str] = {}
+    header_seen = False
+    forked = False
+    own_turn = True
+    callback_turn = str(payload.get("turn_id") or "")
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
             for index, line in enumerate(handle):
@@ -82,6 +86,18 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     continue
                 record_payload = record.get("payload", {})
                 if record.get("type") == "session_meta":
+                    # A fork contains copied ancestor headers and turns after
+                    # its own first header. They are not this child's evidence.
+                    if header_seen:
+                        forked = True
+                        own_turn = False
+                        continue
+                    header_seen = True
+                    identity = record_payload.get("id")
+                    if identity and payload.get("agent_id") and identity != payload["agent_id"]:
+                        return {}
+                    forked = bool(record_payload.get("forked_from_id"))
+                    own_turn = not forked
                     spawn = record_payload
                     for key in ("source", "subagent", "thread_spawn"):
                         spawn = spawn.get(key, {}) if isinstance(spawn, dict) else {}
@@ -94,18 +110,24 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     if parent_thread_id:
                         found["parent_thread_id"] = str(parent_thread_id)
                 elif record.get("type") == "turn_context":
+                    if forked:
+                        own_turn = bool(callback_turn and record_payload.get("turn_id") == callback_turn)
+                    elif callback_turn and record_payload.get("turn_id"):
+                        own_turn = record_payload["turn_id"] == callback_turn
+                    if not own_turn:
+                        continue
                     if record_payload.get("model"):
                         found["model"] = str(record_payload["model"])
                     if record_payload.get("effort"):
                         found["model_reasoning_effort"] = str(record_payload["effort"])
                 elif (record.get("type") == "event_msg"
-                      and record_payload.get("type") == "user_message"):
+                      and record_payload.get("type") == "user_message" and own_turn):
                     message = record_payload.get("message")
                     if isinstance(message, str) and "SYMPHONY_FAST_ROUTE: lead" in message:
                         found["task"] = message
                 elif (record.get("type") == "response_item"
                       and record_payload.get("type") == "message"
-                      and record_payload.get("role") == "user"):
+                      and record_payload.get("role") == "user" and own_turn):
                     content = record_payload.get("content")
                     if isinstance(content, list):
                         message = "\n".join(str(item.get("text")) for item in content

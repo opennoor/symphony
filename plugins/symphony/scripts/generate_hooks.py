@@ -4,8 +4,11 @@
 import argparse
 import ast
 import base64
+import gzip
+import io
 import hashlib
 import json
+import shlex
 from pathlib import Path
 import zlib
 
@@ -35,17 +38,25 @@ def generated(root=PLUGIN):
     # needs to permit an unsigned file or a script from a disappeared cache.
     relay = (root / "scripts/codex_hook.ps1").read_text()
     relay = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + code.replace("'", "''") + "'")
-    windows = "cmd.exe /c powershell.exe -NoProfile -NonInteractive -EncodedCommand " + base64.b64encode(relay.encode("utf-16le")).decode()
-    if len(windows) > 8170:
-        raise ValueError("Windows hook launcher exceeds cmd.exe's 8191-character limit")
     documents = {}
     for provider, filename, variable in (("codex", "codex.json", "PLUGIN_ROOT"),
                                           ("claude", "hooks.json", "CLAUDE_PLUGIN_ROOT")):
         path = root / "hooks" / filename
         document = json.loads(path.read_text())
+        buffer = io.BytesIO()
+        with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0) as archive:
+            archive.write(relay.replace('__SYMPHONY_PROVIDER__', provider).encode())
+        payload = base64.b64encode(buffer.getvalue()).decode()
+        wrapper = ("$m=[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "'));"
+                   "iex ([IO.StreamReader]::new([IO.Compression.GZipStream]::new($m,"
+                   "[IO.Compression.CompressionMode]::Decompress))).ReadToEnd()")
+        prefix = 'powershell.exe -NoProfile -NonInteractive -Command '
+        windows = 'cmd.exe /c ' + prefix + '"' + wrapper + '"'
+        if len(windows) > 8170:
+            raise ValueError("Windows hook launcher exceeds cmd.exe's 8191-character limit")
         command = 'python3 -I -c "' + code + '" "${' + variable + '}" ' + provider
         if provider == "claude":
-            command = 'if [ "${OS:-}" = Windows_NT ]; then python -I -c "' + code + '" "${' + variable + '}" claude; else ' + command + '; fi'
+            command = 'if [ "${OS:-}" = Windows_NT ]; then ' + prefix + shlex.quote(wrapper) + '; else ' + command + '; fi'
         for groups in document["hooks"].values():
             for group in groups:
                 for hook in group["hooks"]:

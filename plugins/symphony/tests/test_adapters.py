@@ -91,6 +91,38 @@ class AdapterContractTests(unittest.TestCase):
             self.assertEqual(codex.payload["model_reasoning_effort"], "high")
             self.assertIn('"blocked"', claude.payload["last_assistant_message"])
 
+    def test_codex_fork_keeps_child_header_and_binds_only_its_callback_turn(self):
+        # Sanitized native fork: child header, copied parent header/turn, own turn.
+        rows = [
+            {"type": "session_meta", "payload": {"id": "child", "forked_from_id": "lead",
+                "agent_path": "/root/symphony_lead_gpt_6_luna_low/run_and_fix", "source": {
+                    "subagent": {"thread_spawn": {"parent_thread_id": "lead"}}}}},
+            {"type": "session_meta", "payload": {"id": "lead",
+                "agent_path": "/root/symphony_lead_gpt_6_luna_low", "source": {
+                    "subagent": {"thread_spawn": {"parent_thread_id": "root"}}}}},
+            {"type": "turn_context", "payload": {"turn_id": "parent-turn", "model": "parent-model", "effort": "high"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "SYMPHONY_FAST_ROUTE: lead\nAncestor task"}},
+            {"type": "turn_context", "payload": {"turn_id": "child-turn", "model": "child-model", "effort": "low"}},
+        ]
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'fork.jsonl'
+            transcript.write_text('\n'.join(json.dumps(row) for row in rows))
+            payload = {"hook_event_name": "SubagentStart", "agent_id": "child", "turn_id": "child-turn",
+                       "agent_transcript_path": str(transcript)}
+            event = event_from_payload("codex", payload)
+            self.assertEqual(event.payload['task_name'], 'run_and_fix')
+            self.assertEqual(event.payload['parent_thread_id'], 'lead')
+            self.assertEqual(event.payload['model'], 'child-model')
+            self.assertEqual(event.payload['model_reasoning_effort'], 'low')
+            self.assertNotIn('task', event.payload)
+            payload.pop('turn_id')
+            ambiguous = event_from_payload('codex', payload)
+            self.assertNotIn('model', ambiguous.payload)
+            self.assertNotIn('model_reasoning_effort', ambiguous.payload)
+            payload['agent_id'] = 'foreign'
+            foreign = event_from_payload('codex', payload)
+            self.assertEqual(foreign.payload['_symphony_child_metadata'], ())
+
     def test_event_id_is_stable_for_replayed_payload(self):
         payload = fixture("codex", "user_prompt")
         self.assertEqual(

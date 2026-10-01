@@ -32,16 +32,20 @@ class RuntimeRetentionTests(unittest.TestCase):
             command = context.split("Check activation through the verified launcher: ", 1)[1]
             self.assertLess(len(command), 1200)
             self.assertNotIn("base64", command)
+            self.assertIn(sys.executable, command)
             shutil.rmtree(root)
             env["CODEX_SESSION_ID"] = "original-session"
             def check():
-                invocation = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
-                              if os.name == "nt" else ["bash", "-c", command])
+                invocation = ([str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'), "-NoProfile", "-NonInteractive", "-Command", command]
+                              if os.name == "nt" else [shutil.which("bash"), "-c", command])
                 return subprocess.run(invocation, cwd=directory, env=env,
                                       capture_output=True, text=True, timeout=20)
             accepted = check()
             self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
             self.assertIn("guarded: matching current-session heartbeat", accepted.stdout)
+            env['PATH'] = ''
+            accepted = check()
+            self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
             env["CODEX_SESSION_ID"] = "foreign-session"
             self.assertNotEqual(0, check().returncode)
             env["CODEX_SESSION_ID"] = "original-session"

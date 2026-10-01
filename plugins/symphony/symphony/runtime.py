@@ -78,7 +78,7 @@ def _retained_activation_command(retained: str, original: str) -> str:
         # Windows PowerShell 5.1 strips double quotes inside native arguments.
         # Single-quoted Python literals survive its legacy argument passing.
         code = code.replace('"', "'")
-    executable = "python.exe" if os.name == "nt" else "python3"
+    executable = str(Path(sys.executable).absolute())
     arguments = [executable, "-I", "-c", code, retained, original]
     return ("& " + " ".join("'" + value.replace("'", "''") + "'" for value in arguments)
             if os.name == "nt" else shlex.join(arguments))
@@ -1151,13 +1151,12 @@ def _transition(
         else:
             actions += observed_actions
             if (
-                provider == "claude"
-                and state.active_run
+                state.active_run
                 and state.active_run.lead_identity
                 and state.active_run.lead_identity == str(payload.get("agent_id") or "")
             ):
                 # SubagentStart context reaches the starting agent, not the root.
-                actions += (Action("inject_context", {"text": _claude_lead_guidance(state)}),)
+                actions += (Action("inject_context", {"text": _lead_guidance(state, provider)}),)
     elif source.kind in {"post_tool_use", "post_tool_failed"}:
         state = _discard_failed_spawn(state, source, provider)
         state, parent_actions = _consume_parent_actions(state)
@@ -3100,7 +3099,9 @@ def _render_actions(
                 "assign substantive implementation, diagnosis, design, review tasks, and product judgment to workers "
                 "or consultants; small tasks need one worker, medium tasks need bounded worker packets, "
                 "and large tasks delegate project work. The lead coordinates, reviews integration, and verifies results. "
-                "Use the matrix for each child packet's own size/complexity."}))
+                "Use the matrix for each child packet's own size/complexity. Require the lead's final response "
+                "to end with one exact `SYMPHONY_OUTCOME: {\"status\":\"completed\"}` line only after "
+                "verification and all children have returned; use blocked or failed when work remains."}))
         elif action.kind == "reject_lead_replacement":
             lead = state.active_run.lead_identity if state.active_run else "the registered lead"
             rendered.append(Action("inject_context", {"text":
@@ -3133,8 +3134,8 @@ def _render_actions(
     return tuple(rendered)
 
 
-def _claude_cells(snapshot, role: str) -> list[str]:
-    """The packaged agent type the matrix selects for each cell."""
+def _provider_cells(snapshot, role: str) -> list[str]:
+    """Exact provider selections, including risk floors, for each matrix cell."""
     cells = []
     for size in ("small", "medium", "large"):
         for complexity in ("simple", "mixed", "complex"):
@@ -3142,23 +3143,37 @@ def _claude_cells(snapshot, role: str) -> list[str]:
                 resolve_tier(route_for(Assessment(size, complexity, risk)), snapshot)
                 for risk in ("normal", "high")
             )
-            cell = f"{size}/{complexity} `symphony:symphony-{role}-{normal['lead_model']}-{normal['lead_effort']}`"
+            def label(choice):
+                return (f"symphony:symphony-{role}-{choice['lead_model']}-{choice['lead_effort']}"
+                        if snapshot.provider == "claude" else f"{choice['lead_model']}/{choice['lead_effort']}")
+            cell = f"{size}/{complexity} `{label(normal)}`"
             if (high["lead_model"], high["lead_effort"]) != (normal["lead_model"], normal["lead_effort"]):
-                cell += f" (high risk: `symphony:symphony-{role}-{high['lead_model']}-{high['lead_effort']}`)"
+                cell += f" (high risk: `{label(high)}`)"
             cells.append(cell)
     return cells
 
 
-def _claude_lead_guidance(state: ProjectState) -> str:
-    """What a Claude lead needs at start and cannot derive: its children's types."""
-    snapshot = _snapshot(state, "claude")
+def _lead_guidance(state: ProjectState, provider: str) -> str:
+    """Give the starting lead its children's exact provider spawn contract."""
+    snapshot = _snapshot(state, provider)
+    protocol = (
+        'Every worker spawn must pass explicit `model` and `reasoning_effort`, `fork_turns="none"`, '
+        'and task name `symphony_worker_<model>_<effort>` using underscores for model punctuation. '
+        'Put `SYMPHONY_ROLE: worker` on the first line of its bounded objective/ownership/evidence/'
+        'constraints/acceptance_check/return_contract/size/complexity packet. '
+        if provider == "codex" else
+        'Every worker spawn uses its exact packaged agent type and a packet beginning `SYMPHONY_ROLE: worker`. '
+    )
     return (
         "For assessed work, assign substantive work to workers or consultants; small tasks need one worker, "
         "medium tasks need bounded worker packets, and large tasks delegate project work. "
         "The lead coordinates, integrates, and verifies results. "
-        "Symphony worker agent types by the packet's own size/complexity: "
-        + "; ".join(_claude_cells(snapshot, "worker"))
-        + f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
+        + protocol + "Symphony worker routes by the packet's own size/complexity: "
+        + "; ".join(_provider_cells(snapshot, "worker"))
+        + (f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
+           if provider == "claude" else
+           f". Consultants use explicit model={snapshot.tiers['strongest']}, reasoning_effort=high, "
+           'fork_turns="none", SYMPHONY_ROLE: consultant, and SYMPHONY_DECISION JSON.')
     )
 
 
@@ -3172,7 +3187,7 @@ def _claude_guidance(state: ProjectState | None, session_id: str = "") -> str:
     snapshot = _snapshot(state, "claude") if state else snapshot_for("claude")
     requested = _boost_preference(state, "claude", session_id) if state else "off"
     assessor = assessor_selection(snapshot, requested)
-    cells = _claude_cells(snapshot, "lead")
+    cells = _provider_cells(snapshot, "lead")
     access = ""
     if state and state.activation.get("claude", {}).get("claude_probe_attempted"):
         profile = _applied_profile(state, "claude")
@@ -3243,6 +3258,11 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         if provider == "codex"
         else ""
     )
+    if provider == "codex":
+        snapshot = _snapshot(state, provider) if state else snapshot_for(provider)
+        codex += ("Profile cell choices override abstract tiers. Select the assessed lead and each worker "
+                  "from these exact cells; never reuse the fast lead selection: "
+                  + "; ".join(_provider_cells(snapshot, "lead")) + ". ")
     boost = ""
     if state is not None and provider:
         session_id = session_id or str(state.activation.get(provider, {}).get("session_id") or "")
@@ -3261,10 +3281,15 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         "\"risk\":\"normal|high\",\"rationale\":\"...\",\"topology\":\"...\"}. "
         "Every later worker or consultant spawn needs its matching SYMPHONY_ROLE line and explicit model/effort; "
         "consultants also need SYMPHONY_DECISION JSON with decision-local size and complexity. "
+        'Relay the child spawn protocol in the lead packet: on Codex every worker uses `fork_turns="none"`, '
+        'explicit model/reasoning_effort from its own cell, underscore `symphony_worker_<model>_<effort>` '
+        'task name, and a packet whose first line is `SYMPHONY_ROLE: worker`. '
         "The matrix fixes execution topology; the assessor's topology is advisory. Relay this lead contract: "
         "assign substantive work to workers or consultants; small tasks need one worker, medium tasks need "
         "bounded worker packets, and large tasks delegate project work. The lead coordinates, integrates, "
         "and verifies results. Use the matrix for each child packet's own size/complexity. "
+        "Require the lead's final response to end with one exact `SYMPHONY_OUTCOME: {\"status\":\"completed\"}` "
+        "line only after verification and all children have returned; use blocked or failed when work remains. "
         "Relay the task in full: the lead cannot see this conversation, so if the request has several parts, "
         "every part goes in the packet and the acceptance check covers all of them. "
         "The assessor packet must require the exact size/complexity/risk vocabulary above and explain that "

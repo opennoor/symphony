@@ -87,6 +87,7 @@ Symphony's hooks enforce supported routing and lifecycle events. They do not obs
 - A small lead assigns substantive work to one worker, then integrates and verifies its result.
 - A medium lead assigns substantive work to bounded worker packets, then integrates and verifies the results.
 - A large lead is an inexpensive administrator: delegate project work and reserve consultant capacity for narrow decisions.
+- After verifying the integrated result and receiving all child results, end the final response with one exact `SYMPHONY_OUTCOME: {"status":"completed"}` line. If work remains, return `blocked` or `failed` as the status. Include this return contract in every lead packet.
 - Preserve active ownership across reassessment. Replace the lead only at a safe boundary or when unavailable or materially incapable.
 - When required consultation is unavailable, a large lead uses the disclosed conservative fallback instead of absorbing specialist reasoning silently.
 - Native successful `SubagentStop` events reconcile a lead even when its start event was missed. If the lead includes `SYMPHONY_OUTCOME: {"status":"completed"}`, the marker stays internal; malformed or non-success reports keep the run recoverable even when the host says the agent ended. Host termination alone cannot override an explicit blocked or failed outcome. Pending launches, active descendants, and unclassified consultant results still prevent run completion.

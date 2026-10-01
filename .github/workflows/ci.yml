@@ -26,7 +26,7 @@ jobs:
 
   windows-hooks:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -84,6 +84,46 @@ jobs:
       - name: Install Codex CLI
         run: npm install -g @openai/codex@0.158.0
 
+      - name: Verify installed native Codex activation checker as a standard user
+        timeout-minutes: 15
+        id: windows_native_checker
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if (-not $env:OPENAI_API_KEY) {
+            if ($env:GITHUB_REF -eq 'refs/heads/main') { throw 'OPENAI_API_KEY is required for standard-user activation verification' }
+            Write-Host '::notice::SKIP native standard-user checker: credential unavailable'
+            exit 0
+          }
+          $user = 'symphony-native'
+          $secure = ConvertTo-SecureString ([guid]::NewGuid().ToString('N') + 'aA1!') -AsPlainText -Force
+          $testRoot = Join-Path $env:PUBLIC 'symphony-native-tests'
+          New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
+          New-LocalUser -Name $user -Password $secure | Out-Null
+          try {
+            icacls.exe $testRoot /grant "$($env:COMPUTERNAME)\${user}:(OI)(CI)M" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not grant standard user native test directory access' }
+            $env:TEMP = $testRoot
+            $env:TMP = $testRoot
+            $credential = [pscredential]::new("$env:COMPUTERNAME\$user", $secure)
+            $python = (Get-Command python.exe -CommandType Application | Select-Object -First 1).Source
+            $stdout = Join-Path $testRoot 'stdout.log'
+            $stderr = Join-Path $testRoot 'stderr.log'
+            $test = Start-Process -FilePath $python -WorkingDirectory $env:GITHUB_WORKSPACE `
+              -Credential $credential -LoadUserProfile -PassThru `
+              -ArgumentList '.github/scripts/windows_native_activation.py' `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            if (-not $test.WaitForExit(600000)) {
+              Stop-Process -Id $test.Id -Force -ErrorAction SilentlyContinue
+              throw 'Standard-user native activation check exceeded ten minutes'
+            }
+            Get-Content $stdout,$stderr
+            if ($test.ExitCode -ne 0) { throw "Standard-user native activation checker exited $($test.ExitCode)" }
+          } finally {
+            Remove-LocalUser -Name $user
+          }
+
       - name: Run real Windows Codex control smoke
         id: windows_codex_native
         continue-on-error: true
@@ -128,6 +168,8 @@ jobs:
           python plugins/symphony/scripts/native_effort_smoke.py --provider codex
           if ($LASTEXITCODE -ne 0) { throw 'Native Codex ultra effort failed' }
           $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
+          python .github/scripts/native_routing_smoke.py --provider codex --timeout 600
+          if ($LASTEXITCODE -ne 0) { throw 'Native Codex mechanical routing and worker execution failed' }
           python .github/scripts/native_managed_concurrency.py --provider codex --timeout 600
           if ($LASTEXITCODE -ne 0) { throw 'Native Codex managed concurrency failed' }
 
@@ -203,6 +245,8 @@ jobs:
           python plugins/symphony/scripts/native_effort_smoke.py --provider claude
           if ($LASTEXITCODE -ne 0) { throw 'Native packaged Claude max assessor failed' }
           $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
+          python .github/scripts/native_routing_smoke.py --provider claude --timeout 600
+          if ($LASTEXITCODE -ne 0) { throw 'Native Claude mechanical routing and worker execution failed' }
           python .github/scripts/claude_isolated_worktree.py --timeout 300
           $isolatedExit = $LASTEXITCODE
           python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600
@@ -223,7 +267,7 @@ jobs:
           }
 
       - name: Preserve Windows Codex native failure after Claude checks
-        if: ${{ always() && steps.windows_codex_native.outcome == 'failure' }}
+        if: ${{ always() && (steps.windows_codex_native.outcome == 'failure' || steps.windows_native_checker.outcome == 'failure') }}
         run: throw 'Windows Codex native checks failed; Claude checks were allowed to run'
 
       - name: Retain sanitized native failure evidence
@@ -315,6 +359,7 @@ jobs:
           git fetch origin tag v1.5.1
           git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
           export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          python3 .github/scripts/native_routing_smoke.py --provider codex --timeout 600
           python3 .github/scripts/native_managed_concurrency.py --provider codex --timeout 600 \
             --live-update \
             --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
@@ -350,6 +395,7 @@ jobs:
             git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
           fi
           export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          python3 .github/scripts/native_routing_smoke.py --provider claude --timeout 600
           set +e
           python3 .github/scripts/claude_isolated_worktree.py --timeout 300
           isolated_exit=$?

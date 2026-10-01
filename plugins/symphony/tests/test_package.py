@@ -206,20 +206,27 @@ class PackageContractTests(unittest.TestCase):
 
     def test_codex_windows_hooks_use_the_packaged_launcher(self):
         import base64
+        import gzip
+        import re
         from plugins.symphony.scripts.generate_hooks import bootstrap
 
-        prefix = "cmd.exe /c powershell.exe -NoProfile -NonInteractive -EncodedCommand "
+        prefix = 'cmd.exe /c powershell.exe -NoProfile -NonInteractive -Command "'
         for handler in handlers("hooks/codex.json"):
             command = handler["commandWindows"]
             self.assertTrue(command.startswith(prefix))
-            source = base64.b64decode(command[len(prefix):]).decode("utf-16le")
+            self.assertTrue(command.endswith('"'))
+            wrapper = command[len(prefix):-1]
+            self.assertTrue(wrapper.isascii())
+            self.assertNotIn('"', wrapper)
+            payload = re.search(r"FromBase64String\('([^']+)'\)", wrapper).group(1)
+            source = gzip.decompress(base64.b64decode(payload)).decode()
             expected = (PLUGIN / "scripts/codex_hook.ps1").read_text().replace(
-                "$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + bootstrap().replace("'", "''") + "'")
+                "$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + bootstrap().replace("'", "''") + "'").replace('__SYMPHONY_PROVIDER__', 'codex')
             self.assertEqual(source, expected)
             self.assertIn("-I -c", source)
             self.assertLess(len(command) + len('cmd.exe /C ""'), 8191)
             self.assertNotIn(".ps1", source)
-            self.assertNotIn('"', command)
+            self.assertEqual(command.count('"'), 2)
 
     def test_claude_hooks_select_available_python_with_a_quoted_plugin_path(self):
         for handler in handlers("hooks/hooks.json"):
@@ -244,6 +251,11 @@ class PackageContractTests(unittest.TestCase):
             env.pop("SYMPHONY_PROVIDER", None)
             if os.name == "nt":
                 bash = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+                aliases = home / "WindowsApps-like alias"
+                aliases.mkdir()
+                (aliases / 'python.exe').write_bytes(b'not a Windows executable')
+                env['PATH'] = str(aliases) + os.pathsep + str(Path(sys.executable).parent) + os.pathsep + env.get('PATH', '')
+                env['PLUGIN_ROOT'] = str(home / 'Wrong Codex Root')
             else:
                 bash = shutil.which("bash")
                 bin_dir = home / "python3 only"
@@ -262,6 +274,27 @@ class PackageContractTests(unittest.TestCase):
             self.assertEqual(activation["claude"]["state"], "guarded")
             self.assertEqual(activation["claude"]["session_id"], "claude-session")
             self.assertNotIn("codex", activation)
+
+    @unittest.skipUnless(os.name == "nt", "runs the Windows shell command")
+    def test_windows_launcher_propagates_runtime_failure_without_reexecuting_hook(self):
+        from plugins.symphony.scripts.generate_hooks import generated
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / 'Reviewed Plugin'
+            shutil.copytree(PLUGIN, root)
+            marker = directory / 'executions'
+            (root / 'scripts/symphony_hook.py').write_text(
+                "from pathlib import Path\np=Path(" + repr(str(marker)) + ")\n"
+                "p.write_text(p.read_text()+'x' if p.exists() else 'x')\nraise SystemExit(73)\n")
+            manifest = json.loads(generated(root)[root / 'hooks/codex.json'])
+            command = manifest['hooks']['SessionStart'][0]['hooks'][0]['commandWindows']
+            env = {**os.environ, 'PLUGIN_ROOT': str(root), 'SYMPHONY_RUNTIME_DIR': str(directory / 'runtimes'),
+                'PATH': str(Path(sys.executable).parent) + os.pathsep + os.environ.get('PATH', ''),
+                'PSExecutionPolicyPreference': 'Restricted'}
+            result = subprocess.run('cmd.exe /C "' + command + '"', env=env, cwd=directory,
+                input='{}', capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 73, result.stderr)
+            self.assertEqual(marker.read_text(), 'x')
 
     @unittest.skipUnless(os.name == "nt", "runs the Windows shell command")
     def test_codex_windows_hooks_run_without_a_working_py_launcher(self):
@@ -364,8 +397,16 @@ class PackageContractTests(unittest.TestCase):
             env["SYMPHONY_STATE_DIR"] = str(missing_state)
             start = config["hooks"]["SessionStart"][0]["hooks"][0]["commandWindows"]
             failed = run_hook(start, payload, env)
-            self.assertNotEqual(failed.returncode, 0)
-            self.assertFalse(missing_state.exists())
+            self.assertEqual(failed.returncode, 0, failed.stderr)
+            self.assertTrue(missing_state.exists(), 'broken first alias did not fall back to usable Python')
+            env["PATH"] = os.pathsep.join((str(launcher_dir), str(alias_dir),
+                str(Path(os.environ["SystemRoot"]) / "System32"),
+                str(Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0")))
+            env["SYMPHONY_STATE_DIR"] = str(home / 'no-python-state')
+            unavailable = run_hook(start, payload, env)
+            self.assertNotEqual(unavailable.returncode, 0)
+            self.assertIn('no working Python 3.10+', unavailable.stderr)
+            self.assertFalse((home / 'no-python-state').exists())
 
         # The digest-pinned Dockur image invokes this exact test entrypoint.
         # Its guest has no Git Bash; native Windows CI exercises both hosts.

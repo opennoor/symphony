@@ -101,7 +101,9 @@ BODIES = {
         "check. For independent review use compatible `ce-code-review` or a requirement-and-diff "
         "review; verify the final tree before success claims. Shipping skills apply only when "
         "authorized. " + PRACTICES + " Verify the integrated "
-        "result before you report.\n\n"
+        "result before you report. Once verified and all children have returned, end your final response "
+        "with one exact `SYMPHONY_OUTCOME: {\"status\":\"completed\"}` line. If work remains, use "
+        "blocked or failed as the status.\n\n"
         "You cannot ask the user questions: record open decisions and assumptions in your result."
     ),
     "worker": (
