@@ -18,6 +18,19 @@ spec.loader.exec_module(native)
 
 
 class WindowsNativeDiagnosticsTests(unittest.TestCase):
+    def test_native_capture_decodes_utf8_and_retains_malformed_bytes_safely(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / 'state.json'
+            state.write_text(json.dumps({'activation': {'codex': {'state': 'guarded', 'session_id': 'abcd'}}}))
+            code = 'import sys;sys.stderr.buffer.write(b"session id: abcd\\n"+"✓".encode("utf-8")+bytes([0x9d]))'
+            with patch.object(native, 'state_file', return_value=state):
+                result, session, _ = native.original_native_activation(root, root, {}, '1.7.0',
+                    [sys.executable, '-c', code])
+            self.assertEqual(session, 'abcd')
+            self.assertIn('✓', result.stderr)
+            self.assertIn('\ufffd', result.stderr)
+
     def test_private_instrumentation_preserves_original_and_payload_stdin(self):
         with TemporaryDirectory(prefix='diagnostic path ') as directory:
             root = Path(directory)
@@ -67,6 +80,8 @@ class WindowsNativeDiagnosticsTests(unittest.TestCase):
             self.assertEqual(first.kwargs['env']['PLUGIN_ROOT'], str(root / 'plugin'))
             self.assertEqual(first.kwargs['creationflags'], 0)
             self.assertEqual(second.kwargs['creationflags'], 0x08000000)
+            self.assertEqual(first.kwargs['encoding'], 'utf-8')
+            self.assertEqual(first.kwargs['errors'], 'replace')
             self.assertEqual(first.args[0], 'C:\\Windows\\cmd.exe /C "powershell.exe -Command "original""')
             self.assertNotIn('PRIVATE', output.getvalue())
             evidence = json.loads(output.getvalue())['windows_native_activation_failure']

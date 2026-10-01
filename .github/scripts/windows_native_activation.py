@@ -84,7 +84,7 @@ def activation_failure_diagnostics(root, project, env, plugin, originals, diagno
             if path.stem.split('-')[0] in {'SessionStart', 'UserPromptSubmit', 'Stop', 'Interrupt'} else 'other',
             'captured': True, 'nonempty': bool(text), 'categories': error_categories(text)})
     payloads = list((root / 'codex-hook-capture').glob('private-payload-SessionStart-*.json'))
-    session = re.search(r'^session id: ([0-9a-f-]+)[ \t]*\r?$', result.stderr, re.MULTILINE)
+    session = re.search(r'^session id: ([0-9a-f-]+)[ \t]*\r?$', (result.stderr or ""), re.MULTILINE)
     if session:
         payloads = [path for path in payloads if json.loads(path.read_text()).get('session_id') == session[1]]
     else:
@@ -99,7 +99,7 @@ def activation_failure_diagnostics(root, project, env, plugin, originals, diagno
         for label, flags in (('normal', 0), ('no-window', 0x08000000)):
             try:
                 replay = subprocess.run(command, cwd=project, env=replay_env, input=payload,
-                    capture_output=True, text=True, timeout=30, creationflags=flags)
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, creationflags=flags)
                 evidence['original_command_replay'].append({'creation_mode': label, 'exit_code': replay.returncode,
                     'categories': error_categories(replay.stderr), 'stdout_nonempty': bool(replay.stdout)})
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -114,7 +114,7 @@ def diagnose_original_failure(root, project, env, version, command, original):
     plugin, commands, diagnostics = instrument_installed_hooks(root, Path(env['CODEX_HOME']), version)
     instrumented = error = None
     try:
-        instrumented = subprocess.run(command, cwd=project, env=env, capture_output=True, text=True, timeout=120)
+        instrumented = subprocess.run(command, cwd=project, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exception:
         error = exception
     activation_failure_diagnostics(root, project, env, plugin, commands, diagnostics, original, instrumented,
@@ -124,11 +124,11 @@ def diagnose_original_failure(root, project, env, version, command, original):
 def original_native_activation(root, project, env, version, command):
     """Only an original unwrapped native heartbeat may pass the activation gate."""
     result = subprocess.run(command, cwd=project, env=env,
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     if result.returncode:
         diagnose_original_failure(root, project, env, version, command, result)
         raise RuntimeError("installed standard-user Codex help command failed")
-    match = re.search(r'^session id: ([0-9a-f-]+)$', result.stderr, re.MULTILINE)
+    match = re.search(r'^session id: ([0-9a-f-]+)$', (result.stderr or ""), re.MULTILINE)
     if not match:
         diagnose_original_failure(root, project, env, version, command, result)
         raise RuntimeError("installed standard-user native session is unavailable")
@@ -186,11 +186,11 @@ def main():
             env["PATH"] = path
             old = "python.exe -I '" + str(Path(heartbeat["plugin_root"]) / "scripts/check_activation.py").replace("'", "''") + "'"
             failed = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command", old],
-                cwd=project, env=env, capture_output=True, text=True, timeout=20)
+                cwd=project, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
             if failed.returncode == 0:
                 raise RuntimeError("old bare-python checker did not reproduce the activation failure")
             checked = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command", command],
-                cwd=project, env=env, capture_output=True, text=True, timeout=20)
+                cwd=project, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
             if checked.returncode or "guarded: matching current-session heartbeat" not in checked.stdout:
                 raise RuntimeError("hook-supplied absolute checker failed after native activation")
             evidence.append({"environment": label, "old_checker_exit": failed.returncode,
@@ -198,7 +198,7 @@ def main():
                 "new_checker_exit": checked.returncode, "native_heartbeat": "guarded", "standard_user": True})
         env["CODEX_SESSION_ID"] = "foreign-session"
         rejected = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command", command],
-            cwd=project, env=env, capture_output=True, text=True, timeout=20)
+            cwd=project, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
         if rejected.returncode == 0:
             raise RuntimeError("absolute interpreter bypassed the original session check")
         print(json.dumps({"provider": "codex", "windows_native_activation": evidence,
