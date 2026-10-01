@@ -42,6 +42,11 @@ def generated(root=PLUGIN):
                                           ("claude", "hooks.json", "CLAUDE_PLUGIN_ROOT")):
         path = root / "hooks" / filename
         document = json.loads(path.read_text())
+        if provider == 'claude':
+            # Root execution before admission must be observed as well as
+            # Agent launches. Discovery and control tools remain available.
+            for group in document['hooks']['PreToolUse']:
+                group['matcher'] = 'Agent|Bash|PowerShell|Write|Edit|NotebookEdit'
         # Claude's Bash command captures this code once for both branches.
         # Duplicating it in the Windows relay exceeds cmd.exe's command limit.
         binding = ("$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"

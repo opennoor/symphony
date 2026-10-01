@@ -62,6 +62,131 @@ CONTROLS = {
 }
 ROLES = {"assessor", "consultant", "lead", "worker"}
 HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
+_ROOT_EXECUTION_TOOLS = {"Bash", "PowerShell", "Write", "Edit", "NotebookEdit"}
+
+
+def _root_admission_key(provider: str, payload: Mapping) -> str:
+    session = payload.get('session_id')
+    if (provider != 'claude' or not isinstance(session, str) or not session
+            or payload.get('agent_id') or payload.get('subagent_id')):
+        return ''
+    return 'claude:' + hashlib.sha256(session.encode()).hexdigest()
+
+
+def _set_root_admission(state: ProjectState, key: str, payload: Mapping,
+                        *, pending: bool, clear_all: bool = False) -> ProjectState:
+    configuration = dict(state.configuration)
+    if clear_all:
+        configuration.pop('root_admission_intents', None)
+    else:
+        recorded = configuration.get('root_admission_intents', {})
+        # Malformed present state cannot become an exemption by rewriting it.
+        if not isinstance(recorded, Mapping):
+            return state
+        intents = dict(recorded)
+        if pending:
+            context = payload.get('prompt_id')
+            # One fixed-size record per outstanding root, no task text or
+            # historical records. Never evict an intent to admit another root.
+            intents[key] = {'version': 1, 'prompt_context': (
+                hashlib.sha256(context.encode()).hexdigest()
+                if isinstance(context, str) and context else '')}
+        else:
+            intents.pop(key, None)
+        if intents:
+            configuration['root_admission_intents'] = intents
+        else:
+            configuration.pop('root_admission_intents', None)
+    return replace(state, configuration=configuration)
+
+
+def _root_admission_prompt(state: ProjectState, source: Event, provider: str,
+                           control: tuple[str, str] | None) -> ProjectState:
+    key = _root_admission_key(provider, source.payload)
+    if not key or not _is_root_origin(source):
+        return state
+    if control is not None:
+        name, argument = control
+        if name == 'disable':
+            return _set_root_admission(state, key, source.payload, pending=False, clear_all=True)
+        if ((name == 'bypass' and argument) or (name == 'stop' and
+                (argument == '--force' or not state.active_run))):
+            return _set_root_admission(state, key, source.payload, pending=False)
+        task = name in {'enable', 'start'} and bool(argument)
+    else:
+        task = state.enabled and bool(str(source.payload.get('prompt') or '').strip())
+        if not state.enabled and not state.active_run:
+            return _set_root_admission(state, key, source.payload, pending=False)
+    recorded = state.configuration.get('root_admission_intents', {})
+    existing = isinstance(recorded, Mapping) and key in recorded
+    if existing or (task and not state.active_run):
+        return _set_root_admission(state, key, source.payload, pending=True)
+    return state
+
+
+def _root_admission_guard(state: ProjectState, source: Event, provider: str) -> tuple[Action, ...]:
+    key = _root_admission_key(provider, source.payload)
+    if not key or source.payload.get('tool_name') not in _ROOT_EXECUTION_TOOLS:
+        return ()
+    recorded = state.configuration.get('root_admission_intents', {})
+    pending = not isinstance(recorded, Mapping) or key in recorded
+    if not pending:
+        return ()
+    if not isinstance(recorded, Mapping):
+        return (_block_tool('Symphony pending root admission state is malformed. '
+                            'Use /symphony:disable to reset it before enabling a new objective.'),)
+    reason = ('Symphony is awaiting managed admission for this root objective. '
+              'Use Agent to launch the offered Symphony fast lead or independent assessor; '
+              'wait for its accepted Start before executing commands or editing files. '
+              'Read, Glob, Grep, Skill and clarification remain available. '
+              'An explicit /symphony:stop with no managed run cancels this intent; '
+              '/symphony:bypass <task> explicitly opts this task out.')
+    return (_block_tool(reason),)
+
+
+def _consume_root_admission(state: ProjectState, source: Event, provider: str,
+                            launches: tuple = ()) -> ProjectState:
+    run = state.active_run
+    if provider != 'claude' or not run or source.kind != 'subagent_started':
+        return state
+    key = _root_admission_key(provider, {'session_id': run.session_id})
+    recorded = state.configuration.get('root_admission_intents', {})
+    if not isinstance(recorded, Mapping) or key not in recorded:
+        return state
+    identity = source.payload.get('agent_id')
+    item = next((item for item in run.delegations if item.identity == identity), None)
+    if (not item or item.role not in {'assessor', 'lead'}
+            or item.state.lower() not in {'working', 'active', 'running'}
+            or source.event_id not in run.assessment.get('_start_event_ids', ())
+            or source.payload.get('parent_thread_id') not in (None, '', run.session_id)):
+        return state
+    named = _agent_label_model_effort(str(source.payload.get('agent_type') or ''), item.role)
+    if (named != (item.requested_tier, item.requested_effort)
+            or _observed_role(source.payload) != item.role
+            or source.payload.get('model') not in (None, '', named[0])
+            or source.payload.get('model_reasoning_effort') not in (None, '', named[1])):
+        return state
+    if item.role == 'assessor':
+        queued = next((launch for launch in launches if isinstance(launch, Mapping)
+                       and launch.get('role') == item.role
+                       and (launch.get('model'), launch.get('effort')) == named), None)
+        routes = run.assessment.get('_assessor_expected_routes', {})
+        if not isinstance(routes, Mapping):
+            return state
+        expected = routes.get(identity) or (
+            queued if queued else assessor_selection(
+                _snapshot(state, provider), _boost_preference(state, provider, run.session_id)))
+        if not isinstance(expected, Mapping):
+            return state
+        if item.requested_effort not in HIGH_EFFORTS or named != (expected.get('model'), expected.get('effort')):
+            return state
+    else:
+        expected = run.assessment.get('_fast_route')
+        if (run.lead_identity != identity or not run.assessment.get('_fast_pending')
+                or run.assessment.get('_lead_route_mismatch') or not isinstance(expected, Mapping)
+                or named != (expected.get('model'), expected.get('effort'))):
+            return state
+    return _set_root_admission(state, key, source.payload, pending=False)
 
 
 def _retained_activation_command(retained: str, original: str) -> str:
@@ -1265,13 +1390,19 @@ def _transition(
         if state.active_run:
             actions += (Action("inject_context", {"text": _recovery_guidance(state, provider)}),)
     elif source.kind == "pre_tool_use":
+        blocked = _root_admission_guard(state, source, provider)
+        if blocked:
+            return state, actions + blocked
         state, delegation_actions = _prepare_delegation(state, source, provider)
         actions += delegation_actions
     elif source.kind in {"subagent_started", "subagent_stopped"}:
         if source.kind == "subagent_started":
             state, deferred = _consume_parent_actions(state)
             actions += deferred
+        launches = state.active_run.assessment.get('_pending_delegations', ()) if state.active_run else ()
+        launches = tuple(launches) if isinstance(launches, (list, tuple)) else ()
         state, observed_actions = _observe_delegation(state, source, environ)
+        state = _consume_root_admission(state, source, provider, launches)
         if source.kind == "subagent_stopped":
             # Neither host accepts injected context on a subagent-stop result,
             # so corrective guidance waits for the next event that does. Render
@@ -1295,6 +1426,12 @@ def _transition(
         state, parent_actions = _consume_parent_actions(state)
         actions += parent_actions
     elif source.kind in {"stop_requested", "interrupt"}:
+        if (source.kind == 'stop_requested' and not state.active_run
+                and source.payload.get('hook_event_name') == 'UserPromptSubmit'
+                and _parse_control(str(source.payload.get('prompt') or '')) == ('stop', '')):
+            key = _root_admission_key(provider, source.payload)
+            if key:
+                state = _set_root_admission(state, key, source.payload, pending=False)
         if source.kind == "stop_requested":
             state, reconciliation_actions = _reconcile_session(state, source, payload)
             actions += reconciliation_actions
@@ -1527,6 +1664,7 @@ def _handle_prompt(
 ) -> tuple[ProjectState, tuple[Action, ...]]:
     prompt = str(source.payload.get("prompt") or "").strip()
     control = _parse_control(prompt)
+    state = _root_admission_prompt(state, source, provider, control)
     if control is None:
         # Enablement decides whether a NEW run opens, never whether a live one
         # is mentioned. Staying silent during a one-shot run left the root free
