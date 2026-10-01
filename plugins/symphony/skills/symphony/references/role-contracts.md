@@ -16,11 +16,11 @@ Claude's Agent `PreToolUse` hook blocks unmarked spawns before launch. On Sympho
 Provider binding is mechanical:
 
 - Claude Code: select a packaged `symphony-<role>-<model>-<effort>` agent type. The agent definition pins both settings because Claude's Agent call does not expose per-call effort. Reference it with the plugin prefix, `symphony:symphony-<role>-<model>-<effort>`. Symphony names the exact assessor and lead types in the root's guidance and the worker types in the lead's start context. Agents run in the background, and a background agent's result reaches Symphony through its `SubagentHandback` report.
-- Codex: pass `model` and `reasoning_effort`, use `fork_turns="none"`, and use `symphony_<role>_<model>_<effort>` as the task name. Relay a bounded packet explicitly; never fork the root history into an assessor or lead.
+- Codex: pass `model` and `reasoning_effort`, use `fork_turns="none"`, and use `symphony_<role>_<model>_<effort>` for assessor, assessed lead, worker, and consultant task names. The initial fast lead uses exactly `symphony_lead_fast_<model>_<effort>` instead; its reserved name must not be replaced by the assessed-lead name. Relay a bounded packet explicitly; never fork the root history into an assessor or lead.
 
 Compact status shows at most five latest delegation records, ordered failed, active/waiting, then recently completed. `agents --all` shows every retained latest record, not every transition.
 
-Use the host role name `symphony_<role>_<model>_<effort>` when custom names are supported. Every visible delegation line includes `role [model/effort]`, the host-observed identity, and its bounded objective. Omit model, effort, tokens, or duration when the host does not expose them; never infer them.
+Use the host role name `symphony_<role>_<model>_<effort>` for assessed work when custom names are supported; keep the fast lead's distinct reserved name before escalation. Every visible delegation line includes `role [model/effort]`, the host-observed identity, and its bounded objective. Omit model, effort, tokens, or duration when the host does not expose them; never infer them.
 
 ## Assessment
 

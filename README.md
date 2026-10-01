@@ -147,6 +147,8 @@ codex plugin add symphony@symphony
 
 Codex updates loaded outside the current process require a new session and renewed `/hooks` review when the hook hash changes. Claude updates require reload or restart. In both providers, the next prompt confirms the loaded version through its heartbeat.
 
+The native mixed-runtime release gate upgrades active 1.6.0 sessions to 1.7.0 while preserving the original run and owner after removal of the old source. Version 1.5.1 is an explicit legacy probe, not this release gate: its writer removes terminal receipts from shared v2 state. After that write, a committed callback whose owner has changed may remain held when exact acknowledgment proof is missing. Finish 1.5.1 work before upgrading; reloading alone cannot restore receipts already lost. Strict regression coverage retains those unresolved callbacks rather than treating them as completion evidence.
+
 Symphony 1.0 imports project enablement and user configuration only. Incompatible active-run state is archived and the next managed task receives a fresh assessment. Pre-1.0 state is located by hashing the repository's git toplevel, with the working directory as a fallback, so an import still succeeds from a subdirectory.
 
 Version 1.4.7 stores concurrent runs in a separate v2 state file. On first use it copies a readable v1 project state, including a live run, without changing the v1 file. Already-running 1.4.6 hooks may continue updating v1 while new hooks update v2; those two versions do not synchronize run completion. Let older sessions finish and reload the plugin before relying on migrated completion status. A new session cannot force-stop an older session's run.

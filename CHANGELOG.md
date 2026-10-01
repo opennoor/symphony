@@ -6,10 +6,15 @@
 - Require successful child work from the current assessment and lead generation before new delegated or mixed runs complete. Preserve the admitted child role and exact lead ownership. Claude scoped credit requires a fresh native child; retained multiple-prompt history has actionable same-lead recovery through fresh bounded delegation. Legacy completion remains compatible.
 - Recover fresh leads after archived history and verified continuations of the latest archived owner through normal lifecycle entry points. Preserve exact native identity, root session, provider, model, effort, turn, and ownership checks. A new objective still requires fresh routing.
 - Bind new Claude fast runs to the exact accepted native launch so a parent call recorded before its hook can reconcile safely. Repeated native Stop releases the host turn while retaining unresolved work and displaying recovery guidance.
+- Reconcile ordinary Claude completion across prompt-context changes and markerless resumed turns, including a first Stop held by unfinished work.
+- Acknowledge an unadmitted preliminary Codex child only when exact native evidence and complete retained history prove its escalation finished before managed work began. Record an explicit unmanaged disposition without task or lead credit. Clarify the distinct fast and assessed lead names.
+- Preserve accepted legacy risk text during route recovery while keeping new assessment validation strict.
 - Reconcile committed archived fast-lead escalation callbacks after the actual 1.6.0 serializer removes newer receipt fields, using surviving exact run and native evidence for acknowledgement only. Missing or conflicting proof remains retained; reloading alone does not restore trimmed evidence.
 - Supply an activation checker pinned to the verified interpreter running the hook, and probe Windows interpreter candidates before use. Preserve launcher expressions when Codex selects an outer PowerShell shell. Keep generated launchers reproducible across supported Python compression backends.
 
 Native checks target Codex CLI 0.159.3 for the `latest` profile. CLI 0.158.0 needs `SYMPHONY_PROFILE=full` because its native spawn path rejects `gpt-6.1-sol`. Existing sessions retain their reviewed runtime until reload or restart; installing an update alone does not prove current-session activation.
+
+Mixed-runtime release checks use the latest released version, 1.6.0. Finish managed work before upgrading from 1.5.1: its serializer can remove whole receipt records, leaving unresolved callbacks held after ownership changes. Repeated Stop or reload does not restore that missing proof.
 
 ## 1.6.0 — prepared 2026-09-29
 

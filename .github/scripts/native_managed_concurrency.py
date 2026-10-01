@@ -100,16 +100,24 @@ def native_metadata_probe(payload):
     return facts
 
 def admission_probe(payload):
-    facts = dict.fromkeys(("state_readable", "owner_run_present", "child_tracked", "child_start_recorded"), False)
+    facts = dict.fromkeys(("state_readable", "owner_run_present", "child_tracked", "child_start_recorded",
+                          "accepted_assessed_lead_route", "canonical_lead_consistent"), False)
     facts["tracked_role"] = "unknown"
     try:
         key = hashlib.sha256(os.path.normcase(str(pathlib.Path(payload["cwd"]).resolve())).encode()).hexdigest()
         path = pathlib.Path(os.environ["SYMPHONY_STATE_DIR"]) / (key + ".v2.json")
         document = json.loads(path.read_text(encoding="utf-8"))
         facts["state_readable"] = True
-        run = document.get("active_runs", {}).get("codex:" + payload["session_id"])
+        run = document.get("active_runs", {}).get(provider + ":" + payload["session_id"])
         facts["owner_run_present"] = isinstance(run, dict)
         if isinstance(run, dict):
+            assessment = run.get("assessment") or {}
+            route = assessment.get("route") or {}
+            expected = "symphony:symphony-lead-" + str(route.get("lead_model") or "") + "-" + str(route.get("lead_effort") or "")
+            facts["accepted_assessed_lead_route"] = bool(provider == "claude" and route
+                and assessment.get("_fast_pending") is not True
+                and payload.get("agent_type") == expected)
+            facts["canonical_lead_consistent"] = run.get("lead_identity") in {None, "", payload.get("agent_id")}
             child = next((item for item in run.get("delegations", [])
                           if item.get("identity") == payload.get("agent_id")), None)
             facts["child_tracked"] = child is not None
@@ -150,6 +158,8 @@ if provider == "codex" and event in {"SubagentStart", "SubagentStop"}:
     # Observer snapshots only: callback clock ordering can precede the
     # product hook. These facts never authorize registration or gate release.
     record["admission_at_capture"] = admission_probe(payload)
+if provider == "claude" and event in {"SubagentStart", "SubagentStop"}:
+    record["admission_at_capture"] = admission_probe(payload)
 if event == "SubagentStop":
     message = payload.get("last_assistant_message")
     markers = re.findall(r'^SYMPHONY_OUTCOME:\\s*(\\{[^\\n]*\\})', message, re.MULTILINE) if isinstance(message, str) else []
@@ -188,6 +198,25 @@ agent_type = payload.get("agent_type")
 is_lead_start = (event == "SubagentStart" and provider == "claude"
                  and isinstance(agent_type, str) and re.fullmatch(
                      r"symphony:symphony-lead-[a-z0-9-]{1,96}", agent_type) is not None)
+if gate_dir and gate_label in {"a", "b"} and is_lead_start:
+    # Resume callbacks remain in the observer timeline, but only the first
+    # root-bound packaged lead Start can define the overlap barrier.
+    identity = payload.get("agent_id")
+    parent = payload.get("parent_thread_id")
+    if (not isinstance(identity, str) or not identity or identity == payload.get("session_id")
+            or parent not in {None, "", payload.get("session_id")}
+            or record["admission_at_capture"]["accepted_assessed_lead_route"] is not True
+            or record["admission_at_capture"]["canonical_lead_consistent"] is not True):
+        is_lead_start = False
+    else:
+        try:
+            with (gate_dir / (gate_label + ".lead.json")).open("x") as stream:
+                json.dump({"session_id": payload.get("session_id"), "agent_id": identity}, stream)
+        except FileExistsError:
+            frozen = json.loads((gate_dir / (gate_label + ".lead.json")).read_text())
+            if frozen.get("session_id") != payload.get("session_id"):
+                raise SystemExit("native gate root session changed")
+            is_lead_start = False
 if (gate_dir and gate_label in {"a", "b"} and event == "SubagentStart"
         and provider == "codex" and agent_type == "default"):
     # Codex 0.159 reports both assessor and lead as agent_type=default.
@@ -716,7 +745,7 @@ def package_version(source):
 
 
 def require_live_update_versions(old_version, candidate_version):
-    """Keep the default released baseline and allow the explicit 1.6.0 replay."""
+    """Require a newer candidate; CI uses 1.6.0 and explicit legacy probes may use 1.5.1."""
     if not isinstance(old_version, str) or old_version not in {"1.5.1", "1.6.0"}:
         raise RuntimeError("live update requires an actual released 1.5.1 or 1.6.0 package")
     if (not isinstance(candidate_version, str)
@@ -763,7 +792,7 @@ def claude_command(env, cwd, *arguments, timeout=60):
     return completed
 
 
-def install_hook_capture(provider, root, home):
+def install_hook_capture(provider, root, home, *, private_children=False, candidate_source=None):
     """Add an independent native callback clock to a disposable CLI home."""
     capture = root / f"{provider}-hook-capture"
     capture.mkdir(exist_ok=True)
@@ -793,9 +822,32 @@ def install_hook_capture(provider, root, home):
                                                              "timeout": 600 if event == "SubagentStart"
                                                              else 10}]})
         settings_path.write_text(json.dumps(settings))
+    if provider == 'claude' and private_children:
+        # Diagnostic-only snapshots preserve hook-time handback normalization.
+        # Product hook commands and callback admission remain untouched.
+        private = root / 'private-child-hooks'
+        private.mkdir(mode=0o700, exist_ok=True)
+        candidate = (Path(candidate_source).resolve() if candidate_source is not None else
+                     Path(__file__).resolve().parents[2] / 'plugins' / 'symphony')
+        anchor = 'provider = sys.argv[3]\n'
+        extra = (
+            "if provider == 'claude' and event in {'SubagentStart', 'SubagentStop'}:\n"
+            "    private_capture = {'raw': payload, 'canonical': None}\n"
+            "    try:\n"
+            f"        sys.path.insert(0, {str(candidate)!r})\n"
+            "        from symphony.adapters import event_from_payload\n"
+            "        private_event = event_from_payload('claude', payload)\n"
+            "        private_capture['canonical'] = {'event_id': private_event.event_id, 'kind': private_event.kind, 'payload': private_event.payload}\n"
+            "    except (OSError, ValueError, TypeError, AttributeError, ImportError):\n"
+            "        pass\n"
+            f"    private_file = pathlib.Path({str(private)!r}) / (invocation + '.json')\n"
+            "    descriptor = os.open(private_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+            "    with os.fdopen(descriptor, 'w', encoding='utf-8') as private_stream:\n"
+            "        json.dump(private_capture, private_stream)\n")
+        script.write_text(CODEX_HOOK_CAPTURE.replace(anchor, anchor + extra), encoding='utf-8')
 
 
-def prepare_baseline_capture(provider, root, candidate_source):
+def prepare_baseline_capture(provider, root, candidate_source, *, capture_child_sources=False):
     """Install the candidate and capture hooks in a fresh native CLI home."""
     candidate_source = candidate_source.resolve()
     version = package_version(candidate_source)
@@ -834,7 +886,8 @@ def prepare_baseline_capture(provider, root, candidate_source):
                 raise RuntimeError("disposable Claude baseline config is not authenticated")
         claude_command(native_env, root, "plugin", "marketplace", "add", str(market))
         claude_command(native_env, root, "plugin", "install", "-y", "symphony@symphony-baseline")
-    install_hook_capture(provider, root, home)
+    install_hook_capture(provider, root, home, private_children=capture_child_sources,
+                         candidate_source=candidate_source)
     return env
 
 
@@ -875,7 +928,8 @@ def prepare_live_update(provider, root, old_source, candidate_source):
                 raise RuntimeError("disposable Claude config is not authenticated")
         claude_command(env, root, "plugin", "marketplace", "add", str(old_market))
         claude_command(env, root, "plugin", "install", "-y", "symphony@symphony-old")
-    install_hook_capture(provider, root, home)
+    install_hook_capture(provider, root, home, private_children=True,
+                         candidate_source=candidate_source)
     old_cache = home / "plugins" / "cache" / "symphony-old" / "symphony" / old_version
     hook = "codex.json" if provider == "codex" else "hooks.json"
     if not (old_cache / "hooks" / hook).is_file():
@@ -3473,7 +3527,72 @@ def claude_host_trace(home, session, lead_id):
     return result
 
 
+def claude_callback_disposition_probe(root, run, document, session_records):
+    """Observe exact private callback identities without replaying or ACKing them."""
+    from native_routing_smoke import Event, _terminal_result_id, _child_turn_token
+    assessment = run.get('assessment') or {}
+    proofs = assessment.get('_substantive_children') or {}
+    known = {item.get('identity') for item in run.get('delegations', [])}
+    output = []
+    for path in sorted((root / 'private-child-hooks').glob('*.json')):
+        try:
+            capture = json.loads(path.read_text(encoding='utf-8'))
+            snapshot, raw = capture.get('canonical'), capture.get('raw')
+            if not isinstance(snapshot, dict) or not isinstance(raw, dict):
+                continue
+            payload, event_id = snapshot.get('payload'), snapshot.get('event_id')
+            if (not isinstance(payload, dict) or payload.get('provider') != 'claude'
+                    or snapshot.get('kind') != 'subagent_stopped'
+                    or raw.get('hook_event_name') != 'SubagentStop'
+                    or set(payload) - set(raw) - {'provider', 'last_assistant_message'}
+                    or set(raw) - set(payload)
+                    or any(payload.get(key) != value for key, value in raw.items()
+                           if key not in {'provider', 'last_assistant_message'})
+                    or event_id != sha256(json.dumps(payload, sort_keys=True,
+                        separators=(',', ':'), default=str).encode()).hexdigest()):
+                continue
+            identity = payload.get('agent_id') or payload.get('subagent_id')
+            if identity not in known or payload.get('session_id') not in {run.get('session_id'), identity}:
+                continue
+            proof = proofs.get(identity) or {}
+            source = Event(event_id, 'subagent_stopped', '', payload)
+            # Observation only, with the same exact retained roster/root boundary.
+            scoped = replace(source, payload={**payload, 'session_id': run['session_id']})
+            result, token = _terminal_result_id(scoped), _child_turn_token(payload)
+            history = [item for item in document.get('event_history', [])
+                if str(item.get('event_id') or '').startswith(event_id + ':')]
+            receipts = [item for item in document.get('terminal_receipts', [])
+                if item.get('provider') == 'claude' and item.get('session') == run['session_id']
+                and item.get('run_id') == run.get('run_id') and item.get('agent') == identity]
+            role = proof.get('role')
+            status = payload.get('status')
+            output.append({'ordinal': len(output),
+                'immutable_start_proof_present': bool(proof),
+                'immutable_start_role': role if role in {'worker', 'consultant', 'lead'} else 'unknown',
+                'canonical_id_equals_admitted_start': event_id == proof.get('start_event_id'),
+                'canonical_id_in_start_ids': event_id in assessment.get('_start_event_ids', ()),
+                'canonical_id_in_terminal_ids': event_id in assessment.get('_terminal_event_ids', ()),
+                'scoped_result_in_terminal_ids': result in assessment.get('_terminal_event_ids', ()),
+                'terminal_token_recorded': token in assessment.get('_terminal_turns', {}).get(identity, ()),
+                'derived_history_count': len(history),
+                'derived_terminal_history_count': sum(item.get('kind') == 'delegation_updated'
+                    and item.get('payload', {}).get('state') in {'completed', 'failed'} for item in history),
+                'pending_canonical_id_count': sum(item.get('event_id') == event_id
+                    for record in session_records for item in record.get('pending', ())),
+                'scoped_receipt_count': len(receipts),
+                'exact_turn_receipt_count': sum(item.get('turn') == token for item in receipts),
+                'exact_result_receipt_count': sum(item.get('result') == result for item in receipts),
+                'supplied_status': status if status in {'completed', 'failed', 'blocked', 'done', 'success', 'succeeded'} else 'other_or_absent',
+                'batch_pending': assessment.get('_batch_pending') is True})
+            if len(output) >= 24:
+                break
+        except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+            continue
+    return output
+
+
 def failure_state(root, provider):
+    from native_routing_smoke import claude_child_binding_probe
     def short_hash(value):
         return sha256(str(value).encode()).hexdigest()[:12] if value else None
 
@@ -3534,6 +3653,10 @@ def failure_state(root, provider):
                 "terminal_turn_hashes": {identity: [short_hash(token) for token in tokens]
                                          for identity, tokens in terminal_turns.items()},
                 'native_literal_workers': codex_literal_worker_probe(run, home) if provider == 'codex' else None,
+                'native_child_binding': claude_child_binding_probe(home, run, document)
+                    if provider == 'claude' else None,
+                'native_callback_disposition': claude_callback_disposition_probe(root, run, document, raw_session_records)
+                    if provider == 'claude' else None,
                 "lead_delegations": [{"identity": item.get("identity"), "state": item.get("state"),
                                       "requested_tier": item.get("requested_tier"),
                                       "requested_effort": item.get("requested_effort")}
@@ -3648,12 +3771,14 @@ def failure_state(root, provider):
                             for event in document.get("event_history", [])
                             if event.get("kind") == "stop_requested"]
         session_records = []
+        raw_session_records = []
         for record_path in (case_root / "state").glob(".session-*.json"):
             try:
                 record = json.loads(record_path.read_text())
             except (OSError, ValueError):
                 continue
             if record.get("state_name") in {None, path.name}:
+                raw_session_records.append(record)
                 session_records.append(session_record_summary(record, root_sessions))
         native_home = root / f'{provider}-{"live-update" if case == "live-update" else "baseline"}-home'
         recovery_probes = {}
@@ -3771,6 +3896,12 @@ def preserve_private_native_failure(root, destination, provider):
     destination.chmod(0o700)
     target = destination / f'{provider}-{uuid.uuid4().hex[:12]}'
     target.mkdir(mode=0o700)
+    private = root / 'private-child-hooks'
+    if provider == 'claude' and private.is_dir():
+        for path in private.glob('*.json'):
+            if path.is_file() and not path.is_symlink():
+                (target / 'private-child-hooks').mkdir(exist_ok=True)
+                shutil.copyfile(path, target / 'private-child-hooks' / path.name)
     for case in ('same-worktree', 'worktrees', 'live-update'):
         source = root / case
         if not source.is_dir():
@@ -3815,12 +3946,13 @@ def main():
     parser.add_argument("--direct-stop-resume", action="store_true",
                         help="probe an exact normal Stop control on Codex live-update resume")
     parser.add_argument("--old-plugin-root", type=Path,
-                        help="actual released 1.5.1 package (default CI baseline), or explicit 1.6.0 package")
+                        help="actual released 1.6.0 package (CI baseline), or explicit legacy 1.5.1 probe")
     parser.add_argument('--keep-failure-dir', type=Path,
                         help='private local evidence directory; never upload its raw native transcripts')
     parser.add_argument("--candidate-plugin-root", type=Path,
                         default=Path(__file__).resolve().parents[2] / "plugins" / "symphony")
     args = parser.parse_args()
+    attempt = uuid.uuid4().hex[:12]
     if args.only_live_update and not args.live_update:
         parser.error("--only-live-update requires --live-update")
     if args.only_live_update and args.only_worktrees:
@@ -3848,7 +3980,7 @@ def main():
             cases = (() if args.only_live_update else
                      (True,) if args.only_worktrees else (False, True))
             baseline_env = (prepare_baseline_capture(args.provider, root,
-                            args.candidate_plugin_root) if cases else None)
+                            args.candidate_plugin_root, capture_child_sources=True) if cases else None)
             results = [check_case(args.provider, root, separate, args.timeout,
                                   args.claude_budget_usd,
                                   baseline_env=baseline_env) for separate in cases]
@@ -3875,7 +4007,7 @@ def main():
             if destination:
                 directory = Path(destination)
                 directory.mkdir(parents=True, exist_ok=True)
-                (directory / f"native-managed-{args.provider}-failure.json").write_text(
+                (directory / f"native-managed-{args.provider}-failure-{attempt}.json").write_text(
                     json.dumps(diagnostics, indent=2), encoding="utf-8")
             print(json.dumps({"provider": args.provider, "failure": diagnostics["failure"],
                               "case_count": len(diagnostics.get("cases", [])),
@@ -3897,7 +4029,7 @@ def main():
     if destination:
         directory = Path(destination)
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"native-managed-{args.provider}-receipt.json").write_text(
+        (directory / f"native-managed-{args.provider}-receipt-{attempt}.json").write_text(
             json.dumps(receipt, indent=2), encoding="utf-8")
     # Full hook timelines belong in the artifact. A large single stdout write
     # can fail on CI's nonblocking pipe after every native check has passed.

@@ -33,6 +33,222 @@ def _instant(value: object) -> datetime | None:
         return None
 
 
+def codex_unmanaged_pre_run_terminal(
+    state: ProjectState, source: Event, session: str, project: Path,
+    environ: Mapping[str, str], result_id: str,
+) -> dict | None:
+    """Prove an unadmitted terminal predates this root's first managed work.
+
+    This is an inbox disposition, never a fast classification or task result.
+    Bounded history must still cover the root's birth; incomplete history is
+    insufficient even when the child precedes the currently visible run.
+    """
+    from .reducer import _EVENT_HISTORY_LIMIT
+
+    payload = source.payload
+    identity, token = payload.get('agent_id'), payload.get('turn_id')
+    callback_at = _instant(source.observed_at)
+    report = payload.get('last_assistant_message')
+    if (source.kind != 'subagent_stopped' or payload.get('provider') != 'codex'
+            or payload.get('session_id') != session or payload.get('parent_thread_id') != session
+            or not isinstance(identity, str) or not _CODEX_ID.fullmatch(identity)
+            or not _CODEX_ID.fullmatch(session) or identity == session
+            or not isinstance(token, str) or not _CODEX_ID.fullmatch(token)
+            or callback_at is None or not _archived_fast_escalation(report)
+            or payload.get('status') not in {None, 'completed', 'done', 'success', 'succeeded'}
+            or not state.event_history or len(state.event_history) >= _EVENT_HISTORY_LIMIT):
+        return None
+    history_times = [_instant(event.observed_at) for event in state.event_history]
+    if any(when is None for when in history_times):
+        return None
+    admissions = [event for event in state.event_history if event.kind == 'task_received'
+                  and event.payload.get('session_id') == session]
+    if not admissions:
+        return None
+    first = min(admissions, key=lambda event: _instant(event.observed_at))
+    boundary = _instant(first.observed_at)
+    runs = (*state.active_runs.values(), *state.recent_runs)
+    if state.active_run and state.active_run not in runs:
+        runs = (*runs, state.active_run)
+    if (not any(run.provider == 'codex' and run.session_id == session
+                and run.run_id == first.event_id and run.started_at == first.observed_at for run in runs)
+            or not callback_at < boundary
+            or any(identity in (receipt.get('agent'), receipt.get('lead'), receipt.get('parent'))
+                   or receipt.get('provider') == 'codex' and receipt.get('session') == session
+                   and receipt.get('result') == result_id for receipt in state.terminal_receipts)
+            or any(event.payload.get('identity') == identity
+                   or event.payload.get('agent_id') == identity
+                   or event.payload.get('agent') == identity
+                   or event.payload.get('lead_identity') == identity
+                   or event.event_id == source.event_id
+                   or event.event_id.startswith(source.event_id + ':')
+                   for event in state.event_history)):
+        return None
+    if any(run.provider == 'codex' and run.session_id == session
+           and not any(event.event_id == run.run_id and event.observed_at == run.started_at
+                       for event in admissions) for run in runs):
+        return None
+    for run in runs:
+        assessment = run.assessment
+        if (run.lead_identity == identity or any(child.identity == identity for child in run.delegations)
+                or any(identity in assessment.get(key, {}) for key in
+                       ('_active_turns', '_terminal_turns', '_substantive_children'))
+                or any(identity in str(value) for key in ('_start_event_ids', '_terminal_event_ids')
+                       for value in assessment.get(key, ()))
+                or any(str(value).rsplit(':', 1)[-1] == result_id
+                       for value in assessment.get('_terminal_event_ids', ()))
+                or any(isinstance(intent, dict) and (intent.get('identity') == identity
+                       or intent.get('role') == 'lead' and intent.get('model') == payload.get('model'))
+                       for intent in assessment.get('_pending_delegations', ()))):
+            return None
+    sessions = Path(environ.get('CODEX_HOME') or Path.home() / '.codex') / 'sessions'
+    if sessions.is_symlink() or not sessions.is_dir():
+        return None
+
+    def read(own_id):
+        paths = tuple(sessions.glob(f'*/*/*/*{own_id}.jsonl'))
+        if (len(paths) != 1 or any(parent.is_symlink() for parent in paths[0].parents
+                                 if parent == sessions or sessions in parent.parents)):
+            return None
+        rows = _complete_native_jsonl(paths[0])
+        if not rows or rows[0].get('type') != 'session_meta':
+            return None
+        header = rows[0]['payload']
+        cwd = header.get('cwd')
+        if (header.get('id') != own_id or header.get('forked_from_id')
+                or sum(row.get('type') == 'session_meta' for row in rows) != 1
+                or not isinstance(cwd, str) or not Path(cwd).is_absolute()
+                or Path(cwd).resolve() != project.resolve()
+                or any(_instant(row.get('timestamp')) is None for row in rows)):
+            return None
+        return rows, header
+
+    root_data, child_data = read(session), read(identity)
+    if not root_data or not child_data:
+        return None
+    root_rows, root_header = root_data
+    rows, header = child_data
+    born = _instant(root_header.get('timestamp'))
+    child_born = _instant(header.get('timestamp'))
+    if (not born or not child_born or history_times[0] > born
+            or state.event_history[0].kind != 'session_heartbeat'
+            or root_header.get('parent_thread_id') or root_header.get('source') != 'exec'
+            or root_header.get('agent_path') not in {None, '/root'}
+            or header.get('parent_thread_id') != session):
+        return None
+    if (any(event.kind == 'task_received' and not event.payload.get('session_id')
+            and _instant(event.observed_at) >= born for event in state.event_history)
+            or any((not run.provider or not run.session_id) and
+                   (_instant(run.started_at) is None or _instant(run.started_at) >= born) for run in runs)):
+        return None
+    nested = header
+    for key in ('source', 'subagent', 'thread_spawn'):
+        nested = nested.get(key, {}) if isinstance(nested, dict) else {}
+    if not isinstance(nested, dict) or nested.get('parent_thread_id') != session:
+        return None
+    path = header.get('agent_path') or nested.get('agent_path')
+    name = payload.get('task_name')
+    if (not isinstance(name, str) or not re.fullmatch(r'symphony_lead_[a-z0-9_]{1,100}', name)
+            or name.startswith('symphony_lead_fast_') or path != f'/root/{name}'
+            or 'agent_path' in nested and 'agent_path' in header
+            and nested['agent_path'] != header['agent_path']):
+        return None
+    starts = [row for row in rows if row.get('type') == 'event_msg'
+              and row['payload'].get('type') == 'task_started']
+    ends = [row for row in rows if row.get('type') == 'event_msg'
+            and row['payload'].get('type') == 'task_complete']
+    contexts = [row for row in rows if row.get('type') == 'turn_context']
+    if (len(starts) != 1 or len(ends) != 1 or len(contexts) != 1
+            or any(row['payload'].get('type') in {'error', 'task_failed', 'turn_aborted',
+                                               'task_interrupted'} for row in rows)
+            or any(row['payload'].get('turn_id') != token for row in (*starts, *ends, *contexts))
+            or ends[0]['payload'].get('last_agent_message') != report
+            or contexts[0]['payload'].get('model') != payload.get('model')
+            or contexts[0]['payload'].get('effort') != payload.get('model_reasoning_effort')
+            or not payload.get('model') or not payload.get('model_reasoning_effort')):
+        return None
+    began, ended = _instant(starts[0]['timestamp']), _instant(ends[0]['timestamp'])
+    context_at = _instant(contexts[0]['timestamp'])
+    if not (born <= child_born <= began <= context_at <= ended < boundary
+            and began <= callback_at < boundary):
+        return None
+    calls, outputs, activity = {}, {}, []
+    for row in root_rows:
+        item = row['payload']
+        when = _instant(row['timestamp'])
+        if row.get('type') == 'response_item' and item.get('type') == 'function_call':
+            call_id = item.get('call_id')
+            if not isinstance(call_id, str) or not call_id or call_id in calls:
+                return None
+            if item.get('name') not in {'spawn_agent', 'followup_task'}:
+                continue
+            try:
+                args = json.loads(item.get('arguments'))
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(args, dict):
+                return None
+            calls[call_id] = (item['name'], args, when)
+        elif row.get('type') == 'response_item' and item.get('type') == 'function_call_output':
+            call_id = item.get('call_id')
+            if not isinstance(call_id, str) or not call_id or call_id in outputs:
+                return None
+            outputs[call_id] = (item.get('output'), when)
+        elif row.get('type') == 'event_msg' and item.get('type') == 'item_completed':
+            entry = item.get('item')
+            if isinstance(entry, dict) and entry.get('type') == 'SubAgentActivity':
+                if item.get('thread_id') != session:
+                    return None
+                activity.append((entry, when))
+    launches = [(key, args, when) for key, (kind, args, when) in calls.items()
+                if kind == 'spawn_agent' and (args.get('task_name') == name
+                    or any(entry.get('id') == key and entry.get('agent_thread_id') == identity
+                           for entry, _ in activity))]
+    if len(launches) != 1:
+        return None
+    call_id, args, called = launches[0]
+    response = outputs.get(call_id)
+    launched = [(entry, when) for entry, when in activity if entry.get('kind') == 'started'
+                and (entry.get('id') == call_id or entry.get('agent_thread_id') == identity
+                     or entry.get('agent_path') == path)]
+    if (args.get('task_name') != name or args.get('fork_turns') != 'none'
+            or args.get('model') != payload['model']
+            or args.get('reasoning_effort') != payload['model_reasoning_effort']
+            or not isinstance(args.get('message'), str) or not args['message']
+            or not response or len(launched) != 1
+            or launched[0][0].get('id') != call_id
+            or launched[0][0].get('agent_thread_id') != identity
+            or launched[0][0].get('agent_path') != path
+            or not born <= called <= child_born <= began
+            or not called <= launched[0][1] <= began
+            or not called <= response[1] < boundary):
+        return None
+    try:
+        returned = json.loads(response[0])
+    except (TypeError, ValueError):
+        return None
+    if returned != {'task_name': path}:
+        return None
+    completed = [(entry, when) for entry, when in activity
+                 if entry.get('kind') == 'completed' and entry.get('agent_thread_id') == identity]
+    if (len(completed) != 1 or completed[0][0].get('id') != 'subagent-completed-' + token
+            or completed[0][0].get('agent_path') != path
+            or not ended <= completed[0][1] < boundary):
+        return None
+    if (any(kind == 'followup_task' and args.get('target') in {name, path, identity}
+            for kind, args, _ in calls.values())
+            or any(kind == 'spawn_agent' and key != call_id and called <= when <= ended
+                   for key, (kind, _, when) in calls.items())
+            or any(entry.get('kind') == 'started' and entry.get('agent_thread_id') != identity
+                   and called <= when <= ended for entry, when in activity)
+            or any(entry.get('agent_thread_id') == identity
+                   and entry.get('kind') not in {'started', 'completed'} for entry, _ in activity)):
+        return None
+    return {'native_call_id': call_id, 'native_path': path,
+            'native_started_at': starts[0]['timestamp'], 'native_completed_at': ends[0]['timestamp'],
+            'first_admission_id': first.event_id, 'first_admission_at': first.observed_at}
+
+
 def _reported_status(message: object) -> str | None:
     if not isinstance(message, str):
         return None

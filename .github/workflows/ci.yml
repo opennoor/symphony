@@ -253,10 +253,10 @@ jobs:
           $managedExit = $LASTEXITCODE
           $oldCheckout = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
           if (-not (Test-Path (Join-Path $oldCheckout 'plugins/symphony/hooks/hooks.json'))) {
-            git fetch origin tag v1.5.1
-            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch released 1.5.1 source' }
-            git worktree add --detach $oldCheckout v1.5.1
-            if ($LASTEXITCODE -ne 0) { throw 'Could not materialize released 1.5.1 source' }
+            git fetch origin tag v1.6.0
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch released 1.6.0 source' }
+            git worktree add --detach $oldCheckout v1.6.0
+            if ($LASTEXITCODE -ne 0) { throw 'Could not materialize released 1.6.0 source' }
           }
           python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 `
             --live-update --old-plugin-root (Join-Path $oldCheckout 'plugins/symphony') `
@@ -375,8 +375,8 @@ jobs:
             '$symphony:symphony help'
           python3 .github/scripts/assert_heartbeat.py codex
           python3 plugins/symphony/scripts/native_effort_smoke.py --provider codex
-          git fetch origin tag v1.5.1
-          git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
+          git fetch origin tag v1.6.0
+          git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.6.0
           export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
           python3 .github/scripts/native_routing_smoke.py --provider codex --timeout 600
           python3 .github/scripts/native_managed_concurrency.py --provider codex --timeout 600 \
@@ -410,8 +410,8 @@ jobs:
           python3 .github/scripts/assert_heartbeat.py claude
           python3 plugins/symphony/scripts/native_effort_smoke.py --provider claude
           if [ ! -d "$RUNNER_TEMP/symphony-old-release/plugins/symphony" ]; then
-            git fetch origin tag v1.5.1
-            git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
+            git fetch origin tag v1.6.0
+            git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.6.0
           fi
           export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
           python3 .github/scripts/native_routing_smoke.py --provider claude --timeout 600

@@ -166,11 +166,12 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 self.assertEqual(target.stat().st_mode & 0o777, 0o700)
                 self.assertEqual((target / 'live-update/logs/a.errors').stat().st_mode & 0o777, 0o600)
 
-    def test_live_update_versions_keep_default_release_and_explicit_160_strict(self):
+    def test_live_update_versions_keep_160_baseline_and_explicit_151_strict(self):
         for old, candidate in (("1.5.1", "1.6.0"), ("1.5.1", "1.7.0"),
                                ("1.6.0", "1.7.0")):
             with self.subTest(old=old, candidate=candidate):
                 native.require_live_update_versions(old, candidate)
+
         for old, candidate in (("1.5.1", "1.5.1"), ("1.5.1", "1.5.0"),
                                ("1.6.0", "1.6.0"), ("1.6.0", "1.5.1"),
                                ("1.7.0", "1.8.0"), ("1.5.0", "1.7.0"),
@@ -179,6 +180,16 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                                ("1.6.0", None)):
             with self.subTest(old=old, candidate=candidate), self.assertRaises(RuntimeError):
                 native.require_live_update_versions(old, candidate)
+
+
+    def test_native_ci_upgrade_baseline_uses_released_160(self):
+        workflow = (PLUGIN.parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        self.assertEqual(workflow.count('git fetch origin tag v1.6.0'), 3)
+        self.assertNotIn('git fetch origin tag v1.5.1', workflow)
+        self.assertEqual(sum('git worktree add --detach' in line and line.endswith(' v1.6.0')
+                             for line in workflow.splitlines()), 3)
+        # The separate legacy recovering-state replay remains a strict test.
+        self.assertIn('Replay released 1.5.1 recovering state', workflow)
 
     def test_live_update_main_accepts_both_released_roots_with_default_candidate(self):
         for old_version in ("1.5.1", "1.6.0"):
@@ -761,6 +772,15 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             script = root / "capture.py"
             script.write_text(native.CODEX_HOOK_CAPTURE)
             gate, capture = root / "gate", root / "capture"
+            project, state = root / 'project', root / 'state'
+            project.mkdir()
+            state.mkdir()
+            document = {'active_runs': {f'claude:root-{label}': {
+                'assessment': {'route': {'lead_model': 'claude-sonnet-5', 'lead_effort': 'low'}}}
+                for label in ('a', 'b')}}
+            native.state_file(state, project).write_text(json.dumps(document), encoding='utf-8')
+            native_env = {**os.environ, 'SYMPHONY_STATE_DIR': str(state),
+                          'SYMPHONY_NATIVE_GATE_DIR': str(gate)}
             assessor = subprocess.run(
                 [sys.executable, "-I", str(script), "SubagentStart", str(capture), "claude"],
                 input=json.dumps({"session_id": "root-a", "agent_id": "assessor",
@@ -774,7 +794,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 started = subprocess.run(
                     [sys.executable, "-I", str(script), "SessionStart", str(capture), "claude"],
                     input=json.dumps({"session_id": f"root-{label}"}),
-                    env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                    env={**native_env,
                          "SYMPHONY_NATIVE_GATE_LABEL": label},
                     text=True, capture_output=True, timeout=5)
                 self.assertEqual(started.returncode, 0)
@@ -788,6 +808,17 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertEqual(foreign.returncode, 0)
             self.assertFalse((gate / "a.ready").exists())
             self.assertFalse((gate / "b.ready").exists())
+            fast = {'active_runs': {'claude:root-a': {'assessment': {'_fast_pending': True,
+                'route': {'lead_model': 'claude-sonnet-5', 'lead_effort': 'low'}}}}}
+            native.state_file(state, project).write_text(json.dumps(fast), encoding='utf-8')
+            skipped = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'claude'],
+                input=json.dumps({'session_id': 'root-a', 'agent_id': 'fast-a', 'cwd': str(project),
+                                  'agent_type': 'symphony:symphony-lead-claude-sonnet-5-low'}),
+                env=native_env, text=True, capture_output=True, timeout=5)
+            self.assertEqual(skipped.returncode, 0, skipped.stderr)
+            self.assertFalse((gate / 'a.ready').exists())
+            self.assertFalse((gate / 'a.lead.json').exists())
+            native.state_file(state, project).write_text(json.dumps(document), encoding='utf-8')
             processes = {}
             try:
                 for label in ("a", "b"):
@@ -795,10 +826,11 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                         [sys.executable, "-I", str(script), "SubagentStart", str(capture), "claude"],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True,
-                        env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                        env={**native_env,
                              "SYMPHONY_NATIVE_GATE_LABEL": "b" if label == "a" else "a"})
                     processes[label].stdin.write(json.dumps({
                         "session_id": f"root-{label}", "agent_id": f"lead-{label}",
+                        "cwd": str(project),
                         "agent_type": "symphony:symphony-lead-claude-sonnet-5-low"}))
                     processes[label].stdin.close()
                 deadline = time.monotonic() + 5
@@ -809,6 +841,17 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     self.assertEqual(json.loads((gate / f"{label}.ready").read_text())
                                      ["session_id"], f"root-{label}")
+                    frozen = (gate / f'{label}.ready').read_bytes()
+                    for identity, agent_type in ((f'lead-{label}', 'symphony:symphony-lead-claude-sonnet-5-low'),
+                                                 ('different-lead', 'symphony:symphony-lead-claude-sonnet-5-low'),
+                                                 ('worker', 'symphony:symphony-worker-claude-sonnet-5-low')):
+                        later = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'claude'],
+                            input=json.dumps({'session_id': f'root-{label}', 'agent_id': identity,
+                                              'cwd': str(project), 'agent_type': agent_type}),
+                            env=native_env, text=True, capture_output=True, timeout=5)
+                        self.assertEqual(later.returncode, 0, later.stderr)
+                        self.assertEqual((gate / f'{label}.ready').read_bytes(), frozen)
+                    self.assertIsNone(process.poll(), 'resumes cannot replace or release initial barrier')
                 starts = [json.loads(path.read_text()) for path in capture.glob("*-entry.json")]
                 self.assertEqual({(record["session_id"], record["native_gate_label"],
                                    record["native_gate_env_label"])
@@ -866,9 +909,93 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                  patch.object(sys, "stderr", stderr), \
                  patch.dict(native.os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
                 self.assertEqual(native.main(), 1)
-            saved = json.loads((Path(temporary) / "native-managed-claude-failure.json").read_text())
-            self.assertEqual(len(saved["cases"][0]["native_trace"]), 100000)
+                report['cases'][0]['native_trace'] = 'second attempt'
+                self.assertEqual(native.main(), 1)
+            saved = [json.loads(path.read_text()) for path in Path(temporary).glob('native-managed-claude-failure-*.json')]
+            self.assertEqual(len(saved), 2)
+            self.assertEqual(sorted(len(item['cases'][0]['native_trace']) for item in saved), [14, 100000])
             self.assertLess(len(stderr.getvalue()), 1000)
+
+    def test_private_claude_snapshots_have_exact_ids_and_export_only_disposition_facts(self):
+        import native_routing_smoke as smoke
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for home_name in ('claude-baseline-home', 'claude-live-update-home'):
+                home = root / home_name
+                home.mkdir()
+                (home / 'settings.json').write_text('{}', encoding='utf-8')
+                native.install_hook_capture('claude', root, home, private_children=True)
+            source = {'provider': 'claude', 'cwd': str(root), 'session_id': 'root', 'agent_id': 'worker',
+                      'prompt_id': 'context', 'role': 'worker', 'status': 'completed',
+                      'hook_event_name': 'SubagentStop', 'last_assistant_message': 'PRIVATE_REPORT_SENTINEL'}
+            completed = subprocess.run([sys.executable, '-I', str(root / 'capture_claude_hook.py'),
+                'SubagentStop', str(root / 'claude-hook-capture'), 'claude'], input=json.dumps(source),
+                capture_output=True, text=True, encoding='utf-8', timeout=5)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, '')
+            captured_path = next((root / 'private-child-hooks').glob('*.json'))
+            captured = json.loads(captured_path.read_text(encoding='utf-8'))
+            event = smoke.event_from_payload('claude', source)
+            self.assertEqual(captured['raw'], source)
+            self.assertEqual(captured['canonical'], {'event_id': event.event_id, 'kind': event.kind, 'payload': event.payload})
+            run = {'session_id': 'root', 'run_id': 'run', 'delegations': [{'identity': 'worker'}],
+                   'assessment': {'_substantive_children': {'worker': {'role': 'worker', 'start_event_id': 'start'}},
+                                  '_start_event_ids': ['start'], '_terminal_event_ids': [], '_terminal_turns': {}}}
+            document = {'event_history': [], 'terminal_receipts': []}
+            pending = [{'pending': [{'event_id': event.event_id}]}]
+            facts = native.claude_callback_disposition_probe(root, run, document, pending)[0]
+            self.assertTrue(facts['immutable_start_proof_present'])
+            self.assertFalse(facts['canonical_id_equals_admitted_start'])
+            self.assertEqual(facts['pending_canonical_id_count'], 1)
+            self.assertEqual(facts['derived_terminal_history_count'], 0)
+            self.assertEqual(facts['exact_result_receipt_count'], 0)
+            result = smoke._terminal_result_id(event)
+            run['assessment']['_terminal_event_ids'] = [result]
+            run['assessment']['_terminal_turns']['worker'] = [smoke._child_turn_token(source)]
+            document['event_history'] = [{'event_id': event.event_id + ':delegation:delegation_updated',
+                'kind': 'delegation_updated', 'payload': {'state': 'completed'}}]
+            document['terminal_receipts'] = [{'provider': 'claude', 'session': 'root', 'run_id': 'run',
+                'agent': 'worker', 'turn': smoke._child_turn_token(source), 'result': result}]
+            matched = native.claude_callback_disposition_probe(root, run, document, [])[0]
+            self.assertTrue(matched['scoped_result_in_terminal_ids'])
+            self.assertTrue(matched['terminal_token_recorded'])
+            self.assertEqual(matched['derived_terminal_history_count'], 1)
+            self.assertEqual(matched['exact_result_receipt_count'], 1)
+            self.assertNotIn('PRIVATE_REPORT_SENTINEL', json.dumps(matched))
+            self.assertNotIn(str(root), json.dumps(matched))
+            self.assertNotIn(event.event_id, json.dumps(matched))
+            saved = native.preserve_private_native_failure(root, root / 'retained', 'claude')
+            self.assertTrue((saved / 'private-child-hooks' / captured_path.name).is_file())
+            captured['canonical']['event_id'] = 'mismatched'
+            captured_path.write_text(json.dumps(captured), encoding='utf-8')
+            self.assertEqual(native.claude_callback_disposition_probe(root, run, document, []), [])
+            if os.name != 'nt':
+                self.assertEqual(captured_path.stat().st_mode & 0o777, 0o600)
+
+    def test_private_claude_capture_uses_explicit_frozen_candidate_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / 'home'
+            home.mkdir()
+            (home / 'settings.json').write_text('{}', encoding='utf-8')
+            alternate = root / 'frozen candidate'
+            package = alternate / 'symphony'
+            package.mkdir(parents=True)
+            (package / '__init__.py').write_text('', encoding='utf-8')
+            (package / 'adapters.py').write_text(
+                "from types import SimpleNamespace\n"
+                "def event_from_payload(provider, payload):\n"
+                "    return SimpleNamespace(event_id='exact-frozen-adapter', kind='subagent_stopped', payload=payload)\n",
+                encoding='utf-8')
+            native.install_hook_capture('claude', root, home, private_children=True,
+                                        candidate_source=alternate)
+            result = subprocess.run([sys.executable, '-I', str(root / 'capture_claude_hook.py'),
+                'SubagentStop', str(root / 'claude-hook-capture'), 'claude'],
+                input=json.dumps({'hook_event_name': 'SubagentStop', 'session_id': 'root', 'agent_id': 'child'}),
+                capture_output=True, text=True, encoding='utf-8', timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = json.loads(next((root / 'private-child-hooks').glob('*.json')).read_text(encoding='utf-8'))
+            self.assertEqual(captured['canonical']['event_id'], 'exact-frozen-adapter')
 
     def test_success_keeps_full_hook_trace_in_artifact_without_flooding_ci_stdout(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -881,7 +1008,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                  patch.object(sys, "stdout", stdout), \
                  patch.dict(native.os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
                 self.assertEqual(native.main(), 0)
-            saved = json.loads((Path(temporary) / "native-managed-claude-receipt.json").read_text())
+            saved = json.loads(next(Path(temporary).glob("native-managed-claude-receipt-*.json")).read_text())
             self.assertEqual(len(saved["native_managed"][0]["native_hook_capture"]["records"][0]),
                              100000)
             self.assertEqual(json.loads(stdout.getvalue())["native_managed"][0]["completed"],

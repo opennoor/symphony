@@ -24,9 +24,10 @@ from .host_evidence import (
     claude_substantive_launch,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
+    codex_unmanaged_pre_run_terminal,
     retained_fast_escalation_receipt,
 )
-from .model import Action, Delegation, Event, ProjectState, RunState
+from .model import Action, Delegation, Event, ProjectState, RunState, persistable
 from .reducer import _ACTIVE_STATES, _stop_block_reason, _substantive_child_completed, reduce
 from .routing import (
     Assessment,
@@ -42,7 +43,7 @@ from .routing import (
     route_for_recorded,
     snapshot_for,
 )
-from .store import StateStore
+from .store import StateStore, project_key
 
 
 CONTROLS = {
@@ -181,6 +182,15 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                       if event.kind == "subagent_started" else event, epoch, current)
                      for event, epoch, current in batch]
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
+            if (not current and provider == 'codex' and expected_owner == session
+                    and event_generation == generation
+                    and (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired):
+                state, disposed = _dispose_unmanaged_pre_run_terminal(
+                    state, event, session, project, environ, generation, source.observed_at,
+                    tuple(item[0] for item in batch))
+                if disposed:
+                    acknowledged.add(event.event_id)
+                    continue
             if event.event_id in recoverable:
                 if followup is not None and provider == "claude" and event.kind == "subagent_stopped":
                     # Preserve the inbox ID until pending_event_id is captured;
@@ -668,6 +678,65 @@ def _finish_pending_batch(
     return _merge_scope(state, scoped, next_scoped, key, provider, session)
 
 
+def _dispose_unmanaged_pre_run_terminal(
+    state: ProjectState, event: Event, session: str, project: Path,
+    environ: Mapping[str, str], generation: int, committed_at: str,
+    batch: tuple[Event, ...] = (),
+) -> tuple[ProjectState, bool]:
+    """Settle only a proven unmanaged callback, without dispatching lifecycle."""
+    payload = event.payload
+    if (event.kind != 'subagent_stopped' or payload.get('provider') != 'codex'
+            or payload.get('session_id') != session or payload.get('parent_thread_id') != session
+            or _observed_role(payload) != 'lead' or _fast_spawn(payload)
+            or type(generation) is not int or generation < 1):
+        return state, False
+    base = {'disposition': 'unmanaged_pre_run', 'provider': 'codex', 'session': session,
+            'agent': payload.get('agent_id'), 'turn': payload.get('turn_id'), 'parent': session,
+            'generation': generation, 'project': project_key(project),
+            'source_event_id': event.event_id, 'source_observed_at': event.observed_at,
+            'result': _terminal_result_id(event)}
+    if any((item.payload.get('agent_id') == base['agent'] and item != event)
+           or item.payload.get('parent_thread_id') == base['agent']
+           or item.kind == 'subagent_started' and _observed_role(item.payload) == 'assessor'
+           for item in batch):
+        return state, False
+    identifier = event.event_id + ':unmanaged-pre-run-disposition'
+    witnesses = ('native_call_id', 'native_path', 'native_started_at', 'native_completed_at',
+                 'first_admission_id', 'first_admission_at')
+    previous = [record for record in state.event_history if record.event_id == identifier]
+    if previous:
+        record = previous[0]
+        exact = (len(previous) == 1 and record.kind == 'unmanaged_terminal_disposed'
+                 and type(record.payload.get('generation')) is int
+                 and set(record.payload) == {*base, *witnesses}
+                 and all(record.payload.get(key) == value for key, value in base.items())
+                 and all(isinstance(record.payload.get(key), str) and record.payload[key]
+                         and len(record.payload[key]) <= 512
+                         for key in witnesses)
+                 and record.payload['native_path'] == '/root/' + str(payload.get('task_name') or ''))
+        if exact:
+            try:
+                instants = [datetime.fromisoformat(record.payload[key].replace('Z', '+00:00'))
+                            for key in ('native_started_at', 'native_completed_at', 'first_admission_at')]
+                exact = (all(instant.tzinfo is not None for instant in instants)
+                         and instants[0] <= instants[1] < instants[2])
+            except (TypeError, ValueError):
+                exact = False
+        return state, exact
+    try:
+        proof = codex_unmanaged_pre_run_terminal(
+            state, event, session, project, environ, base['result'])
+    except (OSError, AttributeError, TypeError, ValueError):
+        proof = None
+    if proof is None:
+        return state, False
+    disposition = Event(identifier, 'unmanaged_terminal_disposed', committed_at, {**base, **proof})
+    if persistable(disposition) != disposition:
+        return state, False
+    committed, _ = reduce(state, disposition)
+    return committed, True
+
+
 def _unresolved_child_guidance(
     state: ProjectState, provider: str, session: str, events: tuple[Event, ...],
 ) -> str:
@@ -709,7 +778,8 @@ def _unresolved_child_guidance(
                     "or repeat Stop. Preserve the result and request explicit reconciliation or a "
                     "separately routed task; a weaker former lead cannot replace the accepted owner.")
     return ("Symphony retained an unresolved child result for this session. "
-            "Retry this turn after its owning run is reconciled.")
+            "Preserve the result and inspect its original native launch and owning run before completion. "
+            "Repeating Stop alone does not restore missing launch or ownership proof.")
 
 
 def _committed_lead_event(
@@ -3420,11 +3490,15 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
         fast = fast_lead_selection(_snapshot(state, provider))
         if (fast["model"] and _boost_preference(state, provider, session_id) == "off"
                 and not (state.active_run and state.active_run.assessment.get("_fast_escalated"))):
-            spawn = (f"Use agent type `symphony:symphony-lead-{fast['model']}-{fast['effort']}`. "
+            fast_name = f"symphony_lead_fast_{re.sub(r'[^a-z0-9]', '_', fast['model'])}_{fast['effort']}"
+            spawn = (f"Use agent type `symphony:symphony-lead-{fast['model']}-{fast['effort']}` "
+                     "and keep `SYMPHONY_FAST_ROUTE: lead` in its Agent prompt; the packaged type alone "
+                     "does not identify a fast launch. "
                      if provider == "claude" else
                      f"Pass `model=\"{fast['model']}\"`, `reasoning_effort=\"{fast['effort']}\"`, "
-                     "`fork_turns=\"none\"`, and name `symphony_lead_fast_<model>_<effort>` "
-                     "using underscores for the model. ")
+                     f"`fork_turns=\"none\"`, and `task_name=\"{fast_name}\"` exactly. "
+                     "The initial fast lead must keep this reserved fast name. Generic assessed-lead "
+                     "names below apply only after escalation; never use them for this first spawn. ")
             return (
                 "Symphony fast route: the root is a courier. Spawn one capable lead at "
                 f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
@@ -3447,7 +3521,7 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                 "wait for native terminal results, and use normal Stop reconciliation. "
                 + ("Claude agents run in the background; end your turn after spawning and wait for the host result. "
                    if provider == "claude" else "")
-                + "After escalation, follow this full assessment and delegation contract: "
+                + "Only after the fast lead's native escalation result, follow this assessment and delegation contract: "
                 + _assessed_guidance(task, provider, state, session_id)
             )
     return _assessed_guidance(task, provider, state, session_id)
@@ -3457,7 +3531,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
     """The same assessor/lead packet contract for escalation and direct assessment."""
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
-        "On Codex, use `fork_turns=\"none\"` for assessor and lead, name them "
+        "On Codex, use `fork_turns=\"none\"` for assessor and assessed lead, name them "
         "`symphony_<role>_<model>_<effort>`, and require the assessor's final response to contain one exact "
         "`SYMPHONY_ASSESSMENT: {\"size\":\"small|medium|large\",\"complexity\":\"simple|mixed|complex\",\"risk\":\"normal|high\","
         "\"rationale\":\"...\",\"topology\":\"...\"}` line. "

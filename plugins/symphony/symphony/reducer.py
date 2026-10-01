@@ -584,6 +584,8 @@ def _force_stop(state: ProjectState, event: Event):
 
 _Handler = Callable[[ProjectState, Event], tuple[ProjectState, tuple[Action, ...]]]
 _HANDLERS: dict[str, _Handler] = {
+    # A proven pre-run callback is an observation only, never child/task credit.
+    "unmanaged_terminal_disposed": lambda state, event: (state, ()),
     "session_heartbeat": _heartbeat,
     "enable": _enable,
     "route_accepted": _route_accepted,
@@ -616,7 +618,7 @@ def reduce(state: ProjectState, event: Event) -> tuple[ProjectState, tuple[Actio
         return state, ()
 
     next_state, actions = handler(state, event)
-    if next_state == state and not actions:
+    if next_state == state and not actions and event.kind != "unmanaged_terminal_disposed":
         return state, ()
     history = tuple(
         deque((*next_state.event_history, persistable(event)), maxlen=_EVENT_HISTORY_LIMIT)

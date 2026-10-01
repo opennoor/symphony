@@ -16,6 +16,26 @@ from plugins.symphony.symphony.store import StateStore
 
 
 class FastRouteTests(unittest.TestCase):
+    def test_fast_launch_identity_is_distinct_from_later_assessed_names(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.tearDown()
+                self.setUp()
+                self.hook(provider, 'SessionStart')
+                control = '$symphony:symphony enable' if provider == 'codex' else '/symphony:enable'
+                self.hook(provider, 'UserPromptSubmit', prompt=control)
+                result = self.hook(provider, 'UserPromptSubmit', prompt='Implement a bounded feature')
+                selected = fast_lead_selection(snapshot_for(provider, profiles_for(provider)[0]['id']))
+                if provider == 'codex':
+                    name = 'symphony_lead_fast_' + selected['model'].replace('-', '_').replace('.', '_') + '_' + selected['effort']
+                    self.assertIn('task_name=\\"' + name + '\\"', result.stdout)
+                    self.assertIn('never use them for this first spawn', result.stdout)
+                    self.assertIn('for assessor and assessed lead', result.stdout)
+                else:
+                    self.assertIn('packaged type alone does not identify a fast launch', result.stdout)
+                    self.assertIn('SYMPHONY_FAST_ROUTE: lead', result.stdout)
+                self.assertIn("Only after the fast lead's native escalation result", result.stdout)
+
     def test_enable_control_only_stays_at_root_and_accompanying_task_keeps_routing(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):
