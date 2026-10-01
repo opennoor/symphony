@@ -392,7 +392,8 @@ def run_case(root, package, timeout, budget):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        shutil.rmtree(home, ignore_errors=True)
+        # main() collects fixed failure facts before its TemporaryDirectory
+        # removes the private native home and all other disposable evidence.
 
 
 def main():

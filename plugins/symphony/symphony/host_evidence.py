@@ -332,6 +332,13 @@ def _claude_observed_fast_launch(run: RunState, launch_id: str, root_prompt: str
 def claude_substantive_launch(
     run: RunState, source: Event, role: str, started_at: str, environ: Mapping[str, str],
 ) -> dict[str, str] | None:
+    return _claude_substantive_launch(run, source, role, started_at, environ)
+
+
+def _claude_substantive_launch(
+    run: RunState, source: Event, role: str, started_at: str, environ: Mapping[str, str],
+    *, original_before: datetime | None = None,
+) -> dict[str, str] | None:
     """Bind an admitted child Start to an exact launch in its owning lead.
 
     Ordinary Claude child hooks do not supply a native parent identity. The
@@ -396,6 +403,12 @@ def claude_substantive_launch(
     parent_rows, child_rows = _native_jsonl(parent_path), _native_jsonl(child_path)
     if parent_rows is None or child_rows is None:
         return None
+    if original_before is not None:
+        # Used only to revalidate an already credited historical worker's
+        # original invocation. Ordinary new credit still sees full history.
+        if any(_instant(row.get('timestamp')) is None for row in child_rows):
+            return None
+        child_rows = [row for row in child_rows if _instant(row['timestamp']) <= original_before]
     launches = []
     for row in parent_rows:
         message = row.get('message')
@@ -1787,21 +1800,24 @@ def claude_sendmessage_source_hash(source: Event, session: str) -> str:
 
 
 def _claude_sendmessage_callback(source: Event, native: Event, session: str,
-                                 called_at: datetime, next_call: datetime | None) -> bool:
+                                 called_at: datetime, next_call: datetime | None, *,
+                                 role: str = 'lead', parent: str | None = None) -> bool:
     payload = source.payload
     identity = native.payload['agent_id']
     when = _instant(source.observed_at)
+    parent = session if parent is None else parent
     owned = (payload.get('session_id') == session or (
         payload.get('session_id') == identity and (
-            payload.get('parent_thread_id') == session
+            payload.get('parent_thread_id') == parent
             or payload.get('_symphony_verified_alias') is True)))
     if (source.kind not in {'subagent_started', 'subagent_stopped'}
             or payload.get('provider') != 'claude' or not owned
             or (payload.get('agent_id') or payload.get('subagent_id')) != identity
-            or payload.get('parent_thread_id') not in {None, '', session}
-            or payload.get('role') not in {None, '', 'lead'}
-            or any(re.search(r'^SYMPHONY_ROLE: (worker|consultant|assessor)[ \t]*$', value, re.MULTILINE)
-                   for value in payload.values() if isinstance(value, str))
+            or payload.get('parent_thread_id') not in {None, '', parent}
+            or payload.get('role') not in {None, '', role}
+            or any(line.strip() in {f'SYMPHONY_ROLE: {other}' for other in
+                   {'lead', 'worker', 'consultant', 'assessor'} - {role}}
+                   for value in payload.values() if isinstance(value, str) for line in value.splitlines())
             or payload.get('agent_type') not in {None, '', native.payload['agent_type']}
             or payload.get('model') not in {None, '', native.payload['model']}
             or payload.get('model_reasoning_effort') not in {
@@ -1822,10 +1838,410 @@ def _claude_sendmessage_callback(source: Event, native: Event, session: str,
     return True
 
 
+def _claude_historical_worker_origin(
+    state: ProjectState, run: RunState, identity: str, project: Path, environ: Mapping[str, str],
+    *, expected_origin: Mapping | None = None,
+) -> dict | None:
+    """Re-prove retained original credit; never admit reused-worker credit."""
+    archived = _instant(run.updated_at)
+    contract = run.assessment.get('substantive_contract')
+    proofs = run.assessment.get('_substantive_children', {})
+    proof = proofs.get(identity) if isinstance(proofs, Mapping) else None
+    if (run.provider != 'claude' or run.status != 'completed' or archived is None
+            or not isinstance(run.outcome, Mapping) or run.outcome.get('status') != 'completed'
+            or run.unreconciled
+            or not isinstance(contract, Mapping) or type(contract.get('version')) is not int
+            or contract['version'] != 1 or not isinstance(contract.get('epoch'), str) or not contract['epoch']
+            or not isinstance(proof, Mapping)
+            or proof.get('role') != 'worker' or proof.get('successful') is not True
+            or proof.get('epoch') != contract.get('epoch') or proof.get('run_id') != run.run_id
+            or proof.get('lead') != run.lead_identity
+            or type(proof.get('owner_generation')) is not int
+            or proof['owner_generation'] != run.owner_generation
+            or proof.get('parent') != run.lead_identity
+            or proof.get('start_parent') not in {'', run.lead_identity}
+            or _instant(proof.get('admitted_at')) is None):
+        return None
+    children = [item for item in run.delegations if item.identity == identity and item.role == 'worker']
+    starts = [event for event in state.event_history
+              if event.event_id == str(proof.get('start_event_id')) + ':delegation:delegation_updated'
+              and event.kind == 'delegation_updated' and event.payload.get('identity') == identity
+              and event.payload.get('role') == 'worker' and event.observed_at == proof['admitted_at']]
+    stops = [event for event in state.event_history if event.kind == 'delegation_updated'
+             and event.payload.get('identity') == identity and event.payload.get('role') == 'worker'
+             and event.payload.get('state') == 'completed'
+             and _instant(event.observed_at) is not None
+             and _instant(proof['admitted_at']) <= _instant(event.observed_at) <= archived]
+    receipts = [receipt for receipt in state.terminal_receipts
+                if receipt.get('provider') == 'claude' and receipt.get('session') == run.session_id
+                and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity]
+    if expected_origin is not None:
+        expected_receipt = expected_origin.get('receipt')
+        if not isinstance(expected_receipt, Mapping):
+            return None
+        receipts = [receipt for receipt in receipts if receipt.get('turn') == expected_receipt.get('turn')]
+        if len(receipts) != 1 or any(receipts[0].get(key) != value for key, value in expected_receipt.items()):
+            return None
+    if (len(children) != 1 or children[0].state != 'completed' or len(starts) != 1 or len(stops) != 1
+            or len(receipts) != 1 or receipts[0].get('lead') != run.lead_identity
+            or receipts[0].get('parent') not in {'', run.lead_identity}
+            or receipts[0].get('status') != 'completed'
+            or not isinstance(receipts[0].get('result'), str)
+            or re.fullmatch(r'[0-9a-f]{64}', receipts[0]['result']) is None
+            or not isinstance(receipts[0].get('turn'), str) or not receipts[0]['turn']
+            or receipts[0].get('result') not in run.assessment.get('_terminal_event_ids', ())
+            or receipts[0].get('turn') not in run.assessment.get('_terminal_turns', {}).get(identity, ())):
+        return None
+    metadata = {'native_model': children[0].requested_tier, 'native_effort': children[0].requested_effort,
+                'native_agent_type': f'symphony:symphony-worker-{children[0].requested_tier}-{children[0].requested_effort}'}
+    if (any(receipts[0].get(key) not in {None, '', expected} for key, expected in metadata.items())
+            or receipts[0].get('native_followup_start_id') not in {None, ''}
+            or receipts[0].get('native_launch_prompt_hash') not in {None, ''}
+            or 'native_fast_escalation' in receipts[0] and receipts[0]['native_fast_escalation'] is not False):
+        return None
+    source = Event(stops[0].event_id, 'subagent_stopped', stops[0].observed_at,
+        {'provider': 'claude', 'session_id': run.session_id, 'agent_id': identity,
+         'parent_thread_id': proof['start_parent'], 'role': 'worker', 'cwd': str(project)})
+    binding = _claude_substantive_launch(run, source, 'worker', proof['admitted_at'], environ,
+                                         original_before=_instant(stops[0].observed_at))
+    if binding is None or any(proof.get(key) != value for key, value in binding.items()):
+        return None
+    home = Path(environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+    paths = tuple((home / 'projects').glob(f'*/{run.session_id}/subagents/agent-{identity}.jsonl'))
+    if len(paths) != 1:
+        return None
+    rows = _native_jsonl(paths[0])
+    if not rows:
+        return None
+    first = next((index for index, row in enumerate(rows) if row.get('type') == 'user'
+                  and isinstance(row.get('message'), dict)
+                  and isinstance(row['message'].get('content'), str)), None)
+    native = (_claude_historical_worker_terminal(rows, first, identity, run.session_id,
+        children[0].requested_tier, children[0].requested_effort) if first is not None else None)
+    if (native is None or _instant(native.observed_at) > archived
+            or _instant(native.observed_at) > _instant(stops[0].observed_at)
+            or hashlib.sha256(native.payload['prompt_id'].encode()).hexdigest() != proof['native_prompt_hash']):
+        return None
+    return {'proof': dict(proof), 'contract': dict(contract),
+            'receipt': {key: receipts[0][key] for key in
+                        ('provider', 'session', 'run_id', 'agent', 'turn', 'result', 'parent', 'lead', 'status')},
+            'terminal_source_id': stops[0].event_id, 'terminal_observed_at': stops[0].observed_at,
+            'model': children[0].requested_tier, 'effort': children[0].requested_effort}
+
+
+def _claude_historical_worker_terminal(rows: list[dict], prompt_index: int,
+                                        identity: str, session: str, model: str, effort: str,
+                                        *, ack_only: bool = False) -> Event | None:
+    """Validate one descendant turn without giving it a lead or worker credit."""
+    if any(row.get('sessionId') != session or row.get('agentId') != identity
+           or row.get('isSidechain') is not True
+           or row.get('type') in {'assistant', 'user'} and not isinstance(row.get('message'), dict)
+           for row in rows):
+        return None
+    prompts = []
+    for index, row in enumerate(rows):
+        if row.get('type') != 'user':
+            continue
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, list) and content and all(isinstance(item, dict)
+                and item.get('type') == 'tool_result' for item in content):
+            continue
+        if (not isinstance(content, str) or not content.strip()
+                or not isinstance(row.get('uuid'), str) or not row['uuid']
+                or _instant(row.get('timestamp')) is None):
+            return None
+        prompts.append(index)
+    if prompt_index not in prompts or len({rows[index]['uuid'] for index in prompts}) != len(prompts):
+        return None
+    offset = prompts.index(prompt_index)
+    end = prompts[offset + 1] if offset + 1 < len(prompts) else len(rows)
+    turn = rows[prompt_index + 1:end]
+    if any(row.get('isApiErrorMessage') is True or row.get('type') == 'error'
+           or row.get('subtype') == 'api_error' for row in turn):
+        return None
+    activity = [row for row in turn if row.get('type') in {'assistant', 'user'}]
+    assistants = [row for row in turn if row.get('type') == 'assistant']
+    if not activity or not assistants or activity[-1] is not assistants[-1]:
+        return None
+    for row in assistants:
+        message = row.get('message')
+        if (not isinstance(message, dict) or message.get('model') != model
+                or (row.get('perTurnEffort') or row.get('effort')) != effort
+                or not isinstance(message.get('content'), list)
+                or any(isinstance(item, dict) and item.get('type') == 'text'
+                       and not isinstance(item.get('text'), str) for item in message['content'])):
+            return None
+        if ack_only and any(isinstance(item, dict) and item.get('type') == 'tool_use'
+                            and item.get('name') != 'SubagentHandback' for item in message['content']):
+            return None
+    terminal = assistants[-1]
+    completed = _instant(terminal.get('timestamp'))
+    began = _instant(rows[prompt_index]['timestamp'])
+    if (terminal['message'].get('stop_reason') != 'end_turn'
+            or any(row['message'].get('stop_reason') == 'end_turn' for row in assistants[:-1])
+            or not isinstance(terminal.get('uuid'), str) or not terminal['uuid']
+            or completed is None or completed <= began):
+        return None
+    final = '\n'.join(item.get('text', '') for item in terminal['message']['content']
+                      if isinstance(item, dict) and item.get('type') == 'text')
+    handbacks = [(item, row) for row in assistants for item in row['message']['content']
+                 if isinstance(item, dict) and item.get('type') == 'tool_use'
+                 and item.get('name') == 'SubagentHandback']
+    report = final
+    reports = [final]
+    if ack_only:
+        supplied_results = [item for row in turn if row.get('type') == 'user'
+                            for item in row['message'].get('content', ())
+                            if isinstance(item, dict) and item.get('type') == 'tool_result']
+        if (len(supplied_results) != len(handbacks)
+                or handbacks and supplied_results[0].get('tool_use_id') != handbacks[0][0].get('id')):
+            return None
+    if handbacks:
+        if len(handbacks) != 1:
+            return None
+        item, call_row = handbacks[0]
+        inputs = item.get('input')
+        text = inputs.get('message') if isinstance(inputs, dict) else None
+        results = [(value, row) for row in turn if row.get('type') == 'user'
+                   for value in (row.get('message') or {}).get('content', ())
+                   if isinstance(value, dict) and value.get('type') == 'tool_result'
+                   and value.get('tool_use_id') == item.get('id')]
+        uses = [value for row in assistants for value in row['message']['content']
+                if isinstance(value, dict) and value.get('type') == 'tool_use'
+                and value.get('id') == item.get('id')]
+        called = _instant(call_row.get('timestamp'))
+        returned = _instant(results[0][1].get('timestamp')) if len(results) == 1 else None
+        if (not isinstance(item.get('id'), str) or not item['id'] or len(results) != 1 or len(uses) != 1
+                or results[0][0].get('is_error') is True or not isinstance(text, str) or not text.strip()
+                or called is None or returned is None or not began <= called <= returned <= completed
+                or turn.index(call_row) >= turn.index(results[0][1])):
+            return None
+        report = text + '\n' + final
+        reports.append(text)
+    if (not report.strip() or 'SYMPHONY_FAST_DECISION:' in report
+            or any('SYMPHONY_OUTCOME:' in text and _reported_status(text) != 'completed'
+                   for text in reports)):
+        return None
+    return Event(hashlib.sha256(f'{session}:{identity}:{terminal["uuid"]}'.encode()).hexdigest(),
+                 'subagent_stopped', completed.isoformat(), {'provider': 'claude',
+                 'session_id': session, 'agent_id': identity, 'role': 'worker',
+                 'prompt_id': rows[prompt_index]['uuid'], 'status': 'completed',
+                 'model': model, 'model_reasoning_effort': effort, 'last_assistant_message': report,
+                 '_symphony_native_started_at': began.isoformat()})
+
+
+def _claude_historical_worker_deliveries(
+    state: ProjectState, run: RunState, events: tuple[Event, ...], project: Path,
+    environ: Mapping[str, str], *, expected_origins: Mapping | None = None, cutoff: datetime | None = None,
+) -> tuple[dict, tuple[Event, ...], dict[str, int], tuple[dict, ...]] | None:
+    """Prove descendant replies separately before any mixed-batch mutation.
+
+    Lead deliveries remain in the returned inventory for the lead prover.
+    Only exact validated worker call bindings may become exclusions there.
+    """
+    archived = _instant(run.updated_at)
+    if archived is None or run.provider != 'claude' or run.status != 'completed':
+        return None
+    projects = Path(environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'projects'
+    paths = tuple(projects.glob(f'*/{run.session_id}.jsonl'))
+    if projects.is_symlink() or len(paths) != 1 or paths[0].parent.is_symlink():
+        return None
+    rows = _native_jsonl(paths[0])
+    if not rows:
+        return None
+    calls, results = [], {}
+    for row in rows:
+        if (row.get('sessionId') != run.session_id or row.get('agentId') or row.get('isSidechain') is True):
+            return None
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        for item in content if isinstance(content, list) else ():
+            if not isinstance(item, dict):
+                return None
+            if row.get('type') == 'user' and item.get('type') == 'tool_result':
+                results.setdefault(item.get('tool_use_id'), []).append((row, item))
+            if row.get('type') != 'assistant' or item.get('type') != 'tool_use' or item.get('name') not in {'Agent', 'SendMessage'}:
+                continue
+            called = _instant(row.get('timestamp'))
+            if called is None:
+                return None
+            if called <= archived or cutoff is not None and called > cutoff:
+                continue
+            values, cwd = item.get('input'), row.get('cwd')
+            if (item.get('name') != 'SendMessage' or not isinstance(values, dict)
+                    or not isinstance(item.get('id'), str) or not item['id']
+                    or not isinstance(values.get('to'), str) or not values['to']
+                    or not isinstance(values.get('message'), str) or not values['message'].strip()
+                    or values.get('notify_when_idle') is not None and values['notify_when_idle'] is not False
+                    or not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute()
+                    or Path(cwd).resolve() != project.resolve()):
+                return None
+            calls.append((called, item))
+    if (not calls or len(calls) > 8 or len({item['id'] for _, item in calls}) != len(calls)
+            or any(calls[index][0] >= calls[index + 1][0] for index in range(len(calls) - 1))):
+        return None
+    origins, natives, records = {}, [], []
+    worker_calls = [(ordinal, called, item) for ordinal, (called, item) in enumerate(calls)
+                    if item['input']['to'] != run.lead_identity]
+    for identity in sorted({item['input']['to'] for _, _, item in worker_calls}):
+        origin = _claude_historical_worker_origin(state, run, identity, project, environ,
+            expected_origin=expected_origins.get(identity) if expected_origins is not None else None)
+        if expected_origins is not None and origin != expected_origins.get(identity):
+            return None
+        if origin is None:
+            return None
+        origins[identity] = origin
+        child_path = paths[0].with_suffix('') / 'subagents' / f'agent-{identity}.jsonl'
+        if child_path.parent.is_symlink() or child_path.parent.parent.is_symlink():
+            return None
+        child_rows = _native_jsonl(child_path)
+        if not child_rows:
+            return None
+        prompts = []
+        for index, row in enumerate(child_rows):
+            if row.get('type') != 'user':
+                continue
+            message = row.get('message')
+            content = message.get('content') if isinstance(message, dict) else None
+            if isinstance(content, list) and content and all(isinstance(item, dict)
+                    and item.get('type') == 'tool_result' for item in content):
+                continue
+            when = _instant(row.get('timestamp'))
+            if not isinstance(content, str) or when is None:
+                return None
+            if when > archived and (cutoff is None or when <= cutoff):
+                prompts.append(index)
+        selected = [(ordinal, called, item) for ordinal, called, item in worker_calls
+                    if item['input']['to'] == identity]
+        if len(prompts) != len(selected):
+            return None
+        for prompt_index, (ordinal, called, item) in zip(prompts, selected):
+            prompt = child_rows[prompt_index]
+            began = _instant(prompt['timestamp'])
+            next_call = calls[ordinal + 1][0] if ordinal + 1 < len(calls) else None
+            matching = results.get(item['id'], ())
+            if (len(matching) != 1 or began < called
+                    or not _claude_coordinator_prompt_matches(prompt, item['input']['message'])):
+                return None
+            result_row, result = matching[0]
+            returned = _instant(result_row.get('timestamp'))
+            content = result.get('content')
+            if isinstance(content, list) and content and all(isinstance(value, dict)
+                    and value.get('type') == 'text' and isinstance(value.get('text'), str) for value in content):
+                content = '\n'.join(value['text'] for value in content)
+            try:
+                response = json.loads(content) if isinstance(content, str) else None
+            except ValueError:
+                return None
+            if (result.get('is_error') is True or returned is None or returned < called
+                    or next_call and returned >= next_call or not isinstance(response, dict)
+                    or response.get('success') is not True or response.get('resumedAgentId') not in {None, identity}):
+                return None
+            native = _claude_historical_worker_terminal(child_rows, prompt_index, identity,
+                run.session_id, origin['model'], origin['effort'], ack_only=True)
+            if native is None or next_call and _instant(native.observed_at) >= next_call:
+                return None
+            native = replace(native, payload={**native.payload, 'parent_thread_id': run.lead_identity,
+                'agent_type': f'symphony:symphony-worker-{origin["model"]}-{origin["effort"]}'})
+            records.append({'agent': identity, 'native_event_id': native.event_id,
+                'prompt_id': native.payload['prompt_id'], 'called_at': called.isoformat(),
+                'completed_at': native.observed_at, 'returned_at': returned.isoformat(),
+                'call_hash': hashlib.sha256(item['id'].encode()).hexdigest(),
+                'message_hash': hashlib.sha256(item['input']['message'].encode()).hexdigest()})
+            natives.append(native)
+    ordered = sorted(zip(natives, records), key=lambda pair: _instant(pair[1]['called_at']))
+    natives = [native for native, _ in ordered]
+    records = [record for _, record in ordered]
+    mapping = {}
+    for event in events:
+        matches = [index for index, (native, record) in enumerate(zip(natives, records))
+                   if _claude_sendmessage_callback(event, native, run.session_id,
+                       _instant(record['called_at']), next((called for called, _ in calls
+                           if called > _instant(record['called_at'])), None),
+                       role='worker', parent=run.lead_identity)]
+        if len(matches) != 1 or event.event_id in mapping:
+            return None
+        mapping[event.event_id] = matches[0]
+    return origins, tuple(natives), mapping, tuple(records)
+
+
+def _claude_sendmessage_late_callback(source: Event, native: Event, session: str,
+                                     called: datetime, environ: Mapping[str, str],
+                                     *, role: str, parent: str, committed_at: datetime) -> bool:
+    """Bound a new source positively; prompt context never identifies a turn."""
+    observed = _instant(source.observed_at)
+    completed = _instant(native.observed_at)
+    if (observed is None or completed is None or observed > committed_at
+            or source.kind == 'subagent_started' and observed > completed
+            or source.kind == 'subagent_stopped' and (
+                not isinstance(source.payload.get('turn_id'), str)
+                or source.payload['turn_id'] != native.payload['prompt_id'])):
+        return False
+    projects = Path(environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'projects'
+    paths = tuple(projects.glob(f'*/{session}.jsonl'))
+    if len(paths) != 1:
+        return False
+    rows = _native_jsonl(paths[0])
+    child = paths[0].with_suffix('') / 'subagents' / f"agent-{native.payload['agent_id']}.jsonl"
+    children = _native_jsonl(child)
+    if not rows or not children:
+        return False
+    upper = []
+    found = False
+    for row in children:
+        if row.get('type') != 'user':
+            continue
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, Mapping) else None
+        if isinstance(content, list) and content and all(isinstance(item, Mapping)
+                and item.get('type') == 'tool_result' for item in content):
+            continue
+        when = _instant(row.get('timestamp'))
+        if not isinstance(content, str) or when is None:
+            return False
+        if row.get('uuid') == native.payload['prompt_id']:
+            if found:
+                return False
+            found = True
+        elif found:
+            upper.append(when)
+    for row in rows:
+        content = row.get('message', {}).get('content')
+        for item in content if isinstance(content, list) else ():
+            if isinstance(item, Mapping) and item.get('type') == 'tool_use' and item.get('name') in {'Agent', 'SendMessage'}:
+                when = _instant(row.get('timestamp'))
+                if when is None:
+                    return False
+                if when > called:
+                    upper.append(when)
+    return found and _claude_sendmessage_callback(source, native, session, called,
+        min(upper, default=None), role=role, parent=parent)
+
+
+def _claude_coordinator_prompt_matches(prompt: Mapping, message: object) -> bool:
+    """Match the exact persisted root SendMessage projection in Claude 2.1.286."""
+    if not isinstance(message, str) or not message.strip():
+        return False
+    content = prompt.get('message')
+    if not isinstance(content, Mapping):
+        return False
+    if 'origin' in prompt:
+        origin = prompt['origin']
+        if not isinstance(origin, Mapping) or origin.get('kind') != 'coordinator':
+            return False
+    if 'isMeta' in prompt and prompt['isMeta'] is not True:
+        return False
+    expected = ('The coordinator sent a message while you were working:\n' + message
+                + '\n\nAddress this before completing your current task.')
+    return content.get('content') == expected
+
+
 def claude_archived_sendmessage_sequence(
     state: ProjectState, events: tuple[Event, ...], session: str,
     project: Path, environ: Mapping[str, str],
     *, committed_run: RunState | None = None, committed_anchor: Mapping | None = None,
+    verified_worker_calls: tuple[Mapping, ...] = (),
 ) -> tuple[RunState, tuple[Event, ...], dict[str, int], dict] | None:
     """Prove every ordered continuation before reopening an assessed archive.
 
@@ -1901,7 +2317,7 @@ def claude_archived_sendmessage_sequence(
     children = _native_jsonl(child_path)
     if not rows or not children:
         return None
-    calls, results = [], {}
+    calls, results, global_calls, excluded = [], {}, [], set()
     for row in rows:
         if (row.get('sessionId') != session or row.get('isSidechain') is True or row.get('agentId')):
             return None
@@ -1923,6 +2339,20 @@ def claude_archived_sendmessage_sequence(
                 continue
             details = item.get('input')
             cwd = row.get('cwd')
+            global_calls.append(when)
+            bindings = [binding for binding in verified_worker_calls
+                        if isinstance(binding, Mapping) and isinstance(item.get('id'), str)
+                        and binding.get('call_hash') == hashlib.sha256(item['id'].encode()).hexdigest()]
+            if bindings:
+                if (len(bindings) != 1 or item.get('name') != 'SendMessage'
+                        or not isinstance(details, dict)
+                        or details.get('to') != bindings[0].get('agent')
+                        or not isinstance(details.get('message'), str)
+                        or hashlib.sha256(details['message'].encode()).hexdigest() != bindings[0].get('message_hash')
+                        or when != _instant(bindings[0].get('called_at'))):
+                    return None
+                excluded.add(bindings[0]['call_hash'])
+                continue
             if (item.get('name') != 'SendMessage' or not isinstance(details, dict)
                     or details.get('to') != run.lead_identity
                     or not isinstance(details.get('message'), str) or not details['message'].strip()
@@ -1932,7 +2362,9 @@ def claude_archived_sendmessage_sequence(
                     or Path(cwd).resolve() != project.resolve()):
                 return None
             calls.append((when, row, item))
-    if not calls or len(calls) > 8 or len({item['id'] for _, _, item in calls}) != len(calls):
+    if (len(excluded) != len(verified_worker_calls) or not calls or len(global_calls) > 8
+            or any(left >= right for left, right in zip(global_calls, global_calls[1:]))
+            or len({item['id'] for _, _, item in calls}) != len(calls)):
         return None
     if any(left[0] >= right[0] for left, right in zip(calls, calls[1:])):
         return None
@@ -1972,7 +2404,7 @@ def claude_archived_sendmessage_sequence(
     native_events, records = [], []
     scoped = replace(state, active_run=run)
     for index, ((called, row, call), prompt) in enumerate(zip(calls, prompts)):
-        next_call = calls[index + 1][0] if index + 1 < len(calls) else None
+        next_call = next((when for when in global_calls if when > called), None)
         began = _instant(prompt['timestamp'])
         matching = results.get(call['id'], ())
         if len(matching) != 1 or began is None or began < called:
@@ -1992,7 +2424,7 @@ def claude_archived_sendmessage_sequence(
                 or next_call and returned >= next_call
                 or not isinstance(response, dict) or response.get('success') is not True
                 or response.get('resumedAgentId') not in {None, run.lead_identity}
-                or prompt['message']['content'] != call['input']['message']):
+                or not _claude_coordinator_prompt_matches(prompt, call['input']['message'])):
             return None
         native = _claude_native_lead_event(scoped, session, project, environ,
             require_missing=False, target_prompt=prompt['uuid'], allow_archived_assessed_markerless=True)
@@ -2016,7 +2448,7 @@ def claude_archived_sendmessage_sequence(
     for event in events:
         matches = [index for index, native in enumerate(native_events)
                    if _claude_sendmessage_callback(event, native, session, calls[index][0],
-                       calls[index + 1][0] if index + 1 < len(calls) else None)]
+                       next((when for when in global_calls if when > calls[index][0]), None))]
         if len(matches) != 1 or event.event_id in mapping:
             return None
         mapping[event.event_id] = matches[0]
@@ -2028,6 +2460,107 @@ def claude_archived_sendmessage_sequence(
                         'topology': run.assessment.get('topology', 'direct'),
                         'model': lead.requested_tier, 'effort': lead.requested_effort}}
     return run, tuple(native_events), mapping, anchor
+
+
+def claude_archived_mixed_sendmessage_sequence(
+    state: ProjectState, events: tuple[Event, ...], session: str, project: Path,
+    environ: Mapping[str, str], *, committed_run: RunState | None = None,
+    committed_anchor: Mapping | None = None,
+) -> tuple | None:
+    """Prove historical descendant acknowledgments before lead continuation.
+
+    Original worker credit is only revalidated. Resumed worker replies receive
+    no new lifecycle, receipt, substantive credit, or outcome authority.
+    """
+    replay = committed_run is not None and committed_anchor is not None
+    if not replay:
+        if not events or len(events) > 16 or f'claude:{session}' in state.active_runs:
+            return None
+        runs = [run for run in state.recent_runs if run.provider == 'claude' and run.session_id == session]
+        if not runs:
+            return None
+        run = runs[-1]
+        if all((event.payload.get('agent_id') or event.payload.get('subagent_id')) == run.lead_identity
+               for event in events):
+            return claude_archived_sendmessage_sequence(state, events, session, project, environ)
+        origins = None
+        cutoff = None
+    else:
+        workers = committed_anchor.get('historical_workers')
+        if workers is None:
+            return claude_archived_sendmessage_sequence(state, events, session, project, environ,
+                committed_run=committed_run, committed_anchor=committed_anchor)
+        owner = committed_anchor.get('owner')
+        if (not isinstance(workers, Mapping) or type(workers.get('version')) is not int
+                or workers['version'] != 1 or not isinstance(workers.get('origins'), Mapping)
+                or not workers['origins'] or not isinstance(workers.get('turns'), (list, tuple))
+                or not isinstance(owner, Mapping) or owner.get('run_id') != committed_run.run_id
+                or owner.get('started_at') != committed_run.started_at
+                or type(committed_anchor.get('owner_generation')) is not int
+                or committed_anchor['owner_generation'] > committed_run.owner_generation):
+            return None
+        origins = workers['origins']
+        proofs, contracts, children = {}, [], []
+        for identity, origin in origins.items():
+            if (not isinstance(identity, str) or not isinstance(origin, Mapping)
+                    or not isinstance(origin.get('proof'), Mapping) or not isinstance(origin.get('contract'), Mapping)):
+                return None
+            proof = origin['proof']
+            if (proof.get('lead') != committed_anchor.get('lead')
+                    or proof.get('owner_generation') != committed_anchor['owner_generation']
+                    or proof.get('run_id') != committed_run.run_id):
+                return None
+            admitted = [child for child in committed_run.delegations if child.identity == identity and child.role == 'worker'
+                        and child.requested_tier == origin.get('model') and child.requested_effort == origin.get('effort')]
+            if len(admitted) != 1:
+                return None
+            children.append(replace(admitted[0], state='completed'))
+            proofs[identity] = dict(proof)
+            contracts.append(dict(origin['contract']))
+        if any(contract != contracts[0] for contract in contracts):
+            return None
+        leads = [child for child in committed_run.delegations if child.identity == committed_anchor.get('lead')
+                 and child.role == 'lead' and child.requested_tier == owner.get('model')
+                 and child.requested_effort == owner.get('effort')]
+        turns = committed_anchor.get('turns')
+        if len(leads) != 1 or not isinstance(turns, (list, tuple)) or not turns or not isinstance(turns[-1], Mapping):
+            return None
+        ended, returned = _instant(turns[-1].get('completed_at')), _instant(turns[-1].get('returned_at'))
+        if ended is None or returned is None:
+            return None
+        cutoff = max(ended, returned)
+        run = replace(committed_run, status='completed', updated_at=committed_anchor.get('archived_at', ''),
+            lead_identity=committed_anchor['lead'], owner_generation=committed_anchor['owner_generation'],
+            outcome={'status': 'completed'}, unreconciled=(), delegations=(replace(leads[0], state='completed'), *children),
+            assessment={**committed_run.assessment, 'substantive_contract': contracts[0],
+                '_substantive_children': proofs, 'size': owner.get('size'), 'complexity': owner.get('complexity'),
+                'topology': owner.get('topology')})
+    worker_events = tuple(event for event in events
+                         if (event.payload.get('agent_id') or event.payload.get('subagent_id')) != run.lead_identity)
+    lead_events = tuple(event for event in events if event not in worker_events)
+    worker_proof = _claude_historical_worker_deliveries(state, run, worker_events, project, environ,
+                                                       expected_origins=origins, cutoff=cutoff)
+    if worker_proof is None or not worker_proof[0]:
+        return None
+    worker_origins, worker_natives, worker_mapping, worker_turns = worker_proof
+    lead_proof = claude_archived_sendmessage_sequence(state, lead_events, session, project, environ,
+        committed_run=run if replay else None, committed_anchor=committed_anchor if replay else None,
+        verified_worker_calls=worker_turns)
+    if lead_proof is None:
+        return None
+    merged = sorted([*lead_proof[3]['turns'], *worker_turns], key=lambda item: _instant(item['called_at']))
+    if (not merged or merged[-1]['native_event_id'] != lead_proof[1][-1].event_id
+            or len({turn['call_hash'] for turn in merged}) != len(merged)
+            or any(_instant(previous['completed_at']) >= _instant(following['called_at'])
+                   or _instant(previous['returned_at']) >= _instant(following['called_at'])
+                   for previous, following in zip(merged, merged[1:]))):
+        return None
+    anchor = {**lead_proof[3], 'historical_workers': {'version': 1, 'origins': worker_origins,
+                                                    'turns': list(worker_turns)}}
+    if replay and anchor['historical_workers'] != {key: committed_anchor['historical_workers'].get(key)
+                                                 for key in ('version', 'origins', 'turns')}:
+        return None
+    return (*lead_proof[:3], anchor, {'natives': worker_natives, 'mapping': worker_mapping})
 
 
 def archived_lead_followup(

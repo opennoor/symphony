@@ -1,5 +1,7 @@
 import importlib.util
+import io
 import json
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import re
 import sys
@@ -22,6 +24,40 @@ with patch.dict(sys.modules, {"native_managed_concurrency": native}):
 
 
 class ClaudeIsolatedWorktreeTests(unittest.TestCase):
+    def test_failure_snapshot_precedes_private_home_cleanup(self):
+        roots = []
+
+        def projects(case, worktree):
+            primary = case / 'primary'
+            primary.mkdir()
+            return primary, primary
+
+        def scratch(root, package):
+            roots.append(root)
+            home = root / 'claude-home'
+            (home / 'projects').mkdir(parents=True)
+            return {'CLAUDE_CONFIG_DIR': str(home)}, home
+
+        def snapshot(root, provider):
+            self.assertEqual(provider, 'claude')
+            self.assertTrue((root / 'claude-home/projects').is_dir())
+            return {'private_native_home_present': True}
+
+        with patch.object(sys, 'argv', ['isolated', '--timeout', '0']), \
+             patch.object(native, 'projects', side_effect=projects), \
+             patch.object(isolated, 'scratch_claude', side_effect=scratch), \
+             patch.object(isolated, 'git_worktree_preflight', return_value={}), \
+             patch.object(isolated, 'verify_lead_model', return_value={}), \
+             patch.object(isolated.shutil, 'which', return_value='claude'), \
+             patch.object(isolated.subprocess, 'Popen', return_value=Mock(poll=Mock(return_value=0))), \
+             patch.object(native, 'failure_state', side_effect=snapshot) as inspect, \
+             patch.dict(isolated.os.environ, {}, clear=True), \
+             redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            self.assertEqual(isolated.main(), 1)
+        inspect.assert_called_once()
+        self.assertEqual(len(roots), 1)
+        self.assertFalse(roots[0].exists())
+
     def test_fixture_route_passes_without_accepting_the_legacy_clamp(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

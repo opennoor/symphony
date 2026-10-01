@@ -17,9 +17,10 @@ from typing import Mapping
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
 from .host_evidence import (
-    _archived_fast_owner,
+    _archived_fast_owner, _instant,
     archived_lead_followup,
-    claude_archived_sendmessage_sequence, claude_sendmessage_source_hash,
+    claude_archived_sendmessage_sequence, claude_archived_mixed_sendmessage_sequence, claude_sendmessage_source_hash,
+    _claude_sendmessage_late_callback,
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
     claude_substantive_launch,
@@ -317,15 +318,25 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             if batch and all(epoch == generation and
                              (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired
                              for event, epoch, _ in batch):
+                committed = _commit_late_sendmessage_sources(state, tuple(event for event, _, _ in batch),
+                    session, generation, project, environ)
+                if committed is not None:
+                    state = committed
+                    acknowledged.update(event.event_id for event, _, current in batch if not current)
+                    batch = []
+            if batch and all(epoch == generation and
+                             (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired
+                             for event, epoch, _ in batch):
                 try:
-                    sequence = claude_archived_sendmessage_sequence(
+                    sequence = claude_archived_mixed_sendmessage_sequence(
                         state, tuple(event for event, _, _ in batch), session,
                         Path(record['project'] or project) if record else project, environ)
                 except (OSError, TypeError, ValueError, AttributeError):
                     sequence = None
                 if sequence is not None:
                     committed = _commit_sendmessage_sequence(state, sequence, tuple(
-                        event for event, _, _ in batch), session, generation, dispatch, project, environ)
+                        event for event, _, _ in batch), session, generation, dispatch, project, environ,
+                        committed_at=source.observed_at)
                     if committed is not None:
                         state = committed
                         acknowledged.update(event.event_id for event, _, current in batch if not current)
@@ -1886,9 +1897,114 @@ def _derived(
     return Event(candidate, kind, source.observed_at, payload or {})
 
 
+def _sendmessage_sequence_digest(sequence: Mapping) -> str:
+    return hashlib.sha256(json.dumps(sequence, sort_keys=True).encode()).hexdigest()
+
+
+def _historical_sendmessage_dispositions_valid(run: RunState, sequence: Mapping,
+                                               proof: tuple, generation: int) -> bool:
+    """Every descendant ACK witness references one fully re-proven sequence."""
+    workers = sequence.get('historical_workers')
+    dispositions = run.assessment.get('_claude_historical_sendmessage_dispositions')
+    if (len(proof) != 5 or not isinstance(workers, Mapping)
+            or not isinstance(workers.get('source_ids'), (list, tuple)) or not workers['source_ids']
+            or len(workers['source_ids']) > 16
+            or not isinstance(dispositions, (list, tuple))):
+        return False
+    digest = _sendmessage_sequence_digest(sequence)
+    relevant = [item for item in dispositions if isinstance(item, Mapping) and item.get('sequence_hash') == digest]
+    if (len(relevant) != len(workers['source_ids'])
+            or len(set(workers['source_ids'])) != len(workers['source_ids'])
+            or {item.get('event_id') for item in relevant} != set(workers['source_ids'])):
+        return False
+    for item in relevant:
+        natives = [native for native in proof[4]['natives'] if native.event_id == item.get('native_event_id')]
+        if (type(item.get('version')) is not int or item['version'] != 1
+                or type(item.get('generation')) is not int or item['generation'] != generation
+                or item.get('kind') not in {'subagent_started', 'subagent_stopped'}
+                or not isinstance(item.get('hash'), str) or re.fullmatch(r'[0-9a-f]{64}', item['hash']) is None
+                or len(natives) != 1):
+            return False
+        native = natives[0]
+        observed = _instant(item.get('observed_at'))
+        turn = next((turn for turn in workers['turns'] if turn.get('native_event_id') == native.event_id), None)
+        # Both source timing and the full cross-target native ordering are
+        # checked again; this never supplies any new worker credit.
+        called = _instant(turn.get('called_at')) if turn is not None else None
+        next_call = min((_instant(record['called_at']) for record in (*sequence['turns'], *workers['turns'])
+                         if called is not None and _instant(record['called_at']) > called), default=None)
+        if (item.get('agent') != native.payload['agent_id'] or item.get('turn') != _child_turn_token(native.payload)
+                or item.get('result') != _terminal_result_id(native)
+                or observed is None or called is None or observed < called
+                or next_call is not None and observed >= next_call
+                or item['kind'] == 'subagent_stopped' and observed < _instant(native.observed_at)):
+            return False
+    return True
+
+
+def _sendmessage_commit_boundary(sequence: Mapping):
+    """The immutable original trigger time bounds newly arriving sources."""
+    committed = _instant(sequence.get('committed_at'))
+    workers = sequence.get('historical_workers', {})
+    if committed is None or not isinstance(workers, Mapping):
+        return None
+    turns = (*sequence.get('turns', ()), *workers.get('turns', ()))
+    if (not turns or any(_instant(turn.get('completed_at')) is None
+                        or _instant(turn['completed_at']) > committed for turn in turns)
+            or any(_instant(item.get('observed_at')) is None
+                   or _instant(item['observed_at']) > committed for item in sequence.get('sources', ()))):
+        return None
+    return committed
+
+
+def _sendmessage_late_sources_valid(run: RunState, sequence: Mapping,
+                                    proof: tuple, generation: int) -> bool:
+    stored = run.assessment.get('_claude_sendmessage_late_sources', ())
+    if not isinstance(stored, (list, tuple)) or any(not isinstance(item, Mapping) for item in stored):
+        return False
+    known = {_sendmessage_sequence_digest(anchor) for anchor in
+             run.assessment.get('_claude_sendmessage_sequences', ()) if isinstance(anchor, Mapping)}
+    if any(item.get('sequence_hash') not in known for item in stored):
+        return False
+    relevant = [item for item in stored if item.get('sequence_hash') == _sendmessage_sequence_digest(sequence)]
+    workers = sequence.get('historical_workers', {})
+    prior_ids = [item.get('event_id') for item in sequence['sources']]
+    prior_ids.extend(workers.get('source_ids', ()))
+    ids = [*prior_ids, *(item.get('event_id') for item in relevant)]
+    if len(ids) > 16 or len(set(ids)) != len(ids):
+        return False
+    natives = (*proof[1], *(proof[4]['natives'] if len(proof) == 5 else ()))
+    turns = (*sequence['turns'], *workers.get('turns', ()))
+    for item in relevant:
+        matching = [native for native in natives if native.event_id == item.get('native_event_id')]
+        if (type(item.get('version')) is not int or item['version'] != 1
+                or type(item.get('generation')) is not int or item['generation'] != generation
+                or item.get('kind') not in {'subagent_started', 'subagent_stopped'}
+                or not isinstance(item.get('event_id'), str) or not item['event_id']
+                or not isinstance(item.get('hash'), str) or re.fullmatch('[0-9a-f]{64}', item['hash']) is None
+                or len(matching) != 1):
+            return False
+        native = matching[0]
+        turn = next((turn for turn in turns if turn['native_event_id'] == native.event_id), None)
+        called = _instant(turn.get('called_at')) if turn else None
+        observed = _instant(item.get('observed_at'))
+        next_call = min((_instant(turn['called_at']) for turn in turns
+                         if called is not None and _instant(turn['called_at']) > called), default=None)
+        if (item.get('agent') != native.payload['agent_id'] or item.get('turn') != _child_turn_token(native.payload)
+                or item.get('result') != _terminal_result_id(native) or called is None or observed is None
+                or observed < called or next_call is not None and observed >= next_call
+                or item['kind'] == 'subagent_stopped' and observed < _instant(native.observed_at)
+                or _sendmessage_commit_boundary(sequence) is None
+                or observed > _sendmessage_commit_boundary(sequence)
+                or item['kind'] == 'subagent_started' and observed > _instant(native.observed_at)
+                or item['kind'] == 'subagent_stopped' and item.get('source_turn_id') != native.payload['prompt_id']):
+            return False
+    return True
+
+
 def _committed_sendmessage_source(state: ProjectState, source: Event,
                                   session: str, generation: int, project: Path,
-                                  environ: Mapping[str, str]) -> bool:
+                                  environ: Mapping[str, str], *, _late_binding: bool = False) -> bool | tuple:
     """ACK one exact committed callback without reopening its old lifecycle."""
     identity = source.payload.get('agent_id') or source.payload.get('subagent_id')
     owned = (source.payload.get('session_id') == session or (
@@ -1896,9 +2012,21 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
             source.payload.get('parent_thread_id') == session
             or source.payload.get('_symphony_verified_alias') is True)))
     if (source.payload.get('provider') != 'claude' or not owned
-            or source.payload.get('parent_thread_id') not in {None, '', session}
             or source.kind not in {'subagent_started', 'subagent_stopped'}):
         return False
+    candidates = []
+    if _late_binding:
+        # A changed payload cannot acquire fresh authority through another
+        # map or sequence while retaining an already committed source ID.
+        for run in (*state.active_runs.values(), *state.recent_runs):
+            for key in ('_claude_sendmessage_late_sources', '_claude_historical_sendmessage_dispositions'):
+                if any(isinstance(item, Mapping) and item.get('event_id') == source.event_id
+                       for item in run.assessment.get(key, ())):
+                    return False
+            if any(isinstance(item, Mapping) and item.get('event_id') == source.event_id
+                   for sequence in run.assessment.get('_claude_sendmessage_sequences', ())
+                   if isinstance(sequence, Mapping) for item in sequence.get('sources', ())):
+                return False
     for run in (*state.active_runs.values(), *state.recent_runs):
         if run.provider != 'claude' or run.session_id != session:
             continue
@@ -1909,15 +2037,16 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
             if (not isinstance(sequence, Mapping) or type(sequence.get('version')) is not int
                     or sequence['version'] != 1 or type(sequence.get('owner_generation')) is not int
                     or sequence.get('owner_generation') > run.owner_generation
-                    or sequence.get('lead') != identity or not isinstance(sequence.get('sources'), (list, tuple))):
+                    or not isinstance(sequence.get('sources'), (list, tuple))):
                 continue
             try:
-                proof = claude_archived_sendmessage_sequence(state, (), session, project, environ,
+                proof = claude_archived_mixed_sendmessage_sequence(state, (), session, project, environ,
                     committed_run=run, committed_anchor=sequence)
             except (OSError, TypeError, ValueError, AttributeError):
                 continue
             if proof is None or proof[3]['turns'] != sequence.get('turns'):
                 continue
+            lead_identity = sequence.get('lead')
             terminal_turns = run.assessment.get('_terminal_turns', {})
             if not isinstance(terminal_turns, Mapping):
                 continue
@@ -1927,7 +2056,7 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                 result = _terminal_result_id(native)
                 receipts = [receipt for receipt in state.terminal_receipts
                             if receipt.get('provider') == 'claude' and receipt.get('session') == session
-                            and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity
+                            and receipt.get('run_id') == run.run_id and receipt.get('agent') == lead_identity
                             and receipt.get('turn') == token]
                 metadata = {'native_agent_type': native.payload.get('agent_type'),
                             'native_model': native.payload.get('model'),
@@ -1948,13 +2077,62 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                         break
                 if (native.event_id + ':followup-start' not in run.assessment.get('_start_event_ids', ())
                         or result not in run.assessment.get('_terminal_event_ids', ())
-                        or token not in terminal_turns.get(identity, ())
+                        or token not in terminal_turns.get(lead_identity, ())
                         or len(receipts) != 1 or receipts[0].get('result') != result
-                        or receipts[0].get('parent') != session or receipts[0].get('lead') != identity
+                        or receipts[0].get('parent') != session or receipts[0].get('lead') != lead_identity
                         or receipts[0].get('status') != 'completed'):
                     valid = False
                     break
             if not valid:
+                continue
+            workers = sequence.get('historical_workers')
+            if workers is not None:
+                try:
+                    worker_dispositions_valid = _historical_sendmessage_dispositions_valid(run, sequence, proof, generation)
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    worker_dispositions_valid = False
+                if not worker_dispositions_valid:
+                    continue
+            try:
+                if not _sendmessage_late_sources_valid(run, sequence, proof, generation):
+                    continue
+            except (TypeError, ValueError, AttributeError, KeyError):
+                continue
+            if _late_binding:
+                committed = _sendmessage_commit_boundary(sequence)
+                if committed is None:
+                    continue
+                turns = (*sequence['turns'], *(workers.get('turns', ()) if workers else ()))
+                natives = (*proof[1], *(proof[4]['natives'] if len(proof) == 5 else ()))
+                for native in natives:
+                    turn = next(turn for turn in turns if turn['native_event_id'] == native.event_id)
+                    called = _instant(turn['called_at'])
+                    historical = native.payload['agent_id'] != lead_identity
+                    if _claude_sendmessage_late_callback(source, native, session, called, environ,
+                            role='worker' if historical else 'lead',
+                            parent=lead_identity if historical else session, committed_at=committed):
+                        candidates.append((run, sequence, native))
+                continue
+            for witness in run.assessment.get('_claude_sendmessage_late_sources', ()):
+                if (witness.get('sequence_hash') == _sendmessage_sequence_digest(sequence)
+                        and witness.get('event_id') == source.event_id and witness.get('kind') == source.kind
+                        and witness.get('agent') == identity and witness.get('observed_at') == source.observed_at
+                        and witness.get('generation') == generation
+                        and witness.get('hash') == claude_sendmessage_source_hash(source, session)):
+                    return True
+            if workers is not None:
+                if identity != lead_identity:
+                    if source.payload.get('parent_thread_id') not in {None, '', lead_identity}:
+                        continue
+                    for witness in run.assessment['_claude_historical_sendmessage_dispositions']:
+                        if (witness.get('sequence_hash') == _sendmessage_sequence_digest(sequence)
+                                and witness.get('event_id') == source.event_id and witness.get('kind') == source.kind
+                                and witness.get('agent') == identity and witness.get('observed_at') == source.observed_at
+                                and witness.get('generation') == generation
+                                and witness.get('hash') == claude_sendmessage_source_hash(source, session)):
+                            return True
+                    continue
+            if identity != lead_identity or source.payload.get('parent_thread_id') not in {None, '', session}:
                 continue
             for witness in sequence['sources']:
                 if (not isinstance(witness, Mapping) or witness.get('event_id') != source.event_id
@@ -1980,19 +2158,66 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                         and receipts[0].get('parent') == session and receipts[0].get('lead') == identity
                         and receipts[0].get('status') == 'completed'):
                     return True
-    return False
+    return candidates[0] if _late_binding and len(candidates) == 1 else False
+
+
+def _commit_late_sendmessage_sources(state: ProjectState, sources: tuple[Event, ...],
+                                     session: str, generation: int, project: Path,
+                                     environ: Mapping[str, str]) -> ProjectState | None:
+    """Persist first-arriving callbacks against existing proof; never dispatch."""
+    if not sources or len(sources) > 16 or len({source.event_id for source in sources}) != len(sources):
+        return None
+    proven = []
+    try:
+        for source in sources:
+            binding = _committed_sendmessage_source(state, source, session, generation, project, environ,
+                                                    _late_binding=True)
+            if not isinstance(binding, tuple):
+                return None
+            proven.append((source, *binding))
+    except (OSError, TypeError, ValueError, AttributeError, KeyError):
+        return None
+    updated = {}
+    for source, original, sequence, native in proven:
+        run = updated.get(original.run_id, original)
+        witness = {'version': 1, 'sequence_hash': _sendmessage_sequence_digest(sequence),
+            'event_id': source.event_id, 'kind': source.kind, 'observed_at': source.observed_at,
+            'generation': generation, 'hash': claude_sendmessage_source_hash(source, session),
+            'agent': native.payload['agent_id'], 'native_event_id': native.event_id,
+            'turn': _child_turn_token(native.payload), 'result': _terminal_result_id(native)}
+        if source.kind == 'subagent_stopped':
+            witness['source_turn_id'] = source.payload['turn_id']
+        updated[run.run_id] = replace(run, assessment={**run.assessment,
+            '_claude_sendmessage_late_sources': (*run.assessment.get('_claude_sendmessage_late_sources', ()), witness)})
+    def substitute(run):
+        return updated.get(run.run_id, run) if run.provider == 'claude' and run.session_id == session else run
+    candidate = replace(state, active_run=substitute(state.active_run) if state.active_run else None,
+        active_runs={key: substitute(run) for key, run in state.active_runs.items()},
+        recent_runs=tuple(substitute(run) for run in state.recent_runs))
+    if not all(_committed_sendmessage_source(candidate, source, session, generation, project, environ)
+               for source in sources):
+        return None
+    return candidate
 
 
 def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: tuple[Event, ...],
                                  session: str, generation: int, dispatch,
-                                 project: Path, environ: Mapping[str, str]) -> ProjectState | None:
-    archived, natives, mapping, anchor = sequence
+                                 project: Path, environ: Mapping[str, str], *, committed_at: str) -> ProjectState | None:
+    archived, natives, mapping, anchor = sequence[:4]
+    workers = sequence[4] if len(sequence) == 5 else None
+    boundary = _instant(committed_at)
+    all_natives = (*natives, *(workers['natives'] if workers else ()))
+    if (boundary is None or any(_instant(native.observed_at) > boundary for native in all_natives)
+            or any(_instant(event.observed_at) is None or _instant(event.observed_at) > boundary
+                   for event in sources)):
+        return None
     original = state
     resumed = replace(archived, status='completing',
                       assessment={**archived.assessment, '_batch_pending': True})
     state = replace(state, active_run=resumed, active_runs={**state.active_runs, f'claude:{session}': resumed},
                     recent_runs=tuple(run for run in state.recent_runs if run != archived))
-    witnesses = []
+    witnesses, dispositions = [], []
+    ordered_sources = tuple(sorted(sources, key=lambda source: (_instant(source.observed_at), source.event_id)))
     for native in natives:
         started = Event(native.event_id + ':followup-start', 'subagent_started',
                         native.payload['_symphony_native_started_at'],
@@ -2002,9 +2227,11 @@ def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: 
         run = state.active_runs.get(f'claude:{session}')
         if not run or run.run_id != archived.run_id or run.lead_identity != archived.lead_identity:
             return None
-    for source in sources:
-        native = natives[mapping[source.event_id]]
-        witnesses.append({'event_id': source.event_id, 'kind': source.kind,
+    for source in ordered_sources:
+        historical = workers is not None and source.event_id in workers['mapping']
+        native = workers['natives'][workers['mapping'][source.event_id]] if historical else natives[mapping[source.event_id]]
+        target = dispositions if historical else witnesses
+        target.append({'event_id': source.event_id, 'kind': source.kind,
                           'observed_at': source.observed_at, 'generation': generation,
                           'hash': claude_sendmessage_source_hash(source, session),
                           'native_event_id': native.event_id, 'turn': _child_turn_token(native.payload),
@@ -2013,8 +2240,24 @@ def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: 
     sequences = run.assessment.get('_claude_sendmessage_sequences', ())
     if not isinstance(sequences, (list, tuple)):
         return None
-    run = replace(run, assessment={**run.assessment,
-        '_claude_sendmessage_sequences': (*sequences, {**anchor, 'sources': witnesses})})
+    committed_anchor = {**anchor, 'sources': witnesses, 'committed_at': committed_at}
+    assessment = dict(run.assessment)
+    if dispositions:
+        historical = dict(committed_anchor['historical_workers'])
+        historical['source_ids'] = [item['event_id'] for item in dispositions]
+        committed_anchor['historical_workers'] = historical
+        digest = _sendmessage_sequence_digest(committed_anchor)
+        stored = assessment.get('_claude_historical_sendmessage_dispositions', ())
+        if not isinstance(stored, (list, tuple)):
+            return None
+        for witness, source in zip(dispositions, (event for event in ordered_sources if event.event_id in workers['mapping'])):
+            witness.update(version=1, sequence_hash=digest,
+                           agent=source.payload.get('agent_id') or source.payload.get('subagent_id'))
+            if any(item.get('event_id') == witness['event_id'] for item in stored if isinstance(item, Mapping)):
+                return None
+        assessment['_claude_historical_sendmessage_dispositions'] = (*stored, *dispositions)
+    assessment['_claude_sendmessage_sequences'] = (*sequences, committed_anchor)
+    run = replace(run, assessment=assessment)
     state = replace(state, active_run=run, active_runs={**state.active_runs, f'claude:{session}': run})
     # Validate all committed receipt/start/turn anchors before any inbox ACK.
     # Assessment uses the existing open codec; no callback text is persisted.

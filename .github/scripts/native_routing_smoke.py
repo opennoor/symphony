@@ -1195,7 +1195,7 @@ def claude_child_binding_probe(home, run_dict, document):
             source_provider_matches=start.payload.get('provider') == terminal.payload.get('provider') == run.provider,
             source_session_matches=start.payload.get('session_id') == terminal.payload.get('session_id') == run.session_id)
         def trace(frame, event, value):
-            if frame.f_code is not host_evidence.claude_substantive_launch.__code__:
+            if frame.f_code is not host_evidence._claude_substantive_launch.__code__:
                 return None
             if event == 'return':
                 values = frame.f_locals

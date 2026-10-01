@@ -17,13 +17,25 @@ import time
 from unittest.mock import patch
 
 
-def sequence_rejection_probe(state, events, session, project, env, evidence):
+def sequence_rejection_probe(state, events, session, project, env, evidence, *, mixed=False):
     """Read the exact failed proof and export only fixed component facts."""
     facts = {'pending_callbacks': len(events), 'native_readers': []}
     sequence_code = evidence.claude_archived_sendmessage_sequence.__code__
     reader_code = evidence._claude_native_lead_event.__code__
+    extra_readers = {getattr(evidence, name).__code__: label for name, label in (
+        ('_claude_historical_worker_origin', 'worker_origin'),
+        ('_claude_historical_worker_terminal', 'worker_terminal'),
+        ('_claude_historical_worker_deliveries', 'worker_deliveries'),
+        ('claude_archived_mixed_sendmessage_sequence', 'mixed_sequence')) if hasattr(evidence, name)}
 
     def trace(frame, kind, result):
+        if frame.f_code in extra_readers:
+            if kind == 'return':
+                stages = facts.setdefault('historical_readers', [])
+                if len(stages) < 24:
+                    stages.append({'reader': extra_readers[frame.f_code], 'source_line': frame.f_lineno,
+                                   'accepted': result is not None})
+            return trace
         if frame.f_code not in {sequence_code, reader_code}:
             return None
         if kind == 'return':
@@ -75,6 +87,8 @@ def sequence_rejection_probe(state, events, session, project, env, evidence):
                         'paired_result_count': len(matches), 'child_prompt_available': index < len(prompts)}
                     if index < len(prompts):
                         delivery['message_matches_child_prompt'] = details.get('message') == prompts[index].get('message', {}).get('content')
+                        delivery['coordinator_projection_matches'] = evidence._claude_coordinator_prompt_matches(
+                            prompts[index], details.get('message'))
                     if len(matches) == 1:
                         result_row, paired = matches[0]
                         content = paired.get('content')
@@ -102,7 +116,8 @@ def sequence_rejection_probe(state, events, session, project, env, evidence):
     previous = sys.gettrace()
     try:
         sys.settrace(trace)
-        facts['accepted'] = evidence.claude_archived_sendmessage_sequence(
+        function = evidence.claude_archived_mixed_sendmessage_sequence if mixed else evidence.claude_archived_sendmessage_sequence
+        facts['accepted'] = function(
             state, tuple(events), session, project, env) is not None
     except (OSError, ValueError, TypeError, AttributeError, KeyError):
         facts['probe_error'] = True
@@ -128,7 +143,14 @@ def captured_sequence_sources(state, session, private_dir, adapters, evidence, m
             snapshots.append(canonical)
     events = {}
     for sequence in sequences:
-        for witness in sequence['sources']:
+        witnesses = list(sequence['sources'])
+        digest = hashlib.sha256(json.dumps(sequence, sort_keys=True).encode()).hexdigest()
+        witnesses.extend(witness for witness in runs[0].assessment.get(
+            '_claude_sendmessage_late_sources', ()) if witness.get('sequence_hash') == digest)
+        if sequence.get('historical_workers') is not None:
+            witnesses.extend(witness for witness in runs[0].assessment.get(
+                '_claude_historical_sendmessage_dispositions', ()) if witness.get('sequence_hash') == digest)
+        for witness in witnesses:
             matches = []
             for snapshot in snapshots:
                 if snapshot.get('event_id') != witness['event_id'] or snapshot.get('kind') != witness['kind']:
@@ -190,8 +212,37 @@ def exact_delta_receipts(state, session, run, sequences):
     return tuple(receipts)
 
 
+def exact_historical_delta(run, sequences, identity, message):
+    turns = [turn for sequence in sequences for turn in sequence.get('historical_workers', {}).get('turns', ())]
+    if (len(turns) != 1 or turns[0].get('agent') != identity
+            or turns[0].get('message_hash') != hashlib.sha256(message.encode()).hexdigest()):
+        raise RuntimeError('native continuation lacks its exact newly requested worker acknowledgment')
+    digests = {hashlib.sha256(json.dumps(sequence, sort_keys=True).encode()).hexdigest() for sequence in sequences}
+    dispositions = tuple(dict(item) for item in run.assessment.get('_claude_historical_sendmessage_dispositions', ())
+                         if item.get('sequence_hash') in digests)
+    if (not dispositions or any(item.get('agent') != identity for item in dispositions)
+            or not any(item.get('kind') == 'subagent_stopped' for item in dispositions)):
+        raise RuntimeError('native continuation lacks newly committed worker ACK dispositions')
+    return dispositions
+
+
 def replay_native_copies(root, original_state, native_home, project, session, events, env, runtime, store_module,
-                         *, expected_sequences, expected_receipts):
+                         *, expected_sequences, expected_receipts, expected_worker_dispositions=(),
+                         expected_late_sources=()):
+    # Reproduce the original transaction trigger time, not replay wall time.
+    # Callback observations already retain their exact captured timestamps.
+    from dataclasses import replace
+    if len(expected_sequences) != 1 or not isinstance(expected_sequences[0].get('committed_at'), str):
+        raise RuntimeError('copied replay lacks original transaction timestamp')
+    original_trigger_time = expected_sequences[0]['committed_at']
+    normalizer = runtime.event_from_payload
+
+    def copied_handle(payload, copied_env):
+        def original_observation(provider, source):
+            return replace(normalizer(provider, source), observed_at=original_trigger_time)
+        with patch.object(runtime, 'event_from_payload', side_effect=original_observation):
+            return runtime.handle(payload, copied_env)
+
     counts = {}
     for mode in ('Stop', 'SessionStart', 'status', 'failed-ack', 'partial-ack'):
         copy = root / ('replay-' + mode)
@@ -203,8 +254,16 @@ def replay_native_copies(root, original_state, native_home, project, session, ev
         shutil.copytree(native_home / 'projects', home / 'projects')
         store = store_module.StateStore(state_dir)
         before = store.load(project)
+        sibling_sessions = {run.session_id for run in (*before.active_runs.values(), *before.recent_runs)
+                            if run.provider == 'claude' and run.session_id != session}
+        sibling_inboxes = {root_session: store._session_path('claude', root_session).read_bytes()
+                           if store._session_path('claude', root_session).is_file() else None
+                           for root_session in sibling_sessions}
         original = next(run for run in before.recent_runs if run.provider == 'claude' and run.session_id == session)
+        late_ids = {item['event_id'] for item in expected_late_sources}
         for event in events:
+            if event.event_id in late_ids:
+                continue
             store.queue_session_event('claude', session, event, ambiguous_owner=True)
         copied_env = {**env, 'SYMPHONY_STATE_DIR': str(state_dir), 'CLAUDE_CONFIG_DIR': str(home),
                       'SYMPHONY_PROVIDER': 'claude'}
@@ -215,18 +274,26 @@ def replay_native_copies(root, original_state, native_home, project, session, ev
         if mode in ('failed-ack', 'partial-ack'):
             with patch.object(store_module.StateStore, 'finish_session_events', side_effect=OSError('copied ACK crash')):
                 try:
-                    runtime.handle(payload, copied_env)
+                    copied_handle(payload, copied_env)
                 except OSError:
                     pass
                 else:
                     raise RuntimeError('copied ACK interruption did not run')
             if mode == 'partial-ack':
                 record = store.session_record('claude', session)
-                store.finish_session_events(record, {events[0].event_id, events[-1].event_id})
-        result = runtime.handle(payload, copied_env)
+                present = [event for event in events if event.event_id not in late_ids]
+                store.finish_session_events(record, {present[0].event_id, present[-1].event_id})
+        elif late_ids:
+            initial = copied_handle(payload, copied_env)
+            if json.loads(initial.stdout or '{}').get('decision') == 'block':
+                raise RuntimeError('copied initial native continuation stayed blocked')
+        for event in events:
+            if event.event_id in late_ids:
+                store.queue_session_event('claude', session, event, ambiguous_owner=True)
+        result = copied_handle(payload, copied_env)
         if json.loads(result.stdout or '{}').get('decision') == 'block':
             raise RuntimeError('copied native continuation stayed blocked')
-        runtime.handle({**payload, 'hook_event_name': 'Stop'}, copied_env)
+        copied_handle({**payload, 'hook_event_name': 'Stop'}, copied_env)
         after = store.load(project)
         final = [run for run in after.recent_runs if run.provider == 'claude' and run.session_id == session]
         if (any(run.session_id == session for run in after.active_runs.values())
@@ -244,12 +311,38 @@ def replay_native_copies(root, original_state, native_home, project, session, ev
                 or any(dict(receipt) not in [dict(item) for item in after.terminal_receipts]
                        for receipt in before.terminal_receipts)):
             raise RuntimeError('copied replay lacks exact new proof or changed prior receipts')
+        if any(item not in final[0].assessment.get('_claude_sendmessage_late_sources', ())
+               for item in expected_late_sources):
+            raise RuntimeError('copied replay lacks exact late callback dispositions')
+        if expected_worker_dispositions:
+            stored = final[0].assessment.get('_claude_historical_sendmessage_dispositions', ())
+            if (any(item not in stored for item in expected_worker_dispositions)
+                    or final[0].assessment.get('_substantive_children') != original.assessment.get('_substantive_children')
+                    or tuple(item for item in final[0].delegations if item.role == 'worker') !=
+                       tuple(item for item in original.delegations if item.role == 'worker')
+                    or tuple(item for item in after.terminal_receipts if item.get('agent') in
+                             original.assessment.get('_substantive_children', {})) !=
+                       tuple(item for item in before.terminal_receipts if item.get('agent') in
+                             original.assessment.get('_substantive_children', {}))):
+                raise RuntimeError('copied worker acknowledgment changed original substantive credit')
+        siblings_before = [run for run in (*before.active_runs.values(), *before.recent_runs)
+                           if run.provider == 'claude' and run.session_id != session]
+        siblings_after = [run for run in (*after.active_runs.values(), *after.recent_runs)
+                          if run.provider == 'claude' and run.session_id != session]
+        if siblings_before != siblings_after:
+            raise RuntimeError('copied continuation changed sibling ownership')
+        if any((store._session_path('claude', root_session).read_bytes()
+                if store._session_path('claude', root_session).is_file() else None) != original_bytes
+               for root_session, original_bytes in sibling_inboxes.items()):
+            raise RuntimeError('copied continuation changed sibling pending callbacks')
         counts[mode] = {'pending_callbacks': 0, 'same_owner': True,
-                        'native_turns': sum(len(sequence['turns']) for sequence in expected_sequences)}
+                        'native_turns': sum(len(sequence['turns']) for sequence in expected_sequences),
+                        'historical_worker_replies': int(bool(expected_worker_dispositions))}
     return counts
 
 
-def check_native_sendmessage(root, candidate, baseline_env, baseline_result, timeout, budget):
+def check_native_sendmessage(root, candidate, baseline_env, baseline_result, timeout, budget,
+                             *, label='a', historical_worker=False):
     import native_managed_concurrency as managed
     candidate = candidate.resolve()
     sys.path.insert(0, str(candidate))
@@ -258,7 +351,7 @@ def check_native_sendmessage(root, candidate, baseline_env, baseline_result, tim
     case = root / 'same-worktree'
     state_dir = case / 'state'
     native_home = Path(baseline_env['CLAUDE_CONFIG_DIR'])
-    owner = baseline_result['original_owners']['a']
+    owner = baseline_result['original_owners'][label]
     session, lead = owner['session_id'], owner['lead_id']
     store = store_module.StateStore(state_dir)
     record = store.session_record('claude', session)
@@ -266,7 +359,7 @@ def check_native_sendmessage(root, candidate, baseline_env, baseline_result, tim
     state = store.load(project)
     if not managed.claude_original_owner_archived(store_module._state_to_dict(state), session, owner['run_id'], lead):
         raise RuntimeError('explicit followup requires the exact completed original owner')
-    private = root / 'private-sendmessage-replay'
+    private = root / ('private-sendmessage-replay-' + label)
     private.mkdir(mode=0o700)
     original_state = private / 'before-followups-state'
     shutil.copytree(state_dir, original_state)
@@ -281,13 +374,28 @@ def check_native_sendmessage(root, candidate, baseline_env, baseline_result, tim
                 'Same-work native continuation two. Preserve the original worker evidence. '
                 'Do not inspect, edit, execute tools or delegate. Return exactly these lines:\n'
                 'CONTINUATION_ACK_TWO\nSYMPHONY_OUTCOME: {"status":"completed"}']
-    request = ('Continue ONLY this original archived Symphony lead. Use SendMessage exactly twice, '
+    before_run = next(run for run in state.recent_runs if run.run_id == owner['run_id'])
+    deliveries = [{'to': lead, 'message': message} for message in messages]
+    worker, worker_message = None, None
+    if historical_worker:
+        proofs = before_run.assessment.get('_substantive_children', {})
+        workers = [identity for identity, proof in proofs.items() if proof.get('role') == 'worker'
+                   and proof.get('successful') is True and proof.get('run_id') == before_run.run_id
+                   and proof.get('lead') == lead and proof.get('owner_generation') == before_run.owner_generation]
+        if len(workers) != 1:
+            raise RuntimeError('native historical acknowledgment requires one originally credited worker')
+        worker = workers[0]
+        worker_message = ('Acknowledge ONLY your already completed original work. Do not inspect, edit, '
+                          'execute tools or delegate. Return exactly HISTORICAL_WORKER_ACK with no outcome marker.')
+        deliveries.insert(1, {'to': worker, 'message': worker_message})
+    request = ('Continue ONLY these original archived Symphony identities. Use SendMessage exactly '
+               + ('three times' if historical_worker else 'twice') + ', '
                'sequentially, targeting the literal original agent ID. Await the first CHILD end_turn '
                'and its CONTINUATION_ACK_ONE report before sending the second; a success:true dispatch '
                'acknowledgment alone is not child completion. Do not use Agent, names, extra messages, new tasks or tools. '
-               'Send the following exact string messages without summarizing them: ' + json.dumps([
-                   {'to': lead, 'message': message} for message in messages]) +
-               '. After the second native terminal, end this root turn so Stop reconciles the same owner.')
+               'Send the following exact string messages without summarizing them: ' + json.dumps(deliveries) +
+               '. Await EACH addressed CHILD end_turn and report before sending the next message. '
+               'After the final lead native terminal, end this root turn so Stop reconciles the same owner.')
     completed = subprocess.run([shutil.which('claude'), '--print', '--model', 'haiku',
         '--max-budget-usd', str(budget), '--permission-mode', 'bypassPermissions', '--resume', session,
         '--output-format', 'json', request], cwd=project, env=env, stdin=subprocess.DEVNULL,
@@ -300,8 +408,11 @@ def check_native_sendmessage(root, candidate, baseline_env, baseline_result, tim
     if completed.returncode:
         raise RuntimeError('native explicit SendMessage root failed')
     after = store.load(project)
-    run = next(run for run in after.recent_runs if run.session_id == session and run.run_id == owner['run_id'])
-    before_run = next(run for run in state.recent_runs if run.run_id == owner['run_id'])
+    matching_runs = [run for run in (*after.active_runs.values(), *after.recent_runs)
+                     if run.session_id == session and run.run_id == owner['run_id']]
+    if len(matching_runs) != 1:
+        raise RuntimeError('native continuation has no unique original owner after delivery')
+    run = matching_runs[0]
     try:
         delta = requested_sequence_delta(before_run, run, messages)
     except RuntimeError:
@@ -310,16 +421,42 @@ def check_native_sendmessage(root, candidate, baseline_env, baseline_result, tim
                   for item in pending]
         # Evaluate the untouched pre-followup owner against the exact current
         # native files and retained callbacks before temporary files disappear.
-        diagnostic = sequence_rejection_probe(state, events, session, project, env, host_evidence)
-        (root / 'sendmessage-proof.json').write_text(json.dumps(diagnostic), encoding='utf-8')
+        diagnostic = sequence_rejection_probe(state, events, session, project, env, host_evidence,
+                                             mixed=historical_worker)
+        (root / ('sendmessage-proof-' + label + '.json')).write_text(json.dumps(diagnostic), encoding='utf-8')
         raise
+    if not managed.claude_original_owner_archived(store_module._state_to_dict(after), session, owner['run_id'], lead):
+        raise RuntimeError('native continuation did not archive the exact original owner')
     receipts = exact_delta_receipts(after, session, run, delta)
+    worker_dispositions = exact_historical_delta(run, delta, worker, worker_message) if historical_worker else ()
+    digests = {hashlib.sha256(json.dumps(sequence, sort_keys=True).encode()).hexdigest() for sequence in delta}
+    late_sources = tuple(item for item in run.assessment.get('_claude_sendmessage_late_sources', ())
+                         if item.get('sequence_hash') in digests)
     sources = captured_sequence_sources(after, session, root / 'private-child-hooks', adapters,
                                         host_evidence, model, sequences=delta)
     turns = sum(len(sequence['turns']) for sequence in delta)
     replays = replay_native_copies(private, original_state, native_home, project, session,
                                    sources, env, runtime, store_module,
-                                   expected_sequences=delta, expected_receipts=receipts)
+                                   expected_sequences=delta, expected_receipts=receipts,
+                                   expected_worker_dispositions=worker_dispositions,
+                                   expected_late_sources=late_sources)
     return {'case': 'archived-sendmessage-sequence', 'native_turns': turns,
             'captured_callbacks': len(sources), 'copied_native_replays': replays,
+            'historical_worker_replies': int(historical_worker),
             'pending_callbacks': 0, 'same_owner': True}
+
+
+def check_native_sendmessage_pair(root, candidate, baseline_env, baseline_result, timeout, budget):
+    """Both required sibling scenarios run even when one fails."""
+    results, errors = [], {}
+    for label, historical in (('a', False), ('b', True)):
+        try:
+            results.append(check_native_sendmessage(root, candidate, baseline_env, baseline_result,
+                timeout, budget, label=label, historical_worker=historical))
+        except Exception as error:
+            errors[label] = {'failed': True, 'timed_out': isinstance(error, subprocess.TimeoutExpired),
+                             'proof_failed': isinstance(error, RuntimeError)}
+    if errors:
+        (root / 'sendmessage-required.json').write_text(json.dumps(errors), encoding='utf-8')
+        raise RuntimeError('required native lead or historical-worker continuation failed')
+    return results

@@ -3908,11 +3908,12 @@ def failure_state(root, provider):
             spawn_probes[path.parent.name] = json.loads(path.read_text())
         except (OSError, ValueError):
             spawn_probes[path.parent.name] = {"snapshot_unreadable": True}
-    sequence_probe = root / 'sendmessage-proof.json'
-    try:
-        sequence_facts = json.loads(sequence_probe.read_text(encoding='utf-8')) if sequence_probe.is_file() else None
-    except (OSError, ValueError):
-        sequence_facts = {'snapshot_unreadable': True}
+    sequence_facts = {}
+    for sequence_probe in (*root.glob('sendmessage-proof*.json'), *root.glob('sendmessage-required.json')):
+        try:
+            sequence_facts[sequence_probe.stem] = json.loads(sequence_probe.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            sequence_facts[sequence_probe.stem] = {'snapshot_unreadable': True}
     return {"provider": provider, "cases": cases, "native_host_trace": host,
             "sendmessage_proof": sequence_facts,
             "native_resume_status": resume_status,
@@ -4027,9 +4028,9 @@ def main():
                                   args.claude_budget_usd,
                                   baseline_env=baseline_env) for separate in cases]
             if args.claude_sendmessage_followups:
-                from native_claude_followup import check_native_sendmessage
-                results.append(check_native_sendmessage(root, args.candidate_plugin_root, baseline_env,
-                                                        results[0], args.timeout, args.claude_budget_usd))
+                from native_claude_followup import check_native_sendmessage_pair
+                results.extend(check_native_sendmessage_pair(root, args.candidate_plugin_root, baseline_env,
+                                                            results[0], args.timeout, args.claude_budget_usd))
             if args.live_update:
                 update = prepare_live_update(args.provider, root, args.old_plugin_root,
                                              args.candidate_plugin_root)

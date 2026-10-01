@@ -15,6 +15,11 @@ from plugins.symphony.tests import test_claude_host_evidence as fixture
 from plugins.symphony.tests.test_claude_host_evidence import SESSION, LEAD, TYPE, REPORT
 
 
+def coordinator_content(message):
+    return ('The coordinator sent a message while you were working:\n' + message
+            + '\n\nAddress this before completing your current task.')
+
+
 class ClaudeSendMessageTests(unittest.TestCase):
     setUp = fixture.ClaudeHostEvidenceTests.setUp
     write_native = fixture.ClaudeHostEvidenceTests.write_native
@@ -47,7 +52,8 @@ class ClaudeSendMessageTests(unittest.TestCase):
             child.extend([
                 {'type': 'user', 'uuid': f'prompt-send-{i}', 'sessionId': SESSION, 'agentId': LEAD,
                  'isSidechain': True, 'timestamp': f'2026-09-29T02:{minute:02}:01Z',
-                 'message': {'content': message}},
+                 'origin': {'kind': 'coordinator'}, 'isMeta': True,
+                 'message': {'content': coordinator_content(message)}},
                 {'type': 'assistant', 'uuid': f'terminal-send-{i}', 'sessionId': SESSION,
                  'agentId': LEAD, 'isSidechain': True, 'timestamp': f'2026-09-29T02:{minute+1:02}:00Z',
                  'effort': 'low', 'message': {'model': 'claude-sonnet-5', 'stop_reason': 'end_turn',
@@ -74,6 +80,36 @@ class ClaudeSendMessageTests(unittest.TestCase):
     def proof(self):
         return claude_archived_sendmessage_sequence(self.store.load(self.project), tuple(self.events),
                                                     SESSION, self.project, self.environ)
+
+    def test_exact_native_coordinator_projection_rejects_raw_and_conflicting_metadata(self):
+        for case in ('raw', 'prefix', 'suffix', 'extra', 'peer', 'malformed-origin', 'not-meta'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prepare()
+                rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+                prompt = rows[-4]
+                message = 'Continue the same task, step 1.'
+                if case == 'raw': prompt['message']['content'] = message
+                if case == 'prefix': prompt['message']['content'] = coordinator_content(message).replace(
+                    'The coordinator', 'A coordinator', 1)
+                if case == 'suffix': prompt['message']['content'] = coordinator_content(message)[:-1]
+                if case == 'extra': prompt['message']['content'] += '\nExtra instructions.'
+                if case == 'peer': prompt['origin'] = {'kind': 'peer'}
+                if case == 'malformed-origin': prompt['origin'] = 'coordinator'
+                if case == 'not-meta': prompt['isMeta'] = False
+                self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                self.assertIsNone(self.proof())
+        self.setUp()
+        self.prepare()
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        # Persisted optional metadata may be absent; exact projected content
+        # and all independent root/native authority are still required.
+        for row in rows:
+            if row.get('origin', {}).get('kind') == 'coordinator':
+                row.pop('origin')
+                row.pop('isMeta')
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.assertIsNotNone(self.proof())
 
     def test_ordered_sequence_commits_each_turn_only_latest_outcome_and_archives_publicly(self):
         for hook in ('Stop', 'SessionStart', 'UserPromptSubmit'):
