@@ -504,6 +504,94 @@ def decision_representations(provider, rows, identity):
     return result
 
 
+def codex_command_turns_verified(document, run_values, rows, identity, home, project):
+    """Verify one command turn, or its single proven same-task native followup."""
+    if (run_values.get('provider') != 'codex' or run_values.get('status') != 'completed'
+            or run_values.get('lead_identity') != identity
+            or run_values.get('outcome', {}).get('status') != 'completed'
+            or not fast_native_identity('codex', rows, identity, run_values)
+            or not worker_transcript_is_unforked('codex', rows, identity)):
+        return None
+    run = _run_from_dict(run_values)
+    native = host_evidence._native_lead_turns(ProjectState(active_run=run), run.session_id,
+                                            {'CODEX_HOME': str(home)})
+    if native is None:
+        return None
+    _, turns, order, latest, _ = native
+    if len(order) not in {1, 2} or set(turns) != set(order) or latest != order[-1]:
+        return None
+    raw = {token: {'start': [], 'context': [], 'complete': [], 'markers': []} for token in order}
+    current = ''
+    for row in rows:
+        payload = row.get('payload', {})
+        if row.get('type') == 'event_msg' and payload.get('type') in {
+                'turn_aborted', 'task_failed', 'task_interrupted', 'error'}:
+            return None
+        kind = ('context' if row.get('type') == 'turn_context' else
+                'start' if row.get('type') == 'event_msg' and payload.get('type') == 'task_started' else
+                'complete' if row.get('type') == 'event_msg' and payload.get('type') == 'task_complete' else '')
+        if kind:
+            token = payload.get('turn_id')
+            if not isinstance(token, str) or not token or token not in raw:
+                return None
+            raw[token][kind].append(row)
+            if kind in {'start', 'context'}:
+                current = token
+        text = assistant_text('codex', row)
+        if any(line.strip().startswith('SYMPHONY_FAST_DECISION:') for line in text.splitlines()):
+            if (current not in raw or payload.get('phase') != 'final_answer'
+                    or not isinstance(payload.get('id'), str) or not payload['id']
+                    or payload.get('turn_id', current) != current):
+                return None
+            raw[current]['markers'].append(row)
+    previous = None
+    last_timestamp = None
+    marker_ids = set()
+    for token in order:
+        records, turn = raw[token], turns[token]
+        if (any(len(records[kind]) != 1 for kind in ('start', 'context', 'complete', 'markers'))
+                or turn.get('failed') or not turn.get('started') or turn.get('completed_at') is None
+                or turn.get('model') != run.assessment.get('_fast_route', {}).get('model')
+                or turn.get('effort') != run.assessment.get('_fast_route', {}).get('effort')):
+            return None
+        began, completed = turn.get('started_at'), turn.get('completed_at')
+        context_at = host_evidence._instant(records['context'][0].get('timestamp'))
+        marker_at = host_evidence._instant(records['markers'][0].get('timestamp'))
+        if (not began or not context_at or not marker_at or not began <= context_at <= marker_at <= completed
+                or previous and not previous < began):
+            return None
+        report = turn.get('message')
+        marker_id = records['markers'][0]['payload']['id']
+        if marker_id in marker_ids:
+            return None
+        marker_ids.add(marker_id)
+        if (not isinstance(report, str) or fast_decision_lines(report) != ['eligible']
+                or sum(line.strip().startswith('SYMPHONY_FAST_DECISION:') for line in report.splitlines()) != 1
+                or assistant_text('codex', records['markers'][0]) != report):
+            return None
+        # Durable receipts are already accepted callback evidence. A synthetic
+        # minimal event cannot reproduce their result hash's extra fields.
+        receipts = [item for item in document.get('terminal_receipts', ())
+                    if item.get('provider') == 'codex' and item.get('session') == run.session_id
+                    and item.get('agent') == identity and item.get('turn') == 'turn_id:' + token]
+        if (len(receipts) != 1 or receipts[0].get('run_id') != run.run_id
+                or receipts[0].get('lead') != identity or receipts[0].get('parent') != run.session_id
+                or receipts[0].get('status') not in {'completed', 'done', 'success', 'succeeded'}
+                or not isinstance(receipts[0].get('result'), str)
+                or re.fullmatch(r'[0-9a-f]{64}', receipts[0]['result']) is None):
+            return None
+        if previous:
+            native_event = Event('command-proof', 'subagent_stopped', completed.isoformat(), {
+                'model': turn['model'], 'model_reasoning_effort': turn['effort'],
+                '_symphony_native_started_at': began.isoformat()})
+            if not host_evidence._codex_root_followup(replace(run, updated_at=previous.isoformat()),
+                native_event, project, {'CODEX_HOME': str(home)}):
+                return None
+        previous = completed
+        last_timestamp = records['markers'][0]['timestamp']
+    return identity, 'eligible', last_timestamp
+
+
 def codex_fast_terminal_probe(document, run_values, rows, identity, home, project):
     """Read canonical turn/report evidence for diagnostics only, never acceptance."""
     result = {'native_reader_available': False, 'started_turns': 0, 'completed_turns': 0,
@@ -566,8 +654,12 @@ def command_witness_probe(provider, rows):
     """Categorize direct native unittest calls/results without exporting arguments or output."""
     result = dict.fromkeys(('direct_shell_calls', 'exact_supported_unittest_calls', 'matched_results',
                            'missing_results', 'error_results', 'ran_tests_present', 'ok_present',
-                           'failed_present', 'explicit_exit_zero', 'explicit_exit_nonzero', 'exit_unreported'), 0)
+                           'failed_present', 'explicit_exit_zero', 'explicit_exit_nonzero', 'exit_unreported',
+                           'all_direct_matched_results', 'all_direct_missing_results', 'all_direct_error_results',
+                           'all_direct_ran_tests_present', 'all_direct_ok_present', 'all_direct_failed_present',
+                           'argv_parse_failures', 'unittest_token_sequence_present', 'duplicate_call_ids'), 0)
     calls, outputs = {}, {}
+    direct_calls = []
     for row in rows:
         value = row.get('payload', {}) if provider == 'codex' else row.get('message', {})
         blocks = [value] if provider == 'codex' else value.get('content', [])
@@ -576,18 +668,36 @@ def command_witness_probe(provider, rows):
                 continue
             if block.get('type') in {'tool_use', 'function_call'} and block.get('name') in {'Bash', 'exec_command'}:
                 result['direct_shell_calls'] += 1
+                call_id = block.get('id', block.get('call_id'))
+                result['duplicate_call_ids'] += bool(call_id and call_id in direct_calls)
+                direct_calls.append(call_id)
                 args = block.get('input', block.get('arguments'))
                 try:
                     args = json.loads(args) if isinstance(args, str) else args
                     tokens = shlex.split(args.get('command', args.get('cmd', '')))
                 except (AttributeError, TypeError, ValueError):
+                    result['argv_parse_failures'] += 1
                     continue
+                result['unittest_token_sequence_present'] += any(tokens[index:index + 2] == ['-m', 'unittest']
+                                                                 for index in range(len(tokens) - 1))
                 if (len(tokens) >= 3 and re.fullmatch(r'python(?:3|\.exe)?', tokens[0])
                         and tokens[1:3] == ['-m', 'unittest'] and all(token in {'-q', '-v'} for token in tokens[3:])):
                     result['exact_supported_unittest_calls'] += 1
                     calls[block.get('id', block.get('call_id'))] = True
             elif block.get('type') in {'tool_result', 'function_call_output'}:
                 outputs[block.get('tool_use_id', block.get('call_id'))] = block
+    for identity in direct_calls:
+        output = outputs.get(identity) if identity else None
+        if output is None:
+            result['all_direct_missing_results'] += 1
+            continue
+        result['all_direct_matched_results'] += 1
+        result['all_direct_error_results'] += output.get('is_error') is True or output.get('isError') is True
+        value = output.get('content', output.get('output', ''))
+        text = value if isinstance(value, str) else json.dumps(value)
+        result['all_direct_ran_tests_present'] += bool(re.search(r'Ran [1-9]\d* tests?', text))
+        result['all_direct_ok_present'] += 'OK' in text
+        result['all_direct_failed_present'] += 'FAILED' in text
     for identity in calls:
         output = outputs.get(identity) if identity else None
         if output is None:
@@ -610,7 +720,7 @@ def command_witness_probe(provider, rows):
     return result
 
 
-def install_private_child_capture(root):
+def install_private_child_capture(root, candidate=PLUGIN):
     """Keep original callback payloads private for exact diagnostic replay."""
     directory = root / 'private-child-hooks'
     directory.mkdir(mode=0o700)
@@ -620,10 +730,18 @@ def install_private_child_capture(root):
     require(source.count(anchor) == 1, 'private callback capture has no unique insertion point')
     extra = (
         "if provider == 'claude' and event in {'SubagentStart', 'SubagentStop'}:\n"
+        "    private_capture = {'raw': payload, 'canonical': None}\n"
+        "    try:\n"
+        f"        sys.path.insert(0, {str(candidate.resolve())!r})\n"
+        "        from symphony.adapters import event_from_payload\n"
+        "        private_event = event_from_payload('claude', payload)\n"
+        "        private_capture['canonical'] = {'event_id': private_event.event_id, 'kind': private_event.kind, 'payload': private_event.payload}\n"
+        "    except (OSError, ValueError, TypeError, AttributeError, ImportError):\n"
+        "        pass\n"
         f"    private_file = pathlib.Path({str(directory)!r}) / (invocation + '.json')\n"
         "    descriptor = os.open(private_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
         "    with os.fdopen(descriptor, 'w', encoding='utf-8') as private_stream:\n"
-        "        json.dump(payload, private_stream)\n")
+        "        json.dump(private_capture, private_stream)\n")
     script.write_text(source.replace(anchor, anchor + extra), encoding='utf-8')
 
 
@@ -637,20 +755,45 @@ def claude_child_binding_probe(home, run_dict, document):
     history = document.get('event_history', ()) if isinstance(document, dict) else ()
     receipts = document.get('terminal_receipts', ()) if isinstance(document, dict) else ()
     sources = {}
+    captures = []
     for path in (home.parent / 'private-child-hooks').glob('*.json'):
         try:
-            payload = json.loads(path.read_text(encoding='utf-8'))
+            captured = json.loads(path.read_text(encoding='utf-8'))
+            snapshot = captured.get('canonical') if isinstance(captured, dict) else None
+            payload = captured.get('raw') if isinstance(captured, dict) and 'raw' in captured else captured
             if not isinstance(payload, dict) or payload.get('hook_event_name') not in {'SubagentStart', 'SubagentStop'}:
                 continue
-            event = event_from_payload('claude', payload)
+            if isinstance(captured, dict) and 'raw' in captured:
+                canonical = snapshot.get('payload') if isinstance(snapshot, dict) else None
+                expected_kind = 'subagent_started' if payload['hook_event_name'] == 'SubagentStart' else 'subagent_stopped'
+                if (not isinstance(canonical, dict) or snapshot.get('kind') != expected_kind
+                        or canonical.get('provider') != 'claude'
+                        or set(canonical) - set(payload) - {'provider', 'last_assistant_message'}
+                        or set(payload) - set(canonical)
+                        or any(canonical.get(key) != value for key, value in payload.items()
+                               if key not in {'provider', 'last_assistant_message'})
+                        or snapshot.get('event_id') != hashlib.sha256(json.dumps(
+                            canonical, sort_keys=True, separators=(',', ':'), default=str).encode()).hexdigest()):
+                    captures.append((payload, None, False))
+                    continue
+                # Reuse the immutable hook-time normalization, including its
+                # handback report. Never re-read the child's later transcript.
+                event = Event(snapshot['event_id'], expected_kind, '', canonical)
+            else:
+                # Older private fixtures contain raw callbacks only. Their
+                # reconstruction still needs an exact durable source ID.
+                event = replace(event_from_payload('claude', payload), observed_at='')
             # The observer clock is not the product's callback admission time.
             # Require the exact canonical source ID in durable derived history.
             matches = [record for record in history if record.get('kind') == 'delegation_updated'
                        and (record.get('event_id') == event.event_id + ':delegation:delegation_updated'
                             or re.fullmatch(re.escape(event.event_id) + r':terminal-epoch:\d+:delegation:delegation_updated',
                                             record.get('event_id', '')) is not None)]
-            if len(matches) == 1 and host_evidence._instant(matches[0].get('observed_at')) is not None:
-                sources[event.event_id] = replace(event, observed_at=matches[0]['observed_at'])
+            admitted = len(matches) == 1 and host_evidence._instant(matches[0].get('observed_at')) is not None
+            if admitted:
+                event = replace(event, observed_at=matches[0]['observed_at'])
+                sources[event.event_id] = event
+            captures.append((payload, event, admitted))
         except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
             continue
     results = []
@@ -666,15 +809,55 @@ def claude_child_binding_probe(home, run_dict, document):
             facts['source_stage'] = 'admitted_start_unavailable'
             results.append(facts)
             continue
-        candidates = [event for event in sources.values() if event.kind == 'subagent_stopped'
-                      and (event.payload.get('agent_id') or event.payload.get('subagent_id')) == identity
-                      and event.payload.get('session_id') == run.session_id
-                      and _child_turn_token(event.payload) == proof.get('turn')
-                      and event.observed_at >= start.observed_at
-                      and any(receipt.get('provider') == 'claude' and receipt.get('session') == run.session_id
-                              and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity
-                              and receipt.get('turn') == proof.get('turn')
-                              and receipt.get('result') == _terminal_result_id(event) for receipt in receipts)]
+        filters = dict.fromkeys(('captured_stops_for_child', 'canonical_snapshot_unavailable', 'canonical_source_available',
+            'canonical_id_history_matches', 'root_session', 'child_alias_session', 'other_session',
+            'proof_turn_matches', 'timestamp_order_matches', 'receipt_owner_matches', 'receipt_turn_matches',
+            'raw_result_hash_matches', 'scoped_result_hash_matches', 'duplicate_exact_sources'), 0)
+        candidates = []
+        for payload, event, admitted in captures:
+            if (payload.get('hook_event_name') != 'SubagentStop'
+                    or (payload.get('agent_id') or payload.get('subagent_id')) != identity):
+                continue
+            filters['captured_stops_for_child'] += 1
+            if event is None:
+                filters['canonical_snapshot_unavailable'] += 1
+                continue
+            filters['canonical_source_available'] += 1
+            if not admitted:
+                continue
+            filters['canonical_id_history_matches'] += 1
+            session = event.payload.get('session_id')
+            filters['root_session' if session == run.session_id else
+                    'child_alias_session' if session == identity else 'other_session'] += 1
+            if session not in {run.session_id, identity} or _child_turn_token(event.payload) != proof.get('turn'):
+                continue
+            filters['proof_turn_matches'] += 1
+            if event.observed_at < start.observed_at:
+                continue
+            filters['timestamp_order_matches'] += 1
+            owner_receipts = [receipt for receipt in receipts if receipt.get('provider') == 'claude'
+                and receipt.get('session') == run.session_id and receipt.get('run_id') == run.run_id
+                and receipt.get('agent') == identity]
+            if not owner_receipts:
+                continue
+            filters['receipt_owner_matches'] += 1
+            turn_receipts = [receipt for receipt in owner_receipts if receipt.get('turn') == proof.get('turn')]
+            if len(turn_receipts) != 1:
+                continue
+            filters['receipt_turn_matches'] += 1
+            filters['raw_result_hash_matches'] += turn_receipts[0].get('result') == _terminal_result_id(event)
+            # Dispatch keeps the original event ID but scopes its payload to
+            # the admitted root before hashing a terminal result. Mirror that
+            # only after exact durable source and receipt-owner checks.
+            scoped = replace(event, payload={**event.payload, 'session_id': run.session_id})
+            if turn_receipts[0].get('result') != _terminal_result_id(scoped):
+                continue
+            filters['scoped_result_hash_matches'] += 1
+            if scoped in candidates:
+                filters['duplicate_exact_sources'] += 1
+            else:
+                candidates.append(scoped)
+        facts['terminal_source_filters'] = filters
         if len(candidates) != 1:
             facts['source_stage'] = 'terminal_source_unavailable' if not candidates else 'ambiguous_terminal_sources'
             results.append(facts)
@@ -1072,7 +1255,7 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
            if not key.startswith("SYMPHONY_") and key not in {"CODEX_SESSION_ID", "CLAUDECODE"}}
     env.update(prepare_baseline_capture(provider, root, candidate))
     if provider == 'claude':
-        install_private_child_capture(root)
+        install_private_child_capture(root, candidate)
     project, _ = projects(root, False)
     greeting = project / "greet.py"
     greeting.write_text("def greet(name):\n    return f'" + ("hello" if case == "run-and-fix" else "Hello") + ", {name}!'\n")
@@ -1174,6 +1357,14 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
             for decision in fast_decision_lines(assistant_text(provider, row)):
                 decisions.append((identity, decision, row.get("timestamp")))
     expected = "eligible" if case == "command" else "escalate"
+    if provider == 'codex' and case == 'command':
+        candidates = [identity for identity, rows in child_rows.items()
+                      if fast_native_identity(provider, rows, identity, run_state, home, project)]
+        require(len(candidates) == 1, 'mechanical command has no unique native fast owner')
+        canonical = codex_command_turns_verified(document, run_state, child_rows[candidates[0]],
+                                                candidates[0], home, project)
+        require(canonical is not None, 'mechanical command lacks exact canonical turn/receipt/followup proof')
+        decisions = [canonical]
     require(len(decisions) == 1 and decisions[0][1] == expected, "native fast lead made the wrong semantic decision")
     fast_identity, _, terminal_time = decisions[0]
     observed_fast = next(item for item in children if item["identity"] == fast_identity)
@@ -1233,6 +1424,9 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
             "assessment": {key: run_state["assessment"].get(key) for key in ("size", "complexity", "topology")},
             "workers": len(workers), "worker_edit_verified": case != "command", "pending_callbacks": 0,
             "worker_packet_role_marker_observed": provider == "claude" and case != "command",
+            **({'verified_fast_command_turns': sum(row.get('type') == 'event_msg' and
+                row.get('payload', {}).get('type') == 'task_started' for row in child_rows[fast_identity])}
+               if provider == 'codex' and case == 'command' else {}),
             **({'claude_completion': claude_completion_probe(document, session, project, home)}
                if provider == 'claude' else {}),
             "status": "completed", "fixture_sha256": fingerprint(greeting)}

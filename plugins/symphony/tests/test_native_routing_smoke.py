@@ -20,6 +20,89 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_command_diagnostics_separate_native_results_from_supported_argv(self):
+        rows = [{'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': 'call', 'name': 'Bash',
+                 'input': {'command': 'cd PRIVATE_SENTINEL && python -m unittest -q'}}]}},
+                {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'call',
+                 'is_error': False, 'content': 'Ran 1 test in 0.1s\nOK'}]}}]
+        result = smoke.command_witness_probe('claude', rows)
+        self.assertEqual(result['exact_supported_unittest_calls'], 0)
+        self.assertEqual(result['matched_results'], 0)
+        self.assertEqual(result['all_direct_matched_results'], 1)
+        self.assertEqual(result['all_direct_ran_tests_present'], 1)
+        self.assertEqual(result['all_direct_ok_present'], 1)
+        self.assertEqual(result['unittest_token_sequence_present'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+        self.assertFalse(smoke.unittest_verified(smoke.tool_evidence('claude', rows)))
+        missing = smoke.command_witness_probe('claude', rows[:1])
+        self.assertEqual(missing['all_direct_missing_results'], 1)
+
+    def test_codex_command_verifies_distinct_completed_turns_only_with_exact_root_followup(self):
+        with TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            identity = '00000000-0000-0000-0000-000000000002'
+            root = '00000000-0000-0000-0000-000000000001'
+            task = 'symphony_lead_fast_model_medium'
+            run = {'run_id': 'run', 'provider': 'codex', 'session_id': root, 'lead_identity': identity,
+                   'started_at': '2026-10-01T00:00:00+00:00', 'task': 'fixture', 'status': 'completed',
+                   'outcome': {'status': 'completed'}, 'assessment': {'_fast_route': {'model': 'model', 'effort': 'medium'}},
+                   'delegations': [{'identity': identity, 'role': 'lead', 'objective': 'fixture', 'state': 'completed',
+                                    'requested_tier': 'model', 'requested_effort': 'medium'}]}
+            def row(kind, payload, seconds):
+                return {'type': kind, 'timestamp': f'2026-10-01T00:00:0{seconds}+00:00', 'payload': payload}
+            message = 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+            rows = [row('session_meta', {'id': identity, 'agent_path': '/root/' + task,
+                        'source': {'subagent': {'thread_spawn': {'parent_thread_id': root}}}}, '0')]
+            for index, seconds in ((1, 1), (2, 3)):
+                token = 'turn-' + str(index)
+                rows.extend([row('event_msg', {'type': 'task_started', 'turn_id': token}, str(seconds)),
+                    row('turn_context', {'turn_id': token, 'model': 'model', 'effort': 'medium'}, str(seconds) + '.1'),
+                    row('response_item', {'type': 'message', 'role': 'assistant', 'id': 'message-' + str(index),
+                        'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': message}]}, str(seconds) + '.2'),
+                    row('event_msg', {'type': 'task_complete', 'turn_id': token, 'last_agent_message': message}, str(seconds) + '.3')])
+            directory = home / 'sessions/2026/10/01'
+            directory.mkdir(parents=True)
+            root_rows = [row('session_meta', {'id': root, 'cwd': str(home)}, '0'),
+                row('response_item', {'type': 'function_call', 'name': 'spawn_agent', 'call_id': 'spawn',
+                    'arguments': json.dumps({'task_name': task, 'model': 'model', 'reasoning_effort': 'medium'})}, '0.1'),
+                row('event_msg', {'type': 'item_completed', 'thread_id': root, 'item': {'type': 'SubAgentActivity',
+                    'id': 'spawn', 'kind': 'started', 'agent_thread_id': identity, 'agent_path': '/root/' + task}}, '0.2'),
+                row('response_item', {'type': 'function_call', 'name': 'followup_task', 'call_id': 'followup',
+                    'arguments': json.dumps({'target': task})}, '2'),
+                row('event_msg', {'type': 'item_completed', 'thread_id': root, 'item': {'type': 'SubAgentActivity',
+                    'id': 'followup', 'kind': 'interacted', 'agent_thread_id': identity, 'agent_path': '/root/' + task}}, '2.1'),
+                row('response_item', {'type': 'function_call_output', 'call_id': 'followup', 'output': ''}, '2.2')]
+            root_path = directory / (root + '.jsonl')
+            def write_root(values):
+                root_path.write_text(''.join(json.dumps(value) + '\n' for value in values), encoding='utf-8')
+            write_root(root_rows)
+            receipts = [{'provider': 'codex', 'session': root, 'run_id': 'run', 'agent': identity,
+                         'turn': 'turn_id:turn-' + str(index), 'lead': identity, 'parent': root,
+                         'status': 'completed', 'result': str(index) * 64} for index in (1, 2)]
+            def check(values, saved=receipts):
+                (directory / (identity + '.jsonl')).write_text(
+                    ''.join(json.dumps(value) + '\n' for value in values), encoding='utf-8')
+                return smoke.codex_command_turns_verified({'terminal_receipts': saved}, run, values, identity, home, home)
+            self.assertEqual(check(rows), (identity, 'eligible', rows[-2]['timestamp']))
+            self.assertIsNotNone(check(rows[:5], receipts[:1]))
+            for changed in (rows[:2] + [rows[1]] + rows[2:], rows[:3] + [rows[2]] + rows[3:],
+                            rows[:4] + [rows[3]] + rows[4:], rows + [rows[-1]],
+                            rows + [row('event_msg', {'type': 'task_started', 'turn_id': 'unfinished'}, '4')],
+                            rows + [row('event_msg', {'type': 'task_failed', 'turn_id': 'turn-2'}, '4')],
+                            rows[:-1], rows[:3] + [row('response_item', {**rows[3]['payload'], 'id': 'conflict',
+                                'content': [{'type': 'output_text', 'text': 'SYMPHONY_FAST_DECISION: escalate'}]}, '1.2')] + rows[3:]):
+                with self.subTest(changed=changed):
+                    self.assertIsNone(check(changed))
+            for field, value in (('parent', 'foreign'), ('lead', 'foreign'), ('run_id', 'foreign'),
+                                 ('status', 'failed'), ('result', 'malformed')):
+                with self.subTest(field=field):
+                    self.assertIsNone(check(rows, [receipts[0], {**receipts[1], field: value}]))
+            self.assertIsNone(check(rows, [*receipts, {**receipts[1], 'result': 'f' * 64}]))
+            write_root(root_rows[:-1])
+            self.assertIsNone(check(rows))
+            write_root([root_rows[0], *root_rows[3:]])
+            self.assertIsNone(check(rows))
+
     def test_private_claude_capture_keeps_raw_callback_outside_public_clock(self):
         from native_managed_concurrency import CODEX_HOOK_CAPTURE
         with TemporaryDirectory() as temporary:
@@ -36,11 +119,31 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             private = tuple((root / 'private-child-hooks').glob('*.json'))
             self.assertEqual(len(private), 1)
-            self.assertEqual(json.loads(private[0].read_text(encoding='utf-8')), payload)
+            captured = json.loads(private[0].read_text(encoding='utf-8'))
+            self.assertEqual(captured['raw'], payload)
+            self.assertEqual(captured['canonical']['payload'], {**payload, 'provider': 'claude'})
+            self.assertEqual(captured['canonical']['event_id'], smoke.event_from_payload('claude', payload).event_id)
             self.assertNotIn('PRIVATE_SENTINEL', ''.join(path.read_text(encoding='utf-8') for path in public.glob('*.json')))
             if os.name != 'nt':
                 self.assertEqual(private[0].stat().st_mode & 0o777, 0o600)
                 self.assertEqual(private[0].parent.stat().st_mode & 0o777, 0o700)
+            transcript = root / 'child.jsonl'
+            handback = {'message': {'content': [{'type': 'tool_use', 'name': 'SubagentHandback',
+                         'input': {'message': 'PRIVATE_HOOK_TIME_REPORT'}}]}}
+            transcript.write_text(json.dumps(handback) + '\n', encoding='utf-8')
+            stop = {**payload, 'hook_event_name': 'SubagentStop', 'agent_transcript_path': str(transcript),
+                    'last_assistant_message': 'Goodbye'}
+            completed = subprocess.run([sys.executable, str(script), 'SubagentStop', str(public), 'claude'],
+                input=json.dumps(stop), capture_output=True, text=True, encoding='utf-8',
+                env={key: value for key, value in os.environ.items() if not key.startswith('SYMPHONY_')})
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            snapshots = [json.loads(path.read_text(encoding='utf-8')) for path in (root / 'private-child-hooks').glob('*.json')]
+            captured_stop = next(item for item in snapshots if item['raw']['hook_event_name'] == 'SubagentStop')
+            self.assertEqual(captured_stop['canonical']['payload']['last_assistant_message'], 'PRIVATE_HOOK_TIME_REPORT\nGoodbye')
+            transcript.write_text(json.dumps({'message': {'content': [{'type': 'tool_use', 'name': 'SubagentHandback',
+                                  'input': {'message': 'LATER_REPORT'}}]}}) + '\n', encoding='utf-8')
+            self.assertNotEqual(captured_stop['canonical']['event_id'], smoke.event_from_payload('claude', stop).event_id)
+            self.assertNotIn('PRIVATE_HOOK_TIME_REPORT', ''.join(path.read_text(encoding='utf-8') for path in public.glob('*.json')))
 
     def test_claude_binding_diagnostic_requires_exact_sources_and_original_timestamps(self):
         from plugins.symphony.tests.test_assessed_contract import AssessedContractTests
@@ -79,6 +182,51 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         self.assertEqual(result['textual_prompt_count'], 1)
         self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
         self.assertNotIn(str(fixture.project), json.dumps(result))
+        self.assertEqual(result['terminal_source_filters']['captured_stops_for_child'], 1)
+        self.assertEqual(result['terminal_source_filters']['scoped_result_hash_matches'], 1)
+        # Snapshot normalization at hook time, not a later mutable handback.
+        for index, source in enumerate((start, terminal)):
+            (private / f'{index}.json').write_text(json.dumps({'raw': source.payload,
+                'canonical': {'event_id': source.event_id, 'kind': source.kind, 'payload': source.payload}}), encoding='utf-8')
+        with patch.object(smoke, 'event_from_payload', side_effect=AssertionError('must not reread handback')):
+            snapshotted = smoke.claude_child_binding_probe(home, run, document)[0]
+        self.assertTrue(snapshotted['binding_reader_accepted'])
+        alias = smoke.event_from_payload('claude', {**terminal.payload, 'session_id': 'worker'})
+        alias_history = [history[0], {**history[1], 'event_id': alias.event_id + ':delegation:delegation_updated'}]
+        scoped_alias = replace(alias, payload={**alias.payload, 'session_id': run['session_id']})
+        alias_receipt = {**receipt, 'result': smoke._terminal_result_id(scoped_alias)}
+        (private / '1.json').write_text(json.dumps({'raw': alias.payload,
+            'canonical': {'event_id': alias.event_id, 'kind': alias.kind, 'payload': alias.payload}}), encoding='utf-8')
+        alias_document = {'event_history': alias_history, 'terminal_receipts': [alias_receipt]}
+        alias_result = smoke.claude_child_binding_probe(home, run, alias_document)[0]
+        self.assertTrue(alias_result['binding_reader_accepted'])
+        filters = alias_result['terminal_source_filters']
+        self.assertEqual(filters['child_alias_session'], 1)
+        self.assertEqual(filters['raw_result_hash_matches'], 0)
+        self.assertEqual(filters['scoped_result_hash_matches'], 1)
+        duplicate_path = private / 'retry.json'
+        duplicate_path.write_text((private / '1.json').read_text(encoding='utf-8'), encoding='utf-8')
+        retried = smoke.claude_child_binding_probe(home, run, alias_document)[0]
+        self.assertTrue(retried['binding_reader_accepted'])
+        self.assertEqual(retried['terminal_source_filters']['captured_stops_for_child'], 2)
+        self.assertEqual(retried['terminal_source_filters']['duplicate_exact_sources'], 1)
+        duplicate_path.unlink()
+        for field, value in (('run_id', 'foreign'), ('session', 'foreign'), ('agent', 'foreign'), ('turn', 'foreign'), ('result', 'foreign')):
+            unavailable = smoke.claude_child_binding_probe(home, run, {
+                **alias_document, 'terminal_receipts': [{**alias_receipt, field: value}]})[0]
+            self.assertEqual(unavailable['source_stage'], 'terminal_source_unavailable')
+            self.assertNotIn('binding_reader_accepted', unavailable)
+        duplicate_receipts = smoke.claude_child_binding_probe(home, run, {
+            **alias_document, 'terminal_receipts': [alias_receipt, alias_receipt]})[0]
+        self.assertEqual(duplicate_receipts['source_stage'], 'terminal_source_unavailable')
+        self.assertEqual(duplicate_receipts['terminal_source_filters']['receipt_turn_matches'], 0)
+        corrupt = {'raw': alias.payload, 'canonical': {'event_id': 'foreign', 'kind': alias.kind, 'payload': alias.payload}}
+        (private / '1.json').write_text(json.dumps(corrupt), encoding='utf-8')
+        unavailable = smoke.claude_child_binding_probe(home, run, alias_document)[0]
+        self.assertEqual(unavailable['terminal_source_filters']['canonical_snapshot_unavailable'], 1)
+        # Existing raw-only fixtures still require exact durable source IDs.
+        for index, source in enumerate((start, terminal)):
+            (private / f'{index}.json').write_text(json.dumps(source.payload), encoding='utf-8')
         for broken in ({'event_history': history[1:], 'terminal_receipts': [receipt]},
                        {'event_history': history[:1], 'terminal_receipts': [receipt]},
                        {'event_history': history, 'terminal_receipts': [{**receipt, 'result': 'foreign'}]},

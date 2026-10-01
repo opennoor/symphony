@@ -344,7 +344,9 @@ def codex_fixture_roles(profile_id="base"):
 
 
 def prompt(provider, label, recover, project, *, defer_recovery=False,
-           codex_profile="base"):
+           codex_profile="base", released_direct_version=None):
+    if released_direct_version not in {None, '1.5.1', '1.6.0'}:
+        raise ValueError('direct original fixture requires a reviewed released baseline')
     assessor_role, lead_role = codex_fixture_roles(codex_profile) if provider == "codex" else ({}, {})
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
     route = ('{"size":"small","complexity":"complex","risk":"normal",'
@@ -352,6 +354,8 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
              if provider == "codex" and codex_profile != "base" else
              '{"size":"small","complexity":"simple","risk":"normal",'
              '"rationale":"disposable native CI gate","topology":"delegated"}')
+    if released_direct_version:
+        route = route.replace('"topology":"delegated"', '"topology":"direct"')
     profiles = json.loads((Path(__file__).resolve().parents[2] / 'plugins/symphony/profiles.json').read_text(encoding='utf-8'))
     profile_id = codex_profile if provider == 'codex' else 'sonnet-5-5'
     profile = next(item for item in profiles['providers'][provider]['profiles'] if item['id'] == profile_id)
@@ -416,7 +420,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
          "SYMPHONY_OUTCOME: {\"status\":\"completed\"}. Do not create a worktree."
          if provider == "codex" and recover and defer_recovery else
          "FIRST-TURN CONTRACT: There is no gate command or file to find or run. "
-         "After your native start hook releases and your worker report is verified, reply with "
+         "After your native start hook releases" + ("" if released_direct_version else " and your worker report is verified") + ", reply with "
          "exactly these two literal lines (no Markdown):\nGATE_RELEASED\n"
          + ('SYMPHONY_OUTCOME: {"status":"blocked"}' if recover else
             'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
@@ -426,7 +430,10 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
          "GATE_RELEASED is a report line, not an operation. "
          "Do not inspect files, execute shell commands, edit files or create a worktree.")
     )
-    lead_task += '\n' + worker_contract
+    lead_task += ('\nThis original released-runtime task is a bounded direct callback report. '
+                  'The original lead owns its execution; no worker report is required. '
+                  'Preserve this same task and identity on completion followup.'
+                  if released_direct_version else '\n' + worker_contract)
     lead_relay = (
         "Pass LEAD_SPAWN_PACKET verbatim as spawn_agent arguments, including message. "
         "The child has no root context; do not expand, paraphrase, or omit its contract. "
@@ -473,7 +480,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
 
 
 def launch(provider, project, label, recover, env, log_dir, budget, session,
-           *, defer_recovery=False):
+           *, defer_recovery=False, released_direct_version=None):
     executable = shutil.which(provider)
     if not executable:
         raise RuntimeError(f"{provider} CLI is missing")
@@ -489,12 +496,12 @@ def launch(provider, project, label, recover, env, log_dir, budget, session,
                    "--output-last-message", str(output),
                    prompt(provider, label, recover, project,
                           defer_recovery=defer_recovery,
-                          codex_profile=codex_profile)]
+                          codex_profile=codex_profile, released_direct_version=released_direct_version)]
     else:
         command = [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
                    "--permission-mode", "bypassPermissions", "--session-id", session,
                    "--output-format", "json",
-                   prompt(provider, label, recover, project)]
+                   prompt(provider, label, recover, project, released_direct_version=released_direct_version)]
     stdout = (log_dir / f"{label}.stdout").open("w", encoding="utf-8")
     stderr = errors.open("w", encoding="utf-8")
     process = subprocess.Popen(command, cwd=project, env=env, stdin=subprocess.DEVNULL,
@@ -1755,7 +1762,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             launch_env = {**env, "SYMPHONY_NATIVE_GATE_DIR": str(gate_dir),
                           "SYMPHONY_NATIVE_GATE_LABEL": label}
             processes[label] = launch(provider, project, label, label == "a" and provider == "codex", launch_env, logs,
-                                      budget, sessions[label])
+                                      budget, sessions[label], released_direct_version=update['old_version'] if update else None)
         deadline = time.monotonic() + timeout
         paths = {label: state_file(state_dir, project) for label, project in (("a", first), ("b", second))}
         while time.monotonic() < deadline:
@@ -2095,8 +2102,11 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 raise RuntimeError(f"{label}: completed run changed lead identity")
             if completed_run.get("run_id") != observed_run_ids[label]:
                 raise RuntimeError(f"{label}: active run was restarted during the native session")
-            require_literal_worker(provider, completed_run, Path(env['CODEX_HOME' if provider == 'codex' else 'CLAUDE_CONFIG_DIR']),
-                                   first if label == 'a' else second, codex_hook_capture_summary(root, provider)['records'])
+            if update:
+                require_released_direct_fixture(completed_run, update['old_version'])
+            else:
+                require_literal_worker(provider, completed_run, Path(env['CODEX_HOME' if provider == 'codex' else 'CLAUDE_CONFIG_DIR']),
+                                       first if label == 'a' else second, codex_hook_capture_summary(root, provider)['records'])
             if update:
                 native_trace = (codex_host_trace(update["home"], sessions[label],
                                                  observed_leads[label], logs / f"{label}.errors",
@@ -2236,6 +2246,120 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     process.wait()
 
 
+def old_stop_hold_conditions(host, old_cli_alive, old_version):
+    """Publish each existing hold predicate without changing its acceptance."""
+    turns = host['lead_turns']
+    return {'native_lead_turn_count': len(turns),
+            'first_native_turn_completed': bool(turns and turns[0].get('completed')),
+            'first_native_outcome_blocked': bool(turns and turns[0].get('reported_outcome') == 'blocked'),
+            'native_followup_count': len(host['followup_calls']),
+            'native_root_spawn_count': len(host['spawn_calls']),
+            'native_root_has_two_spawns': len(host['spawn_calls']) == 2,
+            'old_cli_alive': old_cli_alive, 'old_version': old_version}
+
+
+def require_old_stop_hold(host, alive, old_version, run, home, project, canonical):
+    """A held old turn may include a separately proven original fast escalation."""
+    from native_routing_smoke import native_rows, worker_transcript_is_unforked
+    turns = host['lead_turns']
+    if (len(turns) != 1 or not turns[0].get('completed')
+            or turns[0].get('reported_outcome') != 'blocked'
+            or host['followup_calls'] or not alive):
+        raise RuntimeError('old root advanced beyond its blocked turn during Stop hold')
+    require_assessed_lead_set(run, home, project, canonical,
+                              released_old_version=old_version)
+    leads = [child for child in run.get('delegations', []) if child.get('role') == 'lead']
+    assessors = [child for child in run.get('delegations', []) if child.get('role') == 'assessor']
+    if len(assessors) != 1 or assessors[0].get('state') != 'completed':
+        raise RuntimeError('old hold lacks its one completed original assessor')
+    expected = [*leads, assessors[0]]
+    root_rows = native_rows('codex', home, run['session_id'])
+    if not worker_transcript_is_unforked('codex', root_rows, run['session_id']):
+        raise RuntimeError('old hold root transcript has ambiguous ownership')
+    calls = [row for row in root_rows if row.get('payload', {}).get('type') == 'function_call'
+             and row['payload'].get('name') == 'spawn_agent']
+    if len(calls) != len(expected) or len(host['spawn_calls']) != len(expected):
+        raise RuntimeError('old hold root has extra or missing native launches')
+    remaining = {child['identity']: child for child in expected}
+    if len(remaining) != len(expected):
+        raise RuntimeError('old hold has duplicate child identities')
+    seen_calls, launches, completions = set(), {}, {}
+    root_header = root_rows[0]['payload']
+    # Native exec roots omit agent_path; their direct children have /root/<task>.
+    root_path = root_header.get('agent_path', '/root')
+    if (root_header.get('source') != 'exec' or root_path != '/root'
+            or not isinstance(root_header.get('cwd'), str) or not Path(root_header['cwd']).is_absolute()
+            or Path(root_header['cwd']).resolve() != project.resolve()):
+        raise RuntimeError('old hold root has no exact native exec ownership')
+    for row in calls:
+        payload = row['payload']
+        call_id = payload.get('call_id')
+        if not isinstance(call_id, str) or not call_id or call_id in seen_calls:
+            raise RuntimeError('old hold has duplicate or missing launch call IDs')
+        seen_calls.add(call_id)
+        outputs = [item for item in root_rows if item.get('payload', {}).get('call_id') == call_id
+                   and item['payload'].get('type') == 'function_call_output']
+        if len(outputs) != 1:
+            raise RuntimeError('old hold launch has no unique native result')
+        try:
+            arguments = json.loads(payload['arguments'])
+            result = json.loads(outputs[0]['payload']['output'])
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError('old hold launch has malformed native call/result') from None
+        if not isinstance(arguments, dict) or not isinstance(result, dict) or set(result) != {'task_name'}:
+            raise RuntimeError('old hold launch has malformed native call/result')
+        matches = []
+        for identity, child in remaining.items():
+            rows = native_rows('codex', home, identity)
+            if not worker_transcript_is_unforked('codex', rows, identity):
+                continue
+            header = rows[0]['payload']
+            role_name = ('symphony_lead_fast' if child['role'] == 'lead' and identity != canonical
+                         else 'symphony_' + child['role'])
+            name = role_name + '_' + re.sub(r'\W', '_', child['requested_tier']) + '_' + child['requested_effort']
+            parent = header.get('source', {}).get('subagent', {}).get('thread_spawn', {})
+            if (arguments.get('task_name') == name and arguments.get('fork_turns') == 'none'
+                    and arguments.get('model') == child['requested_tier']
+                    and arguments.get('reasoning_effort') == child['requested_effort']
+                    and result.get('task_name') == header.get('agent_path') == root_path + '/' + name
+                    and parent.get('parent_thread_id') == run['session_id']
+                    and isinstance(header.get('cwd'), str) and Path(header['cwd']).is_absolute()
+                    and Path(header['cwd']).resolve() == project.resolve()):
+                matches.append((identity, rows))
+        if len(matches) != 1:
+            raise RuntimeError('old hold launch/result does not bind one exact original child')
+        identity, rows = matches[0]
+        child = remaining.pop(identity)
+        starts = [item for item in rows if item.get('payload', {}).get('type') == 'task_started']
+        ends = [item for item in rows if item.get('payload', {}).get('type') == 'task_complete']
+        contexts = [item['payload'] for item in rows if item.get('type') == 'turn_context']
+        failed = any(item.get('payload', {}).get('type') in
+                     {'task_failed', 'turn_aborted', 'task_interrupted', 'error'} for item in rows)
+        if len(starts) != 1 or len(ends) != 1 or len(contexts) != 1 or failed:
+            raise RuntimeError('old hold child has no unique successful native turn')
+        turn = starts[0]['payload'].get('turn_id')
+        if (not isinstance(turn, str) or not turn or ends[0]['payload'].get('turn_id') != turn
+                or contexts[0].get('turn_id') != turn
+                or contexts[0].get('model') != child['requested_tier']
+                or contexts[0].get('effort') != child['requested_effort']):
+            raise RuntimeError('old hold child has conflicting native turn/route')
+        try:
+            launch = timestamp_ns(row.get('timestamp'))
+            result_at = timestamp_ns(outputs[0].get('timestamp'))
+            start = timestamp_ns(starts[0].get('timestamp'))
+            end = timestamp_ns(ends[0].get('timestamp'))
+        except (ValueError, TypeError):
+            raise RuntimeError('old hold child has invalid native chronology') from None
+        if not launch <= result_at <= end or not launch <= start <= end:
+            raise RuntimeError('old hold child has conflicting native chronology')
+        launches[identity], completions[identity] = launch, end
+    assessor = assessors[0]['identity']
+    fast = [child['identity'] for child in leads if child['identity'] != canonical]
+    if (remaining or not completions[assessor] < launches[canonical]
+            or fast and not completions[fast[0]] < launches[assessor]):
+        raise RuntimeError('old hold launch order is not fast, assessor, assessed lead')
+
+
 def check_codex_mixed_live_update(root, timeout, budget, update,
                                   direct_stop_resume=False):
     """Keep one released root in flight while a second root loads the candidate.
@@ -2275,7 +2399,7 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                                  "SYMPHONY_NATIVE_TASK_STATUS_FILE": str(native_status),
                                  "SYMPHONY_NATIVE_TASK_STATUS_WAIT": f"WAIT {status_nonce}\n",
                                  "SYMPHONY_NATIVE_HOLD_OLD_STOP": "1"}, logs, budget, "",
-                                defer_recovery=True)
+                                defer_recovery=True, released_direct_version=update['old_version'])
         while time.monotonic() < deadline:
             if processes["a"].poll() is not None:
                 raise RuntimeError("old native CLI exited before original lead gate")
@@ -2416,13 +2540,15 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
             update["home"], sessions["a"], leads["a"], logs / "a.errors",
             strict=True, codex_profile="full")
         old_turns_at_overlap = old_host_at_overlap["lead_turns"]
-        if (len(old_turns_at_overlap) != 1
-                or not old_turns_at_overlap[0].get("completed")
-                or old_turns_at_overlap[0].get("reported_outcome") != "blocked"
-                or old_host_at_overlap["followup_calls"]
-                or len(old_host_at_overlap["spawn_calls"]) != 2
-                or processes["a"].poll() is not None):
-            raise RuntimeError("old root advanced beyond its blocked turn during Stop hold")
+        snapshot['old_stop_hold_conditions'] = old_stop_hold_conditions(
+            old_host_at_overlap, processes['a'].poll() is None, update['old_version'])
+        snapshot_file.write_text(json.dumps(snapshot), encoding='utf-8')
+        old_run_at_overlap = current.get('active_runs', {}).get(f"codex:{sessions['a']}", {})
+        if old_run_at_overlap.get('run_id') != runs['a']:
+            raise RuntimeError('old hold original run ownership changed')
+        require_old_stop_hold(old_host_at_overlap, processes['a'].poll() is None,
+                              update['old_version'], old_run_at_overlap, update['home'], first, leads['a'])
+        snapshot['old_stop_hold_conditions']['native_root_launch_set_verified'] = True
         snapshot["old_host_at_b_registration"] = {
             "original_turn_hash": old_turns_at_overlap[0]["turn_hash"],
             "followup_count": 0, "old_cli_alive": True}
@@ -2523,8 +2649,12 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                 raise RuntimeError(f"{label}: original managed run did not archive completed")
             durable_leads = {item.get("identity") for item in matching[0].get("delegations", [])
                              if item.get("role") == "lead"}
-            require_assessed_lead_set(matching[0], update['home'], first, leads[label])
-            require_literal_worker('codex', matching[0], update['home'])
+            require_assessed_lead_set(matching[0], update['home'], first, leads[label],
+                                      released_old_version=update['old_version'] if label == 'a' else None)
+            if label == 'a':
+                require_released_direct_fixture(matching[0], update['old_version'])
+            else:
+                require_literal_worker('codex', matching[0], update['home'])
             if not any(item.get("kind") == "lead_completed"
                        and item.get("payload", {}).get("identity") == leads[label]
                        for item in document.get("event_history", [])):
@@ -2615,7 +2745,17 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                     process.wait()
 
 
-def require_assessed_lead_set(run, home, project, canonical):
+def require_released_direct_fixture(run, old_version):
+    """Only the explicitly installed old owner's direct task has no new worker mandate."""
+    assessment = run.get('assessment', {})
+    route = assessment.get('route', {})
+    if (old_version not in {'1.5.1', '1.6.0'} or not isinstance(route, dict)
+            or assessment.get('size') != 'small' or route.get('execution') != 'direct'
+            or 'substantive_contract' in assessment):
+        raise RuntimeError('released original fixture lost its legacy direct contract')
+
+
+def require_assessed_lead_set(run, home, project, canonical, *, released_old_version=None):
     """Only one independently identified, completed fast escalation may precede the assessed owner."""
     from native_routing_smoke import native_rows, fast_native_identity, worker_transcript_is_unforked, fast_decision_lines
     leads = [child for child in run.get('delegations', []) if child.get('role') == 'lead']
@@ -2646,7 +2786,10 @@ def require_assessed_lead_set(run, home, project, canonical):
                         and row.get('payload', {}).get('type') == 'task_started']
     failed = any(row.get('type') == 'event_msg' and row.get('payload', {}).get('type') in
                  {'turn_aborted', 'task_failed', 'task_interrupted', 'error'} for row in rows)
-    if (child.get('state') != 'completed' or run.get('assessment', {}).get('_fast_escalated') is not True
+    assessment = run.get('assessment', {})
+    escalated = (assessment.get('_fast_escalated') is True
+                 or released_old_version == '1.6.0' and '_fast_escalated' not in assessment)
+    if (child.get('state') != 'completed' or not escalated
             or len(starts) != 1 or failed or not fast_native_identity('codex', rows, child['identity'], run)
             or not worker_transcript_is_unforked('codex', rows, child['identity'])
             or len(completed) != 1 or not isinstance(completed[0], str)
@@ -2663,6 +2806,56 @@ def require_assessed_lead_set(run, home, project, canonical):
             or contexts[0].get('model') != child['requested_tier'] or contexts[0].get('effort') != child['requested_effort']
             or not chronological):
         raise RuntimeError('managed fast history lacks exact preceding native turn proof')
+
+
+def codex_literal_worker_probe(run, home):
+    """Fixed native worker proof components, without exporting report text."""
+    from native_routing_smoke import native_rows, tool_evidence, worker_launch_verified, worker_transcript_is_unforked
+    workers = [item for item in run.get('delegations', ()) if item.get('role') == 'worker']
+    result = {'worker_count': len(workers), 'completed_workers': sum(item.get('state') == 'completed' for item in workers),
+              'workers': []}
+    for ordinal, worker in enumerate(workers[:12]):
+        facts = {'ordinal': ordinal, 'native_reader_available': False}
+        try:
+            rows = native_rows('codex', home, worker['identity'])
+            lead_rows = native_rows('codex', home, run['lead_identity'])
+            starts = [row for row in rows if row.get('type') == 'event_msg'
+                      and row.get('payload', {}).get('type') == 'task_started']
+            contexts = [row for row in rows if row.get('type') == 'turn_context']
+            terminals = [row for row in rows if row.get('type') == 'event_msg'
+                         and row.get('payload', {}).get('type') == 'task_complete']
+            header = rows[0].get('payload', {}) if rows and rows[0].get('type') == 'session_meta' else {}
+            parent = header.get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id')
+            parent_path = lead_rows[0].get('payload', {}).get('agent_path', '') if lead_rows else ''
+            facts.update(native_reader_available=True,
+                worker_unforked=worker_transcript_is_unforked('codex', rows, worker['identity']),
+                lead_unforked=worker_transcript_is_unforked('codex', lead_rows, run['lead_identity']),
+                native_parent_matches_lead=parent == run['lead_identity'],
+                exact_native_launch_verified=worker_launch_verified('codex', tool_evidence('codex', lead_rows),
+                    worker, rows, run['lead_identity'], parent_path),
+                start_count=len(starts), context_count=len(contexts), complete_count=len(terminals),
+                failed_event_count=sum(row.get('type') == 'event_msg' and row.get('payload', {}).get('type') in
+                    {'turn_aborted', 'task_failed', 'task_interrupted', 'error'} for row in rows))
+            if len(starts) == len(contexts) == len(terminals) == 1:
+                token = starts[0]['payload'].get('turn_id')
+                message = terminals[0]['payload'].get('last_agent_message')
+                context = contexts[0]['payload']
+                facts.update(bound_nonempty_turn=isinstance(token, str) and bool(token)
+                    and token == context.get('turn_id') == terminals[0]['payload'].get('turn_id'),
+                    model_matches=context.get('model') == worker.get('requested_tier'),
+                    effort_matches=context.get('effort') == worker.get('requested_effort'),
+                    exact_literal_report=message == 'GATE_RELEASED',
+                    literal_line_present=isinstance(message, str) and 'GATE_RELEASED' in message.splitlines(),
+                    outcome_marker_count=sum(line.strip().startswith('SYMPHONY_OUTCOME:')
+                        for line in message.splitlines()) if isinstance(message, str) else 0)
+                try:
+                    facts['start_before_completion'] = timestamp_ns(starts[0].get('timestamp')) <= timestamp_ns(terminals[0].get('timestamp'))
+                except (ValueError, TypeError):
+                    facts['start_before_completion'] = False
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError) as error:
+            facts['error_type'] = type(error).__name__
+        result['workers'].append(facts)
+    return result
 
 
 def require_literal_worker(provider, run, home, project=None, captures=()):
@@ -3283,7 +3476,7 @@ def failure_state(root, provider):
         stable["observed_role"] = observed_role(payload)
         return sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
-    def run_summary(run):
+    def run_summary(run, home):
         assessment = run.get("assessment") or {}
         terminal_turns = assessment.get("_terminal_turns") or {}
         return {"session_id": run.get("session_id"), "lead_id": run.get("lead_identity"),
@@ -3294,6 +3487,7 @@ def failure_state(root, provider):
                                              for item in assessment.get("_terminal_event_ids", ())],
                 "terminal_turn_hashes": {identity: [short_hash(token) for token in tokens]
                                          for identity, tokens in terminal_turns.items()},
+                'native_literal_workers': codex_literal_worker_probe(run, home) if provider == 'codex' else None,
                 "lead_delegations": [{"identity": item.get("identity"), "state": item.get("state"),
                                       "requested_tier": item.get("requested_tier"),
                                       "requested_effort": item.get("requested_effort")}
@@ -3415,6 +3609,7 @@ def failure_state(root, provider):
                 continue
             if record.get("state_name") in {None, path.name}:
                 session_records.append(session_record_summary(record, root_sessions))
+        native_home = root / f'{provider}-{"live-update" if case == "live-update" else "baseline"}-home'
         recovery_probes = {}
         if provider == "claude" and case == "live-update":
             native_home = root / "claude-live-update-home"
@@ -3445,8 +3640,8 @@ def failure_state(root, provider):
         cases.append({"case": case, "labels": labels, "cli_session_ids": cli_sessions,
                       "activation_profiles": [activation_summary(item) for item in profiles
                                               if isinstance(item, dict) and item.get("session_id")],
-                      "active_runs": [run_summary(run) for run in document.get("active_runs", {}).values()],
-                      "recent_runs": [run_summary(run) for run in document.get("recent_runs", [])],
+                      "active_runs": [run_summary(run, native_home) for run in document.get("active_runs", {}).values()],
+                      "recent_runs": [run_summary(run, native_home) for run in document.get("recent_runs", [])],
                       "event_kinds": [event.get("kind") for event in document.get("event_history", [])],
                       "lead_lifecycle_events": relevant_events,
                       "root_stop_events": root_stop_events,
@@ -3523,6 +3718,44 @@ def failure_state(root, provider):
             "native_hook_capture": codex_hook_capture_summary(root, provider)}
 
 
+def preserve_private_native_failure(root, destination, provider):
+    """Retain only local fixture evidence, excluding native credentials/config."""
+    destination = destination.resolve()
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.chmod(0o700)
+    target = destination / f'{provider}-{uuid.uuid4().hex[:12]}'
+    target.mkdir(mode=0o700)
+    for case in ('same-worktree', 'worktrees', 'live-update'):
+        source = root / case
+        if not source.is_dir():
+            continue
+        for child in ('logs', 'state', 'native-gate', 'hook decisions'):
+            if (source / child).is_dir():
+                shutil.copytree(source / child, target / case / child)
+        for name in ('update_event_counts.json', 'spawn_probe.json', 'old_root_interruption.json'):
+            if (source / name).is_file():
+                (target / case).mkdir(exist_ok=True)
+                shutil.copyfile(source / name, target / case / name)
+    for name in (f'{provider}-baseline-home', f'{provider}-live-update-home'):
+        source = root / name
+        for child in ('sessions', 'projects'):
+            if (source / child).is_dir():
+                for path in (source / child).rglob('*'):
+                    if (not path.is_file() or path.is_symlink()
+                            or not (path.suffix == '.jsonl' or path.name.endswith('.meta.json'))):
+                        continue
+                    copied = target / name / path.relative_to(source)
+                    copied.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, copied)
+    capture = root / f'{provider}-hook-capture'
+    if capture.is_dir():
+        shutil.copytree(capture, target / capture.name)
+    # The optional directory is local-only and never part of CI's receipt glob.
+    for path in target.rglob('*'):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    return target
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", choices=("codex", "claude"), required=True)
@@ -3537,6 +3770,8 @@ def main():
                         help="probe an exact normal Stop control on Codex live-update resume")
     parser.add_argument("--old-plugin-root", type=Path,
                         help="actual released 1.5.1 package (default CI baseline), or explicit 1.6.0 package")
+    parser.add_argument('--keep-failure-dir', type=Path,
+                        help='private local evidence directory; never upload its raw native transcripts')
     parser.add_argument("--candidate-plugin-root", type=Path,
                         default=Path(__file__).resolve().parents[2] / "plugins" / "symphony")
     args = parser.parse_args()
@@ -3583,6 +3818,8 @@ def main():
                                args.claude_budget_usd, update,
                                direct_stop_resume=args.direct_stop_resume))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            if args.keep_failure_dir:
+                preserve_private_native_failure(root, args.keep_failure_dir, args.provider)
             print(json.dumps({"provider": args.provider, "error": str(error),
                               "logs": str(root)}), file=sys.stderr)
             diagnostics = failure_state(root, args.provider)
