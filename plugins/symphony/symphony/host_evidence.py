@@ -460,6 +460,7 @@ def _claude_native_lead_event(
     *, require_missing: bool, target_prompt: str | None = None,
     allow_fast_escalation: bool = False,
     allow_assessed_markerless: bool = False,
+    allow_archived_assessed_markerless: bool = False,
 ) -> Event | None:
     """Validate one lead terminal against Claude's native parent and child turns.
 
@@ -492,6 +493,16 @@ def _claude_native_lead_event(
         and run.assessment.get("size") in {"small", "medium", "large"}
         and run.assessment.get("complexity") in {"simple", "mixed", "complex"}
         and not run.assessment.get("_claude_native_recovery")
+        and not run.assessment.get("_fast_pending") and not _archived_fast_owner(run))
+    # Only the explicit archived SendMessage sequence prover uses this mode.
+    # It acknowledges intermediate successful native turns without treating
+    # their markerless reports as a completed task outcome.
+    archived_markerless = bool(allow_archived_assessed_markerless and not require_missing
+        and target_prompt is not None and run.status == "completed"
+        and isinstance(run.outcome, Mapping) and run.outcome.get("status") == "completed"
+        and lead.state.lower() == "completed"
+        and run.assessment.get("size") in {"small", "medium", "large"}
+        and run.assessment.get("complexity") in {"simple", "mixed", "complex"}
         and not run.assessment.get("_fast_pending") and not _archived_fast_owner(run))
     home = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     projects = home / "projects"
@@ -543,6 +554,11 @@ def _claude_native_lead_event(
             or not isinstance(launch_input, dict)
             or launch_input.get("subagent_type") != agent_type):
         return None
+    if archived_markerless and (
+            not isinstance(parent.get('cwd'), str) or not parent['cwd'].strip()
+            or not Path(parent['cwd']).is_absolute()
+            or launch_input.get('model') not in {None, '', lead.requested_tier}):
+        return None
     try:
         if Path(str(parent.get("cwd") or "")).resolve() != project.resolve():
             return None
@@ -587,6 +603,11 @@ def _claude_native_lead_event(
         return None
     first_prompt_at = _instant(child_rows[prompt_indices[0]].get('timestamp'))
     if first_prompt_at is None or first_prompt_at < started_at:
+        return None
+    if archived_markerless and (
+            not isinstance(launch_input.get('prompt'), str) or not launch_input['prompt'].strip()
+            or child_rows[prompt_indices[0]]['message']['content'] != launch_input['prompt']
+            or first_prompt_at >= _instant(run.updated_at)):
         return None
     if target_prompt is None:
         prompt_index = len(prompt_indices) - 1
@@ -639,10 +660,28 @@ def _claude_native_lead_event(
                  for item in ((row.get("message") or {}).get("content") or [])
                  if isinstance(item, dict) and item.get("type") == "tool_use"
                  and item.get("name") == "SubagentHandback"]
+    if archived_markerless and handbacks:
+        # A goodbye or a completed final marker must not hide failed,
+        # duplicate, or conflicting reports supplied earlier in this turn.
+        if len(handbacks) != 1:
+            return None
+        handback, _ = handbacks[0]
+        handback_input = handback.get("input")
+        report = handback_input.get("message") if isinstance(handback_input, dict) else None
+        results = [item for row in turn if row.get("type") == "user"
+                   for item in ((row.get("message") or {}).get("content") or [])
+                   if isinstance(item, dict) and item.get("type") == "tool_result"
+                   and item.get("tool_use_id") == handback.get("id")]
+        if (not isinstance(handback.get("id"), str) or not handback["id"]
+                or len(results) != 1 or results[0].get("is_error") is True
+                or not isinstance(report, str) or not report.strip()
+                or "SYMPHONY_FAST_DECISION:" in report
+                or "SYMPHONY_OUTCOME:" in report and _reported_status(report) != "completed"):
+            return None
     if not reports:
         # Background agents hand their result to the parent and then end with
         # a brief goodbye. Only the current turn's successful handback counts.
-        if (not handbacks and assessed_markerless and final_text.strip()
+        if (not handbacks and (assessed_markerless or archived_markerless) and final_text.strip()
                 and "SYMPHONY_OUTCOME:" not in final_text
                 and "SYMPHONY_FAST_DECISION:" not in final_text):
             reports = [final_text]
@@ -661,7 +700,7 @@ def _claude_native_lead_event(
                 or results[0].get("is_error") is True
                 or not (_reported_status(report) == "completed" or
                         allow_fast_escalation and _archived_fast_escalation(report) or
-                        assessed_markerless and isinstance(report, str) and report.strip()
+                        (assessed_markerless or archived_markerless) and isinstance(report, str) and report.strip()
                         and "SYMPHONY_OUTCOME:" not in report
                         and "SYMPHONY_FAST_DECISION:" not in report)):
             return None
@@ -698,6 +737,8 @@ def _claude_native_lead_event(
         "last_assistant_message": report,
         "_symphony_native_started_at": prompt_at.isoformat(),
     }
+    if archived_markerless and handbacks:
+        payload['_symphony_native_callback_report'] = handbacks[0][0]['input']['message'] + '\n' + final_text
     # Freshness validation may be held by outstanding work. Do not turn an
     # ordinary markerless result into a missing-callback recovery anchor that
     # would demand a marker when the same native terminal is checked again.
@@ -1726,6 +1767,267 @@ def _claude_root_followup(
     if result.get("is_error") is True or returned_at is None or returned_at < called_at:
         return None
     return replace(native, payload={**native.payload, "_symphony_root_prompt_id": root_prompt})
+
+
+def claude_sendmessage_source_hash(source: Event, session: str) -> str:
+    """Hash exactly the lifecycle facts retained by the session inbox.
+
+    The callback event ID also binds the original host payload. cwd and hook
+    name are absent from the inbox; kind/root binding and native cwd supply
+    those boundaries. Capture and replay must use the same fixed projection.
+    """
+    fields = ('provider', 'session_id', 'parent_thread_id', 'agent_id', 'subagent_id',
+              'turn_id', 'prompt_id', 'status', 'last_assistant_message', 'agent_transcript_path',
+              'transcript_path', 'agent_type', 'task_name', 'role', 'model', 'model_reasoning_effort',
+              'task', 'objective', '_symphony_child_metadata')
+    payload = {key: source.payload[key] for key in fields if key in source.payload}
+    payload['session_id'] = session
+    return hashlib.sha256(json.dumps({'kind': source.kind, 'payload': payload},
+                                    sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _claude_sendmessage_callback(source: Event, native: Event, session: str,
+                                 called_at: datetime, next_call: datetime | None) -> bool:
+    payload = source.payload
+    identity = native.payload['agent_id']
+    when = _instant(source.observed_at)
+    owned = (payload.get('session_id') == session or (
+        payload.get('session_id') == identity and (
+            payload.get('parent_thread_id') == session
+            or payload.get('_symphony_verified_alias') is True)))
+    if (source.kind not in {'subagent_started', 'subagent_stopped'}
+            or payload.get('provider') != 'claude' or not owned
+            or (payload.get('agent_id') or payload.get('subagent_id')) != identity
+            or payload.get('parent_thread_id') not in {None, '', session}
+            or payload.get('role') not in {None, '', 'lead'}
+            or any(re.search(r'^SYMPHONY_ROLE: (worker|consultant|assessor)[ \t]*$', value, re.MULTILINE)
+                   for value in payload.values() if isinstance(value, str))
+            or payload.get('agent_type') not in {None, '', native.payload['agent_type']}
+            or payload.get('model') not in {None, '', native.payload['model']}
+            or payload.get('model_reasoning_effort') not in {
+                None, '', native.payload['model_reasoning_effort']}
+            or 'turn_id' in payload and payload['turn_id'] != native.payload['prompt_id']
+            or when is None or when < called_at or next_call and when >= next_call):
+        return False
+    # prompt_id is the hook's requestJournal context, not a child invocation.
+    # The original callback time plus exact native report identifies its turn.
+    if source.kind == 'subagent_stopped':
+        report = payload.get('last_assistant_message')
+        return bool(str(payload.get('status') or 'completed').lower() == 'completed'
+                    and when >= _instant(native.observed_at)
+                    and isinstance(report, str)
+                    and ('SYMPHONY_OUTCOME:' not in report or _reported_status(report) == 'completed')
+                    and report in {native.payload['last_assistant_message'],
+                                   native.payload.get('_symphony_native_callback_report')})
+    return True
+
+
+def claude_archived_sendmessage_sequence(
+    state: ProjectState, events: tuple[Event, ...], session: str,
+    project: Path, environ: Mapping[str, str],
+    *, committed_run: RunState | None = None, committed_anchor: Mapping | None = None,
+) -> tuple[RunState, tuple[Event, ...], dict[str, int], dict] | None:
+    """Prove every ordered continuation before reopening an assessed archive.
+
+    Intermediate markerless end_turn reports are acknowledgments only. The
+    final turn must provide a completed outcome. No callback, missing delivery,
+    or unrelated child can be silently removed from the proof inventory.
+    """
+    replay = committed_run is not None and committed_anchor is not None
+    if not replay and (not events or len(events) > 16 or
+                       not any(event.kind == 'subagent_stopped' for event in events)):
+        return None
+    if not replay and f'claude:{session}' in state.active_runs:
+        return None
+    history = [run for run in state.recent_runs if run.provider == 'claude' and run.session_id == session]
+    if not history and not replay:
+        return None
+    run = history[-1] if not replay else committed_run
+    if replay:
+        owner = committed_anchor.get('owner')
+        if (not isinstance(owner, Mapping) or owner.get('run_id') != run.run_id
+                or type(committed_anchor.get('owner_generation')) is not int
+                or committed_anchor['owner_generation'] < 0
+                or not isinstance(committed_anchor.get('lead'), str)
+                or owner.get('size') not in {'small', 'medium', 'large'}
+                or owner.get('complexity') not in {'simple', 'mixed', 'complex'}
+                or owner.get('topology') not in {'direct', 'delegated', 'mixed'}
+                or _instant(owner.get('started_at')) is None
+                or owner.get('started_at') != run.started_at):
+            return None
+        leads = [item for item in run.delegations
+                 if item.identity == committed_anchor['lead'] and item.role == 'lead'
+                 and item.requested_tier == owner.get('model')
+                 and item.requested_effort == owner.get('effort')]
+        if len(leads) != 1 or not owner.get('model') or not owner.get('effort'):
+            return None
+        # Reconstruct the original owner only for native/receipt ACK proof.
+        # This candidate is never dispatched or used to admit another turn.
+        run = replace(run, status='completed', updated_at=committed_anchor.get('archived_at', ''),
+            lead_identity=committed_anchor['lead'], owner_generation=committed_anchor['owner_generation'],
+            outcome={'status': 'completed'}, unreconciled=(),
+            delegations=(replace(leads[0], state='completed'),),
+            assessment={'size': owner['size'], 'complexity': owner['complexity'],
+                        'topology': owner['topology']})
+    archived = _instant(run.updated_at)
+    cutoff = None
+    if replay:
+        turns = committed_anchor.get('turns')
+        if (not isinstance(turns, (list, tuple)) or not turns
+                or not isinstance(turns[-1], Mapping)):
+            return None
+        ended = _instant(turns[-1].get('completed_at'))
+        returned = _instant(turns[-1].get('returned_at'))
+        if ended is None or returned is None:
+            return None
+        cutoff = max(ended, returned)
+    if (run.status != 'completed' or run.unreconciled or not archived
+            or not isinstance(run.outcome, Mapping) or run.outcome.get('status') != 'completed'
+            or not run.lead_identity or _archived_fast_owner(run) or run.assessment.get('_fast_pending')
+            or run.assessment.get('size') not in {'small', 'medium', 'large'}
+            or run.assessment.get('complexity') not in {'simple', 'mixed', 'complex'}
+            or any(item.state.lower() in {'working', 'pending', 'interrupted'} for item in run.delegations)
+            or not replay and any(run.lead_identity in {other.lead_identity, *(item.identity for item in other.delegations)}
+                   for other in state.active_runs.values() if other.provider == 'claude')):
+        return None
+    projects = Path(environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'projects'
+    paths = tuple(projects.glob(f'*/{session}.jsonl'))
+    if projects.is_symlink() or len(paths) != 1 or paths[0].parent.is_symlink():
+        return None
+    rows = _native_jsonl(paths[0])
+    child_path = paths[0].with_suffix('') / 'subagents' / f'agent-{run.lead_identity}.jsonl'
+    if child_path.parent.is_symlink() or child_path.parent.parent.is_symlink():
+        return None
+    children = _native_jsonl(child_path)
+    if not rows or not children:
+        return None
+    calls, results = [], {}
+    for row in rows:
+        if (row.get('sessionId') != session or row.get('isSidechain') is True or row.get('agentId')):
+            return None
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        for item in content if isinstance(content, list) else ():
+            if not isinstance(item, dict):
+                return None
+            if row.get('type') == 'user' and item.get('type') == 'tool_result':
+                results.setdefault(item.get('tool_use_id'), []).append((row, item))
+            if row.get('type') != 'assistant' or item.get('type') != 'tool_use':
+                continue
+            when = _instant(row.get('timestamp'))
+            if item.get('name') not in {'Agent', 'SendMessage'}:
+                continue
+            if when is None:
+                return None
+            if when <= archived or cutoff and when > cutoff:
+                continue
+            details = item.get('input')
+            cwd = row.get('cwd')
+            if (item.get('name') != 'SendMessage' or not isinstance(details, dict)
+                    or details.get('to') != run.lead_identity
+                    or not isinstance(details.get('message'), str) or not details['message'].strip()
+                    or details.get('notify_when_idle') not in {None, False}
+                    or not isinstance(item.get('id'), str) or not item['id']
+                    or not isinstance(cwd, str) or not cwd.strip() or not Path(cwd).is_absolute()
+                    or Path(cwd).resolve() != project.resolve()):
+                return None
+            calls.append((when, row, item))
+    if not calls or len(calls) > 8 or len({item['id'] for _, _, item in calls}) != len(calls):
+        return None
+    if any(left[0] >= right[0] for left, right in zip(calls, calls[1:])):
+        return None
+    prompts, prior_prompts = [], []
+    for row in children:
+        if (row.get('sessionId') != session or row.get('agentId') != run.lead_identity
+                or row.get('isSidechain') is not True):
+            return None
+        if row.get('type') != 'user':
+            continue
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        # Tool results are part of a turn. Every other user row must be a
+        # supported textual prompt; malformed/opaque rows cannot hide reuse.
+        if isinstance(content, list) and content and all(
+                isinstance(item, dict) and item.get('type') == 'tool_result' for item in content):
+            continue
+        if not isinstance(content, str):
+            return None
+        when = _instant(row.get('timestamp'))
+        if when is None or not isinstance(row.get('uuid'), str) or not row['uuid']:
+            return None
+        if cutoff and when > _instant(committed_anchor['turns'][-1]['completed_at']):
+            continue
+        if when > archived:
+            prompts.append(row)
+        else:
+            prior_prompts.append(row)
+    if not prior_prompts:
+        return None
+    prior_native = _claude_native_lead_event(replace(state, active_run=run), session, project, environ,
+        require_missing=False, target_prompt=prior_prompts[-1]['uuid'], allow_archived_assessed_markerless=True)
+    if prior_native is None or _instant(prior_native.observed_at) > archived:
+        return None
+    if len(prompts) != len(calls) or len({row['uuid'] for row in prompts}) != len(prompts):
+        return None
+    native_events, records = [], []
+    scoped = replace(state, active_run=run)
+    for index, ((called, row, call), prompt) in enumerate(zip(calls, prompts)):
+        next_call = calls[index + 1][0] if index + 1 < len(calls) else None
+        began = _instant(prompt['timestamp'])
+        matching = results.get(call['id'], ())
+        if len(matching) != 1 or began is None or began < called:
+            return None
+        result_row, result = matching[0]
+        returned = _instant(result_row.get('timestamp'))
+        result_content = result.get('content')
+        if isinstance(result_content, list) and result_content and all(
+                isinstance(item, dict) and item.get('type') == 'text'
+                and isinstance(item.get('text'), str) for item in result_content):
+            result_content = '\n'.join(item['text'] for item in result_content)
+        try:
+            response = json.loads(result_content) if isinstance(result_content, str) else None
+        except ValueError:
+            return None
+        if (result.get('is_error') is True or returned is None or returned < called
+                or next_call and returned >= next_call
+                or not isinstance(response, dict) or response.get('success') is not True
+                or response.get('resumedAgentId') not in {None, run.lead_identity}
+                or prompt['message']['content'] != call['input']['message']):
+            return None
+        native = _claude_native_lead_event(scoped, session, project, environ,
+            require_missing=False, target_prompt=prompt['uuid'], allow_archived_assessed_markerless=True)
+        if native is None:
+            return None
+        completed = _instant(native.observed_at)
+        if (completed is None or next_call and completed >= next_call
+                or 'SYMPHONY_FAST_DECISION:' in native.payload['last_assistant_message']):
+            return None
+        if index == len(calls) - 1 and _reported_status(native.payload['last_assistant_message']) != 'completed':
+            return None
+        native = replace(native, payload={**native.payload, '_symphony_native_recovery': True,
+            '_symphony_sendmessage_intermediate': index != len(calls) - 1})
+        native_events.append(native)
+        records.append({'call_hash': hashlib.sha256(call['id'].encode()).hexdigest(),
+                        'message_hash': hashlib.sha256(call['input']['message'].encode()).hexdigest(),
+                        'called_at': called.isoformat(), 'native_event_id': native.event_id,
+                        'prompt_id': prompt['uuid'], 'completed_at': native.observed_at,
+                        'returned_at': returned.isoformat()})
+    mapping = {}
+    for event in events:
+        matches = [index for index, native in enumerate(native_events)
+                   if _claude_sendmessage_callback(event, native, session, calls[index][0],
+                       calls[index + 1][0] if index + 1 < len(calls) else None)]
+        if len(matches) != 1 or event.event_id in mapping:
+            return None
+        mapping[event.event_id] = matches[0]
+    lead = next(item for item in run.delegations if item.identity == run.lead_identity and item.role == 'lead')
+    anchor = {'version': 1, 'archived_at': run.updated_at, 'owner_generation': run.owner_generation,
+              'lead': run.lead_identity, 'turns': records,
+              'owner': {'run_id': run.run_id, 'started_at': run.started_at,
+                        'size': run.assessment['size'], 'complexity': run.assessment['complexity'],
+                        'topology': run.assessment.get('topology', 'direct'),
+                        'model': lead.requested_tier, 'effort': lead.requested_effort}}
+    return run, tuple(native_events), mapping, anchor
 
 
 def archived_lead_followup(

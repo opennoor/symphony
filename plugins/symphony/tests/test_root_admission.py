@@ -320,7 +320,7 @@ class RootAdmissionTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         document = json.loads(generated(root)[root / 'hooks/hooks.json'])
         self.assertEqual(document['hooks']['PreToolUse'][0]['matcher'],
-                         'Agent|Bash|PowerShell|Write|Edit|NotebookEdit')
+                         'Agent|SendMessage|Bash|PowerShell|Write|Edit|NotebookEdit')
         self.assertEqual(document['hooks']['PostToolUse'][0]['matcher'], 'Agent')
 
 

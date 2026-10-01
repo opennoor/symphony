@@ -408,7 +408,11 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
         'After your native start hook releases, YOU as the canonical lead must spawn exactly one bounded '
         'worker using WORKER_SPAWN_PACKET verbatim as native spawn arguments; the root never substitutes '
         'for this launch. Await its successful native result and verify its literal GATE_RELEASED report. '
-        'Then return your own specified GATE_RELEASED/outcome lines. Do not search for a callback command '
+        'Relay its return_contract unchanged: the worker final report, or SubagentHandback message if '
+        'background, is exactly GATE_RELEASED, with no outcome marker, preface, Markdown or explanation. '
+        'This literal callback report performs no capability phase. '
+        'Then return your own specified GATE_RELEASED/outcome lines. Use only the exact requested '
+        'completed or blocked enum; never substitute successful. Do not search for a callback command '
         'or gate file. Preserve the successful worker result for same-task followup; do not spawn duplicate '
         'work on routine completion reconciliation. WORKER_SPAWN_PACKET: ' + json.dumps(worker_packet) + '\n')
     recovery = (
@@ -580,6 +584,21 @@ def resume_claude(env, project, session, budget, deadline, logs, label, *, final
     receipt_path.write_text(json.dumps(receipt))
     if completed.returncode:
         raise RuntimeError(f"Claude resume for session {session} exited {completed.returncode}")
+
+
+def claude_original_owner_archived(document, session, run_id, lead_id):
+    """Completion of another run is not a reason to skip the original wake."""
+    if any(run.get('session_id') == session for run in document.get('active_runs', {}).values()):
+        return False
+    matches = [run for run in document.get('recent_runs', ())
+               if run.get('provider') == 'claude' and run.get('session_id') == session
+               and run.get('run_id') == run_id]
+    return bool(len(matches) == 1 and matches[0].get('status') == 'completed'
+        and matches[0].get('lead_identity') == lead_id
+        and (matches[0].get('outcome') or {}).get('status') == 'completed'
+        and not matches[0].get('unreconciled')
+        and all(item.get('state', '').lower() not in {'working', 'pending', 'interrupted'}
+                for item in matches[0].get('delegations', ())))
 
 
 def claude_finalization_ready(document, session, run_id, lead_id, state_dir):
@@ -2056,6 +2075,11 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     raise RuntimeError("native Claude CLI exited unsuccessfully")
                 current = {label: json.loads(path.read_text()) for label, path in paths.items()}
                 for label, process in processes.items():
+                    if not update and claude_original_owner_archived(
+                            current[label], sessions[label], observed_run_ids[label], observed_leads[label]):
+                        # A successful archive needs no extra SendMessage wake.
+                        # Explicit continuation is exercised by its own case.
+                        continue
                     events = current[label].get("event_history", [])
                     old_lead_completed = any(event.get("kind") == "lead_completed"
                                              and event.get("payload", {}).get("identity") == observed_leads[label]
@@ -2098,7 +2122,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                                           sessions[label], budget, deadline, logs,
                                           f"{label}.finalize", finalize=True)
                             finalized.add(label)
-                if (len(resumed) == len(processes)
+                if ((len(resumed) == len(processes) if update else True)
                         and all(any(run.get("session_id") == sessions[label]
                                 and run.get("status") == "completed"
                                 and (run.get("outcome") or {}).get("status") == "completed"
@@ -3943,6 +3967,10 @@ def main():
                         help="run the bounded native upgrade case without baseline cases")
     parser.add_argument("--only-worktrees", action="store_true",
                         help="run only the two independent worktree owners")
+    parser.add_argument('--only-sendmessage-followups', action='store_true',
+                        help='run one fresh same-worktree baseline and explicit archived followups only')
+    parser.add_argument('--claude-sendmessage-followups', action='store_true',
+                        help='prove ordered archived same-lead sends and private copied-state replay')
     parser.add_argument("--direct-stop-resume", action="store_true",
                         help="probe an exact normal Stop control on Codex live-update resume")
     parser.add_argument("--old-plugin-root", type=Path,
@@ -3957,6 +3985,12 @@ def main():
         parser.error("--only-live-update requires --live-update")
     if args.only_live_update and args.only_worktrees:
         parser.error("--only-live-update and --only-worktrees cannot be combined")
+    if args.only_sendmessage_followups:
+        args.claude_sendmessage_followups = True
+    if args.only_sendmessage_followups and args.live_update:
+        parser.error('--only-sendmessage-followups cannot include a live update')
+    if args.claude_sendmessage_followups and (args.provider != 'claude' or args.only_live_update or args.only_worktrees):
+        parser.error('--claude-sendmessage-followups requires the Claude baseline same-worktree case')
     if args.direct_stop_resume and (args.provider != "codex" or not args.live_update):
         parser.error("--direct-stop-resume requires a Codex live-update run")
     with tempfile.TemporaryDirectory(prefix="symphony-native-managed-", ignore_cleanup_errors=True) as temporary:
@@ -3978,12 +4012,16 @@ def main():
                     if not (source_config / ".credentials.json").is_file():
                         raise RuntimeError("Claude live update needs ANTHROPIC_API_KEY or existing auth")
             cases = (() if args.only_live_update else
-                     (True,) if args.only_worktrees else (False, True))
+                     (True,) if args.only_worktrees else (False,) if args.only_sendmessage_followups else (False, True))
             baseline_env = (prepare_baseline_capture(args.provider, root,
                             args.candidate_plugin_root, capture_child_sources=True) if cases else None)
             results = [check_case(args.provider, root, separate, args.timeout,
                                   args.claude_budget_usd,
                                   baseline_env=baseline_env) for separate in cases]
+            if args.claude_sendmessage_followups:
+                from native_claude_followup import check_native_sendmessage
+                results.append(check_native_sendmessage(root, args.candidate_plugin_root, baseline_env,
+                                                        results[0], args.timeout, args.claude_budget_usd))
             if args.live_update:
                 update = prepare_live_update(args.provider, root, args.old_plugin_root,
                                              args.candidate_plugin_root)

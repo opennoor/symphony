@@ -30,6 +30,21 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_nonupdate_wake_skips_only_exact_completed_original_owner(self):
+        run = {'provider': 'claude', 'session_id': 'root', 'run_id': 'original',
+               'lead_identity': 'lead', 'status': 'completed', 'outcome': {'status': 'completed'},
+               'delegations': [{'identity': 'lead', 'role': 'lead', 'state': 'completed'}]}
+        check = lambda document: native.claude_original_owner_archived(document, 'root', 'original', 'lead')
+        self.assertTrue(check({'recent_runs': [run]}))
+        for changes in ({'run_id': 'other'}, {'lead_identity': 'other'}, {'provider': 'codex'},
+                        {'session_id': 'foreign'}, {'status': 'completing'}, {'outcome': None},
+                        {'unreconciled': ['child']},
+                        {'delegations': [{'identity': 'child', 'state': 'working'}]}):
+            with self.subTest(changes=changes):
+                self.assertFalse(check({'recent_runs': [{**run, **changes}]}))
+        self.assertFalse(check({'recent_runs': [run, run]}))
+        self.assertFalse(check({'recent_runs': [run], 'active_runs': {'claude:root': run}}))
+
     def test_cleanup_unblocks_missing_gates_without_overwriting_release_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:
             for name in ('release', 'a.stop-release'):

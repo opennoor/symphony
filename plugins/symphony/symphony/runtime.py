@@ -19,6 +19,7 @@ from .adapters import HookResult, detect_provider, event_from_payload, render
 from .host_evidence import (
     _archived_fast_owner,
     archived_lead_followup,
+    claude_archived_sendmessage_sequence, claude_sendmessage_source_hash,
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
     claude_substantive_launch,
@@ -119,9 +120,38 @@ def _root_admission_prompt(state: ProjectState, source: Event, provider: str,
             return _set_root_admission(state, key, source.payload, pending=False)
     recorded = state.configuration.get('root_admission_intents', {})
     existing = isinstance(recorded, Mapping) and key in recorded
+    if existing and control is not None and not task:
+        # A control detour does not replace the objective that authorized an
+        # observed SendMessage. A new ordinary/task-bearing prompt does.
+        return state
     if existing or (task and not state.active_run):
         return _set_root_admission(state, key, source.payload, pending=True)
     return state
+
+
+def _observe_sendmessage_intent(state: ProjectState, source: Event, provider: str) -> ProjectState:
+    key = _root_admission_key(provider, source.payload)
+    if not key or source.payload.get('tool_name') != 'SendMessage':
+        return state
+    intents = state.configuration.get('root_admission_intents', {})
+    intent = intents.get(key) if isinstance(intents, Mapping) else None
+    details = source.payload.get('tool_input')
+    call = source.payload.get('tool_use_id')
+    context = source.payload.get('prompt_id')
+    history = [run for run in state.recent_runs
+               if run.provider == provider and run.session_id == source.payload.get('session_id')]
+    if (not isinstance(intent, Mapping) or type(intent.get('version')) is not int or intent.get('version') != 1
+            or not isinstance(details, Mapping) or not isinstance(call, str) or not call
+            or not isinstance(context, str) or not context
+            or hashlib.sha256(context.encode()).hexdigest() != intent.get('prompt_context')
+            or not history or history[-1].status != 'completed' or state.active_run
+            or details.get('to') != history[-1].lead_identity
+            or not isinstance(details.get('message'), str) or not details['message'].strip()):
+        return state
+    marked = {**intent, 'continuation_call_hash': hashlib.sha256(call.encode()).hexdigest(),
+              'continuation_message_hash': hashlib.sha256(details['message'].encode()).hexdigest()}
+    return replace(state, configuration={**state.configuration,
+        'root_admission_intents': {**intents, key: marked}})
 
 
 def _root_admission_guard(state: ProjectState, source: Event, provider: str) -> tuple[Action, ...]:
@@ -273,6 +303,33 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         batch = [(event, event_generation, False) for event, event_generation in pending]
         if lifecycle_source:
             batch.append((source, generation, True))
+        if provider == 'claude' and session:
+            retained = []
+            for event, epoch, current in batch:
+                identity = event.payload.get('agent_id') or event.payload.get('subagent_id')
+                if (epoch == generation and identity not in retired
+                        and _committed_sendmessage_source(state, event, session, generation, project, environ)):
+                    if not current:
+                        acknowledged.add(event.event_id)
+                else:
+                    retained.append((event, epoch, current))
+            batch = retained
+            if batch and all(epoch == generation and
+                             (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired
+                             for event, epoch, _ in batch):
+                try:
+                    sequence = claude_archived_sendmessage_sequence(
+                        state, tuple(event for event, _, _ in batch), session,
+                        Path(record['project'] or project) if record else project, environ)
+                except (OSError, TypeError, ValueError, AttributeError):
+                    sequence = None
+                if sequence is not None:
+                    committed = _commit_sendmessage_sequence(state, sequence, tuple(
+                        event for event, _, _ in batch), session, generation, dispatch, project, environ)
+                    if committed is not None:
+                        state = committed
+                        acknowledged.update(event.event_id for event, _, current in batch if not current)
+                        batch = []
         recoverable = _recoverable_fast_events(state, pending, provider, session, generation, retired)
         followup = None
         if session and batch and all(epoch == generation
@@ -1390,6 +1447,7 @@ def _transition(
         if state.active_run:
             actions += (Action("inject_context", {"text": _recovery_guidance(state, provider)}),)
     elif source.kind == "pre_tool_use":
+        state = _observe_sendmessage_intent(state, source, provider)
         blocked = _root_admission_guard(state, source, provider)
         if blocked:
             return state, actions + blocked
@@ -1826,6 +1884,151 @@ def _derived(
     if source.kind == "user_prompt" and any(item.event_id == candidate for item in state.event_history):
         candidate = f"{candidate}:{source.observed_at}"
     return Event(candidate, kind, source.observed_at, payload or {})
+
+
+def _committed_sendmessage_source(state: ProjectState, source: Event,
+                                  session: str, generation: int, project: Path,
+                                  environ: Mapping[str, str]) -> bool:
+    """ACK one exact committed callback without reopening its old lifecycle."""
+    identity = source.payload.get('agent_id') or source.payload.get('subagent_id')
+    owned = (source.payload.get('session_id') == session or (
+        source.payload.get('session_id') == identity and (
+            source.payload.get('parent_thread_id') == session
+            or source.payload.get('_symphony_verified_alias') is True)))
+    if (source.payload.get('provider') != 'claude' or not owned
+            or source.payload.get('parent_thread_id') not in {None, '', session}
+            or source.kind not in {'subagent_started', 'subagent_stopped'}):
+        return False
+    for run in (*state.active_runs.values(), *state.recent_runs):
+        if run.provider != 'claude' or run.session_id != session:
+            continue
+        sequences = run.assessment.get('_claude_sendmessage_sequences', ())
+        if not isinstance(sequences, (list, tuple)):
+            continue
+        for sequence in sequences:
+            if (not isinstance(sequence, Mapping) or type(sequence.get('version')) is not int
+                    or sequence['version'] != 1 or type(sequence.get('owner_generation')) is not int
+                    or sequence.get('owner_generation') > run.owner_generation
+                    or sequence.get('lead') != identity or not isinstance(sequence.get('sources'), (list, tuple))):
+                continue
+            try:
+                proof = claude_archived_sendmessage_sequence(state, (), session, project, environ,
+                    committed_run=run, committed_anchor=sequence)
+            except (OSError, TypeError, ValueError, AttributeError):
+                continue
+            if proof is None or proof[3]['turns'] != sequence.get('turns'):
+                continue
+            terminal_turns = run.assessment.get('_terminal_turns', {})
+            if not isinstance(terminal_turns, Mapping):
+                continue
+            valid = True
+            for native in proof[1]:
+                token = _child_turn_token(native.payload)
+                result = _terminal_result_id(native)
+                receipts = [receipt for receipt in state.terminal_receipts
+                            if receipt.get('provider') == 'claude' and receipt.get('session') == session
+                            and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity
+                            and receipt.get('turn') == token]
+                metadata = {'native_agent_type': native.payload.get('agent_type'),
+                            'native_model': native.payload.get('model'),
+                            'native_effort': native.payload.get('model_reasoning_effort'),
+                            'native_followup_start_id': native.event_id + ':followup-start'}
+                if len(receipts) == 1:
+                    receipt = receipts[0]
+                    # v1.6 drops the new Start field. Surviving route fields
+                    # and any supplied Start must still agree exactly.
+                    if (any(key in receipt and receipt[key] != expected
+                            for key, expected in metadata.items())
+                            or ('native_fast_escalation' in receipt
+                                and receipt['native_fast_escalation'] is not False)
+                            or (receipt.get('native_launch_prompt_hash') not in {None, ''}
+                                and receipt['native_launch_prompt_hash'] != hashlib.sha256(
+                                    native.payload['prompt_id'].encode()).hexdigest())):
+                        valid = False
+                        break
+                if (native.event_id + ':followup-start' not in run.assessment.get('_start_event_ids', ())
+                        or result not in run.assessment.get('_terminal_event_ids', ())
+                        or token not in terminal_turns.get(identity, ())
+                        or len(receipts) != 1 or receipts[0].get('result') != result
+                        or receipts[0].get('parent') != session or receipts[0].get('lead') != identity
+                        or receipts[0].get('status') != 'completed'):
+                    valid = False
+                    break
+            if not valid:
+                continue
+            for witness in sequence['sources']:
+                if (not isinstance(witness, Mapping) or witness.get('event_id') != source.event_id
+                        or witness.get('kind') != source.kind or type(witness.get('generation')) is not int
+                        or witness.get('generation') != generation
+                        or witness.get('observed_at') != source.observed_at
+                        or witness.get('hash') != claude_sendmessage_source_hash(source, session)):
+                    continue
+                native = next((native for native in proof[1] if native.event_id == witness.get('native_event_id')), None)
+                if (native is None or witness.get('turn') != _child_turn_token(native.payload)
+                        or witness.get('result') != _terminal_result_id(native)):
+                    continue
+                start = witness.get('native_event_id', '') + ':followup-start'
+                if (start not in run.assessment.get('_start_event_ids', ())
+                        or witness.get('result') not in run.assessment.get('_terminal_event_ids', ())
+                        or witness.get('turn') not in run.assessment.get('_terminal_turns', {}).get(identity, ())):
+                    continue
+                receipts = [receipt for receipt in state.terminal_receipts
+                            if receipt.get('provider') == 'claude' and receipt.get('session') == session
+                            and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity
+                            and receipt.get('turn') == witness.get('turn')]
+                if (len(receipts) == 1 and receipts[0].get('result') == witness.get('result')
+                        and receipts[0].get('parent') == session and receipts[0].get('lead') == identity
+                        and receipts[0].get('status') == 'completed'):
+                    return True
+    return False
+
+
+def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: tuple[Event, ...],
+                                 session: str, generation: int, dispatch,
+                                 project: Path, environ: Mapping[str, str]) -> ProjectState | None:
+    archived, natives, mapping, anchor = sequence
+    original = state
+    resumed = replace(archived, status='completing',
+                      assessment={**archived.assessment, '_batch_pending': True})
+    state = replace(state, active_run=resumed, active_runs={**state.active_runs, f'claude:{session}': resumed},
+                    recent_runs=tuple(run for run in state.recent_runs if run != archived))
+    witnesses = []
+    for native in natives:
+        started = Event(native.event_id + ':followup-start', 'subagent_started',
+                        native.payload['_symphony_native_started_at'],
+                        {**native.payload, 'status': 'working', 'task': archived.task})
+        state, _ = dispatch(state, started)
+        state, _ = dispatch(state, native)
+        run = state.active_runs.get(f'claude:{session}')
+        if not run or run.run_id != archived.run_id or run.lead_identity != archived.lead_identity:
+            return None
+    for source in sources:
+        native = natives[mapping[source.event_id]]
+        witnesses.append({'event_id': source.event_id, 'kind': source.kind,
+                          'observed_at': source.observed_at, 'generation': generation,
+                          'hash': claude_sendmessage_source_hash(source, session),
+                          'native_event_id': native.event_id, 'turn': _child_turn_token(native.payload),
+                          'result': _terminal_result_id(native)})
+    run = state.active_runs[f'claude:{session}']
+    sequences = run.assessment.get('_claude_sendmessage_sequences', ())
+    if not isinstance(sequences, (list, tuple)):
+        return None
+    run = replace(run, assessment={**run.assessment,
+        '_claude_sendmessage_sequences': (*sequences, {**anchor, 'sources': witnesses})})
+    state = replace(state, active_run=run, active_runs={**state.active_runs, f'claude:{session}': run})
+    # Validate all committed receipt/start/turn anchors before any inbox ACK.
+    # Assessment uses the existing open codec; no callback text is persisted.
+    if not all(_committed_sendmessage_source(state, event, session, generation, project, environ)
+               for event in sources):
+        return None
+    key = _root_admission_key('claude', {'session_id': session})
+    intents = original.configuration.get('root_admission_intents', {})
+    intent = intents.get(key) if isinstance(intents, Mapping) else None
+    if isinstance(intent, Mapping) and any(
+            intent.get('continuation_call_hash') == turn['call_hash']
+            and intent.get('continuation_message_hash') == turn['message_hash'] for turn in anchor['turns']):
+        state = _set_root_admission(state, key, {}, pending=False)
+    return state
 
 
 def _terminal_result_id(source: Event) -> str:
@@ -2369,6 +2572,11 @@ def _observe_delegation(
         state = _record_substantive_child(state, source, role, pending,
                                          successful=terminal and status.lower() in {"completed", "done", "success", "succeeded"},
                                          environ=environ)
+    if (role == 'lead' and terminal and source.payload.get('_symphony_sendmessage_intermediate') is True
+            and source.payload.get('_symphony_native_recovery') is True):
+        # Full sequence proof precedes dispatch. Native end_turn is recorded
+        # as a per-turn acknowledgment, never as an intermediate task outcome.
+        return state, actions
     if role == "lead" and terminal and state.active_run:
         if str(identity) != state.active_run.lead_identity:
             return state, actions
