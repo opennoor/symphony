@@ -3805,6 +3805,8 @@ def failure_state(root, provider):
                 raw_session_records.append(record)
                 session_records.append(session_record_summary(record, root_sessions))
         native_home = root / f'{provider}-{"live-update" if case == "live-update" else "baseline"}-home'
+        if provider == 'claude' and case == 'case' and (root / 'claude-home').is_dir():
+            native_home = root / 'claude-home'
         recovery_probes = {}
         if provider == "claude" and case == "live-update":
             native_home = root / "claude-live-update-home"

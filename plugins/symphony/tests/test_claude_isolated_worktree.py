@@ -63,6 +63,36 @@ class ClaudeIsolatedWorktreeTests(unittest.TestCase):
                 if blocked:
                     self.assertIn("/symphony:proceed", actions[0].payload["reason"])
 
+    def test_isolated_capture_uses_exact_candidate_and_preserves_original_observers(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / 'frozen-candidate'
+            home = root / 'claude-home'
+            version = '1.7.0'
+            installed = home / 'plugins/cache/symphony-isolated/symphony' / version / 'hooks/hooks.json'
+            installed.parent.mkdir(parents=True)
+            installed.write_text('{}')
+            (home / 'settings.json').write_text(json.dumps({'enabledPlugins': {'symphony': True}}))
+            original_mkdir = Path.mkdir
+            with patch.dict(isolated.os.environ, {'ANTHROPIC_API_KEY': 'private-sentinel'}), \
+                 patch.object(native, 'package_version', return_value=version), \
+                 patch.object(native, 'marketplace', return_value=root / 'market'), \
+                 patch.object(native, 'claude_command'), \
+                 patch.object(isolated.Path, 'mkdir', autospec=True, side_effect=lambda path, *a, **kw:
+                              None if path == home else original_mkdir(path, *a, **kw)):
+                env, actual = isolated.scratch_claude(root, package)
+            self.assertEqual(actual, home)
+            settings = json.loads((home / 'settings.json').read_text())
+            self.assertEqual(settings['enabledPlugins'], {'symphony': True})
+            for event in ('SubagentStart', 'SubagentStop'):
+                self.assertEqual(len(settings['hooks'][event]), 2)
+                self.assertIn('capture_hook.py', settings['hooks'][event][0]['hooks'][0]['command'])
+                self.assertIn('capture_claude_hook.py', settings['hooks'][event][1]['hooks'][0]['command'])
+            script = (root / 'capture_claude_hook.py').read_text()
+            self.assertIn(str(package.resolve()), script)
+            self.assertTrue((root / 'private-child-hooks').is_dir())
+            self.assertNotIn('private-sentinel', script)
+
     def test_preflight_requires_the_exact_packaged_serving_model(self):
         for models, error, accepted in (({"claude-sonnet-5-5": {}}, False, True),
                                         ({"claude-sonnet-5": {}}, False, False),

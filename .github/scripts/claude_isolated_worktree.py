@@ -227,6 +227,8 @@ def scratch_claude(root, package):
         "SubagentStop": [{"hooks": [{"type": "command", "command": command}]}],
     }
     settings_file.write_text(json.dumps(settings))
+    native.install_hook_capture('claude', root, home, private_children=True,
+                                candidate_source=package)
     return env, home
 
 
