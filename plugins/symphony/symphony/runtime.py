@@ -2094,7 +2094,7 @@ def _observe_delegation(
             accepted = dict(state.active_run.assessment)
             accepted.pop("_fast_pending", None)
             accepted.update({"size": "small", "complexity": "simple", "risk": "normal",
-                             "topology": "direct", "rationale": "fast lead verified bounded low-risk work",
+                             "topology": "direct", "rationale": "fast lead reported predetermined mechanical work",
                              "route": {"lead_model": selected["model"],
                                        "lead_effort": selected["effort"],
                                        "profile": _applied_profile(state, str(source.payload.get("provider") or "codex"))}})
@@ -2722,7 +2722,7 @@ def _accept_assessment(
         "complexity": assessment.complexity,
         "risk": assessment.risk,
         "rationale": assessment.rationale,
-        "topology": assessment.topology or route.execution,
+        "topology": route.execution,
         "route": route_data,
     }
     return reduce(state, _derived(state, source, "assessment_accepted", accepted, "assessment"))
@@ -3095,7 +3095,12 @@ def _render_actions(
             rendered.append(Action("inject_context", {"text":
                 f"Symphony accepted the assessed route. Selected {provider} lead"
                 f" ({profile} profile): {model}/{effort}. Spawn only this model and effort{agent} "
-                "with the accepted SYMPHONY_ROUTE marker; keep the root thin."}))
+                "with the accepted SYMPHONY_ROUTE marker; keep the root thin. "
+                f"Accepted topology: {route.get('execution', '')}. Relay this lead contract: "
+                "assign substantive implementation, diagnosis, design, review tasks, and product judgment to workers "
+                "or consultants; small tasks need one worker, medium tasks need bounded worker packets, "
+                "and large tasks delegate project work. The lead coordinates, reviews integration, and verifies results. "
+                "Use the matrix for each child packet's own size/complexity."}))
         elif action.kind == "reject_lead_replacement":
             lead = state.active_run.lead_identity if state.active_run else "the registered lead"
             rendered.append(Action("inject_context", {"text":
@@ -3148,6 +3153,9 @@ def _claude_lead_guidance(state: ProjectState) -> str:
     """What a Claude lead needs at start and cannot derive: its children's types."""
     snapshot = _snapshot(state, "claude")
     return (
+        "For assessed work, assign substantive work to workers or consultants; small tasks need one worker, "
+        "medium tasks need bounded worker packets, and large tasks delegate project work. "
+        "The lead coordinates, integrates, and verifies results. "
         "Symphony worker agent types by the packet's own size/complexity: "
         + "; ".join(_claude_cells(snapshot, "worker"))
         + f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
@@ -3199,10 +3207,16 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                 "Symphony fast route: the root is a courier. Spawn one capable lead at "
                 f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
                 "`SYMPHONY_FAST_ROUTE: lead` on separate lines. " + spawn +
-                "Relay the entire task and its acceptance checks. Before any writes, the lead must "
-                "decide whether scope is bounded, requirements clear, risk low, required tools "
+                "Relay the entire task and its acceptance checks. Before any changes, the lead must "
+                "decide whether the WHOLE objective consists only of predetermined mechanical steps "
+                "with an expected result, scope bounded, requirements clear, risk low, required tools "
                 "(including browser or computer control when needed) available, and verification concrete. "
-                "If all hold, work directly end-to-end and finish with exact lines "
+                "Eligible examples: run a supplied bash/git command and report its result, or read a specified "
+                "browser page through known steps. Implementation, diagnosis, design, substantive review, "
+                "product judgment, mixed work, or uncertainty requires escalation before any changes, "
+                "even for a tiny feature. A run-and-fix request escalates as a whole. "
+                "A tool name, short task, or supplied command alone does not establish eligibility. "
+                "Only an eligible mechanical objective runs directly and finishes with exact lines "
                 "`SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`. "
                 "If any check fails or is uncertain, make no changes and finish with exact line "
                 "`SYMPHONY_FAST_DECISION: escalate`; then spawn an independent strongest/high assessor "
@@ -3240,6 +3254,10 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
         "\"risk\":\"normal|high\",\"rationale\":\"...\",\"topology\":\"...\"}. "
         "Every later worker or consultant spawn needs its matching SYMPHONY_ROLE line and explicit model/effort; "
         "consultants also need SYMPHONY_DECISION JSON with decision-local size and complexity. "
+        "The matrix fixes execution topology; the assessor's topology is advisory. Relay this lead contract: "
+        "assign substantive work to workers or consultants; small tasks need one worker, medium tasks need "
+        "bounded worker packets, and large tasks delegate project work. The lead coordinates, integrates, "
+        "and verifies results. Use the matrix for each child packet's own size/complexity. "
         "Relay the task in full: the lead cannot see this conversation, so if the request has several parts, "
         "every part goes in the packet and the acceptance check covers all of them. "
         f"{boost}{codex}{claude}Task: {task}"
@@ -3460,7 +3478,7 @@ def _status(
         route = assessment.get("route", {})
         if not isinstance(route, Mapping):
             route = {}
-        topology = assessment.get("topology") or route.get("execution")
+        topology = route.get("execution") or assessment.get("topology")
         if topology:
             lines.append(f"Topology: {topology}")
         model = route.get("lead_model") or route.get("lead_tier")

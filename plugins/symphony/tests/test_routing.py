@@ -20,9 +20,9 @@ class RoutingTests(unittest.TestCase):
 
     def test_nine_cell_matrix(self):
         expected = {
-            ("small", "simple"): ("capable", "medium", "direct", "none"),
-            ("small", "mixed"): ("capable", "high", "direct", "optional"),
-            ("small", "complex"): ("strongest", "high", "direct", "independent-check"),
+            ("small", "simple"): ("capable", "medium", "delegated", "none"),
+            ("small", "mixed"): ("capable", "high", "delegated", "optional"),
+            ("small", "complex"): ("strongest", "high", "delegated", "independent-check"),
             ("medium", "simple"): ("balanced", "medium", "mixed", "none"),
             ("medium", "mixed"): ("balanced", "high", "mixed", "optional"),
             ("medium", "complex"): ("capable", "high", "mixed", "reserved"),

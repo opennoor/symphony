@@ -34,9 +34,9 @@ class Route:
 
 
 MATRIX = {
-    ("small", "simple"): Route("capable", "medium", "direct", "none"),
-    ("small", "mixed"): Route("capable", "high", "direct", "optional"),
-    ("small", "complex"): Route("strongest", "high", "direct", "independent-check", True),
+    ("small", "simple"): Route("capable", "medium", "delegated", "none"),
+    ("small", "mixed"): Route("capable", "high", "delegated", "optional"),
+    ("small", "complex"): Route("strongest", "high", "delegated", "independent-check", True),
     ("medium", "simple"): Route("balanced", "medium", "mixed", "none"),
     ("medium", "mixed"): Route("balanced", "high", "mixed", "optional"),
     ("medium", "complex"): Route("capable", "high", "mixed", "reserved"),
@@ -171,7 +171,7 @@ def assessor_selection(snapshot: CapabilitySnapshot, requested: str = "off") -> 
 
 
 def fast_lead_selection(snapshot: CapabilitySnapshot) -> dict[str, str]:
-    """A capable, medium-effort first lead, or no fast route for this profile."""
+    """A capable/medium lead to check mechanical eligibility, or no fast route."""
     model = snapshot.tiers.get("capable", "")
     try:
         rank = json.loads((PROFILES_PATH.parent / "model-policy.json").read_text(encoding="utf-8"))["models"][model]["capability_rank"]

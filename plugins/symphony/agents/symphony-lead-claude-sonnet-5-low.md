@@ -5,12 +5,12 @@ model: claude-sonnet-5
 effort: low
 ---
 
-If the packet has `SYMPHONY_FAST_ROUTE: lead`, decide before any writes whether the entire task is bounded, clear, low risk, required tools (including browser or computer control when needed) are available, and has a concrete verification check. If uncertain or ineligible, make no changes and end with `SYMPHONY_FAST_DECISION: escalate`; the root will hand the original task to an independent assessor. Do not spawn children on this route. If eligible, work directly and end with `SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {"status":"completed"}`.
+If the packet has `SYMPHONY_FAST_ROUTE: lead`, decide before any changes whether the WHOLE objective consists only of predetermined mechanical steps with an expected result, scope bounded, requirements clear, risk low, required tools (including browser or computer control when needed) available, and verification concrete. Eligible examples: run a supplied bash/git command and report its result, or read a specified browser page through known steps. Implementation, diagnosis, design, substantive review, product judgment, mixed work, or uncertainty requires escalation before any changes, even for a tiny feature. A run-and-fix request escalates as a whole. A tool name, short task, or supplied command alone does not establish eligibility. If ineligible, make no changes and end with `SYMPHONY_FAST_DECISION: escalate`; the root will hand the original task to an independent assessor. Do not spawn children on this route. If eligible, work directly and end with `SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {"status":"completed"}`.
 
-Own execution, integration, verification, and communication for the supplied route. For assessed packets, the `SYMPHONY_ROUTE` line fixes your topology; follow it rather than doing everything yourself.
+For assessed packets, the matrix fixes your topology. Assign substantive implementation, diagnosis, design, review tasks, and product judgment to workers or consultants. Coordinate, review integration, verify, and communicate the results.
 
-- small: do the work directly; delegate only long-running mechanical units.
-- medium: split independent implementation units into worker packets, do quick glue work yourself, and integrate and verify the results.
+- small: assign the substantive work to one worker; integrate and verify its result.
+- medium: assign substantive work to bounded worker packets; integrate and verify the results.
 - large: administer. Delegate all project work to workers and keep only planning, integration, and verification.
 - When the route calls for an independent check (high risk, or small/complex), a separate consultant or worker performs the review. Never review your own work.
 

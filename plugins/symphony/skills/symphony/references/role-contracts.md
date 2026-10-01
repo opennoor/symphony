@@ -24,7 +24,7 @@ Use the host role name `symphony_<role>_<model>_<effort>` when custom names are 
 
 ## Assessment
 
-For a new task, the hook may offer one fast lead at the account profile's capable model and medium effort. The root only relays the full task; it does not judge safety at its own effort. The lead packet has `SYMPHONY_ROLE: lead` and `SYMPHONY_FAST_ROUTE: lead` on separate lines, with the complete objective and acceptance check. On Codex, name it `symphony_lead_fast_<model>_<effort>` with model punctuation replaced by underscores so a native Start can identify the route even when PreToolUse is absent. Before any writes, the lead decides whether the whole request is bounded, clear, low risk, required tools (including browser or computer control when needed) are available, and has a concrete verification check. It works directly and returns both `SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {"status":"completed"}` only when all hold. Otherwise it makes no changes and returns `SYMPHONY_FAST_DECISION: escalate`. The root then waits for that native terminal, spawns an independent assessor for the original task, and follows the accepted matrix route. Missing, malformed, failed, or interrupted fast decisions remain recoverable. The fast lead cannot spawn descendants before deciding.
+For a new task, the hook may offer one fast lead at the account profile's capable model and medium effort. The root only relays the full task; it does not judge eligibility at its own effort. The lead packet has `SYMPHONY_ROLE: lead` and `SYMPHONY_FAST_ROUTE: lead` on separate lines, with the complete objective and acceptance check. On Codex, name it `symphony_lead_fast_<model>_<effort>` with model punctuation replaced by underscores so a native Start can identify the route even when PreToolUse is absent. Before any changes, the lead checks that the WHOLE objective consists only of predetermined mechanical steps with an expected result, scope bounded, requirements clear, risk low, required tools (including browser or computer control when needed) available, and verification concrete. A supplied bash/git command or reading a specified browser page through known steps can qualify. Implementation, diagnosis, design, substantive review, product judgment, mixed work, or uncertainty escalates before any changes, even for a tiny feature. A run-and-fix request escalates as a whole. Only an eligible mechanical objective works directly and returns both `SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {"status":"completed"}`. Otherwise it makes no changes and returns `SYMPHONY_FAST_DECISION: escalate`. The root waits for that native terminal, spawns an independent assessor for the original task, and follows the accepted matrix route. Missing, malformed, failed, or interrupted fast decisions remain recoverable. The fast lead cannot spawn descendants before deciding.
 
 Run substantive or uncertain work as a bounded assessment on the strongest model in the accepted account profile, normally at `high` effort. A session assessor boost uses native levels above high: Codex xhigh/max/ultra, Claude xhigh/max. Unsupported account/model levels are rejected, never mapped to another effort. Boosts apply only to subsequent assessor spawns. The assessor chooses needs, not provider model names, and does not become the lead implicitly.
 
@@ -35,17 +35,17 @@ size: small | medium | large
 complexity: simple | mixed | complex
 risk: <classification and material concerns>
 rationale: <concise evidence-based reason>
-topology: <direct | selective delegation | administrative delegation>
+topology: <advisory recommendation; the matrix fixes delegated | mixed>
 abstract_role_routes:
   lead: <tier/effort>
-  workers: <tier/effort requirements or none>
+  workers: <tier/effort requirements for substantive work>
   consultants: <tier/effort requirements, capacity, or none>
 ```
 
 The assessor's final response must include the same fields on one exact machine-readable line so Codex can accept the route from its native `SubagentStop` event:
 
 ```text
-SYMPHONY_ASSESSMENT: {"size":"medium","complexity":"mixed","risk":"normal","rationale":"...","topology":"selective delegation"}
+SYMPHONY_ASSESSMENT: {"size":"medium","complexity":"mixed","risk":"normal","rationale":"...","topology":"mixed"}
 ```
 
 Before spawning the selected lead, put its role and the accepted fields on exact first-class lines in the lead task so the lifecycle hook can register the route before the host starts it:
@@ -55,7 +55,7 @@ SYMPHONY_ROLE: lead
 SYMPHONY_ROUTE: {"size":"medium","complexity":"mixed","risk":"normal","rationale":"...","topology":"mixed"}
 ```
 
-The JSON values must use the matrix vocabulary above. Claude can reject malformed Agent spawn markers before launch. On the currently observed Codex collaboration path, Symphony correlates task name and settings from the native child transcript and accepts the route from the assessor's final lifecycle message; no pre-spawn rejection is established for that path.
+The JSON values must use the matrix vocabulary above. The accepted topology always comes from the matrix, even when the assessor recommends a different one. Claude can reject malformed Agent spawn markers before launch. On the currently observed Codex collaboration path, Symphony correlates task name and settings from the native child transcript and accepts the route from the assessor's final lifecycle message; no pre-spawn rejection is established for that path.
 
 ## Actionable work packet
 
@@ -82,9 +82,10 @@ Symphony's hooks enforce supported routing and lifecycle events. They do not obs
 
 ## Lead
 
-- Own execution, integration, verification, and user communication for the task.
-- A small lead works directly except for long-running mechanical work.
-- A medium lead integrates and handles quick work while delegating bounded units selectively.
+- Coordinate execution, integration, verification, and user communication for the task.
+- Assign substantive implementation, diagnosis, design, review tasks, and product judgment to workers or consultants. Review integration and verify returned results as the lead.
+- A small lead assigns substantive work to one worker, then integrates and verifies its result.
+- A medium lead assigns substantive work to bounded worker packets, then integrates and verifies the results.
 - A large lead is an inexpensive administrator: delegate project work and reserve consultant capacity for narrow decisions.
 - Preserve active ownership across reassessment. Replace the lead only at a safe boundary or when unavailable or materially incapable.
 - When required consultation is unavailable, a large lead uses the disclosed conservative fallback instead of absorbing specialist reasoning silently.

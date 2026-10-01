@@ -95,13 +95,13 @@ User interruption and host-enforced overrides remain authoritative, so interrupt
 
 Assessment treats task size and complexity as separate axes. The fixed route is resolved against the capability map shipped with the installed version. Hooks are given no model inventory by either host, so the map is maintained at release time rather than discovered at runtime.
 
-For new tasks with an available capable/medium route, Symphony first sends the full request to one lead. That lead checks scope, clarity, risk, required tools, and verification before making changes. Bounded, clear, low-risk work runs directly; uncertainty or larger work is handed to an independent assessor. A missing or malformed lead decision cannot complete the run. An explicit assessor boost uses the assessor path directly. This before-write check is performed by the lead; current host hooks enforce the route and final disposition but cannot observe every tool action inside an agent.
+For new tasks with an available capable/medium route, Symphony first sends the full request to one lead to check mechanical eligibility. Direct execution requires the whole objective to consist of predetermined mechanical steps with an expected result, bounded scope, clear requirements, low risk, available tools, and concrete verification. Examples include a supplied bash/git command or reading a specified browser page through known steps. Implementation, diagnosis, design, substantive review, product judgment, mixed work, or uncertainty goes to an independent assessor before any changes, even for a tiny feature; a run-and-fix request escalates as a whole. A missing or malformed lead decision cannot complete the run. An explicit assessor boost uses the assessor path directly. This check is performed by the lead; current host hooks enforce the route and final disposition but cannot observe every tool action inside an agent.
 
 Symphony ships several profiles per provider and routes through the best one your plan is entitled to, falling back to a conservative floor when entitlement cannot be read. When your plan clamps a task to a weaker model, the lead spawn stops and waits for `proceed`, so quality never degrades silently; a reduced effort on the same model is announced and continues.
 
 | Size / complexity | Simple | Mixed | Complex |
 |---|---|---|---|
-| Small | capable/medium, direct | capable/high, direct with optional consultation | strongest/high, direct with independent review |
+| Small | capable/medium, delegated | capable/high, delegated with optional consultation | strongest/high, delegated with independent review |
 | Medium | balanced/medium, mixed | balanced/high, mixed with optional consultation | capable/high, mixed with reserved consultation |
 | Large | economy/low, delegated | economy/medium, delegated with reserved consultation | economy/medium, delegated with strongest consultation |
 
@@ -109,7 +109,7 @@ On Claude Code, the first substantive Symphony task checks Sonnet 5 and Opus 5.5
 
 Claude Code's Agent hook can reject an invalid spawn before launch. On Symphony's currently supported Codex collaboration path, a mis-routed spawn is detected after the child starts. Codex documents `PreToolUse` for ordinary `spawn_agent`, but Symphony has not verified pre-spawn enforcement on its exact collaboration path. Claude's packaged hooks match Agent calls, not Skill calls, so optional-capability practice is reported and checked by agents rather than host-enforced.
 
-The assessor is bounded, read-only, and separate from the assessed lead. The assessed lead route never inherits the assessor's expensive model or effort. Large-task leads administer dependency-aware work and reserve capacity for narrow consultant decisions. Small-task leads do straightforward work directly and delegate only genuinely independent or mechanical units.
+The assessor is bounded, read-only, and separate from the assessed lead. The assessed lead route never inherits the assessor's expensive model or effort. The matrix fixes execution topology, overriding an assessor's advisory recommendation. Assessed small substantive work uses one worker; medium work uses bounded worker packets. Leads coordinate, integrate, and verify results. Large-task leads administer dependency-aware work and reserve capacity for narrow consultant decisions.
 
 `reassess` updates subsequent work at a safe evidence boundary. It does not duplicate an active lead or rewrite completed work.
 
