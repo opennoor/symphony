@@ -30,6 +30,54 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_live_update_versions_keep_default_release_and_explicit_160_strict(self):
+        for old, candidate in (("1.5.1", "1.6.0"), ("1.5.1", "1.7.0"),
+                               ("1.6.0", "1.7.0")):
+            with self.subTest(old=old, candidate=candidate):
+                native.require_live_update_versions(old, candidate)
+        for old, candidate in (("1.5.1", "1.5.1"), ("1.5.1", "1.5.0"),
+                               ("1.6.0", "1.6.0"), ("1.6.0", "1.5.1"),
+                               ("1.7.0", "1.8.0"), ("1.5.0", "1.7.0"),
+                               (None, "1.7.0"), ([], "1.7.0"),
+                               ("1.6.0", "1.7"), ("1.6.0", "1.7.0-dev"),
+                               ("1.6.0", None)):
+            with self.subTest(old=old, candidate=candidate), self.assertRaises(RuntimeError):
+                native.require_live_update_versions(old, candidate)
+
+    def test_live_update_main_accepts_both_released_roots_with_default_candidate(self):
+        for old_version in ("1.5.1", "1.6.0"):
+            with self.subTest(old_version=old_version), tempfile.TemporaryDirectory() as temporary:
+                old_root = Path(temporary) / old_version
+                argv = [str(HARNESS), "--provider", "codex", "--live-update",
+                        "--only-live-update", "--old-plugin-root", str(old_root)]
+                update = {"home": Path(temporary) / "disposable-home"}
+                stdout = io.StringIO()
+                with patch.object(native, "package_version", side_effect=[old_version, "1.7.0"]) as versions, \
+                     patch.object(native, "prepare_live_update", return_value=update) as prepare, \
+                     patch.object(native, "prepare_baseline_capture") as baseline, \
+                     patch.object(native, "check_codex_mixed_live_update", return_value={"completed": ["a", "b"]}) as check, \
+                     patch.object(sys, "argv", argv), patch.object(sys, "stdout", stdout), \
+                     patch.dict(native.os.environ, {"OPENAI_API_KEY": "fixture-auth", "SYMPHONY_NATIVE_DIAGNOSTICS_DIR": ""}):
+                    self.assertEqual(native.main(), 0)
+                self.assertEqual([call.args[0] for call in versions.call_args_list], [old_root, PLUGIN])
+                self.assertEqual(prepare.call_args.args[2:], (old_root, PLUGIN))
+                baseline.assert_not_called()
+                self.assertIs(check.call_args.args[3], update)
+
+    def test_live_update_install_preflight_rejects_same_or_newer_old_before_mutation(self):
+        for old, candidate in (("1.5.1", "1.5.1"), ("1.6.0", "1.6.0"),
+                               ("1.6.0", "1.5.1"), ("1.7.0", "1.7.0")):
+            with self.subTest(old=old, candidate=candidate), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with patch.object(native, "package_version", side_effect=[old, candidate]), \
+                     patch.object(native, "marketplace") as market, \
+                     patch.object(native, "codex_command") as command, \
+                     self.assertRaises(RuntimeError):
+                    native.prepare_live_update("codex", root, root / "old", root / "candidate")
+                market.assert_not_called()
+                command.assert_not_called()
+                self.assertFalse((root / "codex-live-update-home").exists())
+
     def test_literal_claude_worker_uses_actual_admitted_start_or_exact_legacy_clock(self):
         from dataclasses import asdict
         from plugins.symphony.tests.test_assessed_contract import AssessedContractTests

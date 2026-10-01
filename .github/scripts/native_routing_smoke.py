@@ -30,7 +30,8 @@ from symphony import host_evidence  # noqa: E402
 from symphony.routing import Assessment, fast_lead_selection, route_for, snapshot_for  # noqa: E402
 from symphony.store import StateStore, _state_from_dict, _run_from_dict  # noqa: E402
 from symphony.model import Event, ProjectState  # noqa: E402
-from symphony.runtime import _terminal_result_id  # noqa: E402
+from symphony.adapters import event_from_payload  # noqa: E402
+from symphony.runtime import _terminal_result_id, _child_turn_token, _observed_role  # noqa: E402
 
 CASES = {
     "command": "Run python -m unittest -q and report the result.",
@@ -162,7 +163,7 @@ def failure_diagnostics(provider, root, document):
             'fast_decision_representations': fast_representations,
             'fast_terminal_turns': fast_terminal_turns,
             'fast_command_witnesses': fast_command_witnesses,
-            'assessed_completion': [assessed_completion_probe(provider, home, run) for run in runs
+            'assessed_completion': [assessed_completion_probe(provider, home, run, document) for run in runs
                                     if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'root_native_launches': root_launches,
             'claude_completion': [claude_completion_probe(document, run.get('session_id'), root / 'primary', home)
@@ -609,7 +610,176 @@ def command_witness_probe(provider, rows):
     return result
 
 
-def assessed_completion_probe(provider, home, run):
+def install_private_child_capture(root):
+    """Keep original callback payloads private for exact diagnostic replay."""
+    directory = root / 'private-child-hooks'
+    directory.mkdir(mode=0o700)
+    script = root / 'capture_claude_hook.py'
+    anchor = 'provider = sys.argv[3]\n'
+    source = script.read_text(encoding='utf-8')
+    require(source.count(anchor) == 1, 'private callback capture has no unique insertion point')
+    extra = (
+        "if provider == 'claude' and event in {'SubagentStart', 'SubagentStop'}:\n"
+        f"    private_file = pathlib.Path({str(directory)!r}) / (invocation + '.json')\n"
+        "    descriptor = os.open(private_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+        "    with os.fdopen(descriptor, 'w', encoding='utf-8') as private_stream:\n"
+        "        json.dump(payload, private_stream)\n")
+    script.write_text(source.replace(anchor, anchor + extra), encoding='utf-8')
+
+
+def claude_child_binding_probe(home, run_dict, document):
+    """Trace binding only when exact admitted callback sources remain available."""
+    try:
+        run = _run_from_dict(run_dict)
+    except (ValueError, TypeError):
+        return [{'source_stage': 'run_unavailable'}]
+    proofs = run.assessment.get('_substantive_children', {})
+    history = document.get('event_history', ()) if isinstance(document, dict) else ()
+    receipts = document.get('terminal_receipts', ()) if isinstance(document, dict) else ()
+    sources = {}
+    for path in (home.parent / 'private-child-hooks').glob('*.json'):
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(payload, dict) or payload.get('hook_event_name') not in {'SubagentStart', 'SubagentStop'}:
+                continue
+            event = event_from_payload('claude', payload)
+            # The observer clock is not the product's callback admission time.
+            # Require the exact canonical source ID in durable derived history.
+            matches = [record for record in history if record.get('kind') == 'delegation_updated'
+                       and (record.get('event_id') == event.event_id + ':delegation:delegation_updated'
+                            or re.fullmatch(re.escape(event.event_id) + r':terminal-epoch:\d+:delegation:delegation_updated',
+                                            record.get('event_id', '')) is not None)]
+            if len(matches) == 1 and host_evidence._instant(matches[0].get('observed_at')) is not None:
+                sources[event.event_id] = replace(event, observed_at=matches[0]['observed_at'])
+        except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+            continue
+    results = []
+    for ordinal, (identity, proof) in enumerate(proofs.items() if isinstance(proofs, dict) else ()):
+        if ordinal >= 12 or not isinstance(proof, dict):
+            continue
+        facts = {'ordinal': ordinal, 'source_stage': 'source_unavailable'}
+        start = sources.get(proof.get('start_event_id'))
+        if (start is None or start.kind != 'subagent_started' or start.observed_at != proof.get('admitted_at')
+                or (start.payload.get('agent_id') or start.payload.get('subagent_id')) != identity
+                or start.payload.get('session_id') != run.session_id
+                or _child_turn_token(start.payload) != proof.get('turn')):
+            facts['source_stage'] = 'admitted_start_unavailable'
+            results.append(facts)
+            continue
+        candidates = [event for event in sources.values() if event.kind == 'subagent_stopped'
+                      and (event.payload.get('agent_id') or event.payload.get('subagent_id')) == identity
+                      and event.payload.get('session_id') == run.session_id
+                      and _child_turn_token(event.payload) == proof.get('turn')
+                      and event.observed_at >= start.observed_at
+                      and any(receipt.get('provider') == 'claude' and receipt.get('session') == run.session_id
+                              and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity
+                              and receipt.get('turn') == proof.get('turn')
+                              and receipt.get('result') == _terminal_result_id(event) for receipt in receipts)]
+        if len(candidates) != 1:
+            facts['source_stage'] = 'terminal_source_unavailable' if not candidates else 'ambiguous_terminal_sources'
+            results.append(facts)
+            continue
+        terminal = candidates[0]
+        role = proof.get('role')
+        facts.update(source_stage='exact_start_and_terminal',
+            immutable_role_matches=_observed_role(terminal.payload) in {'', role}
+                and _observed_role(start.payload) in {'', role},
+            start_parent_consistent=proof.get('start_parent') in {'', run.lead_identity},
+            terminal_parent_consistent=terminal.payload.get('parent_thread_id') in {None, '', run.lead_identity},
+            source_start_parent_matches=proof.get('start_parent') == str(start.payload.get('parent_thread_id') or ''),
+            current_scope=proof.get('run_id') == run.run_id and proof.get('lead') == run.lead_identity
+                and proof.get('owner_generation') == run.owner_generation
+                and proof.get('epoch') == run.assessment.get('substantive_contract', {}).get('epoch'),
+            source_provider_matches=start.payload.get('provider') == terminal.payload.get('provider') == run.provider,
+            source_session_matches=start.payload.get('session_id') == terminal.payload.get('session_id') == run.session_id)
+        def trace(frame, event, value):
+            if frame.f_code is not host_evidence.claude_substantive_launch.__code__:
+                return None
+            if event == 'return':
+                values = frame.f_locals
+                facts.update(source_line=frame.f_lineno, binding_reader_accepted=value is not None,
+                    stage='accepted' if value else 'prompt_identity_timing' if 'prompt' in values else
+                    'child_prompts' if 'prompts' in values else 'cwd' if 'source_cwd' in values else
+                    'native_launch' if 'launches' in values else 'metadata' if 'metadata' in values else
+                    'paths' if 'paths' in values else 'input')
+                child, lead = values.get('child'), values.get('lead')
+                child_meta, lead_meta = values.get('child_meta'), values.get('lead_meta')
+                if isinstance(child_meta, dict) and isinstance(lead_meta, dict):
+                    facts.update(child_depth_two=type(child_meta.get('spawnDepth')) is int and child_meta['spawnDepth'] == 2,
+                        lead_depth_one=type(lead_meta.get('spawnDepth')) is int and lead_meta['spawnDepth'] == 1,
+                        child_type_matches=child is not None and isinstance(child_meta.get('agentType'), str)
+                            and child_meta['agentType'].endswith(f'symphony-{role}-{child.requested_tier}-{child.requested_effort}'),
+                        lead_type_matches=lead is not None and isinstance(lead_meta.get('agentType'), str)
+                            and lead_meta['agentType'].endswith(f'symphony-lead-{lead.requested_tier}-{lead.requested_effort}'))
+                if 'metadata' in values:
+                    facts['metadata_read_count'] = len(values['metadata'])
+                if 'paths' in values:
+                    facts['matching_native_child_paths'] = len(values['paths'])
+                if 'launches' in values:
+                    facts['matching_native_launch_count'] = len(values['launches'])
+                parent, launch = values.get('parent'), values.get('launch')
+                if isinstance(parent, dict) and isinstance(launch, dict):
+                    inputs = launch.get('input')
+                    inputs = inputs if isinstance(inputs, dict) else {}
+                    native_cwd, source_cwd = parent.get('cwd'), terminal.payload.get('cwd')
+                    facts.update(parent_session_matches=parent.get('sessionId') == run.session_id,
+                        parent_agent_matches=parent.get('agentId') == run.lead_identity,
+                        parent_sidechain=parent.get('isSidechain') is True,
+                        exact_agent_call=launch.get('type') == 'tool_use' and launch.get('name') == 'Agent',
+                        explicit_model_present='model' in inputs,
+                        explicit_model_matches=child is not None and ('model' not in inputs or inputs['model'] == child.requested_tier),
+                        subagent_type_matches=inputs.get('subagent_type') == values.get('child_type'),
+                        source_cwd_absolute=isinstance(source_cwd, str) and bool(source_cwd) and Path(source_cwd).is_absolute(),
+                        native_cwd_absolute=isinstance(native_cwd, str) and bool(native_cwd) and Path(native_cwd).is_absolute(),
+                        cwd_matches=isinstance(source_cwd, str) and isinstance(native_cwd, str)
+                            and Path(source_cwd).resolve() == Path(native_cwd).resolve())
+                for label, left, right in (('launch_minus_accepted_ms', 'launched', 'accepted'),
+                                           ('launch_minus_admitted_ms', 'launched', 'admitted'),
+                                           ('prompt_minus_launch_ms', 'when', 'launched'),
+                                           ('prompt_minus_callback_ms', 'when', 'observed')):
+                    if isinstance(values.get(left), datetime) and isinstance(values.get(right), datetime):
+                        facts[label] = round((values[left] - values[right]).total_seconds() * 1000, 3)
+                if 'prompts' in values:
+                    facts['textual_prompt_count'] = len(values['prompts'])
+                if 'child_rows' in values:
+                    facts['native_user_row_count'] = sum(row.get('type') == 'user' for row in values['child_rows'])
+                    unsupported = 0
+                    for row in values['child_rows']:
+                        if row.get('type') != 'user':
+                            continue
+                        message = row.get('message')
+                        content = message.get('content') if isinstance(message, dict) else None
+                        textual = isinstance(content, str) or isinstance(content, list) and bool(content) and all(
+                            isinstance(item, dict) and item.get('type') == 'text' and isinstance(item.get('text'), str)
+                            for item in content)
+                        tool_result = isinstance(content, list) and bool(content) and any(
+                            isinstance(item, dict) and item.get('type') == 'tool_result' for item in content) and all(
+                            isinstance(item, dict) and (item.get('type') == 'tool_result' or item.get('type') == 'text'
+                                and isinstance(item.get('text'), str)) for item in content)
+                        unsupported += not textual and not tool_result
+                    facts['unsupported_native_user_rows'] = unsupported
+                prompt = values.get('prompt')
+                if isinstance(prompt, dict):
+                    facts.update(prompt_session_matches=prompt.get('sessionId') == run.session_id,
+                        prompt_agent_matches=prompt.get('agentId') == identity,
+                        prompt_sidechain=prompt.get('isSidechain') is True,
+                        prompt_uuid_nonempty=isinstance(prompt.get('uuid'), str) and bool(prompt['uuid']))
+            return trace
+        previous = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            host_evidence.claude_substantive_launch(run, terminal, role, proof['admitted_at'],
+                                                   {'CLAUDE_CONFIG_DIR': str(home)})
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            facts['stage'] = 'probe_error'
+            facts['error_type'] = type(error).__name__
+        finally:
+            sys.settrace(previous)
+        results.append(facts)
+    return results
+
+
+def assessed_completion_probe(provider, home, run, document=None):
     """Separate admitted child proof from supplied lead-result categories."""
     assessment = run.get('assessment', {})
     contract = assessment.get('substantive_contract')
@@ -667,7 +837,8 @@ def assessed_completion_probe(provider, home, run):
             latest_effort_matches = bool(contexts and contexts[-1].get('effort') == child.get('requested_effort'))
     except (OSError, ValueError, RuntimeError, TypeError):
         pass
-    return {'contract_present': 'substantive_contract' in assessment,
+    return {'claude_child_binding': claude_child_binding_probe(home, run, document) if provider == 'claude' else [],
+            'contract_present': 'substantive_contract' in assessment,
             'contract_version_one': isinstance(contract, dict) and type(contract.get('version')) is int and contract['version'] == 1,
             'child_proof_counts': counts, 'retryable_lead_present': bool(assessment.get('_retryable_lead')),
             'substantive_child_missing': assessment.get('_substantive_child_missing') is True,
@@ -900,6 +1071,8 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("SYMPHONY_") and key not in {"CODEX_SESSION_ID", "CLAUDECODE"}}
     env.update(prepare_baseline_capture(provider, root, candidate))
+    if provider == 'claude':
+        install_private_child_capture(root)
     project, _ = projects(root, False)
     greeting = project / "greet.py"
     greeting.write_text("def greet(name):\n    return f'" + ("hello" if case == "run-and-fix" else "Hello") + ", {name}!'\n")

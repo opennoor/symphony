@@ -4,7 +4,9 @@ import importlib.util
 from dataclasses import asdict, replace
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 from tempfile import TemporaryDirectory
@@ -18,6 +20,93 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_private_claude_capture_keeps_raw_callback_outside_public_clock(self):
+        from native_managed_concurrency import CODEX_HOOK_CAPTURE
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / 'capture_claude_hook.py'
+            script.write_text(CODEX_HOOK_CAPTURE, encoding='utf-8')
+            smoke.install_private_child_capture(root)
+            payload = {'hook_event_name': 'SubagentStart', 'session_id': 'root', 'agent_id': 'worker',
+                       'role': 'worker', 'private_field': 'PRIVATE_SENTINEL', 'cwd': str(root)}
+            public = root / 'claude-hook-capture'
+            completed = subprocess.run([sys.executable, str(script), 'SubagentStart', str(public), 'claude'],
+                input=json.dumps(payload), capture_output=True, text=True, encoding='utf-8',
+                env={key: value for key, value in os.environ.items() if not key.startswith('SYMPHONY_')})
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            private = tuple((root / 'private-child-hooks').glob('*.json'))
+            self.assertEqual(len(private), 1)
+            self.assertEqual(json.loads(private[0].read_text(encoding='utf-8')), payload)
+            self.assertNotIn('PRIVATE_SENTINEL', ''.join(path.read_text(encoding='utf-8') for path in public.glob('*.json')))
+            if os.name != 'nt':
+                self.assertEqual(private[0].stat().st_mode & 0o777, 0o600)
+                self.assertEqual(private[0].parent.stat().st_mode & 0o777, 0o700)
+
+    def test_claude_binding_diagnostic_requires_exact_sources_and_original_timestamps(self):
+        from plugins.symphony.tests.test_assessed_contract import AssessedContractTests
+        fixture = AssessedContractTests()
+        fixture.begin('claude')
+        self.addCleanup(fixture.doCleanups)
+        fixture.worker()
+        run = asdict(fixture.state.active_run)
+        home = Path(fixture.environ['CLAUDE_CONFIG_DIR'])
+        proof = run['assessment']['_substantive_children']['worker']
+        child = next(item for item in run['delegations'] if item['identity'] == 'worker')
+        fields = {'session_id': run['session_id'], 'agent_id': 'worker', 'cwd': str(fixture.project),
+                  'role': 'worker', 'task': 'SYMPHONY_ROLE: worker', 'parent_thread_id': 'lead',
+                  'model': child['requested_tier'], 'model_reasoning_effort': child['requested_effort'],
+                  'prompt_id': 'worker-1'}
+        start = smoke.event_from_payload('claude', {**fields, 'hook_event_name': 'SubagentStart'})
+        terminal = smoke.event_from_payload('claude', {**fields, 'hook_event_name': 'SubagentStop',
+                                                     'status': 'completed', 'last_assistant_message': 'PRIVATE_SENTINEL'})
+        proof['start_event_id'] = start.event_id
+        history = [{'event_id': source.event_id + ':delegation:delegation_updated',
+                    'kind': 'delegation_updated', 'observed_at': timestamp} for source, timestamp in (
+                        (start, proof['admitted_at']), (terminal, child['updated_at']))]
+        receipt = {'provider': 'claude', 'session': run['session_id'], 'run_id': run['run_id'],
+                   'agent': 'worker', 'turn': proof['turn'], 'result': smoke._terminal_result_id(terminal)}
+        document = {'event_history': history, 'terminal_receipts': [receipt]}
+        private = home.parent / 'private-child-hooks'
+        private.mkdir()
+        for index, source in enumerate((start, terminal)):
+            (private / f'{index}.json').write_text(json.dumps(source.payload), encoding='utf-8')
+        result = smoke.claude_child_binding_probe(home, run, document)[0]
+        self.assertEqual(result['source_stage'], 'exact_start_and_terminal')
+        self.assertEqual(result['stage'], 'accepted')
+        self.assertTrue(result['binding_reader_accepted'])
+        self.assertLessEqual(result['launch_minus_admitted_ms'], 0)
+        self.assertLessEqual(result['prompt_minus_callback_ms'], 0)
+        self.assertEqual(result['textual_prompt_count'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+        self.assertNotIn(str(fixture.project), json.dumps(result))
+        for broken in ({'event_history': history[1:], 'terminal_receipts': [receipt]},
+                       {'event_history': history[:1], 'terminal_receipts': [receipt]},
+                       {'event_history': history, 'terminal_receipts': [{**receipt, 'result': 'foreign'}]},
+                       {'event_history': [{**history[0], 'event_id': 'foreign-source'}, history[1]],
+                        'terminal_receipts': [receipt]}):
+            with self.subTest(broken=broken):
+                unavailable = smoke.claude_child_binding_probe(home, run, broken)[0]
+                self.assertIn('unavailable', unavailable['source_stage'])
+                self.assertNotIn('binding_reader_accepted', unavailable)
+        child_path = next((home / 'projects').glob('*/root/subagents/agent-worker.jsonl'))
+        child_source = child_path.read_text(encoding='utf-8')
+        malformed = {'type': 'user', 'message': {'content': [{'type': 'image', 'source': 'PRIVATE_SENTINEL'}]}}
+        child_path.write_text(child_source + json.dumps(malformed) + '\n', encoding='utf-8')
+        rejected = smoke.claude_child_binding_probe(home, run, document)[0]
+        self.assertEqual(rejected['stage'], 'child_prompts')
+        self.assertFalse(rejected['binding_reader_accepted'])
+        self.assertEqual(rejected['unsupported_native_user_rows'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(rejected))
+        child_path.write_text(child_source, encoding='utf-8')
+        parent_path = next((home / 'projects').glob('*/root/subagents/agent-lead.jsonl'))
+        rows = [json.loads(line) for line in parent_path.read_text(encoding='utf-8').splitlines()]
+        rows[0]['timestamp'] = '2026-10-01T14:00:59+00:00'
+        parent_path.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        rejected = smoke.claude_child_binding_probe(home, run, document)[0]
+        self.assertFalse(rejected['binding_reader_accepted'])
+        self.assertEqual(rejected['stage'], 'native_launch')
+        self.assertGreater(rejected['launch_minus_admitted_ms'], 0)
+
     def test_command_witness_diagnostics_preserve_failed_missing_and_unsafe_command_categories(self):
         def call(identity, command):
             return {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': identity,

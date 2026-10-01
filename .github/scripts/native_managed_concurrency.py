@@ -708,6 +708,17 @@ def package_version(source):
     return version
 
 
+def require_live_update_versions(old_version, candidate_version):
+    """Keep the default released baseline and allow the explicit 1.6.0 replay."""
+    if not isinstance(old_version, str) or old_version not in {"1.5.1", "1.6.0"}:
+        raise RuntimeError("live update requires an actual released 1.5.1 or 1.6.0 package")
+    if (not isinstance(candidate_version, str)
+            or not re.fullmatch(r"\d+\.\d+\.\d+", candidate_version)
+            or tuple(map(int, candidate_version.split(".")))
+               <= tuple(map(int, old_version.split(".")))):
+        raise RuntimeError(f"live update requires a candidate genuinely newer than {old_version}")
+
+
 def marketplace(root, name, source, version):
     destination = root / name
     plugin = destination / "plugins" / "symphony"
@@ -823,8 +834,7 @@ def prepare_baseline_capture(provider, root, candidate_source):
 def prepare_live_update(provider, root, old_source, candidate_source):
     old_source, candidate_source = old_source.resolve(), candidate_source.resolve()
     old_version, candidate_version = package_version(old_source), package_version(candidate_source)
-    if old_version != "1.5.1" or tuple(map(int, candidate_version.split("."))) <= (1, 5, 1):
-        raise RuntimeError("live update requires an actual installed 1.5.1 package and a newer candidate")
+    require_live_update_versions(old_version, candidate_version)
     home = root / f"{provider}-live-update-home"
     home.mkdir()
     env = {**os.environ, "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR": str(home)}
@@ -862,7 +872,7 @@ def prepare_live_update(provider, root, old_source, candidate_source):
     old_cache = home / "plugins" / "cache" / "symphony-old" / "symphony" / old_version
     hook = "codex.json" if provider == "codex" else "hooks.json"
     if not (old_cache / "hooks" / hook).is_file():
-        raise RuntimeError(f"old 1.5.1 package was not installed in the disposable {provider} home")
+        raise RuntimeError(f"old {old_version} package was not installed in the disposable {provider} home")
     return {"provider": provider, "env": env, "home": home, "old_version": old_version,
             "candidate_version": candidate_version, "old_cache": old_cache,
             "candidate_cache": home / "plugins" / "cache" / "symphony-candidate" /
@@ -883,7 +893,7 @@ def update_while_gated(update, env, docs, sessions, projects_by_label, deadline)
         record = next((item for item in choices if item.get("session_id") == session
                        and item.get("plugin_version") == update["old_version"]), None)
         if not record or Path(record.get("plugin_root", "")).resolve() != old_root.resolve():
-            raise RuntimeError(f"{label}: active native session is not using installed 1.5.1")
+            raise RuntimeError(f"{label}: active native session is not using installed {update['old_version']}")
         retained = Path(record.get("runtime_root", ""))
         if not retained.is_dir() or retained.parent.resolve() != Path(env["SYMPHONY_RUNTIME_DIR"]).resolve():
             raise RuntimeError(f"{label}: trusted old runtime was not retained before update")
@@ -2309,7 +2319,7 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
         if not any(item.get("session_id") == sessions["a"]
                    and item.get("plugin_version") == update["old_version"]
                    for item in profiles):
-            raise RuntimeError("old A did not use its guarded 1.5.1 runtime")
+            raise RuntimeError(f"old A did not use its guarded {update['old_version']} runtime")
         snapshot = {"original_owners": {"a": {"session_id": sessions["a"],
                                                "run_id": runs["a"], "lead_id": leads["a"]}},
                     "gate_release_before_update": released_before_registration,
@@ -3525,7 +3535,8 @@ def main():
                         help="run only the two independent worktree owners")
     parser.add_argument("--direct-stop-resume", action="store_true",
                         help="probe an exact normal Stop control on Codex live-update resume")
-    parser.add_argument("--old-plugin-root", type=Path)
+    parser.add_argument("--old-plugin-root", type=Path,
+                        help="actual released 1.5.1 package (default CI baseline), or explicit 1.6.0 package")
     parser.add_argument("--candidate-plugin-root", type=Path,
                         default=Path(__file__).resolve().parents[2] / "plugins" / "symphony")
     args = parser.parse_args()
@@ -3544,9 +3555,7 @@ def main():
                     raise RuntimeError("--live-update requires --old-plugin-root")
                 old_version = package_version(args.old_plugin_root)
                 candidate_version = package_version(args.candidate_plugin_root)
-                if (old_version != "1.5.1"
-                        or tuple(map(int, candidate_version.split("."))) <= (1, 5, 1)):
-                    raise RuntimeError("live update requires 1.5.1 and a genuinely newer candidate")
+                require_live_update_versions(old_version, candidate_version)
                 if args.provider == "codex":
                     auth = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
                     if not os.environ.get("OPENAI_API_KEY") and not auth.is_file():
