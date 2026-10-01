@@ -72,7 +72,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
             for index, line in enumerate(handle):
-                if index >= 32:
+                if index >= 64:
                     break
                 try:
                     record = json.loads(line)
@@ -98,7 +98,22 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                         found["model"] = str(record_payload["model"])
                     if record_payload.get("effort"):
                         found["model_reasoning_effort"] = str(record_payload["effort"])
-                if "task_name" in found and "model_reasoning_effort" in found:
+                elif (record.get("type") == "event_msg"
+                      and record_payload.get("type") == "user_message"):
+                    message = record_payload.get("message")
+                    if isinstance(message, str) and "SYMPHONY_FAST_ROUTE: lead" in message:
+                        found["task"] = message
+                elif (record.get("type") == "response_item"
+                      and record_payload.get("type") == "message"
+                      and record_payload.get("role") == "user"):
+                    content = record_payload.get("content")
+                    if isinstance(content, list):
+                        message = "\n".join(str(item.get("text")) for item in content
+                                            if isinstance(item, dict) and item.get("type") == "input_text"
+                                            and isinstance(item.get("text"), str))
+                        if "SYMPHONY_FAST_ROUTE: lead" in message:
+                            found["task"] = message
+                if {"task_name", "model_reasoning_effort", "task"} <= found.keys():
                     break
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return found

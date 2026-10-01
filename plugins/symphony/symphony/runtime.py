@@ -23,12 +23,13 @@ from .host_evidence import (
     codex_unavailable_lead_proof,
 )
 from .model import Action, Delegation, Event, ProjectState, RunState
-from .reducer import _stop_block_reason, reduce
+from .reducer import _ACTIVE_STATES, _stop_block_reason, reduce
 from .routing import (
     Assessment,
     EFFORTS,
     NO_PROFILE,
     assessor_selection,
+    fast_lead_selection,
     clamp_against_best,
     model_is_weaker,
     profiles_for,
@@ -798,7 +799,8 @@ def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, 
     if source.kind in {"subagent_started", "subagent_stopped"}:
         # A child with no known parent/run cannot claim an arbitrary project
         # run. An assessor may open a new run under its reported session.
-        if source.kind == "subagent_started" and _observed_role(source.payload) == "assessor":
+        if source.kind == "subagent_started" and (_observed_role(source.payload) == "assessor"
+                                                   or _fast_spawn(source.payload)):
             return key, session
         return None
     return key, session
@@ -1370,11 +1372,19 @@ def _observe_delegation(
         return state, ()
     opening: tuple[Action, ...] = ()
     if not state.active_run:
-        if source.kind != "subagent_started" or _observed_role(source.payload) != "assessor":
+        fast = _fast_spawn(source.payload)
+        if source.kind != "subagent_started" or (_observed_role(source.payload) != "assessor" and not fast):
             return state, ()
         state, opening = _open_run(
-            state, source, str(source.payload.get("task") or source.payload.get("objective") or "")
+            state, source, (_tool_objective({"message": source.payload.get("task")}) if fast else
+                            str(source.payload.get("task") or source.payload.get("objective") or ""))
         )
+        if fast and state.active_run:
+            selection = fast_lead_selection(_snapshot(state, str(source.payload.get("provider") or "codex")))
+            state = _mark_fast_run(state, selection, str(source.payload.get("provider") or "codex"))
+            if not selection["model"]:
+                opening += (Action("inject_context", {"text":
+                    "The fast lead floor is unavailable. Stop this tracked child and spawn an independent assessor."}),)
         if not state.active_run:
             return state, opening
     current = next(
@@ -1541,6 +1551,8 @@ def _observe_delegation(
             and state.active_run.lead_identity
             and state.active_run.lead_identity != str(identity)
             and (state.active_run.status == "completing"
+                 or (state.active_run.assessment.get("_fast_escalated")
+                     and not state.active_run.assessment.get("size"))
                  or (retryable_replacement and unavailable_proof is None))):
         # A Codex SubagentStart can arrive without PreToolUse after the root
         # completed its lead, or while the original lead is retryable. The
@@ -1557,7 +1569,8 @@ def _observe_delegation(
             state = replace(state, active_run=replace(state.active_run, assessment=assessment))
         owner_generation = state.active_run.owner_generation
         if (
-            state.active_run.status in {"interrupted", "recovering"}
+            (state.active_run.status in {"interrupted", "recovering"}
+             or state.active_run.assessment.get("_fast_escalated"))
             and state.active_run.lead_identity
             and state.active_run.lead_identity != str(identity)
         ):
@@ -1569,6 +1582,8 @@ def _observe_delegation(
                 source,
                 "lead_started",
                 {"identity": str(identity), "owner_generation": owner_generation,
+                 **({"safe_boundary": True} if state.active_run.assessment.get("_fast_escalated")
+                    and state.active_run.assessment.get("size") else {}),
                  **({"unavailability_digest": unavailable_proof["digest"]}
                     if unavailable_proof is not None else {})},
                 "lead",
@@ -1596,6 +1611,9 @@ def _observe_delegation(
             resolved_profile = None
             if pending.get("role") == "lead" and pending.get("model") and pending.get("effort"):
                 selected = f"{pending['model']}/{pending['effort']}"
+            elif state.active_run.assessment.get("_fast_pending"):
+                selected = "/".join(str(state.active_run.assessment.get("_fast_route", {}).get(key) or "")
+                                    for key in ("model", "effort"))
             elif (session_profile is not None and state.active_run.assessment.get("size")
                   and state.active_run.assessment.get("complexity")):
                 recorded = state.active_run.assessment
@@ -1716,7 +1734,10 @@ def _observe_delegation(
             observed_assessor.requested_tier != expected.get("model")
             or observed_assessor.requested_effort != expected.get("effort")
         ))
-        if mismatch:
+        if status.lower() not in {"completed", "done", "success", "succeeded"}:
+            actions += (Action("inject_context", {"text":
+                "The independent assessor did not complete successfully. Retry assessment before selecting a lead."}),)
+        elif mismatch:
             actions += (Action("inject_context", {"text":
                 f"Assessor boost was not observed at {expected['model']}/{expected['effort']}. "
                 "Retry with the effective boosted route before selecting a lead."}),)
@@ -1788,9 +1809,57 @@ def _observe_delegation(
     if role == "lead" and terminal and state.active_run:
         if str(identity) != state.active_run.lead_identity:
             return state, actions
+        if state.active_run.assessment.get("_fast_escalated"):
+            return state, actions + (Action("inject_context", {"text":
+                "The fast lead already handed off. Await the independent assessment and replacement lead."}),)
         successful = status.lower() in {"completed", "done", "success", "succeeded"}
         outcome = {"status": status}
         report = str(source.payload.get("last_assistant_message") or "")
+        fast_pending = bool(state.active_run.assessment.get("_fast_pending"))
+        decisions = [line.strip().removeprefix("SYMPHONY_FAST_DECISION:").strip()
+                     for line in report.splitlines()
+                     if line.strip().startswith("SYMPHONY_FAST_DECISION:")] if fast_pending else []
+        fast_decision = decisions[0] if len(decisions) == 1 else ""
+        if fast_pending and not state.active_run.assessment.get("_fast_route", {}).get("model"):
+            successful = False
+        fast_route = state.active_run.assessment.get("_fast_route", {}) if fast_pending else {}
+        fast_observed = next((item for item in state.active_run.delegations
+                              if item.identity == str(identity)), None)
+        fast_verified = bool(fast_observed and fast_route.get("model")
+                             and fast_observed.requested_tier == fast_route["model"]
+                             and fast_observed.requested_effort == fast_route["effort"])
+        fast_disallowed = bool(state.active_run.assessment.get("_fast_disallowed"))
+        descendants = [item for item in state.active_run.delegations
+                       if item.identity != str(identity)]
+        unsettled = [item.identity for item in descendants
+                     if item.state.lower() in _ACTIVE_STATES | {"interrupted"}]
+        if (fast_pending and status.lower() in {"completed", "done", "success", "succeeded", "failed"}
+                and (fast_disallowed or not fast_verified)
+                and not unsettled):
+            state = _escalate_fast_run(state, source)
+            return state, actions + (Action("inject_context", {"text":
+                "The fast lead was not authorized at its native route. Its result cannot complete "
+                "the task; inspect any partial work and spawn an independent assessor."}),)
+        if fast_pending and not fast_verified:
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead route could not be verified at the capable/medium floor."}),)
+        if fast_pending and (unsettled or (fast_decision == "eligible" and descendants)):
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead cannot finish while descendants remain, and direct completion "
+                "is invalid after any descendant: "
+                + ", ".join(item.identity for item in descendants)}),)
+        if fast_pending and successful and fast_verified and fast_decision == "escalate":
+            state = _escalate_fast_run(state, source)
+            return state, actions + (Action("inject_context", {"text":
+                "Fast lead handed off. Inspect any partial work, then spawn an independent "
+                "assessor for the full task."}),)
+        if fast_pending and fast_decision != "eligible":
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead decision missing or invalid. Recover the same lead's terminal decision; "
+                "an assessor can start only after an explicit escalation."}),)
         outcome_lines = [line for line in report.splitlines() if line.strip().startswith("SYMPHONY_OUTCOME:")]
         if outcome_lines:
             try:
@@ -1804,6 +1873,22 @@ def _observe_delegation(
                 successful = False
                 actions += (Action("inject_context", {"text":
                     "The lead ended with a malformed SYMPHONY_OUTCOME report. Reconcile its result or retry the lead; the run remains recoverable."}),)
+        elif fast_pending:
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead completion requires an explicit SYMPHONY_OUTCOME report."}),)
+        if fast_pending and len(outcome_lines) != 1:
+            successful = False
+        if fast_pending and successful and fast_decision == "eligible":
+            selected = state.active_run.assessment["_fast_route"]
+            accepted = dict(state.active_run.assessment)
+            accepted.pop("_fast_pending", None)
+            accepted.update({"size": "small", "complexity": "simple", "risk": "normal",
+                             "topology": "direct", "rationale": "fast lead verified bounded low-risk work",
+                             "route": {"lead_model": selected["model"],
+                                       "lead_effort": selected["effort"],
+                                       "profile": _applied_profile(state, str(source.payload.get("provider") or "codex"))}})
+            state = replace(state, active_run=replace(state.active_run, assessment=accepted))
         assessment = state.active_run.assessment
         if not successful and str(identity) == state.active_run.lead_identity and assessment.get("_pending_lead_completion"):
             assessment = dict(assessment)
@@ -1986,6 +2071,32 @@ def _open_run(
     return state, tuple(item for item in opened if item.kind != "request_assessment")
 
 
+def _mark_fast_run(state: ProjectState, selection: Mapping[str, str], provider: str) -> ProjectState:
+    run = state.active_run
+    if not run:
+        return state
+    assessment = {**run.assessment, "_fast_pending": True,
+                  "_fast_route": dict(selection),
+                  "_lead_expected_route": dict(selection)}
+    if _boost_preference(state, provider, run.session_id) != "off" or not selection["model"]:
+        assessment["_fast_disallowed"] = True
+    return replace(state, active_run=replace(run, assessment=assessment))
+
+
+def _escalate_fast_run(state: ProjectState, source: Event) -> ProjectState:
+    run = state.active_run
+    if not run:
+        return state
+    assessment = dict(run.assessment)
+    assessment.pop("_fast_pending", None)
+    assessment["_fast_escalated"] = True
+    assessment.pop("_lead_expected_route", None)
+    return replace(state, active_run=replace(
+        run, status="assessing", assessment=assessment, outcome=None,
+        updated_at=source.observed_at,
+    ))
+
+
 def _observed_role(payload: Mapping[str, object]) -> str:
     for value in payload.values():
         if not isinstance(value, str):
@@ -2009,6 +2120,18 @@ def _observed_role(payload: Mapping[str, object]) -> str:
     return ""
 
 
+def _fast_spawn(payload: Mapping[str, object]) -> bool:
+    if _observed_role(payload) != "lead":
+        return False
+    if _marker_value(payload, "SYMPHONY_FAST_ROUTE:") == "lead":
+        return True
+    # Codex's collaboration path may emit only a native Start, with the
+    # packet unavailable to PreToolUse. The explicit host task name carries
+    # the route; it is a role label, not a task-content classifier.
+    return (payload.get("provider") == "codex"
+            and str(payload.get("task_name") or "").startswith("symphony_lead_fast_"))
+
+
 def _prepare_delegation(
     state: ProjectState, source: Event, provider: str
 ) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -2028,7 +2151,8 @@ def _prepare_delegation(
         return state, (_block_tool("Symphony capability profiles are invalid; repair the shipped profiles before spawning."),)
     if _applied_profile(state, provider) == NO_PROFILE:
         return state, (_block_tool("Symphony has no launchable route in this account's available model roster."),)
-    if not state.active_run and role != "assessor":
+    fast_launch = role == "lead" and _marker_value(values, "SYMPHONY_FAST_ROUTE:") == "lead"
+    if not state.active_run and role != "assessor" and not fast_launch:
         return state, (
             _block_tool(
                 "Spawn the Symphony assessor first; a run begins when the assessor starts."
@@ -2054,6 +2178,8 @@ def _prepare_delegation(
             )
     if role == "assessor" and effort not in HIGH_EFFORTS:
         return state, (_block_tool("The Symphony assessor requires a strong model at high effort or above."),)
+    if role == "assessor" and state.active_run and state.active_run.assessment.get("_fast_pending"):
+        return state, (_block_tool("Wait for the fast lead's terminal decision before spawning an assessor."),)
     if role == "assessor":
         session_id = str(source.payload.get("session_id") or "")
         requested = _boost_preference(state, provider, session_id)
@@ -2069,22 +2195,45 @@ def _prepare_delegation(
 
     actions: tuple[Action, ...] = ()
     objective = _tool_objective(values)
+    if fast_launch:
+        if provider == "codex" and isinstance(values, Mapping) and not str(values.get("task_name") or "").startswith("symphony_lead_fast_"):
+            return state, (_block_tool("Name the Codex fast lead `symphony_lead_fast_<model>_<effort>`."),)
+        if _boost_preference(state, provider, str(source.payload.get("session_id") or "")) != "off":
+            return state, (_block_tool("An assessor boost is active; spawn the selected boosted assessor first."),)
+        if state.active_run:
+            return state, (_block_tool("A run already owns this task; continue its recorded route."),)
+        selection = fast_lead_selection(_snapshot(state, provider))
+        if not selection["model"]:
+            return state, (_block_tool("The capable/medium fast lead floor is unavailable; spawn an independent assessor."),)
+        if (model, effort) != (selection["model"], selection["effort"]):
+            return state, (_block_tool(
+                f"Fast lead route mismatch: expected {selection['model']}/{selection['effort']}."
+            ),)
+        state, actions = _open_run(state, source, objective)
+        state = _mark_fast_run(state, selection, provider)
     if role == "assessor" and not state.active_run:
         state, actions = _open_run(state, source, objective)
     if role == "lead":
+        if state.active_run.assessment.get("_fast_pending") and not fast_launch:
+            return state, (_block_tool("Recover the fast lead's decision before another lead can start."),)
         if state.active_run.status == "completing" and state.active_run.lead_identity:
             return state, (_block_tool(
                 "The tracked lead has already completed this run. Invoke the normal "
                 f"`{_control_name('stop', provider)}` control to verify and archive it "
                 "before starting another task."
             ),)
+        if state.active_run.assessment.get("_fast_escalated") and not state.active_run.assessment.get("size"):
+            return state, (_block_tool("The fast lead escalated. Wait for an independent accepted assessment before another lead starts."),)
         if state.active_run.assessment.get("_boost_assessment_pending"):
             return state, (_block_tool("A valid boosted assessor result is required before selecting the lead."),)
-        assessment = _assessment_from_marker(values, "SYMPHONY_ROUTE:")
-        if assessment is None:
+        assessment = _assessment_from_marker(values, "SYMPHONY_ROUTE:") if not fast_launch else None
+        if assessment is None and not fast_launch:
             return state, (_block_tool("Add a valid SYMPHONY_ROUTE JSON line to the lead packet, then retry."),)
         recorded = state.active_run.assessment
-        if recorded.get("size") and recorded.get("complexity"):
+        if fast_launch:
+            route = None
+            required_model, required_effort = model, effort
+        elif recorded.get("size") and recorded.get("complexity"):
             if (
                 assessment.size != recorded.get("size")
                 or assessment.complexity != recorded.get("complexity")
@@ -2104,17 +2253,18 @@ def _prepare_delegation(
         else:
             route = route_for(assessment)
         spawn_session = str(source.payload.get("session_id") or "")
-        snapshot = _snapshot(state, provider)
-        resolved = resolve_tier(route, snapshot)
-        required_model = str(resolved["lead_model"])
-        required_effort = str(resolved["lead_effort"])
+        if not fast_launch:
+            snapshot = _snapshot(state, provider)
+            resolved = resolve_tier(route, snapshot)
+            required_model = str(resolved["lead_model"])
+            required_effort = str(resolved["lead_effort"])
         drift = _route_drift(recorded, required_model, required_effort)
         if drift and drift["weaker"]:
             if _accepted_route(state, provider, spawn_session) != f"{required_model}/{required_effort}":
                 return state, (_drift_block(provider, drift),)
         elif drift:
             actions += (_drift_notice(drift),)
-        clamp = _clamp_actions(state, provider, route, spawn_session)
+        clamp = () if fast_launch else _clamp_actions(state, provider, route, spawn_session)
         if any(item.kind == "block_tool" for item in clamp):
             return state, clamp
         actions += clamp
@@ -2125,9 +2275,12 @@ def _prepare_delegation(
                     f"observed {model}/{effort}. Spawn the selected lead with the expected route, then retry."
                 ),
             )
-        if not (recorded.get("size") and recorded.get("complexity")):
+        if not fast_launch and not (recorded.get("size") and recorded.get("complexity")):
             state, accepted = _accept_assessment(state, source, provider, values, assessment)
             actions += accepted
+    elif role in {"worker", "consultant"} and (state.active_run.assessment.get("_fast_pending")
+                                                or state.active_run.assessment.get("_fast_escalated")):
+        return state, (_block_tool("Wait for the fast decision and, if escalated, its assessed replacement lead before spawning descendants."),)
     elif role in {"worker", "consultant"} and not state.active_run.lead_identity:
         return state, (_block_tool(f"Register the selected lead before spawning a Symphony {role}."),)
     if role == "consultant" and not _decision_markers(values):
@@ -2825,6 +2978,31 @@ def _claude_guidance(state: ProjectState | None, session_id: str = "") -> str:
 def _assessment_guidance(task: str, provider: str = "", state: ProjectState | None = None, session_id: str = "") -> str:
     if state is not None and provider:
         session_id = session_id or str(state.activation.get(provider, {}).get("session_id") or "")
+        fast = fast_lead_selection(_snapshot(state, provider))
+        if fast["model"] and _boost_preference(state, provider, session_id) == "off":
+            spawn = (f"Use agent type `symphony:symphony-lead-{fast['model']}-{fast['effort']}`. "
+                     if provider == "claude" else
+                     f"Pass `model=\"{fast['model']}\"`, `reasoning_effort=\"{fast['effort']}\"`, "
+                     "`fork_turns=\"none\"`, and name `symphony_lead_fast_<model>_<effort>` "
+                     "using underscores for the model. ")
+            return (
+                "Symphony fast route: the root is a courier. Spawn one capable lead at "
+                f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
+                "`SYMPHONY_FAST_ROUTE: lead` on separate lines. " + spawn +
+                "Relay the entire task and its acceptance checks. Before any writes, the lead must "
+                "decide whether scope is bounded, requirements clear, risk low, required tools "
+                "(including browser or computer control when needed) available, and verification concrete. "
+                "If all hold, work directly end-to-end and finish with exact lines "
+                "`SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`. "
+                "If any check fails or is uncertain, make no changes and finish with exact line "
+                "`SYMPHONY_FAST_DECISION: escalate`; then spawn an independent strongest/high assessor "
+                "for the original task, followed by the matrix-selected lead. "
+                "The fast lead cannot spawn descendants before deciding. Preserve the same run, "
+                "wait for native terminal results, and use normal Stop reconciliation. "
+                + ("Claude agents run in the background; end your turn after spawning and wait for the host result. "
+                   if provider == "claude" else "")
+                + f"Task: {task}"
+            )
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
         "On Codex, use `fork_turns=\"none\"` for assessor and lead, name them "
@@ -2959,6 +3137,14 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     run = state.active_run
     if not run:
         return "Symphony has no active run."
+    if run.assessment.get("_fast_escalated") and not run.assessment.get("size"):
+        assessor = assessor_selection(_snapshot(state, provider),
+                                      _boost_preference(state, provider, run.session_id))
+        return (f"Fast lead {run.lead_identity} escalated this run before writes. "
+                f"Spawn one independent assessor at {assessor['model']}/{assessor['effort']} "
+                "with `SYMPHONY_ROLE: assessor` and the full original task. Await its valid "
+                "SYMPHONY_ASSESSMENT result before spawning the matrix-selected replacement lead. "
+                "Preserve this run and reconcile tracked children before Stop.")
     completion = _completion_ready_guidance(run, provider)
     if completion:
         return f"Symphony run {run.run_id} remains completing. {completion}"

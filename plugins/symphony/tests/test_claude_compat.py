@@ -62,10 +62,9 @@ class ClaudeCompatTests(unittest.TestCase):
         text = self.hook("UserPromptSubmit", prompt="/symphony:start Build the feature")[
             "hookSpecificOutput"
         ]["additionalContext"]
-        self.assertIn(f"`symphony:symphony-assessor-{STRONGEST}-high`", text)
-        self.assertIn("medium/mixed `symphony:symphony-lead-", text)
+        self.assertIn("`symphony:symphony-lead-claude-opus-5-5-medium`", text)
+        self.assertIn("SYMPHONY_FAST_DECISION: escalate", text)
         self.assertIn("end your turn", text)
-        self.assertIn("superpowers:brainstorming", text)
 
     def test_assessment_marker_is_read_from_the_handback_report(self):
         self.spawn_assessor()

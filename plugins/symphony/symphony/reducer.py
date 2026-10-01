@@ -206,7 +206,7 @@ def _assessment_accepted(state: ProjectState, event: Event):
         assessment.pop("_pending_delegations", None)
     if state.active_run.status in {"completing", "interrupted", "recovering", "stopping"}:
         status = state.active_run.status
-    elif state.active_run.lead_identity:
+    elif state.active_run.lead_identity and not state.active_run.assessment.get("_fast_escalated"):
         status = "active"
     else:
         status = "assessed"
@@ -227,6 +227,11 @@ def _lead_started(state: ProjectState, event: Event):
     identity = event.payload.get("identity")
     if not run or not identity:
         return state, ()
+
+    if run.assessment.get("_fast_escalated") and identity == run.lead_identity:
+        # This lead gave up the task at a terminal handoff. A same-identity
+        # native restart cannot undo that decision while assessment is pending.
+        return state, (Action("ignore_stale_owner", {"identity": identity}),)
 
     requested_generation = int(event.payload.get("owner_generation", run.owner_generation))
     if run.lead_identity is None:
@@ -269,7 +274,7 @@ def _lead_started(state: ProjectState, event: Event):
         status="active",
         outcome=None,
         assessment={key: value for key, value in run.assessment.items()
-                    if key not in {"_retryable_lead", "_lead_route_mismatch",
+                    if key not in {"_retryable_lead", "_fast_escalated", "_lead_route_mismatch",
                                    "_lead_route_mismatch_owner", "_codex_unavailable_proof"}},
         updated_at=event.observed_at,
     )

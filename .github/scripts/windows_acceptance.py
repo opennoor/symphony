@@ -26,6 +26,7 @@ TESTS = (
     "plugins.symphony.tests.test_reducer.LifecycleReducerTests.test_replacement_lead_cannot_archive_ambiguous_old_start",
     "plugins.symphony.tests.test_runtime_retention",
     "plugins.symphony.tests.test_boost",
+    "plugins.symphony.tests.test_fast_route",
 )
 
 
