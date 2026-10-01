@@ -161,7 +161,7 @@ class FastRouteTests(unittest.TestCase):
         packet = f"SYMPHONY_ROLE: lead\nSYMPHONY_FAST_ROUTE: lead\n{full_task}"
         transcript = Path(self.temp.name) / "fast.jsonl"
         transcript.write_text("\n".join((
-            json.dumps({"type": "session_meta", "payload": {"agent_path": f"/root/{task_name}"}}),
+            json.dumps({"type": "session_meta", "payload": {"id": "fast-native", "agent_path": f"/root/{task_name}"}}),
             json.dumps({"type": "turn_context", "payload": {"model": observed_model or model, "effort": "medium"}}),
             json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user",
                       "content": [{"type": "input_text", "text": packet}]}}),

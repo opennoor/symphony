@@ -153,8 +153,9 @@ class AssessorBoostTests(unittest.TestCase):
             "message": "SYMPHONY_ROLE: assessor\nDo it", "model": "gpt-6-astra",
             "reasoning_effort": "ultra"})
         transcript = Path(self.temp.name) / "child.jsonl"
-        transcript.write_text(json.dumps({"type": "turn_context", "payload": {
-            "model": "gpt-6-astra", "effort": "high"}}) + "\n")
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": "assessor"}}) + "\n"
+            + json.dumps({"type": "turn_context", "payload": {
+                "model": "gpt-6-astra", "effort": "high"}}) + "\n")
         self.send(hook_event_name="SubagentStart", agent_id="assessor", role="assessor",
                   model="gpt-6-astra", model_reasoning_effort="high",
                   agent_transcript_path=str(transcript))

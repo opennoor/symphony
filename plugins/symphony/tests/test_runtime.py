@@ -854,7 +854,7 @@ class RuntimeTests(unittest.TestCase):
                     json.dumps(
                         {
                             "type": "session_meta",
-                            "payload": {"agent_path": f"/root/{codex_agent_type('assessor', CODEX_STRONGEST, 'high')}"},
+                            "payload": {"id": "assessor-1", "agent_path": f"/root/{codex_agent_type('assessor', CODEX_STRONGEST, 'high')}"},
                         }
                     ),
                     json.dumps(
@@ -911,7 +911,7 @@ class RuntimeTests(unittest.TestCase):
                     json.dumps(
                         {
                             "type": "session_meta",
-                            "payload": {"agent_path": f"/root/symphony_lead_{self.simple['model'].replace('-', '_')}_{self.simple['effort']}"},
+                            "payload": {"id": "lead-1", "agent_path": f"/root/symphony_lead_{self.simple['model'].replace('-', '_')}_{self.simple['effort']}"},
                         }
                     ),
                     json.dumps(
@@ -3240,7 +3240,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("_pending_lead_completion", StateStore(self.state_root).load(self.project).active_run.assessment)
 
         transcript = self.root / "corrected-lead.jsonl"
-        transcript.write_text(json.dumps({
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": "lead-1"}}) + "\n" + json.dumps({
             "type": "turn_context", "payload": {"model": "wrong-model", "effort": self.simple["effort"]},
         }), encoding="utf-8")
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",

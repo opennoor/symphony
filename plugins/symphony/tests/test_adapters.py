@@ -36,6 +36,7 @@ class AdapterContractTests(unittest.TestCase):
                             {
                                 "type": "session_meta",
                                 "payload": {
+                                    "id": "agent-1",
                                     "agent_path": "/root/symphony_assessor_gpt_6_astra_high",
                                     "source": {"subagent": {"thread_spawn": {
                                         "parent_thread_id": "root-session",
@@ -74,6 +75,7 @@ class AdapterContractTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             transcript = Path(temp) / "child.jsonl"
             transcript.write_text('not json\n' + json.dumps({"type": "session_meta", "payload": {
+                "id": "child",
                 "agent_path": "/root/symphony_worker_model_high", "source": {
                     "subagent": {"thread_spawn": {"parent_thread_id": "lead-thread"}},
                 },
@@ -84,12 +86,66 @@ class AdapterContractTests(unittest.TestCase):
                     "message": 'SYMPHONY_OUTCOME: {"status":"blocked"}',
                 },
             }]}}), encoding="utf-8")
-            payload = {"hook_event_name": "SubagentStop", "agent_transcript_path": str(transcript)}
+            payload = {"hook_event_name": "SubagentStop", "agent_id": "child", "agent_transcript_path": str(transcript)}
             codex = event_from_payload("codex", payload)
             claude = event_from_payload("claude", payload)
             self.assertEqual(codex.payload["parent_thread_id"], "lead-thread")
             self.assertEqual(codex.payload["model_reasoning_effort"], "high")
             self.assertIn('"blocked"', claude.payload["last_assistant_message"])
+
+    def test_codex_transcript_metadata_requires_exact_nonempty_header_and_callback_identity(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'id': 'child', 'agent_path': '/root/symphony_lead_fast_model_medium',
+                      'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}
+            turn = {'type': 'turn_context', 'payload': {'turn_id': 'turn', 'model': 'model', 'effort': 'medium'}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                payload = {'hook_event_name': hook, 'agent_id': 'child', 'turn_id': 'turn',
+                           'agent_transcript_path': str(transcript), 'model': 'callback-model'}
+                for identity in (None, '', 0, True, [], {}, 'foreign', 'child'):
+                    with self.subTest(hook=hook, header_identity=identity):
+                        candidate = {**header, 'id': identity}
+                        if identity is None:
+                            candidate.pop('id')
+                        transcript.write_text('\n'.join(json.dumps(row) for row in
+                            ({'type': 'session_meta', 'payload': candidate}, turn, task)), encoding='utf-8')
+                        event = event_from_payload('codex', payload)
+                        if identity == 'child':
+                            self.assertEqual(event.payload['parent_thread_id'], 'root')
+                            self.assertEqual(event.payload['model'], 'model')
+                            self.assertIn('task', event.payload)
+                        else:
+                            self.assertEqual(event.payload['_symphony_child_metadata'], ())
+                            self.assertEqual(event.payload['model'], 'callback-model')
+                            for field in ('parent_thread_id', 'task_name', 'task', 'model_reasoning_effort'):
+                                self.assertNotIn(field, event.payload)
+                transcript.write_text('\n'.join(json.dumps(row) for row in
+                    ({'type': 'session_meta', 'payload': header}, turn, task)), encoding='utf-8')
+                for identity in (None, '', 0, True, [], {}):
+                    with self.subTest(hook=hook, callback_identity=identity):
+                        invalid = {**payload, 'agent_id': identity}
+                        if identity is None:
+                            invalid.pop('agent_id')
+                        self.assertEqual(event_from_payload('codex', invalid).payload['_symphony_child_metadata'], ())
+                transcript.write_text('\n'.join(json.dumps(row) for row in (turn, task)), encoding='utf-8')
+                self.assertEqual(event_from_payload('codex', payload).payload['_symphony_child_metadata'], ())
+                for malformed in (None, [], 'invalid header', 0, True):
+                    for preceding_header in (False, True):
+                        with self.subTest(hook=hook, malformed_payload=malformed, preceding_header=preceding_header):
+                            prefix = ({'type': 'session_meta', 'payload': header},) if preceding_header else ()
+                            transcript.write_text('\n'.join(json.dumps(row) for row in
+                                (*prefix, {'type': 'session_meta', 'payload': malformed},
+                                 {'type': 'session_meta', 'payload': header}, turn, task)), encoding='utf-8')
+                            rejected = event_from_payload('codex', payload)
+                            self.assertEqual(rejected.payload['_symphony_child_metadata'], ())
+                            self.assertEqual(rejected.payload['model'], 'callback-model')
+                # Rows before the child's verified header do not supply metadata.
+                transcript.write_text('\n'.join(json.dumps(row) for row in
+                    (turn, task, {'type': 'session_meta', 'payload': header})), encoding='utf-8')
+                event = event_from_payload('codex', payload)
+                self.assertEqual(event.payload['model'], 'callback-model')
+                self.assertNotIn('task', event.payload)
 
     def test_codex_fork_keeps_child_header_and_binds_only_its_callback_turn(self):
         # Sanitized native fork: child header, copied parent header/turn, own turn.

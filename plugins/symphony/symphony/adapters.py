@@ -66,7 +66,8 @@ def event_from_payload(provider: str, payload: dict[str, Any]) -> Event:
 
 def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     transcript = payload.get("agent_transcript_path") or payload.get("transcript_path")
-    if not transcript:
+    callback_identity = payload.get("agent_id")
+    if not transcript or not isinstance(callback_identity, str) or not callback_identity:
         return {}
     found: dict[str, str] = {}
     header_seen = False
@@ -82,9 +83,15 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     record = json.loads(line)
                 except ValueError:
                     continue
-                if not isinstance(record, dict) or not isinstance(record.get("payload", {}), dict):
+                if not isinstance(record, dict):
+                    continue
+                if not isinstance(record.get("payload", {}), dict):
+                    if record.get("type") == "session_meta":
+                        return {}
                     continue
                 record_payload = record.get("payload", {})
+                if record.get("type") != "session_meta" and not header_seen:
+                    continue
                 if record.get("type") == "session_meta":
                     # A fork contains copied ancestor headers and turns after
                     # its own first header. They are not this child's evidence.
@@ -94,7 +101,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                         continue
                     header_seen = True
                     identity = record_payload.get("id")
-                    if identity and payload.get("agent_id") and identity != payload["agent_id"]:
+                    if not isinstance(identity, str) or not identity or identity != callback_identity:
                         return {}
                     forked = bool(record_payload.get("forked_from_id"))
                     own_turn = not forked
