@@ -39,6 +39,12 @@ class GreetingTests(unittest.TestCase):
     def test_default(self):
         self.assertEqual(greet('Ada'), 'Hello, Ada!')
 """
+FIXTURE_INSTRUCTIONS = (
+    "This is a disposable greeting fixture. Use native apply_patch, Write, or Edit for file changes. "
+    "Verify the integrated result with exactly python -m unittest -q in one standalone native "
+    "exec_command (Codex) or Bash (Claude) invocation. Return the full structured tool result, "
+    "including exit code and output. On Codex use text(await tools.exec_command({\"cmd\":\"python -m unittest -q\"})); "
+    "Do not batch verification with other commands or print only result.output.\n")
 
 
 def setup_prompt(provider):
@@ -89,12 +95,70 @@ def failure_diagnostics(provider, root, document):
         except (OSError, ValueError, AttributeError, TypeError):
             pass
     boosts = document.get("configuration", {}).get("assessor_boosts", {}).values()
+    phases = []
+    phase_path = root / 'logs' / 'phases.json'
+    if phase_path.is_file():
+        for phase in json.loads(phase_path.read_text()):
+            if phase.get('phase') in {'enable', 'objective', 'reconcile', 'stop'}:
+                phases.append({'phase': phase['phase'], 'resume': phase.get('resume') is True,
+                               'returned': phase.get('returned') is True,
+                               'cli_success': phase.get('cli_success') is True})
     return {"enabled": document.get("enabled") is True,
             "activation_guarded": activation.get("state") == "guarded",
             "profile": activation.get("profile") if activation.get("profile") in {"latest", "full", "opus-5-5"} else "unknown",
             "loaded_version": activation.get("plugin_version") if re.fullmatch(r"\d+\.\d+\.\d+", str(activation.get("plugin_version"))) else "unknown",
             "boost_levels": sorted({value for value in boosts if isinstance(value, str) and value in {"off", "xhigh", "max", "ultra"}}),
-            "callbacks": counts, "native_signals": native_signals}
+            "callbacks": counts, "native_signals": native_signals,
+            "lifecycle": lifecycle_diagnostics(provider, root, document), 'phases': phases}
+
+
+def lifecycle_diagnostics(provider, root, document):
+    """Bounded state categories; identities, messages and arbitrary reasons stay private."""
+    store = StateStore(root / 'state')
+    result = []
+    for run in document.get('active_runs', {}).values():
+        if run.get('provider') != provider:
+            continue
+        assessment = run.get('assessment', {})
+        known = {run.get('session_id'), run.get('lead_identity'),
+                 *(child.get('identity') for child in run.get('delegations', []))} - {None, ''}
+        kinds = dict.fromkeys(('subagent_started', 'subagent_stopped', 'other'), 0)
+        matches = dict.fromkeys(('agent_known', 'parent_known', 'session_known', 'turn_active',
+                                'turn_terminal', 'generation_current', 'ambiguous_owner'), 0)
+        records = dict.fromkeys(('root', 'alias', 'missing', 'overflow'), 0)
+        owner = run.get('session_id')
+        for session in (owner, *store.aliases_for_owner(provider, owner)):
+            record = store.session_record(provider, session)
+            if record is None:
+                records['missing'] += 1
+                continue
+            records['root' if session == owner else 'alias'] += 1
+            records['overflow'] += record.get('overflow') is True
+            for entry in record.get('pending', []):
+                kind = entry.get('kind')
+                kinds[kind if kind in kinds else 'other'] += 1
+                payload = entry.get('payload', {})
+                identity = payload.get('agent_id') or payload.get('subagent_id')
+                token = next((field + ':' + str(payload[field]) for field in ('turn_id', 'prompt_id')
+                              if payload.get(field)), '')
+                matches['agent_known'] += identity in known
+                matches['parent_known'] += payload.get('parent_thread_id') in known
+                matches['session_known'] += payload.get('session_id') in known
+                matches['turn_active'] += bool(token) and assessment.get('_active_turns', {}).get(identity) == token
+                matches['turn_terminal'] += bool(token) and token in assessment.get('_terminal_turns', {}).get(identity, [])
+                matches['generation_current'] += entry.get('generation') == record.get('generation')
+                matches['ambiguous_owner'] += entry.get('ambiguous_owner') is True
+        conditions = {key: bool(assessment.get('_' + key)) for key in (
+            'batch_pending', 'ambiguous_child_starts', 'ambiguous_child_stops',
+            'pending_delegations', 'invalid_consultants', 'lead_route_mismatch', 'pending_lead_completion')}
+        conditions['active_children'] = any(child.get('state') in {'working', 'pending', 'running', 'active'}
+                                            for child in run.get('delegations', []))
+        conditions['interrupted_children'] = any(child.get('state') == 'interrupted'
+                                                 for child in run.get('delegations', []))
+        conditions['successful_outcome'] = (run.get('outcome') or {}).get('status') in {'completed', 'done', 'success', 'succeeded'}
+        result.append({'pending_kinds': kinds, 'invocation_matches': matches, 'records': records,
+                       'stop_conditions': conditions})
+    return result
 
 
 def require(condition, message):
@@ -341,9 +405,7 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     greeting = project / "greet.py"
     greeting.write_text("def greet(name):\n    return f'" + ("hello" if case == "run-and-fix" else "Hello") + ", {name}!'\n")
     (project / "test_greet.py").write_text(TEST)
-    (project / "AGENTS.md").write_text(
-        "This is a disposable greeting fixture. Use native apply_patch, Write, or Edit for file changes. "
-        "Verify the integrated result with python -m unittest -q.\n")
+    (project / "AGENTS.md").write_text(FIXTURE_INSTRUCTIONS)
     run_git("add", ".", cwd=project)
     run_git("commit", "-m", "greeting fixture", cwd=project)
     initial_hash = fingerprint(greeting)
@@ -359,12 +421,15 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     prompt = CASES[case]
     logs = root / "logs"
     logs.mkdir()
+    phases = []
     deadline = time.monotonic() + timeout
     last_unchanged_ns = time.time_ns()
     first_change_after_ns = None
 
-    def run(prompt, resume=False):
+    def run(prompt, resume=False, phase='objective'):
         nonlocal last_unchanged_ns, first_change_after_ns
+        phases.append({'phase': phase, 'resume': resume, 'returned': False, 'cli_success': False})
+        (logs / 'phases.json').write_text(json.dumps(phases))
         if provider == "codex":
             command = [executable, "exec", "--dangerously-bypass-hook-trust",
                        "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
@@ -387,9 +452,11 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
                     process.wait()
                     raise RuntimeError("native semantic case exceeded its time limit")
                 time.sleep(.1)
+        phases[-1].update(returned=True, cli_success=process.returncode == 0)
+        (logs / 'phases.json').write_text(json.dumps(phases))
         require(process.returncode == 0, "native semantic CLI failed")
 
-    run(setup_prompt(provider))
+    run(setup_prompt(provider), phase='enable')
     state_path = state_file(state_dir, project)
     require(state_path.is_file(), "installed enable hook did not create durable state")
     version = json.loads((candidate / ".codex-plugin" / "plugin.json").read_text())["version"]
@@ -405,10 +472,10 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     active = lambda doc: doc.get("active_runs", {}).get(owner)
     if provider == "claude" and active(document):
         # Background native results may need a same-session root turn to reconcile.
-        run("Continue this Symphony session after its background results; reconcile the existing work and finish.", True)
+        run("Continue this Symphony session after its background results; reconcile the existing work and finish.", True, 'reconcile')
         document = json.loads(state_path.read_text())
         if (active(document) or {}).get("status") == "completing":
-            run("/symphony:stop", True)
+            run("/symphony:stop", True, 'stop')
             document = json.loads(state_path.read_text())
     require(active(document) is None, "native Stop did not archive the run")
     runs = [item for item in document.get("recent_runs", []) if item.get("session_id") == session]

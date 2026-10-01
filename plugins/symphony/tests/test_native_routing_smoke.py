@@ -15,6 +15,43 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_fixture_verification_is_observable_without_forcing_routing(self):
+        instructions = smoke.FIXTURE_INSTRUCTIONS
+        self.assertIn('one standalone native', instructions)
+        self.assertIn('full structured tool result', instructions)
+        self.assertIn('text(await tools.exec_command({"cmd":"python -m unittest -q"}));', instructions)
+        self.assertNotIn('SYMPHONY_ROLE', instructions)
+        self.assertNotIn('SYMPHONY_FAST_DECISION', instructions)
+
+    def test_lifecycle_diagnostics_count_binding_and_conditions_without_secrets(self):
+        from plugins.symphony.symphony.model import Event
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = smoke.StateStore(root / 'state')
+            state_path = root / 'state' / ('a' * 64 + '.v2.json')
+            store.bind_session('claude', 'root', state_path, True)
+            store.bind_session('claude', 'child', state_path, True, owner_session='root')
+            payload = {'provider': 'claude', 'session_id': 'root', 'agent_id': 'child',
+                       'parent_thread_id': 'root', 'prompt_id': 'turn', 'last_assistant_message': 'PRIVATE_SENTINEL'}
+            store.queue_session_event('claude', 'child', Event('start', 'subagent_started', 'now', payload), ambiguous_owner=True)
+            store.queue_session_event('claude', 'root', Event('stop', 'subagent_stopped', 'now',
+                                      {**payload, 'agent_id': 'foreign', 'prompt_id': 'other'}))
+            document = {'active_runs': {'claude:root': {'provider': 'claude', 'session_id': 'root',
+                'lead_identity': 'lead', 'outcome': {'status': 'completed'}, 'assessment': {
+                    '_batch_pending': True, '_active_turns': {'child': 'prompt_id:turn'},
+                    '_lead_route_mismatch': 'PRIVATE_SENTINEL'},
+                'delegations': [{'identity': 'child', 'state': 'completed'}]}}}
+            result = smoke.lifecycle_diagnostics('claude', root, document)
+            self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+            self.assertEqual(result[0]['pending_kinds']['subagent_started'], 1)
+            self.assertEqual(result[0]['pending_kinds']['subagent_stopped'], 1)
+            self.assertEqual(result[0]['records']['alias'], 1)
+            self.assertEqual(result[0]['invocation_matches']['agent_known'], 1)
+            self.assertEqual(result[0]['invocation_matches']['turn_active'], 1)
+            self.assertEqual(result[0]['invocation_matches']['ambiguous_owner'], 1)
+            self.assertTrue(result[0]['stop_conditions']['batch_pending'])
+            self.assertTrue(result[0]['stop_conditions']['lead_route_mismatch'])
+
     def test_fast_decision_allows_horizontal_whitespace_but_keeps_exact_line_and_count(self):
         for suffix in ('', '  ', '\t', ' \t\r'):
             self.assertEqual(smoke.fast_decision_lines('SYMPHONY_FAST_DECISION: eligible' + suffix), ['eligible'])
