@@ -93,7 +93,7 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                          "message": {"content": "Do more work."}})
         self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    def prepare_archived_followup(self, *, with_start=False):
+    def prepare_archived_followup(self, *, with_start=False, promptless=False):
         self.environ["SYMPHONY_PROVIDER"] = "claude"
         self.write_root_prompt()
         archived = replace(self.run, status="completed", owner_generation=7,
@@ -130,6 +130,8 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         self.child.write_text("".join(json.dumps(row) + "\n" for row in child))
         payload = {"provider": "claude", "cwd": str(self.project), "session_id": SESSION,
                    "agent_id": LEAD, "agent_type": TYPE, "prompt_id": "root-two"}
+        if promptless:
+            payload.pop("prompt_id")
         if with_start:
             self.store.queue_session_event("claude", SESSION, event_from_payload("claude", {
                 **payload, "hook_event_name": "SubagentStart"}), ambiguous_owner=True)
@@ -139,10 +141,11 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         return archived, terminal
 
     def test_archived_claude_resume_reconciles_through_root_hooks_and_replays(self):
-        for event in ("Stop", "SessionStart", "UserPromptSubmit"):
-            with self.subTest(event=event):
+        for event, promptless in ((event, promptless) for event in
+                                  ("Stop", "SessionStart", "UserPromptSubmit") for promptless in (False, True)):
+            with self.subTest(event=event, promptless=promptless):
                 self.setUp()
-                archived, terminal = self.prepare_archived_followup()
+                archived, terminal = self.prepare_archived_followup(promptless=promptless)
                 result = handle({"cwd": str(self.project), "session_id": SESSION,
                                  "hook_event_name": event, "prompt": "/symphony:status"}, self.environ)
                 self.assertNotIn('"decision": "block"', result.stdout)
@@ -161,10 +164,11 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
 
     def test_archived_claude_resume_preserves_start_and_terminal_across_crash(self):
-        for event in ("Stop", "SessionStart", "UserPromptSubmit"):
-            with self.subTest(event=event):
+        for event, promptless in ((event, promptless) for event in
+                                  ("Stop", "SessionStart", "UserPromptSubmit") for promptless in (False, True)):
+            with self.subTest(event=event, promptless=promptless):
                 self.setUp()
-                self.prepare_archived_followup(with_start=True)
+                self.prepare_archived_followup(with_start=True, promptless=promptless)
                 with patch.object(StateStore, "finish_session_events", side_effect=OSError("crash")):
                     with self.assertRaises(OSError):
                         handle({"cwd": str(self.project), "session_id": SESSION,
@@ -177,10 +181,11 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
 
     def test_archived_claude_resume_terminal_before_start_is_stable(self):
-        for hook, with_start in (("Stop", False), ("UserPromptSubmit", False), ("Stop", True)):
-            with self.subTest(hook=hook, with_start=with_start):
+        for hook, with_start, promptless in ((hook, start, promptless) for hook, start in
+                (("Stop", False), ("UserPromptSubmit", False), ("Stop", True)) for promptless in (False, True)):
+            with self.subTest(hook=hook, with_start=with_start, promptless=promptless):
                 self.setUp()
-                _, terminal = self.prepare_archived_followup(with_start=with_start)
+                _, terminal = self.prepare_archived_followup(with_start=with_start, promptless=promptless)
                 handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": hook,
                         "prompt": "/symphony:status"}, self.environ)
                 started = {key: value for key, value in terminal.items()
@@ -201,16 +206,114 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                          "message": {"content": [{**resume["message"]["content"][0], "id": "new-resume"}]}}
                 rows.append(newer)
                 self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    self.store.load(self.project), event_from_payload("claude", terminal),
+                    SESSION, self.project, self.environ))
                 handle(started, self.environ)
                 self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
 
-    def test_archived_claude_resume_requires_exact_successful_evidence(self):
-        for change in ("missing-resume", "failed-resume", "foreign-resume", "duplicate-resume",
-                       "foreign-project", "foreign-root", "missing-result", "markerless", "failed-native",
-                       "wrong-model", "wrong-effort", "foreign-parent", "wrong-prompt", "future-generation"):
-            with self.subTest(change=change):
+    def test_promptless_original_receipt_cannot_ack_a_new_queued_resume(self):
+        self.environ["SYMPHONY_PROVIDER"] = "claude"
+        handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
+        terminal = {"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "SubagentStop",
+                    "agent_id": LEAD, "agent_type": TYPE, "last_assistant_message": REPORT}
+        source = event_from_payload("claude", terminal)
+        self.assertTrue(claude_committed_native_terminal_replay(
+            self.store.load(self.project), source, SESSION, self.project, self.environ))
+        rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+        rows.append({"type": "assistant", "sessionId": SESSION, "cwd": str(self.project),
+                     "timestamp": "2026-10-02T02:00:00Z", "message": {"content": [{
+                         "type": "tool_use", "name": "Agent", "id": "new-resume",
+                         "input": {"resume": LEAD, "subagent_type": TYPE}}]}})
+        self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        for trimmed in (False, True):
+            with self.subTest(trimmed=trimmed):
+                state = self.store.load(self.project)
+                if trimmed:
+                    state = replace(state, recent_runs=())
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    state, source, SESSION, self.project, self.environ))
+        handle(terminal, self.environ)
+        result = handle({"cwd": str(self.project), "session_id": SESSION,
+                         "hook_event_name": "Stop"}, self.environ)
+        self.assertIn('"decision": "block"', result.stdout)
+        self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
+
+    def test_promptless_followup_receipt_replay_checks_latest_root_and_child(self):
+        _, terminal = self.prepare_archived_followup(promptless=True)
+        handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
+        state = replace(self.store.load(self.project), recent_runs=())
+        self.store.save(self.project, state)
+        source = event_from_payload("claude", terminal)
+        source = replace(source, payload={**source.payload, "_symphony_owner_conflict": True})
+        self.assertTrue(claude_committed_native_terminal_replay(
+            state, source, SESSION, self.project, self.environ))
+        rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+        resume = rows[-2]
+        rows.append({**resume, "timestamp": "2026-10-02T02:00:00Z",
+                     "message": {"content": [{**resume["message"]["content"][0], "id": "new-resume"}]}})
+        self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        self.assertFalse(claude_committed_native_terminal_replay(
+            state, source, SESSION, self.project, self.environ))
+
+    def test_promptless_archived_followup_accepts_successful_native_handback(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
                 self.setUp()
-                self.prepare_archived_followup()
+                _, terminal = self.prepare_archived_followup(promptless=True)
+                rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+                final = rows.pop()
+                rows.extend([
+                    {**final, "uuid": "handback-two", "timestamp": "2026-09-29T02:03:50Z",
+                     "message": {"model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{
+                         "type": "tool_use", "name": "SubagentHandback", "id": "handback-two",
+                         "input": {"message": terminal["last_assistant_message"]}}]}},
+                    {**rows[-1], "uuid": "handback-result-two", "timestamp": "2026-09-29T02:03:51Z",
+                     "message": {"content": [{"type": "tool_result", "tool_use_id": "handback-two",
+                                              "is_error": failed}]}},
+                    {**final, "message": {**final["message"], "content": [{"type": "text", "text": "Done."}]}}
+                ])
+                self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                terminal.update(agent_transcript_path=str(self.child), last_assistant_message="Done.")
+                record = self.store.session_record("claude", SESSION)
+                record["pending"] = []
+                self.store._write_json(self.store._session_path("claude", SESSION), record)
+                self.store.queue_session_event("claude", SESSION, event_from_payload("claude", terminal),
+                                               ambiguous_owner=True)
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertEqual(failed, '\"decision\": \"block\"' in result.stdout)
+                self.assertEqual(int(failed), len(self.store.session_record("claude", SESSION)["pending"]))
+
+    def test_archived_claude_resume_rejects_missing_project_and_invocation_ids(self):
+        for field in ("cwd", "id"):
+            for value in ((None, "", 123, [], ".", "relative") if field == "cwd" else (None, "", 123, [])):
+                with self.subTest(field=field, value=value):
+                    self.setUp()
+                    archived, _ = self.prepare_archived_followup(promptless=True)
+                    rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                    if field == "cwd":
+                        rows[-2]["cwd"] = value
+                    else:
+                        rows[-2]["message"]["content"][0]["id"] = value
+                        rows[-1]["message"]["content"][0]["tool_use_id"] = value
+                    self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                    with patch("os.getcwd", return_value=str(self.project)):
+                        result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                         "hook_event_name": "Stop"}, self.environ)
+                    self.assertIn('"decision": "block"', result.stdout)
+                    self.assertEqual((archived,), self.store.load(self.project).recent_runs)
+                    self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
+
+    def test_archived_claude_resume_requires_exact_successful_evidence(self):
+        for change, promptless in ((change, promptless) for change in (
+                "missing-resume", "failed-resume", "foreign-resume", "duplicate-resume",
+                "foreign-project", "foreign-root", "missing-result", "markerless", "failed-native",
+                "wrong-model", "wrong-effort", "foreign-parent", "wrong-prompt", "future-generation")
+                for promptless in (False, True)):
+            with self.subTest(change=change, promptless=promptless):
+                self.setUp()
+                self.prepare_archived_followup(promptless=promptless)
                 parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
                 child = [json.loads(line) for line in self.child.read_text().splitlines()]
                 if change == "missing-resume":

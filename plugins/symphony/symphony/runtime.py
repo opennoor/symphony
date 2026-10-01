@@ -1684,6 +1684,9 @@ def _observe_delegation(
             receipt["native_agent_type"] = str(source.payload.get("agent_type") or "")
             receipt["native_model"] = str(source.payload.get("model") or "")
             receipt["native_effort"] = str(source.payload.get("model_reasoning_effort") or "")
+            followup_start = f"{source.event_id}:followup-start"
+            if followup_start in state.active_run.assessment.get("_start_event_ids", ()):
+                receipt["native_followup_start_id"] = followup_start
             if (source.payload.get("provider") == "claude"
                     and str(identity) == state.active_run.lead_identity
                     and state.active_run.assessment.get("_claude_lead_start_identity") == str(identity)):

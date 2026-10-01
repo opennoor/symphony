@@ -114,7 +114,7 @@ def _receipt_from_dict(value: Any) -> dict[str, str]:
     required = ("provider", "session", "agent", "run_id",
                 "turn", "result", "parent", "lead")
     optional = ("status", "native_agent_type", "native_model", "native_effort",
-                "native_launch_prompt_hash")
+                "native_launch_prompt_hash", "native_followup_start_id")
     return {**{key: _text(receipt.get(key), f"terminal receipt.{key}")
                for key in required},
             **{key: _text(receipt.get(key, ""), f"terminal receipt.{key}")
