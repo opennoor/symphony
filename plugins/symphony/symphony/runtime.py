@@ -677,13 +677,17 @@ def _committed_lead_event(
     state: ProjectState, event: Event, provider: str, session: str,
 ) -> bool:
     """An exact committed lead event survives a crash before its inbox ACK."""
+    identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
+    owned_session = (event.payload.get("session_id") == session or (
+        event.payload.get("session_id") == identity and (
+            event.payload.get("parent_thread_id") == session
+            or event.payload.get("_symphony_verified_alias") is True)))
     if (event.payload.get("provider") != provider
-            or event.payload.get("session_id") != session
+            or not owned_session
             or event.payload.get("parent_thread_id") not in (
                 {None, "", session} if provider == "claude" else {session})
             or not _child_turn_token(event.payload)):
         return False
-    identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
     for run in (*state.active_runs.values(), *state.recent_runs):
         if (run.provider != provider or run.session_id != session
                 or run.lead_identity != identity):
@@ -702,7 +706,7 @@ def _committed_lead_event(
                     and event.payload.get("model_reasoning_effort") in {None, "", lead.requested_effort}):
                 return True
         if event.kind == "subagent_stopped":
-            result = _terminal_result_id(event)
+            result = _terminal_result_id(replace(event, payload={**event.payload, "session_id": session}))
             if any(item == result or item.endswith(f":{result}")
                    for item in run.assessment.get("_terminal_event_ids", ())):
                 return True

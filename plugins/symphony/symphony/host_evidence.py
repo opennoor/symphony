@@ -579,7 +579,10 @@ def claude_committed_native_terminal_replay(
                                           allow_original_launch=not followup)
             if native is None:
                 continue
-            followup_callback = followup and source.payload.get("session_id") == session
+            followup_callback = followup and (
+                source.payload.get("session_id") == session
+                or source.payload.get("parent_thread_id") == session
+                or source.payload.get("_symphony_verified_alias") is True)
         root_prompt = native.payload.get("_symphony_root_prompt_id")
         root_callback = bool(root_prompt and source.payload.get("prompt_id") == root_prompt)
         launch_owner = (source.payload.get("session_id") == session
@@ -1261,7 +1264,11 @@ def archived_lead_followup(
         return None
     for event in events:
         payload = event.payload
-        if (payload.get("provider") != provider or payload.get("session_id") != session
+        owned_session = (payload.get("session_id") == session or (
+            payload.get("session_id") == run.lead_identity and (
+                payload.get("parent_thread_id") == session
+                or payload.get("_symphony_verified_alias") is True)))
+        if (payload.get("provider") != provider or not owned_session
                 or (payload.get("agent_id") or payload.get("subagent_id")) != run.lead_identity
                 or event.kind not in {"subagent_started", "subagent_stopped"}):
             return None
@@ -1292,11 +1299,15 @@ def claude_committed_native_start_replay(
 ) -> bool:
     """Recognize a delayed Start only for an already accepted native followup."""
     payload = source.payload
+    identity = payload.get("agent_id") or payload.get("subagent_id")
+    owned_session = (payload.get("session_id") == session or (
+        payload.get("session_id") == identity and (
+            payload.get("parent_thread_id") == session
+            or payload.get("_symphony_verified_alias") is True)))
     if (source.kind != "subagent_started" or payload.get("provider") != "claude"
-            or payload.get("session_id") != session
+            or not owned_session
             or payload.get("parent_thread_id") not in {None, "", session}):
         return False
-    identity = payload.get("agent_id") or payload.get("subagent_id")
     for run in (*state.active_runs.values(), *state.recent_runs):
         if (run.provider != "claude" or run.session_id != session or run.lead_identity != identity
                 or run.status not in {"completing", "completed"}):

@@ -332,6 +332,70 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 self.assertIn("prompt_id:prompt-two",
                               self.store.load(self.project).recent_runs[0].assessment["_terminal_turns"][LEAD])
 
+    def test_archived_claude_followup_drains_bound_child_alias_and_replays(self):
+        for parent in (None, SESSION):
+            for crash in (False, True):
+                with self.subTest(parent=parent, crash=crash):
+                    self.setUp()
+                    _, terminal = self.prepare_archived_followup(promptless=True)
+                    record = self.store.session_record("claude", SESSION)
+                    record["pending"] = []
+                    self.store._write_json(self.store._session_path("claude", SESSION), record)
+                    self.store.bind_session("claude", LEAD, self.store._path(self.project),
+                                            False, self.project, SESSION)
+                    terminal["session_id"] = LEAD
+                    if parent:
+                        terminal["parent_thread_id"] = parent
+                    started = {key: value for key, value in terminal.items()
+                               if key not in {"status", "last_assistant_message"}}
+                    started["hook_event_name"] = "SubagentStart"
+                    handle(started, self.environ)
+                    handle(terminal, self.environ)
+                    root = {"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}
+                    if crash:
+                        with patch.object(StateStore, "finish_session_events", side_effect=OSError("crash")):
+                            with self.assertRaises(OSError):
+                                handle(root, self.environ)
+                    result = handle(root, self.environ)
+                    self.assertNotIn('"decision": "block"', result.stdout)
+                    before = self.store.load(self.project)
+                    self.assertEqual(1, len(before.recent_runs))
+                    self.assertIn("prompt_id:prompt-two", before.recent_runs[0].assessment["_terminal_turns"][LEAD])
+                    receipt = next(item for item in before.terminal_receipts if item["turn"] == "prompt_id:prompt-two")
+                    self.assertTrue(receipt["native_followup_start_id"].endswith(":followup-start"))
+                    self.assertEqual([], self.store.session_record("claude", LEAD)["pending"])
+                    handle(started, self.environ)
+                    handle(terminal, self.environ)
+                    result = handle(root, self.environ)
+                    self.assertNotIn('"decision": "block"', result.stdout)
+                    self.assertEqual(before.recent_runs, self.store.load(self.project).recent_runs)
+                    self.assertEqual(before.terminal_receipts, self.store.load(self.project).terminal_receipts)
+                    self.assertEqual([], self.store.session_record("claude", LEAD)["pending"])
+
+    def test_archived_claude_followup_retains_foreign_parent_and_sibling_alias(self):
+        for sibling in (False, True):
+            with self.subTest(sibling=sibling):
+                self.setUp()
+                self.prepare_archived_followup(promptless=True)
+                record = self.store.session_record("claude", SESSION)
+                terminal = record["pending"][0]["payload"]
+                terminal["hook_event_name"] = "SubagentStop"
+                record["pending"] = []
+                self.store._write_json(self.store._session_path("claude", SESSION), record)
+                alias = "sibling-child" if sibling else LEAD
+                self.store.bind_session("claude", alias, self.store._path(self.project),
+                                        False, self.project, SESSION)
+                terminal["session_id"] = alias
+                terminal["parent_thread_id"] = SESSION if sibling else "foreign-root"
+                handle(terminal, self.environ)
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertIn('"decision": "block"', result.stdout)
+                state = self.store.load(self.project)
+                self.assertNotIn("prompt_id:prompt-two", state.recent_runs[0].assessment["_terminal_turns"][LEAD])
+                self.assertIsNone(state.active_run)
+                self.assertEqual(1, len(self.store.session_record("claude", alias)["pending"]))
+
     def test_archived_claude_resume_requires_exact_successful_evidence(self):
         for change, promptless in ((change, promptless) for change in (
                 "missing-resume", "failed-resume", "foreign-resume", "duplicate-resume",

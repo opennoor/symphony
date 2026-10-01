@@ -476,6 +476,40 @@ class HostEvidenceTests(unittest.TestCase):
                 self.assertEqual((archived,), self.store.load(self.project).recent_runs)
                 self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
 
+    def test_archived_followup_drains_bound_codex_child_alias(self):
+        for crash in (False, True):
+            self.tearDown()
+            self.setUp()
+            archived, terminal, _ = self.load_archived_followup_fixture()
+            record = self.store.session_record("codex", ROOT_ID)
+            record["pending"] = []
+            self.store._write_json(self.store._session_path("codex", ROOT_ID), record)
+            self.store.bind_session("codex", LEAD_ID, self.store._path(self.project),
+                                    False, self.project, ROOT_ID)
+            terminal["session_id"] = LEAD_ID
+            started = {key: value for key, value in terminal.items()
+                       if key not in {"status", "last_assistant_message"}}
+            started["hook_event_name"] = "SubagentStart"
+            handle(started, self.environ)
+            handle(terminal, self.environ)
+            root = {"cwd": str(self.project), "session_id": ROOT_ID, "hook_event_name": "Stop"}
+            if crash:
+                with patch.object(StateStore, "finish_session_events", side_effect=OSError("crash")):
+                    with self.assertRaises(OSError):
+                        handle(root, self.environ)
+            result = handle(root, self.environ)
+            self.assertNotIn('"decision": "block"', result.stdout)
+            state = self.store.load(self.project)
+            self.assertEqual(archived.run_id, state.recent_runs[0].run_id)
+            self.assertIn(f"turn_id:{NEW_TURN}", state.recent_runs[0].assessment["_terminal_turns"][LEAD_ID])
+            self.assertEqual([], self.store.session_record("codex", LEAD_ID)["pending"])
+            handle(started, self.environ)
+            handle(terminal, self.environ)
+            result = handle(root, self.environ)
+            self.assertNotIn('"decision": "block"', result.stdout)
+            self.assertEqual(state.recent_runs, self.store.load(self.project).recent_runs)
+            self.assertEqual([], self.store.session_record("codex", LEAD_ID)["pending"])
+
     def test_archived_followup_requires_successful_exact_native_evidence(self):
         for change in ("missing-root", "failed-call", "wrong-target", "wrong-child", "foreign-project",
                        "foreign-root", "missing-result", "duplicate-call", "later-followup", "markerless",
