@@ -93,6 +93,7 @@ def failure_diagnostics(provider, root, document):
     fast_provenance = dict.fromkeys(('matching_native_candidates', 'unforked_candidates',
                                     'forked_or_foreign_candidates', 'header_count'), 0)
     fast_representations = []
+    fast_identity_components = []
     fast_terminal_turns = []
     fast_command_witnesses = []
     paths = (home / ("sessions" if provider == "codex" else "projects")).rglob("*.jsonl")
@@ -112,6 +113,12 @@ def failure_diagnostics(provider, root, document):
                     root_launches[key] += counts_for_root[key]
             fast_candidate = any(fast_native_identity(provider, rows, identity, run, home, root / 'primary')
                                  for run in runs)
+            if (provider == 'codex' and identity in known_children
+                    and any(fast_decision_lines(assistant_text(provider, row)) for row in rows)):
+                for run in runs:
+                    if (len(fast_identity_components) < 12 and run.get('provider') == provider
+                            and any(child.get('identity') == identity for child in run.get('delegations', []))):
+                        fast_identity_components.append(codex_fast_identity_probe(rows, identity, run))
             if fast_candidate:
                 fast_provenance['matching_native_candidates'] += 1
                 fast_provenance['header_count'] += sum(row.get('type') == 'session_meta' for row in rows)
@@ -161,11 +168,13 @@ def failure_diagnostics(provider, root, document):
             "callbacks": counts, "native_signals": native_signals,
             'fast_raw_tool_categories': fast_calls, 'fast_native_provenance': fast_provenance,
             'fast_decision_representations': fast_representations,
+            **({'fast_identity_components': fast_identity_components} if provider == 'codex' else {}),
             'fast_terminal_turns': fast_terminal_turns,
             'fast_command_witnesses': fast_command_witnesses,
             'assessed_completion': [assessed_completion_probe(provider, home, run, document) for run in runs
                                     if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'root_native_launches': root_launches,
+            **({'claude_phases': claude_phase_diagnostics(root, home)} if provider == 'claude' else {}),
             'claude_completion': [claude_completion_probe(document, run.get('session_id'), root / 'primary', home)
                 for run in document.get('active_runs', {}).values()
                 if provider == 'claude' and run.get('provider') == provider and run.get('status') == 'completing'],
@@ -329,6 +338,7 @@ def lifecycle_diagnostics(provider, root, document):
         matches = dict.fromkeys(('agent_known', 'parent_known', 'session_known', 'turn_active',
                                 'turn_terminal', 'generation_current', 'ambiguous_owner'), 0)
         records = dict.fromkeys(('root', 'alias', 'missing', 'overflow'), 0)
+        pending_terminals = []
         owner = run.get('session_id')
         for session in (owner, *store.aliases_for_owner(provider, owner)):
             record = store.session_record(provider, session)
@@ -351,6 +361,8 @@ def lifecycle_diagnostics(provider, root, document):
                 matches['turn_terminal'] += bool(token) and token in assessment.get('_terminal_turns', {}).get(identity, [])
                 matches['generation_current'] += entry.get('generation') == record.get('generation')
                 matches['ambiguous_owner'] += entry.get('ambiguous_owner') is True
+                if provider == 'codex' and kind == 'subagent_stopped' and len(pending_terminals) < 12:
+                    pending_terminals.append(codex_pending_terminal_probe(root, document, run, record, entry))
         conditions = {key: bool(assessment.get('_' + key)) for key in (
             'batch_pending', 'ambiguous_child_starts', 'ambiguous_child_stops',
             'pending_delegations', 'invalid_consultants', 'lead_route_mismatch', 'pending_lead_completion')}
@@ -360,8 +372,236 @@ def lifecycle_diagnostics(provider, root, document):
                                                  for child in run.get('delegations', []))
         conditions['successful_outcome'] = (run.get('outcome') or {}).get('status') in {'completed', 'done', 'success', 'succeeded'}
         result.append({'pending_kinds': kinds, 'invocation_matches': matches, 'records': records,
-                       'stop_conditions': conditions})
+                       'stop_conditions': conditions,
+                       **({'pending_terminals': pending_terminals,
+                           'pending_terminal_details_truncated': kinds['subagent_stopped'] > len(pending_terminals)}
+                          if provider == 'codex' else {})})
     return result
+
+
+def codex_pending_terminal_probe(root, document, current, record, entry):
+    """Read an original inbox event against retained evidence, without ACK or dispatch."""
+    payload = entry.get('payload', {})
+    identity = payload.get('agent_id') or payload.get('subagent_id')
+    owner, lead = current.get('session_id'), current.get('lead_identity')
+    token = _child_turn_token(payload)
+    event = Event(entry.get('event_id', ''), entry.get('kind', ''), entry.get('observed_at', ''), payload)
+    observed, started = host_evidence._instant(event.observed_at), host_evidence._instant(current.get('started_at'))
+    known = {child.get('identity') for child in current.get('delegations', [])} - {None, ''}
+    classify = lambda value: ('missing' if not value else 'root' if value == owner else
+        'canonical_lead' if value == lead else 'known_child' if value in known else 'other')
+    bound = (payload.get('provider') == record.get('provider') == 'codex'
+        and record.get('owner_session') == owner
+        and record.get('state_name') == StateStore(root / 'state')._path(root / 'primary').name
+        and entry.get('generation') == record.get('generation')
+        and payload.get('session_id') in {owner, record.get('session')}
+        and (record.get('session') == owner or record.get('session') == identity))
+    raw_result = _terminal_result_id(event)
+    scoped_result = _terminal_result_id(replace(event, payload={**payload, 'session_id': owner})) if bound else None
+    facts = {'source': {'event_id_present': isinstance(event.event_id, str) and bool(event.event_id),
+        'observed_at_valid': observed is not None, 'event_before_current_run': bool(observed and started and observed < started),
+        'provider_matches': payload.get('provider') == 'codex', 'agent_present': isinstance(identity, str) and bool(identity),
+        'parent_category': classify(payload.get('parent_thread_id')),
+        'session_category': 'bound_alias' if bound and payload.get('session_id') != owner else classify(payload.get('session_id')),
+        'generation_current': entry.get('generation') == record.get('generation'),
+        'ambiguous_owner': entry.get('ambiguous_owner') is True, 'turn_kind': _child_turn_kind(payload),
+        'turn_present': bool(token), 'root_normalization_bound': bound}, 'runs': {}, 'receipts': {}, 'native': {}}
+    runs = [*document.get('active_runs', {}).values(), *document.get('recent_runs', [])]
+    compatible = document.get('active_run')
+    if isinstance(compatible, dict) and compatible not in runs:
+        runs.append(compatible)
+    counts = dict.fromkeys(('retained', 'provider_root', 'foreign_root_agent',
+        'current_canonical', 'current_superseded', 'current_delegation',
+        'prior_canonical', 'prior_superseded', 'prior_delegation',
+        'current_active_turn', 'current_terminal_turn', 'prior_active_turn', 'prior_terminal_turn',
+        'current_native_start_anchor', 'prior_native_start_anchor',
+        'current_substantive_start_anchor', 'prior_substantive_start_anchor',
+        'current_terminal_result', 'prior_terminal_result'), 0)
+    for run in runs:
+        counts['retained'] += 1
+        children = [child for child in run.get('delegations', []) if child.get('identity') == identity]
+        if run.get('provider') != 'codex' or run.get('session_id') != owner:
+            counts['foreign_root_agent'] += bool(children) or run.get('lead_identity') == identity
+            continue
+        counts['provider_root'] += 1
+        scope = 'current' if run.get('run_id') == current.get('run_id') else 'prior'
+        counts[scope + '_canonical'] += run.get('lead_identity') == identity
+        counts[scope + '_superseded'] += any(child.get('role') in {'lead', 'rejected_lead'}
+            and run.get('lead_identity') != identity for child in children)
+        counts[scope + '_delegation'] += bool(children)
+        assessment = run.get('assessment', {})
+        counts[scope + '_active_turn'] += bool(token) and assessment.get('_active_turns', {}).get(identity) == token
+        counts[scope + '_terminal_turn'] += bool(token) and token in assessment.get('_terminal_turns', {}).get(identity, [])
+        native_start = (hashlib.sha256(('codex-host-turn\0' + identity + '\0' + str(payload.get('turn_id'))).encode()).hexdigest()
+                        if isinstance(identity, str) and payload.get('turn_id') else None)
+        counts[scope + '_native_start_anchor'] += bool(native_start) and any(value in assessment.get('_start_event_ids', ())
+            for value in (native_start, native_start + ':followup-start'))
+        proof = assessment.get('_substantive_children', {}).get(identity, {})
+        counts[scope + '_substantive_start_anchor'] += (bool(proof.get('start_event_id'))
+            and proof.get('turn') == token and proof['start_event_id'] in assessment.get('_start_event_ids', ()))
+        counts[scope + '_terminal_result'] += any(value in assessment.get('_terminal_event_ids', ())
+            for value in (event.event_id, raw_result, scoped_result) if value)
+    facts['runs'] = counts
+    receipt_counts = dict.fromkeys(('all', 'provider', 'provider_root', 'agent', 'turn',
+        'raw_result', 'scoped_result', 'parent', 'canonical_lead', 'same_run', 'prior_run',
+        'same_run_result_parent_raw', 'same_run_result_parent_scoped',
+        'prior_run_result_parent_raw', 'prior_run_result_parent_scoped',
+        'same_run_all_fields_raw', 'same_run_all_fields_scoped',
+        'prior_run_all_fields_raw', 'prior_run_all_fields_scoped', 'retained_canonical_lead'), 0)
+    retained_ids = {run.get('run_id') for run in runs if run.get('provider') == 'codex' and run.get('session_id') == owner}
+    for receipt in document.get('terminal_receipts', []):
+        receipt_counts['all'] += 1
+        if receipt.get('provider') != payload.get('provider'):
+            continue
+        receipt_counts['provider'] += 1
+        if receipt.get('session') != owner:
+            continue
+        receipt_counts['provider_root'] += 1
+        if receipt.get('agent') != identity:
+            continue
+        receipt_counts['agent'] += 1
+        if receipt.get('turn') != token:
+            continue
+        receipt_counts['turn'] += 1
+        raw, scoped = receipt.get('result') == raw_result, scoped_result is not None and receipt.get('result') == scoped_result
+        parent = receipt.get('parent') == str(payload.get('parent_thread_id') or '')
+        receipt_counts['raw_result'] += raw
+        receipt_counts['scoped_result'] += scoped
+        receipt_counts['parent'] += parent
+        receipt_counts['canonical_lead'] += receipt.get('lead') == lead
+        scope = ('same_run' if receipt.get('run_id') == current.get('run_id') else
+                 'prior_run' if receipt.get('run_id') in retained_ids else None)
+        if scope:
+            receipt_counts[scope] += 1
+            receipt_counts[scope + '_result_parent_raw'] += raw and parent
+            receipt_counts[scope + '_result_parent_scoped'] += scoped and parent
+            retained_lead = any(run.get('provider') == 'codex' and run.get('session_id') == owner
+                and run.get('run_id') == receipt.get('run_id') and run.get('lead_identity') == receipt.get('lead') for run in runs)
+            receipt_counts['retained_canonical_lead'] += retained_lead
+            receipt_counts[scope + '_all_fields_raw'] += raw and parent and retained_lead
+            receipt_counts[scope + '_all_fields_scoped'] += scoped and parent and retained_lead
+    facts['receipts'] = receipt_counts
+    history = document.get('event_history', [])
+    facts['history'] = {'source_event_exact': sum(item.get('event_id') == event.event_id for item in history),
+        'derived_terminal_exact': sum(item.get('event_id') == event.event_id + ':delegation:delegation_updated'
+            or isinstance(item.get('event_id'), str) and re.fullmatch(re.escape(event.event_id)
+                + r':terminal-epoch:\d+:delegation:delegation_updated', item['event_id']) is not None for item in history)}
+    native = facts['native']
+    native['source'] = 'identity_unavailable'
+    if not isinstance(identity, str) or not host_evidence._CODEX_ID.fullmatch(identity):
+        return facts
+    try:
+        rows = native_rows('codex', root / 'codex-baseline-home', identity)
+    except (RuntimeError, OSError, ValueError):
+        native['source'] = 'missing_or_ambiguous'
+        return facts
+    headers = [row.get('payload', {}) for row in rows if row.get('type') == 'session_meta']
+    first = rows[0].get('payload', {}) if rows and rows[0].get('type') == 'session_meta' else {}
+    parent = first.get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id')
+    cwd = first.get('cwd')
+    native.update(source='available', header_count=len(headers), own_first_header=first.get('id') == identity,
+        unforked=worker_transcript_is_unforked('codex', rows, identity),
+        parent_category=classify(parent), parent_matches_callback=parent == payload.get('parent_thread_id'),
+        cwd_absolute=isinstance(cwd, str) and Path(cwd).is_absolute(),
+        cwd_matches_fixture=isinstance(cwd, str) and Path(cwd).is_absolute()
+            and Path(cwd).resolve() == (root / 'primary').resolve())
+    basename = str(first.get('agent_path') or '').rsplit('/', 1)[-1]
+    native['task_role'] = next((role for role, prefix in (
+        ('fast_lead', 'symphony_lead_fast_'), ('assessor', 'symphony_assessor_'),
+        ('lead', 'symphony_lead_'), ('worker', 'symphony_worker_'), ('consultant', 'symphony_consultant_'))
+        if basename.startswith(prefix)), 'other')
+    if not native['own_first_header'] or not native['unforked']:
+        return facts
+    turn_id = payload.get('turn_id')
+    selected = [(row, row.get('payload', {})) for row in rows if turn_id
+                and row.get('payload', {}).get('turn_id') == turn_id]
+    starts = [row for row, value in selected if row.get('type') == 'event_msg' and value.get('type') == 'task_started']
+    contexts = [value for row, value in selected if row.get('type') == 'turn_context']
+    completions = [row for row, value in selected if row.get('type') == 'event_msg' and value.get('type') == 'task_complete']
+    failures = [row for row, value in selected if row.get('type') == 'event_msg'
+                and value.get('type') in {'error', 'task_failed', 'turn_aborted', 'task_interrupted'}]
+    native.update(start_count=len(starts), context_count=len(contexts), completed_count=len(completions),
+        failed_count=len(failures), unique_completed_turn=len(starts) == len(contexts) == len(completions) == 1 and not failures,
+        report_matches_callback=len(completions) == 1
+            and completions[0]['payload'].get('last_agent_message') == payload.get('last_assistant_message'),
+        context_model_matches_callback=len(contexts) == 1 and contexts[0].get('model') == payload.get('model'),
+        context_effort_matches_callback=len(contexts) == 1 and contexts[0].get('effort') == payload.get('model_reasoning_effort'))
+    all_starts = [row.get('payload', {}).get('turn_id') for row in rows if row.get('type') == 'event_msg'
+                  and row.get('payload', {}).get('type') == 'task_started']
+    latest = all_starts[-1] if all_starts else None
+    native['newer_started_turn'] = bool(latest and turn_id and latest != turn_id)
+    native['latest_turn_unfinished'] = bool(latest and not any(row.get('type') == 'event_msg'
+        and row.get('payload', {}).get('type') == 'task_complete'
+        and row.get('payload', {}).get('turn_id') == latest for row in rows))
+    native['retained_child_route_matches'] = sum(len(contexts) == 1
+        and contexts[0].get('model') == child.get('requested_tier')
+        and contexts[0].get('effort') == child.get('requested_effort')
+        for run in runs if run.get('provider') == 'codex' and run.get('session_id') == owner
+        for child in run.get('delegations', []) if child.get('identity') == identity)
+    if len(starts) == len(completions) == 1:
+        began, completed = host_evidence._instant(starts[0].get('timestamp')), host_evidence._instant(completions[0].get('timestamp'))
+        native['chronology_valid'] = bool(began and completed and began <= completed)
+        native['completion_before_callback'] = bool(completed and observed and completed <= observed)
+    return facts
+
+
+def claude_root_rows(home, session):
+    if not isinstance(session, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', session):
+        return None
+    paths = list((home / 'projects').glob(f'*/{session}.jsonl'))
+    return _native_jsonl(paths[0]) if len(paths) == 1 else None
+
+
+def claude_phase_diagnostics(root, home):
+    """Fixed per-CLI-phase observations; private stdout/native text is never exported."""
+    path = root / 'logs' / 'phases.json'
+    if not path.is_file():
+        return []
+    phases = json.loads(path.read_text(encoding='utf-8'))
+    output = []
+    for phase in phases[:8]:
+        if phase.get('phase') not in {'enable', 'objective', 'reconcile', 'stop'}:
+            continue
+        facts = {'phase': phase['phase'], 'returned': phase.get('returned') is True,
+                 'cli_success': phase.get('cli_success') is True, 'stdout_range_available': False,
+                 'result_objects': 0, 'result_error': False, 'budget_exceeded': False,
+                 'native_range_available': False, 'root_final_end_turns': 0,
+                 'root_tools': dict.fromkeys(('Agent', 'Bash', 'Read', 'Write', 'Edit', 'Skill', 'other'), 0)}
+        begin, end = phase.get('stdout_begin'), phase.get('stdout_end')
+        try:
+            stdout = root / 'logs' / 'stdout'
+            if type(begin) is int and type(end) is int and 0 <= begin <= end <= stdout.stat().st_size and end - begin <= 2 * 1024 * 1024:
+                with stdout.open('rb') as stream:
+                    stream.seek(begin)
+                    text = stream.read(end - begin).decode('utf-8')
+                facts['stdout_range_available'] = True
+                for line in text.splitlines():
+                    try:
+                        result = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(result, dict) and result.get('type') == 'result':
+                        facts['result_objects'] += 1
+                        facts['result_error'] |= result.get('is_error') is True
+                        facts['budget_exceeded'] |= result.get('subtype') == 'error_max_budget_usd'
+            rows = claude_root_rows(home, phase.get('root_session'))
+            first, last = phase.get('root_rows_before'), phase.get('root_rows_after')
+            if rows is not None and type(first) is int and type(last) is int and 0 <= first <= last <= len(rows):
+                scoped = [row for row in rows[first:last] if row.get('type') in {'assistant', 'user'}]
+                if all(row.get('sessionId') == phase.get('root_session') and not row.get('agentId')
+                       and row.get('isSidechain') is not True for row in scoped):
+                    facts['native_range_available'] = True
+                    for row in scoped:
+                        message = row.get('message', {})
+                        facts['root_final_end_turns'] += row.get('type') == 'assistant' and message.get('stop_reason') == 'end_turn'
+                        for block in message.get('content', []) if isinstance(message.get('content'), list) else ():
+                            if isinstance(block, dict) and block.get('type') == 'tool_use':
+                                name = block.get('name')
+                                facts['root_tools'][name if name in facts['root_tools'] else 'other'] += 1
+        except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+            facts['source_error'] = True
+        output.append(facts)
+    return output
 
 
 def require(condition, message):
@@ -436,6 +676,32 @@ def claude_fast_launch_identity(home, project, identity, run, fast):
                 and ('model' not in values or values['model'] == fast['model']))
     except (OSError, UnicodeError, ValueError, AttributeError, TypeError):
         return False
+
+
+def codex_fast_identity_probe(rows, identity, run):
+    """Explain pre-filter identity failures without using them as admission proof."""
+    children = [child for child in run.get('delegations', []) if child.get('identity') == identity]
+    child = children[0] if children else {}
+    fast = run.get('assessment', {}).get('_fast_route', {})
+    header = rows[0].get('payload', {}) if rows and rows[0].get('type') == 'session_meta' else {}
+    spawn = header.get('source', {}).get('subagent', {}).get('thread_spawn', {})
+    model, effort = fast.get('model'), fast.get('effort')
+    route_present = isinstance(model, str) and bool(model) and isinstance(effort, str) and bool(effort)
+    expected = 'symphony_lead_fast_' + re.sub(r'\W', '_', model) + '_' + effort if route_present else None
+    path, nested_path = header.get('agent_path'), spawn.get('agent_path')
+    return {'known_child_count': len(children), 'lead_role': child.get('role') == 'lead',
+        'fast_route_present': route_present,
+        'model_matches_fast': route_present and child.get('requested_tier') == model,
+        'effort_matches_fast': route_present and child.get('requested_effort') == effort,
+        'own_first_header': bool(header) and header.get('id') == identity,
+        'header_count': sum(row.get('type') == 'session_meta' for row in rows),
+        'unforked': worker_transcript_is_unforked('codex', rows, identity),
+        'top_level_path_present': isinstance(path, str) and bool(path),
+        'top_level_basename_exact': isinstance(path, str) and path.rsplit('/', 1)[-1] == expected,
+        'top_level_fast_prefix': isinstance(path, str) and path.rsplit('/', 1)[-1].startswith('symphony_lead_fast_'),
+        'nested_path_present': isinstance(nested_path, str) and bool(nested_path),
+        'nested_basename_exact': isinstance(nested_path, str) and nested_path.rsplit('/', 1)[-1] == expected,
+        'root_parent_matches': bool(run.get('session_id')) and spawn.get('parent_thread_id') == run['session_id']}
 
 
 def fast_native_identity(provider, rows, identity, run, home=None, project=None):
@@ -1351,6 +1617,11 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     def run(prompt, resume=False, phase='objective'):
         nonlocal last_unchanged_ns, first_change_after_ns
         phases.append({'phase': phase, 'resume': resume, 'returned': False, 'cli_success': False})
+        if provider == 'claude':
+            home = Path(env['CLAUDE_CONFIG_DIR'])
+            rows = claude_root_rows(home, session)
+            phases[-1].update(root_session=session, root_rows_before=len(rows) if rows is not None else
+                0 if not list((home / 'projects').glob(f'*/{session}.jsonl')) else None)
         (logs / 'phases.json').write_text(json.dumps(phases))
         if provider == "codex":
             command = [executable, "exec", "--dangerously-bypass-hook-trust",
@@ -1362,6 +1633,9 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
                        "--permission-mode", "bypassPermissions", "--output-format", "json",
                        "--resume" if resume else "--session-id", session, prompt]
         with (logs / "stdout").open("a", encoding="utf-8") as output, (logs / "stderr").open("a", encoding="utf-8") as errors:
+            if provider == 'claude':
+                phases[-1]['stdout_begin'] = output.tell()
+                (logs / 'phases.json').write_text(json.dumps(phases), encoding='utf-8')
             process = subprocess.Popen(command, cwd=project, env=env, stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=errors)
             while process.poll() is None:
@@ -1375,6 +1649,10 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
                     raise RuntimeError("native semantic case exceeded its time limit")
                 time.sleep(.1)
         phases[-1].update(returned=True, cli_success=process.returncode == 0)
+        if provider == 'claude':
+            rows = claude_root_rows(Path(env['CLAUDE_CONFIG_DIR']), session)
+            phases[-1].update(stdout_end=(logs / 'stdout').stat().st_size,
+                             root_rows_after=len(rows) if rows is not None else None)
         (logs / 'phases.json').write_text(json.dumps(phases))
         require(process.returncode == 0, "native semantic CLI failed")
 

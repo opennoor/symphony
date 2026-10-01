@@ -557,6 +557,41 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         fork = {'type': 'session_meta', 'payload': {'id': 'fast', 'forked_from_id': 'root'}}
         self.assertFalse(smoke.fast_turn_has_only_escalation('codex', [fork], [], 'fast'))
 
+    def test_pre_filter_fast_identity_diagnostics_explain_nested_and_extended_paths_without_admission(self):
+        identity, root_id = 'PRIVATE_CHILD', 'PRIVATE_ROOT'
+        run = {'provider': 'codex', 'session_id': root_id,
+               'assessment': {'_fast_route': {'model': 'model', 'effort': 'medium'}},
+               'delegations': [{'identity': identity, 'role': 'lead',
+                                'requested_tier': 'model', 'requested_effort': 'medium'}]}
+        path = '/PRIVATE_PATH/symphony_lead_fast_model_medium'
+        header = {'type': 'session_meta', 'payload': {'id': identity,
+            'source': {'subagent': {'thread_spawn': {'parent_thread_id': root_id, 'agent_path': path}}}}}
+        marker = {'type': 'response_item', 'payload': {'type': 'message', 'role': 'assistant',
+                  'content': [{'type': 'output_text', 'text': 'SYMPHONY_FAST_DECISION: eligible'}]}}
+        facts = smoke.codex_fast_identity_probe([header, marker], identity, run)
+        self.assertTrue(facts['own_first_header'])
+        self.assertTrue(facts['root_parent_matches'])
+        self.assertTrue(facts['model_matches_fast'])
+        self.assertTrue(facts['nested_basename_exact'])
+        self.assertFalse(facts['top_level_path_present'])
+        self.assertFalse(smoke.fast_native_identity('codex', [header, marker], identity, run))
+        extended = json.loads(json.dumps(header))
+        extended['payload']['agent_path'] = path + '_retry'
+        facts = smoke.codex_fast_identity_probe([extended, marker], identity, run)
+        self.assertTrue(facts['top_level_fast_prefix'])
+        self.assertFalse(facts['top_level_basename_exact'])
+        self.assertFalse(smoke.fast_native_identity('codex', [extended, marker], identity, run))
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            native = root / 'codex-baseline-home' / 'sessions'
+            native.mkdir(parents=True)
+            (native / 'child.jsonl').write_text('\n'.join(json.dumps(row) for row in (header, marker)), encoding='utf-8')
+            diagnostic = smoke.failure_diagnostics('codex', root, {'recent_runs': [run]})
+            self.assertEqual(diagnostic['fast_native_provenance']['matching_native_candidates'], 0)
+            self.assertEqual(len(diagnostic['fast_identity_components']), 1)
+            self.assertTrue(diagnostic['fast_identity_components'][0]['nested_basename_exact'])
+            self.assertNotIn('PRIVATE_', json.dumps(diagnostic))
+
     def test_decision_representation_diagnostics_never_deduplicate_missing_or_distinct_identity(self):
         header = {'type': 'session_meta', 'payload': {'id': 'fast'}}
         turn = {'type': 'turn_context', 'payload': {'turn_id': 'turn'}}
@@ -634,6 +669,101 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         duplicated = 'SYMPHONY_FAST_DECISION: eligible  \nSYMPHONY_FAST_DECISION: eligible'
         self.assertEqual(len(smoke.fast_decision_lines(duplicated)), 2)
 
+    def test_pending_codex_stop_diagnostics_bind_exact_prior_evidence_without_ack(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'primary'
+            project.mkdir()
+            owner = '00000000-0000-0000-0000-000000000001'
+            child = '00000000-0000-0000-0000-000000000002'
+            lead = '00000000-0000-0000-0000-000000000003'
+            store = smoke.StateStore(root / 'state')
+            store.bind_session('codex', owner, store._path(project), True, project=project)
+            store.bind_session('codex', child, store._path(project), True, project=project, owner_session=owner)
+            payload = {'provider': 'codex', 'session_id': child, 'agent_id': child,
+                       'parent_thread_id': owner, 'turn_id': 'PRIVATE_TURN', 'role': 'lead',
+                       'model': 'model', 'model_reasoning_effort': 'medium', 'status': 'completed',
+                       'last_assistant_message': 'PRIVATE_REPORT'}
+            source = smoke.Event('PRIVATE_EVENT', 'subagent_stopped', '2026-10-01T00:00:03Z', payload)
+            store.queue_session_event('codex', child, source, ambiguous_owner=True)
+            record = store.session_record('codex', child)
+            entry = record['pending'][0]
+            scoped = replace(source, payload={**payload, 'session_id': owner})
+            result_hash = smoke._terminal_result_id(scoped)
+            token = 'turn_id:PRIVATE_TURN'
+            start_hash = hashlib.sha256(('codex-host-turn\0' + child + '\0PRIVATE_TURN').encode()).hexdigest()
+            current = {'run_id': 'current', 'provider': 'codex', 'session_id': owner,
+                       'lead_identity': lead, 'started_at': '2026-10-01T00:00:04Z', 'assessment': {},
+                       'delegations': [{'identity': lead, 'role': 'lead', 'state': 'completed'}]}
+            prior = {**current, 'run_id': 'prior', 'started_at': '2026-10-01T00:00:00Z',
+                     'delegations': [{'identity': child, 'role': 'lead', 'state': 'completed',
+                                      'requested_tier': 'model', 'requested_effort': 'medium'}],
+                     'assessment': {'_terminal_turns': {child: [token]}, '_start_event_ids': [start_hash],
+                                    '_terminal_event_ids': [result_hash]}}
+            receipt = {'provider': 'codex', 'session': owner, 'agent': child, 'turn': token,
+                       'run_id': 'prior', 'result': result_hash, 'parent': owner, 'lead': child}
+            document = {'active_runs': {'codex:' + owner: current}, 'recent_runs': [prior],
+                        'terminal_receipts': [receipt], 'event_history': [
+                            {'event_id': source.event_id + ':delegation:delegation_updated'}]}
+            native = root / 'codex-baseline-home' / 'sessions' / (child + '.jsonl')
+            native.parent.mkdir(parents=True)
+            rows = [{'type': 'session_meta', 'payload': {'id': child, 'cwd': str(project),
+                      'agent_path': '/root/symphony_lead_fast_model_medium',
+                      'source': {'subagent': {'thread_spawn': {'parent_thread_id': owner}}}}},
+                    {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:01Z',
+                     'payload': {'type': 'task_started', 'turn_id': 'PRIVATE_TURN'}},
+                    {'type': 'turn_context', 'payload': {'turn_id': 'PRIVATE_TURN', 'model': 'model', 'effort': 'medium'}},
+                    {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:02Z',
+                     'payload': {'type': 'task_complete', 'turn_id': 'PRIVATE_TURN', 'last_agent_message': 'PRIVATE_REPORT'}}]
+            def write(rows):
+                native.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+            write(rows)
+            before = {path: path.read_bytes() for path in (root / 'state').rglob('*') if path.is_file()}
+            probe = smoke.codex_pending_terminal_probe(root, document, current, record, entry)
+            self.assertTrue(probe['source']['event_before_current_run'])
+            self.assertTrue(probe['source']['ambiguous_owner'])
+            self.assertTrue(probe['source']['root_normalization_bound'])
+            self.assertEqual(probe['source']['parent_category'], 'root')
+            self.assertEqual(probe['source']['session_category'], 'bound_alias')
+            self.assertEqual(probe['runs']['current_delegation'], 0)
+            self.assertEqual(probe['runs']['prior_superseded'], 1)
+            self.assertEqual(probe['runs']['prior_native_start_anchor'], 1)
+            self.assertEqual(probe['runs']['prior_terminal_turn'], 1)
+            self.assertEqual(probe['receipts']['raw_result'], 0)
+            self.assertEqual(probe['receipts']['prior_run_result_parent_scoped'], 1)
+            self.assertEqual(probe['receipts']['prior_run_all_fields_scoped'], 0)
+            self.assertEqual(probe['history']['derived_terminal_exact'], 1)
+            self.assertTrue(probe['native']['unique_completed_turn'])
+            self.assertTrue(probe['native']['report_matches_callback'])
+            self.assertEqual(probe['native']['task_role'], 'fast_lead')
+            self.assertEqual(probe['native']['retained_child_route_matches'], 1)
+            self.assertEqual(before, {path: path.read_bytes() for path in (root / 'state').rglob('*') if path.is_file()})
+            for secret in ('PRIVATE', child, owner, lead, str(project), result_hash, start_hash):
+                self.assertNotIn(secret, json.dumps(probe))
+            result = smoke.lifecycle_diagnostics('codex', root, document)[0]
+            self.assertEqual(len(result['pending_terminals']), 1)
+            self.assertFalse(result['pending_terminal_details_truncated'])
+            for field, value in (('owner_session', 'foreign'), ('generation', 99), ('state_name', 'foreign')):
+                foreign = smoke.codex_pending_terminal_probe(root, document, current, {**record, field: value}, entry)
+                self.assertFalse(foreign['source']['root_normalization_bound'])
+                self.assertEqual(foreign['receipts']['scoped_result'], 0)
+            for field, value in (('provider', 'claude'), ('session', 'foreign'), ('agent', 'foreign'),
+                                 ('turn', 'foreign'), ('result', 'foreign'), ('parent', 'foreign')):
+                changed = smoke.codex_pending_terminal_probe(root, {**document, 'terminal_receipts': [{**receipt, field: value}]},
+                                                             current, record, entry)
+                self.assertEqual(changed['receipts']['prior_run_result_parent_scoped'], 0)
+            write([rows[0], rows[0], *rows[1:]])
+            inherited = smoke.codex_pending_terminal_probe(root, document, current, record, entry)
+            self.assertFalse(inherited['native']['unforked'])
+            self.assertNotIn('unique_completed_turn', inherited['native'])
+            write([*rows, rows[-1]])
+            duplicated = smoke.codex_pending_terminal_probe(root, document, current, record, entry)
+            self.assertFalse(duplicated['native']['unique_completed_turn'])
+            write([*rows, {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'new'}}])
+            unfinished = smoke.codex_pending_terminal_probe(root, document, current, record, entry)
+            self.assertTrue(unfinished['native']['newer_started_turn'])
+            self.assertTrue(unfinished['native']['latest_turn_unfinished'])
+
     def test_failure_diagnostics_export_categories_without_native_secrets(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -652,6 +782,51 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
             self.assertEqual(result['callbacks']['UserPromptSubmit'], 1)
             self.assertTrue(result['native_signals']['spawn_unknown_model'])
             self.assertEqual(result['profile'], 'full')
+
+    def test_claude_phase_diagnostics_keep_exact_objective_ranges_and_private_outputs(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            logs = root / 'logs'
+            logs.mkdir()
+            home = root / 'claude-baseline-home'
+            session = 'PRIVATE_ROOT'
+            path = home / 'projects' / 'fixture' / (session + '.jsonl')
+            path.parent.mkdir(parents=True)
+            rows = [{'type': 'file-history-snapshot', 'snapshot': 'PRIVATE_SNAPSHOT'},
+                    {'type': 'assistant', 'sessionId': session, 'message': {'content': [
+                        {'type': 'tool_use', 'name': 'Skill', 'input': {'skill': 'PRIVATE_SKILL'}}], 'stop_reason': 'tool_use'}},
+                    {'type': 'assistant', 'sessionId': session, 'message': {'content': [
+                        {'type': 'text', 'text': 'PRIVATE_FINAL \u201d'}], 'stop_reason': 'end_turn'}}]
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+            enable = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'PRIVATE_ENABLE'}) + '\n'
+            objective = json.dumps({'type': 'result', 'subtype': 'error_max_budget_usd',
+                                    'is_error': True, 'result': 'PRIVATE_BUDGET'}) + '\n'
+            (logs / 'stdout').write_text(enable + objective, encoding='utf-8')
+            phases = [{'phase': 'enable', 'returned': True, 'cli_success': True, 'root_session': session,
+                       'root_rows_before': 0, 'root_rows_after': 1,
+                       'stdout_begin': 0, 'stdout_end': len(enable.encode('utf-8'))},
+                      {'phase': 'objective', 'returned': True, 'cli_success': False, 'root_session': session,
+                       'root_rows_before': 1, 'root_rows_after': 3,
+                       'stdout_begin': len(enable.encode('utf-8')), 'stdout_end': len((enable + objective).encode('utf-8'))}]
+            (logs / 'phases.json').write_text(json.dumps(phases), encoding='utf-8')
+            facts = smoke.claude_phase_diagnostics(root, home)
+            self.assertEqual([phase['budget_exceeded'] for phase in facts], [False, True])
+            self.assertEqual([phase['result_error'] for phase in facts], [False, True])
+            self.assertTrue(all(phase['native_range_available'] for phase in facts))
+            self.assertEqual(facts[0]['root_tools']['Skill'], 0)
+            self.assertEqual(facts[1]['root_tools']['Skill'], 1)
+            self.assertEqual(facts[1]['root_tools']['Agent'], 0)
+            self.assertEqual(facts[1]['root_final_end_turns'], 1)
+            self.assertNotIn('PRIVATE', json.dumps(facts))
+            rows[-1]['agentId'] = 'foreign-child'
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+            self.assertFalse(smoke.claude_phase_diagnostics(root, home)[1]['native_range_available'])
+            phases[1]['stdout_end'] += 1
+            phases[1]['root_rows_after'] = 100
+            (logs / 'phases.json').write_text(json.dumps(phases), encoding='utf-8')
+            rejected = smoke.claude_phase_diagnostics(root, home)[1]
+            self.assertFalse(rejected['stdout_range_available'])
+            self.assertFalse(rejected['native_range_available'])
 
     def test_documented_enable_precedes_plain_objectives_and_requires_durable_state(self):
         self.assertEqual(smoke.setup_prompt('codex'), '$symphony:symphony enable')

@@ -243,6 +243,7 @@ def _claude_native_lead_event(
     state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
     *, require_missing: bool, target_prompt: str | None = None,
     allow_fast_escalation: bool = False,
+    allow_assessed_markerless: bool = False,
 ) -> Event | None:
     """Validate one lead terminal against Claude's native parent and child turns.
 
@@ -265,6 +266,17 @@ def _claude_native_lead_event(
             or not lead.requested_tier or not lead.requested_effort
             or (require_missing and run.assessment.get("_terminal_turns", {}).get(lead_id))):
         return None
+    # Ordinary assessed callbacks already accept native terminal success without
+    # an outcome marker. This opt-in checks their latest-turn freshness only;
+    # missing callbacks, recovered outcomes, and fast reports remain strict.
+    assessed_markerless = bool(allow_assessed_markerless and not require_missing
+        and target_prompt is None and run.status == "completing"
+        and isinstance(run.outcome, Mapping) and run.outcome.get("status") == "completed"
+        and lead.state.lower() == "completed"
+        and run.assessment.get("size") in {"small", "medium", "large"}
+        and run.assessment.get("complexity") in {"simple", "mixed", "complex"}
+        and not run.assessment.get("_claude_native_recovery")
+        and not run.assessment.get("_fast_pending") and not _archived_fast_owner(run))
     home = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     projects = home / "projects"
     if projects.is_symlink() or not projects.is_dir():
@@ -407,13 +419,18 @@ def _claude_native_lead_event(
         return None
     reports = [final_text] if (final_status == "completed" or
         allow_fast_escalation and _archived_fast_escalation(final_text)) else []
+    handbacks = [(item, row) for row in assistants[:-1]
+                 for item in ((row.get("message") or {}).get("content") or [])
+                 if isinstance(item, dict) and item.get("type") == "tool_use"
+                 and item.get("name") == "SubagentHandback"]
     if not reports:
         # Background agents hand their result to the parent and then end with
         # a brief goodbye. Only the current turn's successful handback counts.
-        handbacks = [(item, row) for row in assistants[:-1]
-                     for item in ((row.get("message") or {}).get("content") or [])
-                     if isinstance(item, dict) and item.get("type") == "tool_use"
-                     and item.get("name") == "SubagentHandback"]
+        if (not handbacks and assessed_markerless and final_text.strip()
+                and "SYMPHONY_OUTCOME:" not in final_text
+                and "SYMPHONY_FAST_DECISION:" not in final_text):
+            reports = [final_text]
+    if not reports:
         if len(handbacks) != 1:
             return None
         handback, _ = handbacks[0]
@@ -427,7 +444,10 @@ def _claude_native_lead_event(
         if (not isinstance(handback_id, str) or len(results) != 1
                 or results[0].get("is_error") is True
                 or not (_reported_status(report) == "completed" or
-                        allow_fast_escalation and _archived_fast_escalation(report))):
+                        allow_fast_escalation and _archived_fast_escalation(report) or
+                        assessed_markerless and isinstance(report, str) and report.strip()
+                        and "SYMPHONY_OUTCOME:" not in report
+                        and "SYMPHONY_FAST_DECISION:" not in report)):
             return None
         reports = [report]
     # A later worker failure or restart supersedes this result, even when its
@@ -460,9 +480,13 @@ def _claude_native_lead_event(
         "prompt_id": prompt_id, "status": "completed",
         "model": lead.requested_tier, "model_reasoning_effort": lead.requested_effort,
         "last_assistant_message": report,
-        "_symphony_native_recovery": True,
         "_symphony_native_started_at": prompt_at.isoformat(),
     }
+    # Freshness validation may be held by outstanding work. Do not turn an
+    # ordinary markerless result into a missing-callback recovery anchor that
+    # would demand a marker when the same native terminal is checked again.
+    if not (assessed_markerless and _reported_status(report) is None):
+        payload["_symphony_native_recovery"] = True
     if root_prompt_id:
         payload["_symphony_root_prompt_id"] = root_prompt_id
     event_id = hashlib.sha256(f"claude-host-turn\0{session}\0{lead_id}\0{terminal_id}".encode()).hexdigest()
@@ -618,7 +642,8 @@ def claude_completing_lead_turn(
         try:
             event = _claude_native_lead_event(
                 state, session, project, environ, require_missing=False,
-                allow_fast_escalation=allow_fast_escalation)
+                allow_fast_escalation=allow_fast_escalation,
+                allow_assessed_markerless=True)
         except (AttributeError, OSError, TypeError, ValueError):
             return "unknown", None
         if event is None or event.payload["prompt_id"] != latest:

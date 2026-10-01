@@ -992,6 +992,169 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         self.assertIn("prompt_id:prompt-two",
                       settled.recent_runs[-1].assessment["_terminal_turns"][LEAD])
 
+    def prepare_ordinary_markerless_continuation(self, *, handback=False, report="Task completed.", prompt_count=2):
+        self.write_native(final=False)
+        handle({"session_id": SESSION, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD,
+                "parent_thread_id": SESSION, "agent_type": TYPE,
+                "last_assistant_message": "Task completed.", "status": "completed"}, self.environ)
+        active = self.store.load(self.project).active_run
+        self.assertEqual("completing", active.status)
+        self.assertNotIn("_claude_native_recovery", active.assessment)
+        self.write_native(report=report if prompt_count == 1 else "Earlier result.",
+                          handback=handback and prompt_count == 1)
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        if prompt_count == 1:
+            return active, rows
+        began = datetime.fromisoformat(active.delegations[0].updated_at) + timedelta(seconds=1)
+        if prompt_count == 3:
+            rows.extend([
+                {"type": "user", "uuid": "prompt-middle", "sessionId": SESSION,
+                 "agentId": LEAD, "isSidechain": True, "timestamp": (began - timedelta(seconds=0.5)).isoformat(),
+                 "message": {"content": "Reconcile the same task."}},
+                {"type": "assistant", "uuid": "terminal-middle", "sessionId": SESSION,
+                 "agentId": LEAD, "isSidechain": True, "timestamp": (began - timedelta(seconds=0.25)).isoformat(),
+                 "effort": "low", "message": {"model": "claude-sonnet-5", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "Earlier reconciliation completed."}]}},
+            ])
+        rows.append({"type": "user", "uuid": "prompt-two", "sessionId": SESSION,
+            "agentId": LEAD, "isSidechain": True, "timestamp": began.isoformat(),
+            "message": {"content": "Reconcile the same task."}})
+        if handback:
+            rows.extend([
+                {"type": "assistant", "uuid": "handback-two", "sessionId": SESSION,
+                 "agentId": LEAD, "isSidechain": True, "timestamp": (began + timedelta(seconds=1)).isoformat(),
+                 "effort": "low", "message": {"model": "claude-sonnet-5", "stop_reason": "tool_use",
+                     "content": [{"type": "tool_use", "name": "SubagentHandback", "id": "toolu-two",
+                                  "input": {"message": report}}]}},
+                {"type": "user", "uuid": "handback-result-two", "sessionId": SESSION,
+                 "agentId": LEAD, "isSidechain": True, "timestamp": (began + timedelta(seconds=2)).isoformat(),
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu-two",
+                                          "is_error": False}]}},
+            ])
+        rows.append({"type": "assistant", "uuid": "terminal-two", "sessionId": SESSION,
+            "agentId": LEAD, "isSidechain": True, "timestamp": (began + timedelta(seconds=3)).isoformat(),
+            "effort": "low", "message": {"model": "claude-sonnet-5", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Goodbye." if handback else report}]}})
+        self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return active, rows
+
+    def test_ordinary_assessed_markerless_latest_turn_archives_through_stop(self):
+        from plugins.symphony.symphony.host_evidence import _claude_native_lead_event
+        for count, handback, report in ((count, handback, report) for count in (1, 2, 3)
+                                       for handback, report in ((False, "Task completed."),
+                                                               (True, "Task completed."), (True, REPORT))):
+            with self.subTest(prompt_count=count, handback=handback, report=report):
+                self.store.save(self.project, ProjectState(active_run=self.run))
+                active, _ = self.prepare_ordinary_markerless_continuation(
+                    handback=handback, report=report, prompt_count=count)
+                state = self.store.load(self.project)
+                if report != REPORT:
+                    self.assertIsNone(_claude_native_lead_event(state, SESSION, self.project, self.environ,
+                                                              require_missing=False))
+                stop = handle({"session_id": SESSION, "cwd": str(self.project),
+                               "hook_event_name": "Stop"}, self.environ)
+                self.assertNotEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+                settled = self.store.load(self.project)
+                self.assertIsNone(settled.active_run)
+                self.assertEqual(active.run_id, settled.recent_runs[-1].run_id)
+                self.assertEqual("completed", settled.recent_runs[-1].status)
+                if count > 1:
+                    self.assertIn("prompt_id:prompt-two", settled.recent_runs[-1].assessment["_terminal_turns"][LEAD])
+
+    def test_assessed_markerless_freshness_preserves_conflicting_and_strict_evidence_guards(self):
+        cases = ("unfinished", "wrong-model", "wrong-effort", "foreign-parent", "foreign-child",
+                 "failed-final", "blocked-outcome", "malformed-outcome", "duplicate-outcome",
+                 "failed-handback", "duplicate-handback", "failed-handback-outcome",
+                 "malformed-handback-outcome", "recovery-anchor", "fast-owner", "fast-pending")
+        for case in cases:
+            with self.subTest(case=case):
+                self.store.save(self.project, ProjectState(active_run=self.run))
+                active, rows = self.prepare_ordinary_markerless_continuation(handback="handback" in case)
+                if case == "unfinished":
+                    rows.append({**rows[-1], "type": "user", "uuid": "prompt-three",
+                        "timestamp": (datetime.fromisoformat(rows[-1]["timestamp"]) + timedelta(seconds=1)).isoformat(),
+                        "message": {"content": "More work."}})
+                elif case == "wrong-model":
+                    rows[-1]["message"]["model"] = "foreign-model"
+                elif case == "wrong-effort":
+                    rows[-1]["effort"] = "high"
+                elif case == "foreign-parent":
+                    parent = json.loads(self.parent.read_text().splitlines()[0])
+                    parent["sessionId"] = "foreign-root"
+                    self.parent.write_text(json.dumps(parent) + "\n")
+                elif case == "foreign-child":
+                    rows[-1]["agentId"] = "foreign-child"
+                elif case == "failed-final":
+                    rows[-1]["message"]["stop_reason"] = "error"
+                elif case in {"blocked-outcome", "malformed-outcome", "duplicate-outcome"}:
+                    rows[-1]["message"]["content"][0]["text"] = ({
+                        "blocked-outcome": 'SYMPHONY_OUTCOME: {"status":"blocked"}',
+                        "malformed-outcome": "SYMPHONY_OUTCOME: broken",
+                        "duplicate-outcome": REPORT + "\n" + REPORT})[case]
+                elif case == "failed-handback":
+                    rows[-2]["message"]["content"][0]["is_error"] = True
+                elif case == "duplicate-handback":
+                    rows[-3]["message"]["content"].append(dict(rows[-3]["message"]["content"][0]))
+                elif case in {"failed-handback-outcome", "malformed-handback-outcome"}:
+                    rows[-3]["message"]["content"][0]["input"]["message"] = (
+                        'SYMPHONY_OUTCOME: {"status":"failed"}' if case == "failed-handback-outcome"
+                        else "SYMPHONY_OUTCOME: broken")
+                else:
+                    assessment = dict(active.assessment)
+                    if case == "recovery-anchor":
+                        assessment["_claude_native_recovery"] = "prompt_id:prompt-one"
+                    elif case == "fast-owner":
+                        assessment["_fast_route"] = {"model": "claude-sonnet-5", "effort": "low"}
+                    elif case == "fast-pending":
+                        assessment["_fast_pending"] = True
+                    active = replace(active, assessment=assessment)
+                    state = self.store.load(self.project)
+                    self.store.save(self.project, replace(state, active_run=active,
+                        active_runs={f"claude:{SESSION}": active}))
+                self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                stop = handle({"session_id": SESSION, "cwd": str(self.project), "hook_event_name": "Stop"}, self.environ)
+                self.assertEqual("block", json.loads(stop.stdout or "{}").get("decision"))
+                held = self.store.load(self.project)
+                self.assertEqual(active.run_id, held.active_run.run_id)
+                self.assertEqual("completing", held.active_run.status)
+                self.assertEqual({"status": "completed"}, held.active_run.outcome)
+
+    def test_markerless_freshness_rechecks_after_pending_launch_settles(self):
+        for settlement in ("failed-launch", "completed-worker"):
+            with self.subTest(settlement=settlement):
+                self.store.save(self.project, ProjectState(active_run=self.run))
+                active, _ = self.prepare_ordinary_markerless_continuation()
+                worker_input = {"subagent_type": "symphony:symphony-worker-claude-sonnet-5-low",
+                                "prompt": "SYMPHONY_ROLE: worker\nFinish bounded work."}
+                common = {"session_id": SESSION, "cwd": str(self.project)}
+                handle({**common, "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                        "tool_input": worker_input}, self.environ)
+                request = {**common, "hook_event_name": "Stop"}
+                blocked = handle(request, self.environ)
+                self.assertEqual("block", json.loads(blocked.stdout or "{}").get("decision"))
+                held = self.store.load(self.project)
+                self.assertEqual(active.run_id, held.active_run.run_id)
+                self.assertEqual("completing", held.active_run.status)
+                self.assertNotIn("_claude_native_recovery", held.active_run.assessment)
+                if settlement == "failed-launch":
+                    handle({**common, "hook_event_name": "PostToolUseFailure", "tool_name": "Agent",
+                            "tool_input": worker_input, "error": "Launch rejected"}, self.environ)
+                else:
+                    worker = {**common, "agent_id": "aa1234567890abcd", "parent_thread_id": LEAD,
+                              "agent_type": worker_input["subagent_type"]}
+                    handle({**worker, "hook_event_name": "SubagentStart"}, self.environ)
+                    still_working = handle(request, self.environ)
+                    self.assertEqual("block", json.loads(still_working.stdout or "{}").get("decision"))
+                    handle({**worker, "hook_event_name": "SubagentStop", "status": "completed",
+                            "last_assistant_message": "Bounded work finished."}, self.environ)
+                archived = handle(request, self.environ)
+                self.assertNotEqual("block", json.loads(archived.stdout or "{}").get("decision"))
+                settled = self.store.load(self.project)
+                self.assertIsNone(settled.active_run)
+                self.assertEqual(active.run_id, settled.recent_runs[-1].run_id)
+                self.assertEqual("completed", settled.recent_runs[-1].status)
+
     def test_delayed_old_callback_cannot_archive_newer_unfinished_native_turn(self):
         self.write_native(later_prompt=True)
         handle({"session_id": SESSION, "cwd": str(self.project),
