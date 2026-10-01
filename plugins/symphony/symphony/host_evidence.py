@@ -294,6 +294,7 @@ def _claude_native_lead_event(
         "model": lead.requested_tier, "model_reasoning_effort": lead.requested_effort,
         "last_assistant_message": report,
         "_symphony_native_recovery": True,
+        "_symphony_native_started_at": prompt_at.isoformat(),
     }
     if root_prompt_id:
         payload["_symphony_root_prompt_id"] = root_prompt_id
@@ -1046,6 +1047,240 @@ def codex_completing_lead_turn(
         "parent_thread_id": session, "turn_id": latest_started, "status": status,
         "model": lead.requested_tier, "model_reasoning_effort": lead.requested_effort,
         "last_assistant_message": message,
+        "_symphony_native_started_at": began.isoformat(),
     }
     event_id = hashlib.sha256(f"codex-host-turn\0{lead_id}\0{latest_started}".encode()).hexdigest()
     return "completed", Event(event_id, "subagent_stopped", completed_at.isoformat(), payload)
+
+
+def _codex_root_followup(
+    run: RunState, native: Event, project: Path, environ: Mapping[str, str],
+) -> bool:
+    """Bind a successful root followup to the original spawn and new turn."""
+    sessions = Path(environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    paths = tuple(sessions.glob(f"*/*/*/*{run.session_id}.jsonl"))
+    if sessions.is_symlink() or len(paths) != 1:
+        return False
+    path = paths[0]
+    if any(parent.is_symlink() for parent in path.parents if sessions in parent.parents):
+        return False
+    rows = _complete_native_jsonl(path)
+    if (not rows or rows[0].get("type") != "session_meta"
+            or rows[0]["payload"].get("id") != run.session_id
+            or Path(str(rows[0]["payload"].get("cwd") or "")).resolve() != project.resolve()):
+        return False
+    calls, outputs, activity = {}, {}, []
+    for row in rows[1:]:
+        payload = row["payload"]
+        when = _instant(row.get("timestamp"))
+        if when is None:
+            return False
+        if row.get("type") == "response_item" and payload.get("type") == "function_call":
+            if payload.get("name") not in {"spawn_agent", "followup_task"}:
+                continue
+            call_id = payload.get("call_id")
+            if not isinstance(call_id, str) or not call_id or call_id in calls:
+                return False
+            try:
+                args = json.loads(payload.get("arguments"))
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(args, dict):
+                return False
+            calls[call_id] = (payload["name"], args, when)
+        elif row.get("type") == "response_item" and payload.get("type") == "function_call_output":
+            call_id = payload.get("call_id")
+            if call_id in outputs:
+                return False
+            outputs[call_id] = (payload.get("output"), when)
+        elif row.get("type") == "event_msg" and payload.get("type") == "item_completed":
+            item = payload.get("item")
+            if (isinstance(item, dict) and item.get("type") == "SubAgentActivity"
+                    and item.get("agent_thread_id") == run.lead_identity):
+                activity.append((item, when))
+    spawns = [(call_id, args, when) for call_id, (name, args, when) in calls.items()
+              if name == "spawn_agent" and any(item.get("id") == call_id
+                    and item.get("kind") == "started" for item, _ in activity)]
+    if len(spawns) != 1:
+        return False
+    _, spawn, spawned_at = spawns[0]
+    task = spawn.get("task_name")
+    if (not isinstance(task, str) or not re.fullmatch(r"[a-z0-9_]{1,128}", task)
+            or spawn.get("model") != native.payload["model"]
+            or spawn.get("reasoning_effort") != native.payload["model_reasoning_effort"]):
+        return False
+    followups = [(call_id, when) for call_id, (name, args, when) in calls.items()
+                 if name == "followup_task" and args.get("target") in {task, f"/root/{task}"}]
+    if not followups:
+        return False
+    archived = _instant(run.updated_at)
+    followups = [(call_id, when) for call_id, when in followups if archived and when > archived]
+    if len(followups) != 1:
+        return False
+    call_id, called_at = followups[0]
+    response = outputs.get(call_id)
+    deliveries = [when for item, when in activity if item.get("id") == call_id
+                  and item.get("kind") == "interacted" and item.get("agent_path") == f"/root/{task}"]
+    began = _instant(native.payload.get("_symphony_native_started_at"))
+    completed = _instant(native.observed_at)
+    archived = _instant(run.updated_at)
+    return bool(response and response[0] == "" and len(deliveries) == 1
+                and began and completed and archived
+                and spawned_at < archived < called_at <= deliveries[0] <= began
+                and called_at <= response[1] <= completed)
+
+
+def _claude_root_followup(
+    run: RunState, native: Event, project: Path, environ: Mapping[str, str], *, replay: bool = False,
+) -> Event | None:
+    """Claude resumes are proven by an exact Agent resume and tool result."""
+    projects = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    paths = tuple(projects.glob(f"*/{run.session_id}.jsonl"))
+    if projects.is_symlink() or len(paths) != 1 or paths[0].parent.is_symlink():
+        return None
+    rows = _native_jsonl(paths[0])
+    if not rows:
+        return None
+    calls, results = [], {}
+    root_prompt = None
+    for row in rows:
+        if row.get("sessionId") != run.session_id:
+            return None
+        content = (row.get("message") or {}).get("content")
+        if row.get("type") == "user" and isinstance(content, str):
+            root_prompt = row.get("uuid")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                return None
+            if row.get("type") == "assistant" and item.get("type") == "tool_use":
+                details = item.get("input")
+                if (item.get("name") == "Agent" and isinstance(details, dict)
+                        and details.get("resume") == run.lead_identity):
+                    calls.append((row, item, root_prompt))
+            elif row.get("type") == "user" and item.get("type") == "tool_result":
+                results.setdefault(item.get("tool_use_id"), []).append((row, item))
+    archived = _instant(run.updated_at)
+    if not replay:
+        calls = [(row, call, prompt) for row, call, prompt in calls
+                 if archived and _instant(row.get("timestamp"))
+                 and _instant(row["timestamp"]) > archived]
+    if not calls or (not replay and len(calls) != 1):
+        return None
+    row, call, root_prompt = calls[-1]
+    if sum(item.get("id") == call.get("id") for _, item, _ in calls) != 1:
+        return None
+    matching = results.get(call.get("id"), ())
+    began = _instant(native.payload.get("_symphony_native_started_at"))
+    archived = _instant(run.updated_at)
+    called_at = _instant(row.get("timestamp"))
+    if (len(matching) != 1 or not began or not archived or not called_at
+            or not called_at <= began or (not replay and called_at <= archived)
+            or Path(str(row.get("cwd") or "")).resolve() != project.resolve()
+            or call["input"].get("subagent_type") not in {None, native.payload["agent_type"]}):
+        return None
+    result_row, result = matching[0]
+    returned_at = _instant(result_row.get("timestamp"))
+    if result.get("is_error") is True or returned_at is None or returned_at < called_at:
+        return None
+    return replace(native, payload={**native.payload, "_symphony_root_prompt_id": root_prompt})
+
+
+def archived_lead_followup(
+    state: ProjectState, events: tuple[Event, ...], provider: str, session: str,
+    project: Path, environ: Mapping[str, str],
+) -> tuple[RunState, Event] | None:
+    """A root's explicit native followup continues its latest completed run.
+
+    An outcome alone cannot reopen ownership. Require the original lineage,
+    a successful root followup, and a completed new native turn at the pinned
+    route; every retained callback must agree with that turn.
+    """
+    if (not any(event.kind == "subagent_stopped" for event in events)
+            or f"{provider}:{session}" in state.active_runs):
+        return None
+    history = [run for run in state.recent_runs
+               if run.provider == provider and run.session_id == session]
+    if not history:
+        return None
+    run = history[-1]
+    if (run.status != "completed" or run.unreconciled or not run.lead_identity
+            or any(item.state.lower() in {"working", "pending", "interrupted"}
+                   for item in run.delegations)
+            or any(run.lead_identity in {other.lead_identity, *(item.identity for item in other.delegations)}
+                   for other in state.active_runs.values() if other.provider == provider)):
+        return None
+    scoped = replace(state, active_run=replace(run, status="completing"))
+    if provider == "codex":
+        _, native = codex_completing_lead_turn(scoped, session, environ)
+        if (native is None or native.payload.get("status") != "completed"
+                or not _codex_root_followup(run, native, project, environ)):
+            return None
+    elif provider == "claude":
+        _, native = claude_completing_lead_turn(scoped, session, project, environ)
+        if native is None:
+            return None
+        native = _claude_root_followup(run, native, project, environ)
+        if native is None:
+            return None
+    else:
+        return None
+    for event in events:
+        payload = event.payload
+        if (payload.get("provider") != provider or payload.get("session_id") != session
+                or (payload.get("agent_id") or payload.get("subagent_id")) != run.lead_identity
+                or event.kind not in {"subagent_started", "subagent_stopped"}):
+            return None
+        if provider == "codex":
+            if (payload.get("parent_thread_id") != session
+                    or payload.get("turn_id") != native.payload["turn_id"]
+                    or payload.get("model") not in {None, "", native.payload["model"]}
+                    or payload.get("model_reasoning_effort") not in {
+                        None, "", native.payload["model_reasoning_effort"]}
+                    or event.kind == "subagent_stopped" and (
+                        str(payload.get("status") or "completed").lower() != "completed"
+                        or payload.get("last_assistant_message") != native.payload["last_assistant_message"])):
+                return None
+        elif event.kind == "subagent_stopped":
+            if (not payload.get("prompt_id")
+                    or payload.get("prompt_id") not in {native.payload["prompt_id"],
+                                                        native.payload.get("_symphony_root_prompt_id")}
+                    or not _claude_callback_matches_native(event, native, session, allow_conflict=True)):
+                return None
+        elif (payload.get("parent_thread_id") not in {None, "", session}
+              or payload.get("prompt_id") not in {native.payload["prompt_id"],
+                                                  native.payload.get("_symphony_root_prompt_id")}):
+            return None
+    return run, native
+
+
+def claude_committed_native_start_replay(
+    state: ProjectState, source: Event, session: str, project: Path, environ: Mapping[str, str],
+) -> bool:
+    """Recognize a delayed Start only for an already accepted native followup."""
+    payload = source.payload
+    if (source.kind != "subagent_started" or payload.get("provider") != "claude"
+            or payload.get("session_id") != session
+            or payload.get("parent_thread_id") not in {None, "", session}
+            or not payload.get("prompt_id")):
+        return False
+    identity = payload.get("agent_id") or payload.get("subagent_id")
+    for run in (*state.active_runs.values(), *state.recent_runs):
+        if (run.provider != "claude" or run.session_id != session or run.lead_identity != identity
+                or run.status not in {"completing", "completed"}):
+            continue
+        native = _claude_native_lead_event(
+            replace(state, active_run=run), session, project, environ, require_missing=False)
+        if (native is None or run.assessment.get("_claude_native_recovery") !=
+                f"prompt_id:{native.payload['prompt_id']}"
+                or f"{native.event_id}:followup-start" not in run.assessment.get("_start_event_ids", ())):
+            continue
+        native = _claude_root_followup(run, native, project, environ, replay=True)
+        if (native is not None and payload["prompt_id"] in {
+                native.payload["prompt_id"], native.payload.get("_symphony_root_prompt_id")}
+                and payload.get("agent_type") in {None, "", native.payload["agent_type"]}
+                and payload.get("model") in {None, "", native.payload["model"]}
+                and payload.get("model_reasoning_effort") in {None, "", native.payload["model_reasoning_effort"]}):
+            return True
+    return False

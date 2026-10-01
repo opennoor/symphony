@@ -3,6 +3,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from plugins.symphony.symphony.host_evidence import (
     codex_completing_lead_turn, codex_recovered_lead_event,
@@ -329,6 +330,174 @@ class HostEvidenceTests(unittest.TestCase):
                     rows[4:4] = duplicate
                     self.transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
                 self.assertIsNone(codex_recovered_lead_event(old, ROOT_ID, self.environ))
+
+    def load_archived_followup_fixture(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/archived-followup-codex.json").read_text())
+        fixture["root"][0]["payload"]["cwd"] = str(self.project)
+        root = self.transcript.with_name(f"rollout-2026-09-29-{ROOT_ID}.jsonl")
+        root.write_text("".join(json.dumps(row) + "\n" for row in fixture["root"]))
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in fixture["child"]))
+        self.environ["SYMPHONY_PROVIDER"] = "codex"
+        model, effort = "gpt-6.1-sol", "medium"
+        archived = replace(self.run, status="completed", owner_generation=7,
+                           started_at="2026-10-01T09:06:17+00:00", updated_at="2026-10-01T09:08:21+00:00",
+                           outcome={"status": "completed", "summary": "old"},
+                           assessment={"size": "small", "complexity": "simple",
+                                       "_fast_route": {"model": model, "effort": effort},
+                                       "_terminal_turns": {LEAD_ID: [f"turn_id:{OLD_TURN}"]}},
+                           delegations=(Delegation(LEAD_ID, "lead", "task", "completed", model, effort),))
+        self.store.save(self.project, ProjectState(recent_runs=(archived,)))
+        self.store.bind_session("codex", ROOT_ID, self.store._path(self.project), False,
+                               self.project, ROOT_ID)
+        report = fixture["child"][-1]["payload"]["last_agent_message"]
+        payload = {"provider": "codex", "session_id": ROOT_ID, "cwd": str(self.project),
+                   "hook_event_name": "SubagentStop", "agent_id": LEAD_ID, "agent_type": "lead",
+                   "parent_thread_id": ROOT_ID, "turn_id": NEW_TURN, "status": "completed",
+                   "model": model, "model_reasoning_effort": effort, "last_assistant_message": report}
+        event = event_from_payload("codex", payload)
+        self.store.queue_session_event("codex", ROOT_ID, event, ambiguous_owner=True)
+        return archived, payload, root
+
+    def test_archived_native_followup_reconciles_terminal_only_through_root_hooks(self):
+        for hook in ("Stop", "SessionStart", "UserPromptSubmit"):
+            with self.subTest(hook=hook):
+                self.tearDown()
+                self.setUp()
+                archived, payload, _ = self.load_archived_followup_fixture()
+                result = handle({"session_id": ROOT_ID, "cwd": str(self.project),
+                                 "hook_event_name": hook, "prompt": "$symphony:symphony status"}, self.environ)
+                self.assertNotIn('"decision": "block"', result.stdout)
+                handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": "Stop"}, self.environ)
+                state = self.store.load(self.project)
+                self.assertIsNone(state.active_run)
+                self.assertEqual(1, len(state.recent_runs))
+                resumed = state.recent_runs[0]
+                self.assertEqual(archived.run_id, resumed.run_id)
+                self.assertEqual(archived.owner_generation, resumed.owner_generation)
+                self.assertEqual({"status": "completed"}, resumed.outcome)
+                self.assertIn(f"turn_id:{NEW_TURN}", resumed.assessment["_terminal_turns"][LEAD_ID])
+                self.assertEqual([], self.store.session_record("codex", ROOT_ID)["pending"])
+                self.store.queue_session_event("codex", ROOT_ID, event_from_payload("codex", payload), ambiguous_owner=True)
+                handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": "Stop"}, self.environ)
+                self.assertEqual(state.recent_runs, self.store.load(self.project).recent_runs)
+                self.assertEqual(state.terminal_receipts, self.store.load(self.project).terminal_receipts)
+                self.assertEqual([], self.store.session_record("codex", ROOT_ID)["pending"])
+
+    def test_archived_followup_terminal_before_start_is_stable(self):
+        for hook in ("Stop", "UserPromptSubmit"):
+            with self.subTest(hook=hook):
+                self.tearDown()
+                self.setUp()
+                _, terminal, _ = self.load_archived_followup_fixture()
+                handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": hook,
+                        "prompt": "$symphony:symphony status"}, self.environ)
+                started = {key: value for key, value in terminal.items()
+                           if key not in {"status", "last_assistant_message"}}
+                started["hook_event_name"] = "SubagentStart"
+                handle(started, self.environ)
+                result = handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": "Stop"}, self.environ)
+                self.assertNotIn('"decision": "block"', result.stdout)
+                self.assertIsNone(self.store.load(self.project).active_run)
+                self.assertEqual(1, len(self.store.load(self.project).recent_runs))
+                self.assertEqual([], self.store.session_record("codex", ROOT_ID)["pending"])
+
+    def test_archived_followup_requires_successful_exact_native_evidence(self):
+        for change in ("missing-root", "failed-call", "wrong-target", "wrong-child", "foreign-project",
+                       "foreign-root", "missing-result", "duplicate-call", "later-followup", "markerless",
+                       "failed-native", "wrong-model", "wrong-effort", "wrong-turn", "foreign-parent",
+                       "foreign-provider", "foreign-session", "future-generation", "new-owner", "descendant", "wrong-role"):
+            with self.subTest(change=change):
+                self.tearDown()
+                self.setUp()
+                archived, payload, root = self.load_archived_followup_fixture()
+                rows = [json.loads(line) for line in root.read_text().splitlines()]
+                child = [json.loads(line) for line in self.transcript.read_text().splitlines()]
+                followup = next(row for row in rows if row["payload"].get("name") == "followup_task")
+                result = next(row for row in rows if row["payload"].get("type") == "function_call_output"
+                              and row["payload"].get("call_id") == "followup")
+                if change == "failed-call":
+                    result["payload"]["output"] = "failed"
+                elif change == "wrong-target":
+                    followup["payload"]["arguments"] = json.dumps({"target": "another-lead"})
+                elif change == "wrong-child":
+                    for row in rows:
+                        if row["payload"].get("item", {}).get("kind") == "interacted":
+                            row["payload"]["item"]["agent_thread_id"] = "another-child"
+                elif change == "foreign-project":
+                    rows[0]["payload"]["cwd"] = str(self.project.parent)
+                elif change == "foreign-root":
+                    rows[0]["payload"]["id"] = "foreign"
+                elif change == "missing-result":
+                    rows.remove(result)
+                elif change == "duplicate-call":
+                    rows.append(followup)
+                elif change == "later-followup":
+                    rows.append({**followup, "timestamp": "2026-10-01T09:51:00Z",
+                                 "payload": {**followup["payload"], "call_id": "later"}})
+                elif change in {"markerless", "failed-native"}:
+                    child[-1]["payload"]["last_agent_message"] = (
+                        "Done" if change == "markerless" else 'SYMPHONY_OUTCOME: {"status":"blocked"}')
+                elif change in {"wrong-model", "wrong-effort"}:
+                    context = [row for row in child if row["type"] == "turn_context"][-1]
+                    context["payload"]["model" if change == "wrong-model" else "effort"] = "wrong"
+                elif change == "new-owner":
+                    newer = replace(archived, run_id="newer", status="active")
+                    self.store.save(self.project, replace(self.store.load(self.project),
+                                                         active_run=newer, active_runs={f"codex:{ROOT_ID}": newer}))
+                elif change == "descendant":
+                    blocked = replace(archived, delegations=(*archived.delegations, Delegation("worker", "worker", "task", "working", "gpt-6-luna", "low")))
+                    self.store.save(self.project, replace(self.store.load(self.project), recent_runs=(blocked,)))
+                else:
+                    record = self.store.session_record("codex", ROOT_ID)
+                    if change == "future-generation":
+                        record["pending"][0]["generation"] += 1
+                    elif change != "missing-root":
+                        field = {"wrong-turn": "turn_id", "foreign-parent": "parent_thread_id",
+                                 "foreign-provider": "provider", "foreign-session": "session_id",
+                                 "wrong-role": "agent_type"}[change]
+                        record["pending"][0]["payload"][field] = "worker" if change == "wrong-role" else "foreign"
+                    self.store._write_json(self.store._session_path("codex", ROOT_ID), record)
+                root.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                if change == "missing-root":
+                    root.unlink()
+                self.transcript.write_text("".join(json.dumps(row) + "\n" for row in child))
+                before = self.store.load(self.project)
+                result = handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": "Stop"}, self.environ)
+                self.assertIn('"decision": "block"', result.stdout)
+                self.assertEqual(before.recent_runs, self.store.load(self.project).recent_runs)
+                self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
+
+    def test_superseded_fast_lead_cannot_replace_archived_high_owner(self):
+        archived, _, _ = self.load_archived_followup_fixture()
+        stronger = replace(archived, lead_identity="stronger-owner", owner_generation=8,
+                           delegations=(*archived.delegations, Delegation(
+                               "stronger-owner", "lead", "task", "completed", "gpt-6-astra", "high")))
+        self.store.save(self.project, replace(self.store.load(self.project), recent_runs=(stronger,)))
+        for event in ("Stop", "UserPromptSubmit"):
+            result = handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": event,
+                             "prompt": "$symphony:symphony status"}, self.environ)
+            self.assertIn("superseded lead", result.stdout)
+            self.assertIn("Do not resume", result.stdout)
+            self.assertIn("or repeat Stop", result.stdout)
+        self.assertIsNone(self.store.load(self.project).active_run)
+        self.assertEqual((stronger,), self.store.load(self.project).recent_runs)
+        self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
+
+    def test_archived_followup_recovery_commit_before_ack_is_idempotent(self):
+        for hook in ("Stop", "SessionStart", "UserPromptSubmit"):
+            with self.subTest(hook=hook):
+                self.tearDown()
+                self.setUp()
+                self.load_archived_followup_fixture()
+                with patch.object(StateStore, "finish_session_events", side_effect=OSError("crash")):
+                    with self.assertRaises(OSError):
+                        handle({"session_id": ROOT_ID, "cwd": str(self.project),
+                                "hook_event_name": hook, "prompt": "$symphony:symphony status"}, self.environ)
+                result = handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": "Stop"}, self.environ)
+                self.assertNotIn('"decision": "block"', result.stdout)
+                self.assertIsNone(self.store.load(self.project).active_run)
+                self.assertEqual(1, len(self.store.load(self.project).recent_runs))
+                self.assertEqual([], self.store.session_record("codex", ROOT_ID)["pending"])
 
     def test_archived_followup_terminal_requires_new_task_ownership(self):
         self.environ["SYMPHONY_PROVIDER"] = "codex"

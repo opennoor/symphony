@@ -44,6 +44,9 @@ jobs:
         # requested WAIT turn. This checks candidate migration independently.
         run: python -m unittest plugins.symphony.tests.test_host_evidence.HostEvidenceTests.test_released_151_recovering_state_reconciles_unique_native_followup
 
+      - name: Replay fresh and archived followups on Windows
+        run: python -m unittest plugins.symphony.tests.test_fast_route plugins.symphony.tests.test_host_evidence plugins.symphony.tests.test_claude_host_evidence
+
       - name: Execute Windows hooks as a standard user
         timeout-minutes: 5
         run: |

@@ -17,7 +17,8 @@ from typing import Mapping
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
 from .host_evidence import (
-    claude_committed_native_terminal_replay, claude_completing_lead_turn,
+    archived_lead_followup,
+    claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
@@ -143,11 +144,53 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         if lifecycle_source:
             batch.append((source, generation, True))
         recoverable = _recoverable_fast_events(state, pending, provider, session, generation, retired)
+        followup = None
+        if session and batch and all(epoch == generation
+                         and _observed_role(event.payload) in {"", "lead"} and
+                         (event.payload.get("agent_id") or event.payload.get("subagent_id")) not in retired
+                         for event, epoch, _ in batch):
+            try:
+                followup = archived_lead_followup(
+                    state, tuple(event for event, _, _ in batch), provider, session,
+                    Path(record["project"] or project) if record else project, environ)
+            except (OSError, TypeError, ValueError, AttributeError):
+                followup = None
+        if followup is not None:
+            archived, native = followup
+            resumed = replace(archived, status="completing",
+                              assessment={**archived.assessment, "_batch_pending": True})
+            state = replace(state, active_run=resumed,
+                            active_runs={**state.active_runs, f"{provider}:{session}": resumed},
+                            recent_runs=tuple(run for run in state.recent_runs if run != archived))
+            started = Event(f"{native.event_id}:followup-start", "subagent_started",
+                            native.payload["_symphony_native_started_at"],
+                            {**native.payload, "agent_type": native.payload.get("agent_type", "lead"),
+                             "status": "working", "task": archived.task})
+            if provider == "claude":
+                started = replace(started, payload={**started.payload, "prompt_id":
+                    native.payload.get("_symphony_root_prompt_id") or native.payload["prompt_id"]})
+            state, _ = dispatch(state, started)
+            recoverable.update(event.event_id for event, _, _ in batch)
+            # Callback arrival can lag the native terminal. Its proven Start
+            # belongs before that terminal, even when hooks arrived backwards.
+            batch = [(replace(event, observed_at=started.observed_at)
+                      if event.kind == "subagent_started" else event, epoch, current)
+                     for event, epoch, current in batch]
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
             if event.event_id in recoverable:
+                if followup is not None and provider == "claude" and event.kind == "subagent_stopped":
+                    event = replace(event, payload=followup[1].payload)
                 event = replace(event, payload={**event.payload, "_symphony_owner_conflict": False})
             state = _hold_pending_batch(state, provider, session)
             pending_event_id = event.event_id
+            if not current:
+                identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
+                if event_generation < generation:
+                    acknowledged.add(pending_event_id)
+                    continue
+                if event_generation != generation or identity in retired:
+                    unresolved = True
+                    continue
             if provider == "claude" and expected_owner:
                 scoped = _scope_state(state, f"claude:{expected_owner}", expected_owner, provider)
                 native = claude_current_native_lead_event(
@@ -155,14 +198,36 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 if native is not None:
                     event = native
             if (provider == "claude" and expected_owner
+                    and _observed_role(event.payload) in {"", "lead"}
+                    and claude_committed_native_start_replay(
+                        state, event, expected_owner, Path(record["project"] or project), environ)):
+                if not current:
+                    acknowledged.add(pending_event_id)
+                continue
+            if (provider == "claude" and event.kind == "subagent_started" and any(
+                    run.provider == provider and run.session_id == session
+                    and run.status in {"completing", "completed"}
+                    and run.lead_identity == (event.payload.get("agent_id") or event.payload.get("subagent_id"))
+                    and event.event_id in run.assessment.get("_start_event_ids", ())
+                    and any(item.endswith(":followup-start") for item in run.assessment.get("_start_event_ids", ()))
+                    for run in (*state.active_runs.values(), *state.recent_runs))):
+                # Claude can reuse a root prompt ID for another Agent resume.
+                # The native check above must distinguish that new call from
+                # a delayed Start before exact-payload replay is safe.
+                if current:
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                unresolved = True
+                continue
+            if (provider == "claude" and expected_owner
                     and claude_committed_native_terminal_replay(
                         state, event, expected_owner, project, environ)):
                 if not current:
                     acknowledged.add(pending_event_id)
                 continue
             if current:
-                if (expected_owner and _committed_child_start_replay(
-                        state, event, provider, expected_owner)):
+                if (expected_owner and (_committed_child_start_replay(
+                        state, event, provider, expected_owner)
+                        or _committed_lead_event(state, event, provider, expected_owner))):
                     continue
                 if (expected_owner and _committed_child_terminal_replay(
                         state, event, provider, expected_owner, allow_active=True)):
@@ -195,10 +260,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     continue
                 state, source_actions = dispatch(state, event)
                 continue
-            identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
-            disposition = ("stale" if event_generation < generation else
-                           "hold" if event_generation != generation or identity in retired else
-                           _pending_child_disposition(state, event, provider, session))
+            disposition = _pending_child_disposition(state, event, provider, session)
             if disposition == "stale":
                 acknowledged.add(pending_event_id)
             elif disposition == "apply":
@@ -206,10 +268,11 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 acknowledged.add(pending_event_id)
             else:
                 unresolved = True
+        unresolved_reason = _unresolved_child_guidance(
+            state, provider, session, tuple(event for event, _, _ in batch
+                                           if event.event_id not in acknowledged)) if unresolved else ""
         if source.kind == "stop_requested" and unresolved:
-            return state, ((Action("block_stop", {"reason":
-                "Symphony retained an unresolved child result for this session. "
-                "Retry this turn after its owning run is reconciled."}),), acknowledged)
+            return state, ((Action("block_stop", {"reason": unresolved_reason}),), acknowledged)
         if (not unresolved and provider == "claude"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"claude:{session}", session, provider)
@@ -293,9 +356,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 state = _finish_pending_batch(state, provider, session, source)
             state, actions = dispatch(state, source)
         if unresolved and source.kind in {"session_heartbeat", "user_prompt"}:
-            actions += (Action("inject_context", {"text":
-                "Symphony retained an unresolved child result for this session; "
-                "completion stays blocked until it is reconciled."}),)
+            actions += (Action("inject_context", {"text": unresolved_reason}),)
         return state, (actions, acknowledged)
 
     session = str(source.payload.get("session_id") or "")
@@ -591,23 +652,53 @@ def _finish_pending_batch(
     return _merge_scope(state, scoped, next_scoped, key, provider, session)
 
 
-def _committed_fast_event(
+def _unresolved_child_guidance(
+    state: ProjectState, provider: str, session: str, events: tuple[Event, ...],
+) -> str:
+    history = [run for run in state.recent_runs
+               if run.provider == provider and run.session_id == session]
+    if history and f"{provider}:{session}" not in state.active_runs:
+        run = history[-1]
+        superseded = {item.identity for item in run.delegations
+                      if item.role == "lead" and item.identity != run.lead_identity}
+        if any((event.payload.get("agent_id") or event.payload.get("subagent_id")) in superseded
+               for event in events):
+            return ("Symphony retained an unresolved child result from a superseded lead. "
+                    f"The archived owner is `{run.lead_identity}`. Do not resume the superseded lead "
+                    "or repeat Stop. Preserve the result and request explicit reconciliation or a "
+                    "separately routed task; a weaker former lead cannot replace the accepted owner.")
+    return ("Symphony retained an unresolved child result for this session. "
+            "Retry this turn after its owning run is reconciled.")
+
+
+def _committed_lead_event(
     state: ProjectState, event: Event, provider: str, session: str,
 ) -> bool:
-    """A committed fast result survives a crash before its inbox ACK."""
+    """An exact committed lead event survives a crash before its inbox ACK."""
     if (event.payload.get("provider") != provider
             or event.payload.get("session_id") != session
-            or event.payload.get("parent_thread_id") != session
+            or event.payload.get("parent_thread_id") not in (
+                {None, "", session} if provider == "claude" else {session})
             or not _child_turn_token(event.payload)):
         return False
     identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
     for run in (*state.active_runs.values(), *state.recent_runs):
         if (run.provider != provider or run.session_id != session
-                or run.lead_identity != identity or not run.assessment.get("_fast_route")):
+                or run.lead_identity != identity):
             continue
-        if (event.kind == "subagent_started"
-                and event.event_id in run.assessment.get("_start_event_ids", ())):
-            return True
+        if event.kind == "subagent_started":
+            if event.event_id in run.assessment.get("_start_event_ids", ()):
+                return True
+            # A native followup may report its terminal before the Start hook.
+            native_id = hashlib.sha256(
+                f"codex-host-turn\0{identity}\0{event.payload.get('turn_id')}".encode()).hexdigest()
+            lead = next((item for item in run.delegations if item.identity == identity), None)
+            if (provider == "codex" and _observed_role(event.payload) in {"", "lead"}
+                    and _child_turn_token(event.payload) in run.assessment.get("_terminal_turns", {}).get(identity, ())
+                    and f"{native_id}:followup-start" in run.assessment.get("_start_event_ids", ())
+                    and lead and event.payload.get("model") in {None, "", lead.requested_tier}
+                    and event.payload.get("model_reasoning_effort") in {None, "", lead.requested_effort}):
+                return True
         if event.kind == "subagent_stopped":
             result = _terminal_result_id(event)
             if any(item == result or item.endswith(f":{result}")
@@ -656,7 +747,7 @@ def _pending_child_disposition(
 ) -> str:
     """Replay only a child lifecycle that the current run already identifies."""
     if (_committed_child_start_replay(state, event, provider, session)
-            or _committed_fast_event(state, event, provider, session)):
+            or _committed_lead_event(state, event, provider, session)):
         return "stale"
     if _pre_run_unmanaged_claude_child(state, event, provider, session):
         return "stale"

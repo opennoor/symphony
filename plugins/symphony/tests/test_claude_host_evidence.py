@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from plugins.symphony.symphony.host_evidence import (
     claude_committed_native_terminal_replay, claude_recovered_lead_event,
@@ -91,6 +92,164 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                          "timestamp": "2026-09-29T02:03:00Z",
                          "message": {"content": "Do more work."}})
         self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def prepare_archived_followup(self, *, with_start=False):
+        self.environ["SYMPHONY_PROVIDER"] = "claude"
+        self.write_root_prompt()
+        archived = replace(self.run, status="completed", owner_generation=7,
+                           updated_at="2026-09-29T02:02:01+00:00", outcome={"status": "completed"},
+                           assessment={**self.run.assessment, "_claude_native_recovery": "prompt_id:prompt-one",
+                                       "_terminal_turns": {LEAD: ["prompt_id:prompt-one"]}},
+                           delegations=(replace(self.run.delegations[0], state="completed"),))
+        self.store.save(self.project, ProjectState(recent_runs=(archived,)))
+        self.store.bind_session("claude", SESSION, self.store._path(self.project), False, self.project, SESSION)
+        parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
+        parent.extend([
+            {"type": "user", "uuid": "root-two", "sessionId": SESSION,
+             "timestamp": "2026-09-29T02:02:50Z", "message": {"content": "Continue the original task."}},
+            {"type": "assistant", "sessionId": SESSION, "cwd": str(self.project),
+             "timestamp": "2026-09-29T02:03:00Z", "message": {"content": [{
+                 "type": "tool_use", "name": "Agent", "id": "resume-call",
+                 "input": {"resume": LEAD, "subagent_type": TYPE, "prompt": "Continue the original task."}}]}},
+            {"type": "user", "sessionId": SESSION, "timestamp": "2026-09-29T02:04:01Z",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "resume-call",
+                                      "content": "Agent completed", "is_error": False}]}},
+        ])
+        self.parent.write_text("".join(json.dumps(row) + "\n" for row in parent))
+        report = REPORT + "\nNew result."
+        child = [json.loads(line) for line in self.child.read_text().splitlines()]
+        child.extend([
+            {"type": "user", "uuid": "prompt-two", "sessionId": SESSION, "agentId": LEAD,
+             "isSidechain": True, "timestamp": "2026-09-29T02:03:01Z",
+             "message": {"content": "Continue the original task."}},
+            {"type": "assistant", "uuid": "terminal-two", "sessionId": SESSION, "agentId": LEAD,
+             "isSidechain": True, "timestamp": "2026-09-29T02:04:00Z", "effort": "low",
+             "message": {"model": "claude-sonnet-5", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": report}]}},
+        ])
+        self.child.write_text("".join(json.dumps(row) + "\n" for row in child))
+        payload = {"provider": "claude", "cwd": str(self.project), "session_id": SESSION,
+                   "agent_id": LEAD, "agent_type": TYPE, "prompt_id": "root-two"}
+        if with_start:
+            self.store.queue_session_event("claude", SESSION, event_from_payload("claude", {
+                **payload, "hook_event_name": "SubagentStart"}), ambiguous_owner=True)
+        terminal = {**payload, "hook_event_name": "SubagentStop", "status": "completed",
+                    "last_assistant_message": report}
+        self.store.queue_session_event("claude", SESSION, event_from_payload("claude", terminal), ambiguous_owner=True)
+        return archived, terminal
+
+    def test_archived_claude_resume_reconciles_through_root_hooks_and_replays(self):
+        for event in ("Stop", "SessionStart", "UserPromptSubmit"):
+            with self.subTest(event=event):
+                self.setUp()
+                archived, terminal = self.prepare_archived_followup()
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": event, "prompt": "/symphony:status"}, self.environ)
+                self.assertNotIn('"decision": "block"', result.stdout)
+                handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
+                state = self.store.load(self.project)
+                self.assertIsNone(state.active_run)
+                self.assertEqual(1, len(state.recent_runs))
+                self.assertEqual(archived.run_id, state.recent_runs[0].run_id)
+                self.assertEqual(7, state.recent_runs[0].owner_generation)
+                self.assertIn("prompt_id:prompt-two", state.recent_runs[0].assessment["_terminal_turns"][LEAD])
+                self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+                self.store.queue_session_event("claude", SESSION, event_from_payload("claude", terminal), ambiguous_owner=True)
+                handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
+                self.assertEqual(state.recent_runs, self.store.load(self.project).recent_runs)
+                self.assertEqual(state.terminal_receipts, self.store.load(self.project).terminal_receipts)
+                self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+
+    def test_archived_claude_resume_preserves_start_and_terminal_across_crash(self):
+        for event in ("Stop", "SessionStart", "UserPromptSubmit"):
+            with self.subTest(event=event):
+                self.setUp()
+                self.prepare_archived_followup(with_start=True)
+                with patch.object(StateStore, "finish_session_events", side_effect=OSError("crash")):
+                    with self.assertRaises(OSError):
+                        handle({"cwd": str(self.project), "session_id": SESSION,
+                                "hook_event_name": event, "prompt": "/symphony:status"}, self.environ)
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertNotIn('"decision": "block"', result.stdout)
+                self.assertIsNone(self.store.load(self.project).active_run)
+                self.assertEqual(1, len(self.store.load(self.project).recent_runs))
+                self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+
+    def test_archived_claude_resume_terminal_before_start_is_stable(self):
+        for hook, with_start in (("Stop", False), ("UserPromptSubmit", False), ("Stop", True)):
+            with self.subTest(hook=hook, with_start=with_start):
+                self.setUp()
+                _, terminal = self.prepare_archived_followup(with_start=with_start)
+                handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": hook,
+                        "prompt": "/symphony:status"}, self.environ)
+                started = {key: value for key, value in terminal.items()
+                           if key not in {"status", "last_assistant_message"}}
+                started["hook_event_name"] = "SubagentStart"
+                handle(started, self.environ)
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertNotIn('"decision": "block"', result.stdout)
+                self.assertIsNone(self.store.load(self.project).active_run)
+                self.assertEqual(1, len(self.store.load(self.project).recent_runs))
+                self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+                # A subsequent resume in the same root prompt is new work,
+                # even before its child transcript has flushed a new prompt.
+                rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                resume = rows[-2]
+                newer = {**resume, "timestamp": "2026-10-02T02:00:00Z",
+                         "message": {"content": [{**resume["message"]["content"][0], "id": "new-resume"}]}}
+                rows.append(newer)
+                self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                handle(started, self.environ)
+                self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
+
+    def test_archived_claude_resume_requires_exact_successful_evidence(self):
+        for change in ("missing-resume", "failed-resume", "foreign-resume", "duplicate-resume",
+                       "foreign-project", "foreign-root", "missing-result", "markerless", "failed-native",
+                       "wrong-model", "wrong-effort", "foreign-parent", "wrong-prompt", "future-generation"):
+            with self.subTest(change=change):
+                self.setUp()
+                self.prepare_archived_followup()
+                parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                child = [json.loads(line) for line in self.child.read_text().splitlines()]
+                if change == "missing-resume":
+                    del parent[-2]
+                elif change == "failed-resume":
+                    parent[-1]["message"]["content"][0]["is_error"] = True
+                elif change == "foreign-resume":
+                    parent[-2]["message"]["content"][0]["input"]["resume"] = "other-child"
+                elif change == "duplicate-resume":
+                    parent.append(parent[-2])
+                elif change == "foreign-project":
+                    parent[-2]["cwd"] = str(self.project.parent)
+                elif change == "foreign-root":
+                    parent[-2]["sessionId"] = "foreign"
+                elif change == "missing-result":
+                    parent.pop()
+                elif change in {"markerless", "failed-native"}:
+                    child[-1]["message"]["content"][0]["text"] = (
+                        "Done" if change == "markerless" else 'SYMPHONY_OUTCOME: {"status":"blocked"}')
+                elif change == "wrong-model":
+                    child[-1]["message"]["model"] = "wrong"
+                elif change == "wrong-effort":
+                    child[-1]["effort"] = "wrong"
+                else:
+                    record = self.store.session_record("claude", SESSION)
+                    if change == "future-generation":
+                        record["pending"][0]["generation"] += 1
+                    else:
+                        record["pending"][0]["payload"]["parent_thread_id" if change == "foreign-parent" else "prompt_id"] = "foreign"
+                    self.store._write_json(self.store._session_path("claude", SESSION), record)
+                self.parent.write_text("".join(json.dumps(row) + "\n" for row in parent))
+                self.child.write_text("".join(json.dumps(row) + "\n" for row in child))
+                before = self.store.load(self.project)
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertIn('"decision": "block"', result.stdout)
+                self.assertEqual(before.recent_runs, self.store.load(self.project).recent_runs)
+                self.assertIsNone(self.store.load(self.project).active_run)
+                self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
 
     def recovered(self):
         return claude_recovered_lead_event(ProjectState(active_run=self.run), SESSION,
