@@ -39,6 +39,7 @@ from .routing import (
     profiles_for,
     resolve_tier,
     route_for,
+    route_for_recorded,
     snapshot_for,
 )
 from .store import StateStore
@@ -1970,10 +1971,7 @@ def _observe_delegation(
             elif (session_profile is not None and state.active_run.assessment.get("size")
                   and state.active_run.assessment.get("complexity")):
                 recorded = state.active_run.assessment
-                route = route_for(Assessment(
-                    str(recorded["size"]), str(recorded["complexity"]),
-                    str(recorded.get("risk", "normal")),
-                ))
+                route = route_for_recorded(recorded)
                 resolved = resolve_tier(route, snapshot_for(provider, session_profile or None))
                 selected = f"{resolved['lead_model']}/{resolved['lead_effort']}"
                 resolved_profile = session_profile
@@ -1991,10 +1989,7 @@ def _observe_delegation(
                 if assessment.get("_boost_assessment_pending"):
                     expected["approval_required"] = "A valid boosted assessor result is required before selecting the lead."
                 if resolved_profile is not None and assessment.get("size"):
-                    route = route_for(Assessment(
-                        str(assessment["size"]), str(assessment["complexity"]),
-                        str(assessment.get("risk", "normal")),
-                    ))
+                    route = route_for_recorded(assessment)
                     drift = _route_drift(assessment, model, effort)
                     if drift and drift["weaker"] and _accepted_route(state, provider, session) != selected:
                         expected["approval_required"] = _drift_block(provider, drift).payload["reason"]
@@ -2632,15 +2627,7 @@ def _prepare_delegation(
                 return state, (
                     _block_tool("Use the accepted Symphony size/complexity route for this lead."),
                 )
-            route = route_for(
-                Assessment(
-                    str(recorded["size"]),
-                    str(recorded["complexity"]),
-                    str(recorded.get("risk", "normal")),
-                    str(recorded.get("rationale", "")),
-                    str(recorded.get("topology", "")),
-                )
-            )
+            route = route_for_recorded(recorded)
         else:
             route = route_for(assessment)
         spawn_session = str(source.payload.get("session_id") or "")
@@ -2874,13 +2861,7 @@ def _standing_route(state: ProjectState, provider: str) -> str:
     recorded = run.assessment if run else None
     if not isinstance(recorded, Mapping) or not recorded.get("size"):
         return ""
-    route = route_for(
-        Assessment(
-            str(recorded["size"]),
-            str(recorded["complexity"]),
-            str(recorded.get("risk", "normal")),
-        )
-    )
+    route = route_for_recorded(recorded)
     resolved = resolve_tier(route, _snapshot(state, provider))
     return f"{resolved['lead_model']}/{resolved['lead_effort']}"
 

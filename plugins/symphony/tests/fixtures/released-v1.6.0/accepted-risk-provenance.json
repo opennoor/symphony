@@ -1,0 +1,19 @@
+{
+  "tag": "v1.6.0",
+  "commit": "729f02db40e7093f65b5db71a4681a53a1e68693",
+  "fixture_sha256": "4cd908cab369ebc37b4fa7dcf4dd793ed68e3023e83dd065df3bb35f43d81ab3",
+  "sources": {
+    "runtime.py": {
+      "blob": "6f0bcbed13a5788ad1e7797219a7746e7fe59bed",
+      "sha256": "4ca7dd098df3081f5c04e1b79627ba50cb9f1b88689febcebf100435be45d564"
+    },
+    "routing.py": {
+      "blob": "0e1c8d02de4f761eb9ca83b3fa0fdc79adc69832",
+      "sha256": "e9d241bffe4fa743957ba8a8d2723b861a1981857bb73cfbe1cc6a96cbf8c895"
+    },
+    "store.py": {
+      "blob": "848c0a870bdcf08084d7fe44c47ad74573853f43",
+      "sha256": "61ab4b896c06d60b9bcd2209b91e53ff886d6ab328f6887f3badeb5cf1f1448b"
+    }
+  }
+}

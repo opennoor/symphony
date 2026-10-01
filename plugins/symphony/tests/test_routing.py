@@ -13,7 +13,7 @@ from plugins.symphony.symphony.routing import (
 
 class RoutingTests(unittest.TestCase):
     def test_router_rejects_unknown_and_malformed_risk(self):
-        for risk in ('critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
+        for risk in ('low', 'material concerns', 'critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
             with self.subTest(risk=risk), self.assertRaises(ValueError):
                 route_for(Assessment('small', 'simple', risk=risk))
         self.assertEqual(route_for(Assessment('small', 'simple')).risk, 'normal')

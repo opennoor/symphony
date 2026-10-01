@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 import json
 from pathlib import Path
+from typing import Mapping
 
 from .model import CapabilitySnapshot
 
@@ -113,6 +114,22 @@ def route_for(assessment: Assessment) -> Route:
         effort = "medium" if route.lead_effort == "low" else route.lead_effort
         route = replace(route, lead_effort=effort, independent_review=True)
     return replace(route, size=assessment.size, complexity=assessment.complexity, risk=assessment.risk)
+
+
+def route_for_recorded(recorded: Mapping[str, object]) -> Route:
+    """Re-resolve an accepted legacy route without rewriting its evidence.
+
+    Released assessments allowed freeform risk strings; only exact ``high``
+    enabled safeguards. New accepted assessments carry a substantive contract
+    and retain strict validation. This compatibility path is never ingress.
+    """
+    risk = recorded.get('risk', 'normal')
+    accepted = recorded.get('route')
+    legacy = ('substantive_contract' not in recorded and isinstance(accepted, Mapping)
+              and isinstance(accepted.get('lead_model'), str) and bool(accepted['lead_model'])
+              and accepted.get('lead_effort') in EFFORTS and isinstance(risk, str))
+    effective_risk = 'high' if risk == 'high' else 'normal' if legacy else risk
+    return route_for(Assessment(str(recorded['size']), str(recorded['complexity']), effective_risk))
 
 
 def resolve_tier(route: Route, snapshot: CapabilitySnapshot) -> dict[str, object]:

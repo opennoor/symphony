@@ -35,7 +35,7 @@ class FastRouteTests(unittest.TestCase):
 
     def test_provider_assessment_markers_reject_invalid_risk_and_keep_legacy_default(self):
         for provider in ('codex', 'claude'):
-            for risk in ('critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
+            for risk in ('low', 'material concerns', 'critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
                 with self.subTest(provider=provider, risk=risk):
                     report = 'SYMPHONY_ASSESSMENT: ' + json.dumps({'size': 'small', 'complexity': 'simple', 'risk': risk})
                     self.assertIsNone(_assessment_from_marker({'provider': provider, 'last_assistant_message': report}, 'SYMPHONY_ASSESSMENT:'))

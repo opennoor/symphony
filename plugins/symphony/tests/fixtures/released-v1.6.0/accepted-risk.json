@@ -1,0 +1,723 @@
+{
+  "claude/high": {
+    "activation": {
+      "claude": {
+        "profile": "fable-5-5"
+      }
+    },
+    "active_run": {
+      "assessment": {
+        "complexity": "simple",
+        "rationale": "Released risk text",
+        "risk": "high",
+        "route": {
+          "consultation": "none",
+          "degraded": false,
+          "execution": "direct",
+          "independent_review": true,
+          "lead_effort": "medium",
+          "lead_model": "claude-sonnet-5-5",
+          "lead_tier": "capable",
+          "profile": "fable-5-5"
+        },
+        "size": "small",
+        "topology": "direct"
+      },
+      "delegations": [],
+      "lead_identity": null,
+      "outcome": null,
+      "owner_generation": 1,
+      "owner_seen_at": "",
+      "provider": "claude",
+      "run_id": "legacy-run",
+      "session_id": "legacy-root",
+      "started_at": "2026-09-01T00:00:00+00:00",
+      "status": "assessed",
+      "task": "Retained bounded work",
+      "unreconciled": [],
+      "updated_at": "2026-09-01T00:00:01+00:00"
+    },
+    "active_runs": {
+      "claude:legacy-root": {
+        "assessment": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "high",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": true,
+            "lead_effort": "medium",
+            "lead_model": "claude-sonnet-5-5",
+            "lead_tier": "capable",
+            "profile": "fable-5-5"
+          },
+          "size": "small",
+          "topology": "direct"
+        },
+        "delegations": [],
+        "lead_identity": null,
+        "outcome": null,
+        "owner_generation": 1,
+        "owner_seen_at": "",
+        "provider": "claude",
+        "run_id": "legacy-run",
+        "session_id": "legacy-root",
+        "started_at": "2026-09-01T00:00:00+00:00",
+        "status": "assessed",
+        "task": "Retained bounded work",
+        "unreconciled": [],
+        "updated_at": "2026-09-01T00:00:01+00:00"
+      }
+    },
+    "configuration": {},
+    "enabled": true,
+    "event_history": [
+      {
+        "event_id": "legacy-assessor-result:assessment:assessment_accepted",
+        "kind": "assessment_accepted",
+        "observed_at": "2026-09-01T00:00:01+00:00",
+        "payload": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "high",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": true,
+            "lead_effort": "medium",
+            "lead_model": "claude-sonnet-5-5",
+            "lead_tier": "capable",
+            "profile": "fable-5-5"
+          },
+          "size": "small",
+          "topology": "direct"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [],
+    "schema_version": 2,
+    "terminal_receipts": []
+  },
+  "claude/low": {
+    "activation": {
+      "claude": {
+        "profile": "fable-5-5"
+      }
+    },
+    "active_run": {
+      "assessment": {
+        "complexity": "simple",
+        "rationale": "Released risk text",
+        "risk": "low",
+        "route": {
+          "consultation": "none",
+          "degraded": false,
+          "execution": "direct",
+          "independent_review": false,
+          "lead_effort": "low",
+          "lead_model": "claude-sonnet-5-5",
+          "lead_tier": "capable",
+          "profile": "fable-5-5"
+        },
+        "size": "small",
+        "topology": "direct"
+      },
+      "delegations": [],
+      "lead_identity": null,
+      "outcome": null,
+      "owner_generation": 1,
+      "owner_seen_at": "",
+      "provider": "claude",
+      "run_id": "legacy-run",
+      "session_id": "legacy-root",
+      "started_at": "2026-09-01T00:00:00+00:00",
+      "status": "assessed",
+      "task": "Retained bounded work",
+      "unreconciled": [],
+      "updated_at": "2026-09-01T00:00:01+00:00"
+    },
+    "active_runs": {
+      "claude:legacy-root": {
+        "assessment": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "low",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "claude-sonnet-5-5",
+            "lead_tier": "capable",
+            "profile": "fable-5-5"
+          },
+          "size": "small",
+          "topology": "direct"
+        },
+        "delegations": [],
+        "lead_identity": null,
+        "outcome": null,
+        "owner_generation": 1,
+        "owner_seen_at": "",
+        "provider": "claude",
+        "run_id": "legacy-run",
+        "session_id": "legacy-root",
+        "started_at": "2026-09-01T00:00:00+00:00",
+        "status": "assessed",
+        "task": "Retained bounded work",
+        "unreconciled": [],
+        "updated_at": "2026-09-01T00:00:01+00:00"
+      }
+    },
+    "configuration": {},
+    "enabled": true,
+    "event_history": [
+      {
+        "event_id": "legacy-assessor-result:assessment:assessment_accepted",
+        "kind": "assessment_accepted",
+        "observed_at": "2026-09-01T00:00:01+00:00",
+        "payload": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "low",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "claude-sonnet-5-5",
+            "lead_tier": "capable",
+            "profile": "fable-5-5"
+          },
+          "size": "small",
+          "topology": "direct"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [],
+    "schema_version": 2,
+    "terminal_receipts": []
+  },
+  "claude/material concerns": {
+    "activation": {
+      "claude": {
+        "profile": "fable-5-5"
+      }
+    },
+    "active_run": {
+      "assessment": {
+        "complexity": "simple",
+        "rationale": "Released risk text",
+        "risk": "material concerns",
+        "route": {
+          "consultation": "none",
+          "degraded": false,
+          "execution": "direct",
+          "independent_review": false,
+          "lead_effort": "low",
+          "lead_model": "claude-sonnet-5-5",
+          "lead_tier": "capable",
+          "profile": "fable-5-5"
+        },
+        "size": "small",
+        "topology": "direct"
+      },
+      "delegations": [],
+      "lead_identity": null,
+      "outcome": null,
+      "owner_generation": 1,
+      "owner_seen_at": "",
+      "provider": "claude",
+      "run_id": "legacy-run",
+      "session_id": "legacy-root",
+      "started_at": "2026-09-01T00:00:00+00:00",
+      "status": "assessed",
+      "task": "Retained bounded work",
+      "unreconciled": [],
+      "updated_at": "2026-09-01T00:00:01+00:00"
+    },
+    "active_runs": {
+      "claude:legacy-root": {
+        "assessment": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "material concerns",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "claude-sonnet-5-5",
+            "lead_tier": "capable",
+            "profile": "fable-5-5"
+          },
+          "size": "small",
+          "topology": "direct"
+        },
+        "delegations": [],
+        "lead_identity": null,
+        "outcome": null,
+        "owner_generation": 1,
+        "owner_seen_at": "",
+        "provider": "claude",
+        "run_id": "legacy-run",
+        "session_id": "legacy-root",
+        "started_at": "2026-09-01T00:00:00+00:00",
+        "status": "assessed",
+        "task": "Retained bounded work",
+        "unreconciled": [],
+        "updated_at": "2026-09-01T00:00:01+00:00"
+      }
+    },
+    "configuration": {},
+    "enabled": true,
+    "event_history": [
+      {
+        "event_id": "legacy-assessor-result:assessment:assessment_accepted",
+        "kind": "assessment_accepted",
+        "observed_at": "2026-09-01T00:00:01+00:00",
+        "payload": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "material concerns",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "claude-sonnet-5-5",
+            "lead_tier": "capable",
+            "profile": "fable-5-5"
+          },
+          "size": "small",
+          "topology": "direct"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [],
+    "schema_version": 2,
+    "terminal_receipts": []
+  },
+  "codex/high": {
+    "activation": {
+      "codex": {
+        "profile": "latest"
+      }
+    },
+    "active_run": {
+      "assessment": {
+        "complexity": "simple",
+        "rationale": "Released risk text",
+        "risk": "high",
+        "route": {
+          "consultation": "none",
+          "degraded": false,
+          "execution": "direct",
+          "independent_review": true,
+          "lead_effort": "medium",
+          "lead_model": "gpt-6-luna",
+          "lead_tier": "capable",
+          "profile": "latest"
+        },
+        "size": "small",
+        "topology": "direct"
+      },
+      "delegations": [],
+      "lead_identity": null,
+      "outcome": null,
+      "owner_generation": 1,
+      "owner_seen_at": "",
+      "provider": "codex",
+      "run_id": "legacy-run",
+      "session_id": "legacy-root",
+      "started_at": "2026-09-01T00:00:00+00:00",
+      "status": "assessed",
+      "task": "Retained bounded work",
+      "unreconciled": [],
+      "updated_at": "2026-09-01T00:00:01+00:00"
+    },
+    "active_runs": {
+      "codex:legacy-root": {
+        "assessment": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "high",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": true,
+            "lead_effort": "medium",
+            "lead_model": "gpt-6-luna",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "small",
+          "topology": "direct"
+        },
+        "delegations": [],
+        "lead_identity": null,
+        "outcome": null,
+        "owner_generation": 1,
+        "owner_seen_at": "",
+        "provider": "codex",
+        "run_id": "legacy-run",
+        "session_id": "legacy-root",
+        "started_at": "2026-09-01T00:00:00+00:00",
+        "status": "assessed",
+        "task": "Retained bounded work",
+        "unreconciled": [],
+        "updated_at": "2026-09-01T00:00:01+00:00"
+      }
+    },
+    "configuration": {},
+    "enabled": true,
+    "event_history": [
+      {
+        "event_id": "legacy-assessor-result:assessment:assessment_accepted",
+        "kind": "assessment_accepted",
+        "observed_at": "2026-09-01T00:00:01+00:00",
+        "payload": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "high",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": true,
+            "lead_effort": "medium",
+            "lead_model": "gpt-6-luna",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "small",
+          "topology": "direct"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [],
+    "schema_version": 2,
+    "terminal_receipts": []
+  },
+  "codex/low": {
+    "activation": {
+      "codex": {
+        "profile": "latest"
+      }
+    },
+    "active_run": {
+      "assessment": {
+        "complexity": "simple",
+        "rationale": "Released risk text",
+        "risk": "low",
+        "route": {
+          "consultation": "none",
+          "degraded": false,
+          "execution": "direct",
+          "independent_review": false,
+          "lead_effort": "low",
+          "lead_model": "gpt-6-luna",
+          "lead_tier": "capable",
+          "profile": "latest"
+        },
+        "size": "small",
+        "topology": "direct"
+      },
+      "delegations": [],
+      "lead_identity": null,
+      "outcome": null,
+      "owner_generation": 1,
+      "owner_seen_at": "",
+      "provider": "codex",
+      "run_id": "legacy-run",
+      "session_id": "legacy-root",
+      "started_at": "2026-09-01T00:00:00+00:00",
+      "status": "assessed",
+      "task": "Retained bounded work",
+      "unreconciled": [],
+      "updated_at": "2026-09-01T00:00:01+00:00"
+    },
+    "active_runs": {
+      "codex:legacy-root": {
+        "assessment": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "low",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "gpt-6-luna",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "small",
+          "topology": "direct"
+        },
+        "delegations": [],
+        "lead_identity": null,
+        "outcome": null,
+        "owner_generation": 1,
+        "owner_seen_at": "",
+        "provider": "codex",
+        "run_id": "legacy-run",
+        "session_id": "legacy-root",
+        "started_at": "2026-09-01T00:00:00+00:00",
+        "status": "assessed",
+        "task": "Retained bounded work",
+        "unreconciled": [],
+        "updated_at": "2026-09-01T00:00:01+00:00"
+      }
+    },
+    "configuration": {},
+    "enabled": true,
+    "event_history": [
+      {
+        "event_id": "legacy-assessor-result:assessment:assessment_accepted",
+        "kind": "assessment_accepted",
+        "observed_at": "2026-09-01T00:00:01+00:00",
+        "payload": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "low",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "gpt-6-luna",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "small",
+          "topology": "direct"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [],
+    "schema_version": 2,
+    "terminal_receipts": []
+  },
+  "codex/low-drift": {
+    "activation": {
+      "codex": {
+        "profile": "latest"
+      }
+    },
+    "active_run": {
+      "assessment": {
+        "complexity": "complex",
+        "rationale": "Released risk text",
+        "risk": "low",
+        "route": {
+          "consultation": "reserved",
+          "degraded": false,
+          "execution": "mixed",
+          "independent_review": false,
+          "lead_effort": "high",
+          "lead_model": "gpt-6.1-sol",
+          "lead_tier": "capable",
+          "profile": "latest"
+        },
+        "size": "medium",
+        "topology": "mixed"
+      },
+      "delegations": [],
+      "lead_identity": null,
+      "outcome": null,
+      "owner_generation": 1,
+      "owner_seen_at": "",
+      "provider": "codex",
+      "run_id": "legacy-run",
+      "session_id": "legacy-root",
+      "started_at": "2026-09-01T00:00:00+00:00",
+      "status": "assessed",
+      "task": "Retained bounded work",
+      "unreconciled": [],
+      "updated_at": "2026-09-01T00:00:01+00:00"
+    },
+    "active_runs": {
+      "codex:legacy-root": {
+        "assessment": {
+          "complexity": "complex",
+          "rationale": "Released risk text",
+          "risk": "low",
+          "route": {
+            "consultation": "reserved",
+            "degraded": false,
+            "execution": "mixed",
+            "independent_review": false,
+            "lead_effort": "high",
+            "lead_model": "gpt-6.1-sol",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "medium",
+          "topology": "mixed"
+        },
+        "delegations": [],
+        "lead_identity": null,
+        "outcome": null,
+        "owner_generation": 1,
+        "owner_seen_at": "",
+        "provider": "codex",
+        "run_id": "legacy-run",
+        "session_id": "legacy-root",
+        "started_at": "2026-09-01T00:00:00+00:00",
+        "status": "assessed",
+        "task": "Retained bounded work",
+        "unreconciled": [],
+        "updated_at": "2026-09-01T00:00:01+00:00"
+      }
+    },
+    "configuration": {},
+    "enabled": true,
+    "event_history": [
+      {
+        "event_id": "legacy-assessor-result:assessment:assessment_accepted",
+        "kind": "assessment_accepted",
+        "observed_at": "2026-09-01T00:00:01+00:00",
+        "payload": {
+          "complexity": "complex",
+          "rationale": "Released risk text",
+          "risk": "low",
+          "route": {
+            "consultation": "reserved",
+            "degraded": false,
+            "execution": "mixed",
+            "independent_review": false,
+            "lead_effort": "high",
+            "lead_model": "gpt-6.1-sol",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "medium",
+          "topology": "mixed"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [],
+    "schema_version": 2,
+    "terminal_receipts": []
+  },
+  "codex/material concerns": {
+    "activation": {
+      "codex": {
+        "profile": "latest"
+      }
+    },
+    "active_run": {
+      "assessment": {
+        "complexity": "simple",
+        "rationale": "Released risk text",
+        "risk": "material concerns",
+        "route": {
+          "consultation": "none",
+          "degraded": false,
+          "execution": "direct",
+          "independent_review": false,
+          "lead_effort": "low",
+          "lead_model": "gpt-6-luna",
+          "lead_tier": "capable",
+          "profile": "latest"
+        },
+        "size": "small",
+        "topology": "direct"
+      },
+      "delegations": [],
+      "lead_identity": null,
+      "outcome": null,
+      "owner_generation": 1,
+      "owner_seen_at": "",
+      "provider": "codex",
+      "run_id": "legacy-run",
+      "session_id": "legacy-root",
+      "started_at": "2026-09-01T00:00:00+00:00",
+      "status": "assessed",
+      "task": "Retained bounded work",
+      "unreconciled": [],
+      "updated_at": "2026-09-01T00:00:01+00:00"
+    },
+    "active_runs": {
+      "codex:legacy-root": {
+        "assessment": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "material concerns",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "gpt-6-luna",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "small",
+          "topology": "direct"
+        },
+        "delegations": [],
+        "lead_identity": null,
+        "outcome": null,
+        "owner_generation": 1,
+        "owner_seen_at": "",
+        "provider": "codex",
+        "run_id": "legacy-run",
+        "session_id": "legacy-root",
+        "started_at": "2026-09-01T00:00:00+00:00",
+        "status": "assessed",
+        "task": "Retained bounded work",
+        "unreconciled": [],
+        "updated_at": "2026-09-01T00:00:01+00:00"
+      }
+    },
+    "configuration": {},
+    "enabled": true,
+    "event_history": [
+      {
+        "event_id": "legacy-assessor-result:assessment:assessment_accepted",
+        "kind": "assessment_accepted",
+        "observed_at": "2026-09-01T00:00:01+00:00",
+        "payload": {
+          "complexity": "simple",
+          "rationale": "Released risk text",
+          "risk": "material concerns",
+          "route": {
+            "consultation": "none",
+            "degraded": false,
+            "execution": "direct",
+            "independent_review": false,
+            "lead_effort": "low",
+            "lead_model": "gpt-6-luna",
+            "lead_tier": "capable",
+            "profile": "latest"
+          },
+          "size": "small",
+          "topology": "direct"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [],
+    "schema_version": 2,
+    "terminal_receipts": []
+  }
+}
