@@ -30,6 +30,18 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_cleanup_unblocks_missing_gates_without_overwriting_release_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ('release', 'a.stop-release'):
+                gate = Path(directory) / name
+                native.ensure_native_gate_release(gate)
+                self.assertTrue(gate.is_file())
+                boundary = 1_700_000_000_123_456_789
+                os.utime(gate, ns=(boundary, boundary))
+                recorded = gate.stat().st_mtime_ns
+                native.ensure_native_gate_release(gate)
+                self.assertEqual(gate.stat().st_mtime_ns, recorded)
+
     def test_old_stop_hold_binds_released_160_fast_assessor_and_lead_native_history(self):
         import copy
         import native_routing_smoke as smoke
@@ -336,6 +348,61 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 with patch.object(smoke, 'native_rows', side_effect=[canonical, fast_rows]):
                     native.require_assessed_lead_set(values, project, project, 'lead')
             check(run, rows)
+            # Real lead admission consumes the intermediate escalation flag.
+            # The archived candidate must instead prove its scoped receipt.
+            from dataclasses import asdict
+            from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
+            from plugins.symphony.symphony.reducer import _lead_started
+            import copy
+            route = {'execution': 'delegated', 'lead_model': 'model', 'lead_effort': 'medium'}
+            contract = {'version': 1, 'epoch': 'accepted-source', 'accepted_at': '2026-10-01T00:00:02.500+00:00'}
+            result = 'd' * 64
+            assessment = {**run['assessment'], 'substantive_contract': contract, 'route': route,
+                '_terminal_turns': {'fast': ['turn_id:turn']}, '_terminal_event_ids': [result]}
+            before = RunState(run_id='current', task='fixture', status='assessed', started_at='2026-10-01T00:00:00+00:00',
+                updated_at='2026-10-01T00:00:02+00:00', lead_identity='fast', assessment=assessment,
+                delegations=tuple(Delegation(objective='', **child) for child in (lead, fast)),
+                session_id='root', provider='codex')
+            admitted, _ = _lead_started(ProjectState(active_run=before), Event('lead-start', 'lead_started',
+                '2026-10-01T00:00:03+00:00', {'identity': 'lead', 'owner_generation': 2, 'safe_boundary': True}))
+            candidate = asdict(admitted.active_run)
+            self.assertEqual(candidate['lead_identity'], 'lead')
+            self.assertNotIn('_fast_escalated', candidate['assessment'])
+            receipt = {'provider': 'codex', 'session': 'root', 'run_id': 'current', 'agent': 'fast', 'lead': 'fast',
+                       'parent': 'root', 'turn': 'turn_id:turn', 'result': result, 'status': 'completed'}
+            anchor = {'event_id': 'accepted-source:assessment:assessment_accepted', 'kind': 'assessment_accepted',
+                      'observed_at': contract['accepted_at'], 'payload': {'route': route}}
+            document = {'terminal_receipts': [receipt], 'event_history': [anchor]}
+            def check_candidate(values=candidate, proof=document):
+                with patch.object(smoke, 'native_rows', side_effect=[canonical, rows]):
+                    native.require_assessed_lead_set(values, project, project, 'lead', document=proof)
+            check_candidate()
+            for key, value in (('version', True), ('version', 2), ('epoch', ''), ('accepted_at', 'invalid'),
+                               ('accepted_at', '2026-10-01T00:00:01+00:00'), ('accepted_at', '2026-10-01T00:00:04+00:00')):
+                altered = copy.deepcopy(candidate)
+                altered['assessment']['substantive_contract'][key] = value
+                with self.subTest(contract_key=key, value=value), self.assertRaises(RuntimeError):
+                    check_candidate(altered)
+            for key, value in (('execution', 'direct'), ('lead_model', 'foreign'), ('lead_effort', 'high')):
+                altered = copy.deepcopy(candidate)
+                altered['assessment']['route'][key] = value
+                with self.subTest(route_key=key), self.assertRaises(RuntimeError):
+                    check_candidate(altered)
+            for field in ('provider', 'session', 'run_id', 'agent', 'lead', 'parent', 'turn', 'result', 'status'):
+                with self.subTest(receipt_key=field), self.assertRaises(RuntimeError):
+                    check_candidate(proof={**document, 'terminal_receipts': [{**receipt, field: 'foreign'}]})
+            for proof in (None, {}, {**document, 'terminal_receipts': [receipt, receipt]},
+                          {**document, 'event_history': []}, {**document, 'event_history': [anchor, anchor]},
+                          {**document, 'event_history': [{**anchor, 'observed_at': 'foreign'}]},
+                          {**document, 'event_history': [{**anchor, 'kind': 'foreign'}]}):
+                with self.subTest(document=proof), self.assertRaises(RuntimeError):
+                    check_candidate(proof=proof)
+            for key, value in (('_terminal_turns', {}), ('_terminal_event_ids', []), ('_fast_escalated', False),
+                               ('_fast_escalated', None), ('_fast_escalated', 'true'), ('substantive_contract', None)):
+                altered = copy.deepcopy(candidate)
+                altered['assessment'][key] = value
+                with self.subTest(assessment_key=key), self.assertRaises(RuntimeError):
+                    check_candidate(altered)
             for values, other in (({**run, 'delegations': [lead, fast, {**fast, 'identity': 'extra'}]}, rows),
                                   ({**run, 'delegations': [lead, {**fast, 'state': 'failed'}]}, rows),
                                   (run, [header('fast', 'symphony_lead_model_medium'), *rows[1:]]),

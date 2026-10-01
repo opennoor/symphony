@@ -161,13 +161,15 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
                   'prompt_id': 'worker-1'}
         start = smoke.event_from_payload('claude', {**fields, 'hook_event_name': 'SubagentStart'})
         terminal = smoke.event_from_payload('claude', {**fields, 'hook_event_name': 'SubagentStop',
+                                                     'prompt_id': 'later-root-request',
                                                      'status': 'completed', 'last_assistant_message': 'PRIVATE_SENTINEL'})
         proof['start_event_id'] = start.event_id
         history = [{'event_id': source.event_id + ':delegation:delegation_updated',
                     'kind': 'delegation_updated', 'observed_at': timestamp} for source, timestamp in (
                         (start, proof['admitted_at']), (terminal, child['updated_at']))]
         receipt = {'provider': 'claude', 'session': run['session_id'], 'run_id': run['run_id'],
-                   'agent': 'worker', 'turn': proof['turn'], 'result': smoke._terminal_result_id(terminal)}
+                   'agent': 'worker', 'turn': smoke._child_turn_token(terminal.payload),
+                   'result': smoke._terminal_result_id(terminal)}
         document = {'event_history': history, 'terminal_receipts': [receipt]}
         private = home.parent / 'private-child-hooks'
         private.mkdir()
@@ -177,6 +179,12 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         self.assertEqual(result['source_stage'], 'exact_start_and_terminal')
         self.assertEqual(result['stage'], 'accepted')
         self.assertTrue(result['binding_reader_accepted'])
+        self.assertFalse(result['hook_tokens_equal'])
+        self.assertTrue(result['scoped_token_compatible'])
+        self.assertEqual(result['start_token_kind'], 'prompt_id')
+        self.assertEqual(result['terminal_token_kind'], 'prompt_id')
+        self.assertEqual(result['terminal_source_filters']['proof_turn_matches'], 0)
+        self.assertEqual(result['terminal_source_filters']['receipt_turn_matches'], 1)
         self.assertLessEqual(result['launch_minus_admitted_ms'], 0)
         self.assertLessEqual(result['prompt_minus_callback_ms'], 0)
         self.assertEqual(result['textual_prompt_count'], 1)
@@ -735,6 +743,57 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         self.assertFalse(smoke.unittest_verified([("exec_command", {"cmd": "echo 'python -m unittest -q'"}, "", output)]))
         self.assertFalse(smoke.unittest_verified([("exec", 'text("tools.exec_command python -m unittest");', "", output)]))
         self.assertFalse(smoke.unittest_verified([("exec_command", {"cmd": 'python -m unittest -q || echo "Ran 1 test OK"'}, "", output + " FAILED")]))
+
+    def test_finite_bash_unittest_forms_bind_cwd_and_successful_native_result(self):
+        with TemporaryDirectory(prefix='fixture space ') as temporary:
+            project = Path(temporary).resolve()
+            stdout = '----------------------------------------------------------------------\nRan 3 tests in 0.001s\n\nOK\n'
+            def evidence(command, *, text=stdout, error=False, missing=False):
+                rows = [{'message': {'content': [{'type': 'tool_use', 'id': 'call', 'name': 'Bash',
+                         'input': {'command': command}}]}}]
+                if not missing:
+                    rows.append({'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'call',
+                                 'content': text, 'is_error': error}]}})
+                return smoke.tool_evidence('claude', rows)
+            supported = ['python -m unittest -q', 'python3 -m unittest -v 2>&1',
+                         f'cd "{project}" && python.exe -m unittest -q 2>&1',
+                         f"cd '{project}' && python -m unittest"]
+            for command in supported:
+                with self.subTest(command=command):
+                    self.assertTrue(smoke.unittest_verified(evidence(command), project))
+                    self.assertFalse(smoke.unittest_verified(evidence(command, error=True), project))
+                    self.assertFalse(smoke.unittest_verified(evidence(command, missing=True), project))
+                    for text in ('Ran 0 tests in 0.001s\n\nOK\n', stdout + 'FAILED',
+                                 'Ran 3 tests in 0.001s\n', 'echo Ran 3 tests in 0.001s OK'):
+                        self.assertFalse(smoke.unittest_verified(evidence(command, text=text), project))
+            unsafe = [f'cd "{project.parent}" && python -m unittest -q', 'cd . && python -m unittest -q',
+                      f'cd "{project}"; python -m unittest -q', 'python -m unittest -q || echo OK',
+                      'echo python -m unittest -q', '$(echo python) -m unittest -q',
+                      '`echo python` -m unittest -q', 'python -m unittest -q && echo OK',
+                      'python -m unittest -q 2>&1; echo OK', 'python -m unittest -q | cat',
+                      'python -m unittest -q > output.txt', 'python -m unittest discover',
+                      'python -m unittest test_greet', '/usr/bin/python3 -m unittest -q',
+                      'python -m unittest -q\necho OK']
+            for command in unsafe:
+                with self.subTest(command=command):
+                    self.assertFalse(smoke.unittest_verified(evidence(command), project))
+            self.assertFalse(smoke.unittest_verified(evidence(supported[-1])))
+            # This grammar belongs to Claude Bash, not Codex native exec.
+            self.assertFalse(smoke.unittest_verified([('exec_command', {'cmd': supported[2]}, '', stdout)], project))
+            rows = [{'message': {'content': [{'type': 'tool_use', 'id': str(index), 'name': 'Bash',
+                      'input': {'command': command}}]}} for index, command in enumerate([
+                          supported[2], unsafe[0], 'python -m unittest discover',
+                          '/usr/bin/python3 -m unittest -q', 'python -m unittest -q || echo OK'])]
+            facts = smoke.command_witness_probe('claude', rows, project)
+            self.assertEqual(facts['exact_supported_unittest_calls'], 1)
+            shapes = facts['bash_shapes']
+            self.assertEqual(shapes['bound_cwd_prefix_present'], 2)
+            self.assertEqual(shapes['bound_cwd_matches'], 1)
+            self.assertEqual(shapes['stderr_merge_present'], 1)
+            self.assertEqual(shapes['discover_arguments'], 1)
+            self.assertEqual(shapes['absolute_interpreter'], 1)
+            self.assertEqual(shapes['unsupported_shell_operators'], 1)
+            self.assertNotIn(str(project), json.dumps(facts))
 
     def test_captured_output_wrapper_requires_exact_command_and_leading_test_result(self):
         source = 'const r = await tools.exec_command({cmd:"python -m unittest -q && git diff -- greet.py",workdir:"/fixture"}); text(r.output);'

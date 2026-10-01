@@ -2258,6 +2258,14 @@ def old_stop_hold_conditions(host, old_cli_alive, old_version):
             'old_cli_alive': old_cli_alive, 'old_version': old_version}
 
 
+def ensure_native_gate_release(path):
+    """Cleanup may unblock a missing gate, but must preserve a prior release boundary."""
+    try:
+        path.touch(exist_ok=False)
+    except FileExistsError:
+        pass
+
+
 def require_old_stop_hold(host, alive, old_version, run, home, project, canonical):
     """A held old turn may include a separately proven original fast escalation."""
     from native_routing_smoke import native_rows, worker_transcript_is_unforked
@@ -2650,7 +2658,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
             durable_leads = {item.get("identity") for item in matching[0].get("delegations", [])
                              if item.get("role") == "lead"}
             require_assessed_lead_set(matching[0], update['home'], first, leads[label],
-                                      released_old_version=update['old_version'] if label == 'a' else None)
+                                      released_old_version=update['old_version'] if label == 'a' else None,
+                                      document=document)
             if label == 'a':
                 require_released_direct_fixture(matching[0], update['old_version'])
             else:
@@ -2733,8 +2742,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                                         "records": [item for item in capture["records"]
                                                     if item.get("session_id") in set(sessions.values())]}}
     finally:
-        (gate_dir / "release").touch()
-        (gate_dir / "a.stop-release").touch()
+        ensure_native_gate_release(gate_dir / "release")
+        ensure_native_gate_release(gate_dir / "a.stop-release")
         for process in processes.values():
             if process.poll() is None:
                 process.terminate()
@@ -2755,7 +2764,7 @@ def require_released_direct_fixture(run, old_version):
         raise RuntimeError('released original fixture lost its legacy direct contract')
 
 
-def require_assessed_lead_set(run, home, project, canonical, *, released_old_version=None):
+def require_assessed_lead_set(run, home, project, canonical, *, released_old_version=None, document=None):
     """Only one independently identified, completed fast escalation may precede the assessed owner."""
     from native_routing_smoke import native_rows, fast_native_identity, worker_transcript_is_unforked, fast_decision_lines
     leads = [child for child in run.get('delegations', []) if child.get('role') == 'lead']
@@ -2787,8 +2796,15 @@ def require_assessed_lead_set(run, home, project, canonical, *, released_old_ver
     failed = any(row.get('type') == 'event_msg' and row.get('payload', {}).get('type') in
                  {'turn_aborted', 'task_failed', 'task_interrupted', 'error'} for row in rows)
     assessment = run.get('assessment', {})
+    contract = assessment.get('substantive_contract')
+    route = assessment.get('route')
+    scoped_candidate = ('_fast_escalated' not in assessment and isinstance(contract, dict)
+        and type(contract.get('version')) is int and contract['version'] == 1
+        and isinstance(contract.get('epoch'), str) and bool(contract['epoch'])
+        and isinstance(route, dict) and route.get('execution') in {'delegated', 'mixed'})
     escalated = (assessment.get('_fast_escalated') is True
-                 or released_old_version == '1.6.0' and '_fast_escalated' not in assessment)
+                 or released_old_version == '1.6.0' and '_fast_escalated' not in assessment
+                 or scoped_candidate)
     if (child.get('state') != 'completed' or not escalated
             or len(starts) != 1 or failed or not fast_native_identity('codex', rows, child['identity'], run)
             or not worker_transcript_is_unforked('codex', rows, child['identity'])
@@ -2806,6 +2822,36 @@ def require_assessed_lead_set(run, home, project, canonical, *, released_old_ver
             or contexts[0].get('model') != child['requested_tier'] or contexts[0].get('effort') != child['requested_effort']
             or not chronological):
         raise RuntimeError('managed fast history lacks exact preceding native turn proof')
+    if scoped_candidate:
+        token = 'turn_id:' + turn
+        receipts = [item for item in (document or {}).get('terminal_receipts', ())
+                    if item.get('provider') == 'codex' and item.get('session') == run.get('session_id')
+                    and item.get('agent') == child['identity'] and item.get('turn') == token]
+        anchors = [item for item in (document or {}).get('event_history', ())
+                   if item.get('event_id') == contract['epoch'] + ':assessment:assessment_accepted']
+        receipt = receipts[0] if len(receipts) == 1 else {}
+        anchor = anchors[0] if len(anchors) == 1 else {}
+        result = receipt.get('result')
+        if (receipt.get('run_id') != run.get('run_id') or receipt.get('lead') != child['identity']
+                or receipt.get('parent') != run.get('session_id')
+                or receipt.get('status') not in {'completed', 'done', 'success', 'succeeded'}
+                or not isinstance(result, str) or re.fullmatch(r'[0-9a-f]{64}', result) is None
+                or result not in assessment.get('_terminal_event_ids', ())
+                or token not in assessment.get('_terminal_turns', {}).get(child['identity'], ())
+                or anchor.get('kind') != 'assessment_accepted'
+                or anchor.get('observed_at') != contract.get('accepted_at')
+                or anchor.get('payload', {}).get('route') != route
+                or route.get('lead_model') != canonical_child['requested_tier']
+                or route.get('lead_effort') != canonical_child['requested_effort']):
+            raise RuntimeError('managed candidate fast history lacks exact durable receipt/assessment scope')
+        try:
+            scoped_order = (timestamp_ns(terminal_rows[0].get('timestamp'))
+                < timestamp_ns(contract.get('accepted_at'))
+                < min(timestamp_ns(row.get('timestamp')) for row in canonical_starts))
+        except (ValueError, TypeError):
+            scoped_order = False
+        if not scoped_order:
+            raise RuntimeError('managed candidate fast history does not precede accepted assessment/owner')
 
 
 def codex_literal_worker_probe(run, home):

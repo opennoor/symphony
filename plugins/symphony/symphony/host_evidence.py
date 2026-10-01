@@ -131,6 +131,7 @@ def claude_substantive_launch(
     if (run.provider != 'claude' or source.payload.get('provider') != 'claude'
             or source.payload.get('session_id') != run.session_id
             or role not in {'worker', 'consultant'} or accepted is None or admitted is None or observed is None
+            or observed < admitted
             or any(not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', value)
                    for value in (identity, lead_id, run.session_id))
             or source.payload.get('parent_thread_id') not in (None, '', lead_id)

@@ -31,7 +31,7 @@ from symphony.routing import Assessment, fast_lead_selection, route_for, snapsho
 from symphony.store import StateStore, _state_from_dict, _run_from_dict  # noqa: E402
 from symphony.model import Event, ProjectState  # noqa: E402
 from symphony.adapters import event_from_payload  # noqa: E402
-from symphony.runtime import _terminal_result_id, _child_turn_token, _observed_role  # noqa: E402
+from symphony.runtime import _terminal_result_id, _child_turn_token, _child_turn_kind, _substantive_turn_matches, _observed_role  # noqa: E402
 
 CASES = {
     "command": "Run python -m unittest -q and report the result.",
@@ -118,7 +118,7 @@ def failure_diagnostics(provider, root, document):
                 verified = worker_transcript_is_unforked(provider, rows, identity)
                 fast_provenance['unforked_candidates' if verified else 'forked_or_foreign_candidates'] += 1
                 fast_representations.append(decision_representations(provider, rows, identity))
-                fast_command_witnesses.append(command_witness_probe(provider, rows))
+                fast_command_witnesses.append(command_witness_probe(provider, rows, root / 'primary'))
                 if provider == 'codex':
                     bound_runs = [run for run in runs if fast_native_identity(provider, rows, identity, run, home, root / 'primary')]
                     if len(bound_runs) == 1:
@@ -650,7 +650,46 @@ def codex_fast_terminal_probe(document, run_values, rows, identity, home, projec
     return result
 
 
-def command_witness_probe(provider, rows):
+def bash_unittest_shape(command, project=None):
+    """A finite literal Bash grammar; never execute or expand its arguments."""
+    facts = dict.fromkeys(('bound_cwd_prefix_present', 'bound_cwd_matches', 'stderr_merge_present',
+                          'interpreter_family_matches', 'absolute_interpreter', 'discover_arguments',
+                          'specific_test_arguments', 'unsupported_shell_operators', 'finite_bash_shape_supported'), False)
+    if not isinstance(command, str):
+        return facts
+    source = command.strip()
+    redirected = re.sub(r'\s+2>&1$', '', source)
+    facts['stderr_merge_present'] = redirected != source
+    source = redirected
+    cd = re.match(r'''^cd\s+(?P<cwd>'[^']*'|"[^"$`]*"|[^\s;&|<>`$]+)\s+&&\s+''', source)
+    if cd:
+        facts['bound_cwd_prefix_present'] = True
+        try:
+            cwd = shlex.split(cd['cwd'])[0]
+            facts['bound_cwd_matches'] = (project is not None and Path(cwd).is_absolute()
+                                         and Path(cwd).resolve() == Path(project).resolve())
+        except (OSError, ValueError, IndexError):
+            pass
+        source = source[cd.end():]
+    facts['unsupported_shell_operators'] = bool(re.search(r'[;&|<>`$\r\n]', source))
+    try:
+        tokens = shlex.split(source)
+    except ValueError:
+        return facts
+    if tokens:
+        facts['interpreter_family_matches'] = re.fullmatch(r'python(?:3|\.exe)?', tokens[0]) is not None
+        facts['absolute_interpreter'] = Path(tokens[0]).is_absolute()
+    if len(tokens) >= 3 and tokens[1:3] == ['-m', 'unittest']:
+        facts['discover_arguments'] = 'discover' in tokens[3:]
+        facts['specific_test_arguments'] = any(token not in {'-q', '-v', 'discover'} for token in tokens[3:])
+    literal = re.fullmatch(r'python(?:3|\.exe)?\s+-m\s+unittest(?:\s+-(?:q|v))*', source)
+    facts['finite_bash_shape_supported'] = (literal is not None and not facts['unsupported_shell_operators']
+        and not re.search(r'[$`\r\n]', command)
+        and (not cd or facts['bound_cwd_matches']))
+    return facts
+
+
+def command_witness_probe(provider, rows, project=None):
     """Categorize direct native unittest calls/results without exporting arguments or output."""
     result = dict.fromkeys(('direct_shell_calls', 'exact_supported_unittest_calls', 'matched_results',
                            'missing_results', 'error_results', 'ran_tests_present', 'ok_present',
@@ -659,6 +698,7 @@ def command_witness_probe(provider, rows):
                            'all_direct_ran_tests_present', 'all_direct_ok_present', 'all_direct_failed_present',
                            'argv_parse_failures', 'unittest_token_sequence_present', 'duplicate_call_ids'), 0)
     calls, outputs = {}, {}
+    bash_shapes = {key: 0 for key in bash_unittest_shape('')}
     direct_calls = []
     for row in rows:
         value = row.get('payload', {}) if provider == 'codex' else row.get('message', {})
@@ -679,8 +719,13 @@ def command_witness_probe(provider, rows):
                     result['argv_parse_failures'] += 1
                     continue
                 result['unittest_token_sequence_present'] += any(tokens[index:index + 2] == ['-m', 'unittest']
-                                                                 for index in range(len(tokens) - 1))
-                if (len(tokens) >= 3 and re.fullmatch(r'python(?:3|\.exe)?', tokens[0])
+                                                               for index in range(len(tokens) - 1))
+                shape = bash_unittest_shape(args.get('command', ''), project) if provider == 'claude' else None
+                if shape:
+                    for key, value in shape.items():
+                        bash_shapes[key] += value
+                if (shape and shape['finite_bash_shape_supported'] or provider != 'claude'
+                        and len(tokens) >= 3 and re.fullmatch(r'python(?:3|\.exe)?', tokens[0])
                         and tokens[1:3] == ['-m', 'unittest'] and all(token in {'-q', '-v'} for token in tokens[3:])):
                     result['exact_supported_unittest_calls'] += 1
                     calls[block.get('id', block.get('call_id'))] = True
@@ -717,6 +762,8 @@ def command_witness_probe(provider, rows):
             code = None
         result['explicit_exit_zero' if type(code) is int and code == 0 else
                'explicit_exit_nonzero' if type(code) is int else 'exit_unreported'] += 1
+    if provider == 'claude':
+        result['bash_shapes'] = bash_shapes
     return result
 
 
@@ -829,9 +876,10 @@ def claude_child_binding_probe(home, run_dict, document):
             session = event.payload.get('session_id')
             filters['root_session' if session == run.session_id else
                     'child_alias_session' if session == identity else 'other_session'] += 1
-            if session not in {run.session_id, identity} or _child_turn_token(event.payload) != proof.get('turn'):
+            terminal_token = _child_turn_token(event.payload)
+            if session not in {run.session_id, identity}:
                 continue
-            filters['proof_turn_matches'] += 1
+            filters['proof_turn_matches'] += terminal_token == proof.get('turn')
             if event.observed_at < start.observed_at:
                 continue
             filters['timestamp_order_matches'] += 1
@@ -841,7 +889,7 @@ def claude_child_binding_probe(home, run_dict, document):
             if not owner_receipts:
                 continue
             filters['receipt_owner_matches'] += 1
-            turn_receipts = [receipt for receipt in owner_receipts if receipt.get('turn') == proof.get('turn')]
+            turn_receipts = [receipt for receipt in owner_receipts if receipt.get('turn') == terminal_token]
             if len(turn_receipts) != 1:
                 continue
             filters['receipt_turn_matches'] += 1
@@ -865,6 +913,11 @@ def claude_child_binding_probe(home, run_dict, document):
         terminal = candidates[0]
         role = proof.get('role')
         facts.update(source_stage='exact_start_and_terminal',
+            start_token_kind=_child_turn_kind(start.payload),
+            terminal_token_kind=_child_turn_kind(terminal.payload),
+            hook_tokens_equal=proof.get('turn') == _child_turn_token(terminal.payload),
+            scoped_token_compatible=_substantive_turn_matches(run.provider, proof.get('turn'),
+                _child_turn_token(terminal.payload), proof.get('turn_kind'), _child_turn_kind(terminal.payload)),
             immutable_role_matches=_observed_role(terminal.payload) in {'', role}
                 and _observed_role(start.payload) in {'', role},
             start_parent_consistent=proof.get('start_parent') in {'', run.lead_identity},
@@ -1232,12 +1285,26 @@ def observed_composed_unittest(source, output):
     return False
 
 
-def unittest_verified(evidence):
+def unittest_verified(evidence, project=None):
     for name, arguments, _, output in evidence:
         if name in {"exec", "functions.exec"} and observed_composed_unittest(arguments, output):
             return True
         details = arguments if name in {"Bash", "exec_command"} else composed_call(arguments, "exec_command") if name in {"exec", "functions.exec"} else None
         if not isinstance(details, dict):
+            continue
+        if name == 'Bash':
+            if not bash_unittest_shape(details.get('command'), project)['finite_bash_shape_supported']:
+                continue
+            try:
+                result = json.loads(output)
+            except (TypeError, ValueError):
+                result = output
+            if isinstance(result, list) and all(isinstance(block, dict) and block.get('type') == 'text'
+                                              and isinstance(block.get('text'), str) for block in result):
+                result = '\n'.join(block['text'] for block in result)
+            if (isinstance(result, str) and re.search(r'(?m)^Ran [1-9]\d* tests? in \d+(?:\.\d+)?s\r?$', result)
+                    and re.search(r'(?m)^OK\r?$', result) and 'FAILED' not in result):
+                return True
             continue
         try:
             tokens = shlex.split(details.get("command", details.get("cmd", "")))
@@ -1376,7 +1443,7 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     if case == "command":
         require(not workers and not assessors and fingerprint(greeting) == initial_hash,
                 "mechanical objective changed the fixture or used assessed delegation")
-        require(unittest_verified(fast_evidence),
+        require(unittest_verified(fast_evidence, project),
                 "mechanical command has no successful native tool result")
     else:
         require(len(assessors) == 1 and workers, "substantive objective lacks an independent assessor or worker")
@@ -1412,7 +1479,7 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
                     "worker native launch/result is not bound to the canonical assessed lead")
         require(any(fixture_edit(provider, tool_evidence(provider, child_rows[item["identity"]]), project) for item in workers),
                 "fixture edit has no successful worker-origin native tool evidence")
-        require(unittest_verified(lead_evidence),
+        require(unittest_verified(lead_evidence, project),
                 "lead integration has no successful native verification call")
     oracle = "from greet import greet; assert greet('Ada') == 'Hello, Ada!'"
     if case == "feature":

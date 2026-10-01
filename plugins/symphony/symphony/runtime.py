@@ -1637,6 +1637,28 @@ def _child_turn_token(payload: Mapping[str, object]) -> str:
     return ""
 
 
+def _child_turn_kind(payload: Mapping[str, object]) -> str:
+    if 'turn_id' in payload:
+        return 'turn_id'
+    return 'prompt_id' if payload.get('prompt_id') else 'none'
+
+
+def _substantive_turn_matches(provider: str, admitted: object, observed: str,
+                             admitted_kind: object, observed_kind: str) -> bool:
+    # Claude prompt_id correlates hook request context until the next user
+    # prompt; it does not identify a child's native invocation. Only its
+    # scoped native launch proof can bridge that context change. Explicit
+    # native turns and every Codex token retain exact equality.
+    if admitted_kind not in (None, 'none', 'prompt_id', 'turn_id'):
+        return False
+    if admitted == observed and not (admitted_kind is not None and admitted_kind != observed_kind
+                                    and 'turn_id' in (admitted_kind, observed_kind)):
+        return True
+    return (provider == 'claude' and isinstance(admitted, str)
+            and admitted_kind in ('none', 'prompt_id') and observed_kind in ('none', 'prompt_id')
+            and all(not token or token.startswith('prompt_id:') for token in (admitted, observed)))
+
+
 def _record_substantive_child(state: ProjectState, source: Event, role: str,
                               pending: Mapping, *, successful: bool,
                               environ: Mapping[str, str] | None = None) -> ProjectState:
@@ -1656,17 +1678,19 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
     proofs = dict(recorded) if isinstance(recorded, Mapping) else {}
     proof = proofs.get(identity)
     token = _child_turn_token(source.payload)
+    token_kind = _child_turn_kind(source.payload)
     if source.kind == 'subagent_started':
         # A duplicate Start for this invocation cannot rewrite its admitted
         # role or parent. A genuinely new turn gets its own proof epoch.
-        if (not isinstance(proof, Mapping) or proof.get('turn') != token
+        if (not isinstance(proof, Mapping) or not _substantive_turn_matches(
+                run.provider, proof.get('turn'), token, proof.get('turn_kind'), token_kind)
                 or any(proof.get(key) != value for key, value in scope.items())):
-            proof = {**scope, 'turn': token, 'role': role, 'start_event_id': source.event_id,
+            proof = {**scope, 'turn': token, 'turn_kind': token_kind, 'role': role, 'start_event_id': source.event_id,
                      'admitted_at': source.observed_at,
                      'start_parent': str(source.payload.get('parent_thread_id') or ''),
                      'successful': False}
     elif (not isinstance(proof, Mapping) or any(proof.get(key) != value for key, value in scope.items())
-          or proof.get('turn') != token):
+          or not _substantive_turn_matches(run.provider, proof.get('turn'), token, proof.get('turn_kind'), token_kind)):
         # Role/model-only launch intents cannot identify this native child.
         return state
     binding = None

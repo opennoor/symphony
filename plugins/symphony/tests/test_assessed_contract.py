@@ -59,7 +59,7 @@ class AssessedContractTests(unittest.TestCase):
         self.state, _ = _accept_assessment(self.state, self.event('subagent_stopped'),
                                             self.provider, {}, Assessment('small', 'simple'))
 
-    def child(self, identity, role, terminal, turn, *, status='completed', report='', parent=None):
+    def child(self, identity, role, terminal, turn, *, status='completed', report='', parent=None, hook_fields=None):
         route = self.state.active_run.assessment['route']
         fields = {'provider': self.provider, 'session_id': 'root', 'agent_id': identity,
                   'cwd': str(self.project),
@@ -67,6 +67,11 @@ class AssessedContractTests(unittest.TestCase):
                   'parent_thread_id': parent or ('root' if role == 'lead' else 'lead'),
                   'model': route['lead_model'], 'model_reasoning_effort': route['lead_effort'],
                   'turn_id' if self.provider == 'codex' else 'prompt_id': turn}
+        for key, value in (hook_fields or {}).items():
+            if value is None:
+                fields.pop(key, None)
+            else:
+                fields[key] = value
         if terminal:
             fields.update(status=status, last_assistant_message=report)
         elif self.provider == 'claude' and role in {'worker', 'consultant'}:
@@ -475,7 +480,7 @@ class AssessedContractTests(unittest.TestCase):
     def test_claude_native_parent_binding_can_resolve_only_an_admitted_same_scope_start(self):
         from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
         for scenario in ('valid', 'missing-start', 'new-assessment', 'foreign-parent', 'missing-native',
-                         'new-turn', 'wrong-role', 'duplicate-launch', 'foreign-cwd', 'foreign-native-parent',
+                         'prompt-context-change', 'explicit-turn-change', 'wrong-role', 'duplicate-launch', 'foreign-cwd', 'foreign-native-parent',
                          'old-launch', 'launch-after-start', 'foreign-session', 'wrong-model', 'wrong-effort',
                          'missing-cwd', 'relative-cwd', 'relative-source-cwd', 'model-override', 'future-prompt',
                          'newer-string-prompt', 'newer-text-block-prompt', 'missing-prompt-id', 'malformed-prompt'):
@@ -496,8 +501,10 @@ class AssessedContractTests(unittest.TestCase):
                     self.assess()
                 if scenario == 'foreign-parent':
                     fields['parent_thread_id'] = 'root'
-                if scenario == 'new-turn':
+                if scenario == 'prompt-context-change':
                     fields['prompt_id'] = 'other-turn'
+                if scenario == 'explicit-turn-change':
+                    fields['turn_id'] = 'other-turn'
                 if scenario == 'wrong-role':
                     fields['role'] = 'consultant'
                 if scenario == 'missing-native':
@@ -544,8 +551,8 @@ class AssessedContractTests(unittest.TestCase):
                 child.write_text(''.join(json.dumps(row) + '\n' for row in child_rows), encoding='utf-8')
                 terminal = self.event('subagent_stopped', **fields, status='completed')
                 self.state, _ = _observe_delegation(self.state, terminal, self.environ)
-                self.assertEqual(_substantive_child_completed(self.state.active_run), scenario == 'valid')
-                if scenario == 'valid':
+                self.assertEqual(_substantive_child_completed(self.state.active_run), scenario in {'valid', 'prompt-context-change'})
+                if scenario in {'valid', 'prompt-context-change'}:
                     proof = self.state.active_run.assessment['_substantive_children']['worker']
                     self.assertEqual(proof['start_event_id'], start.event_id)
                     self.assertEqual(proof['parent'], 'lead')
@@ -578,6 +585,77 @@ class AssessedContractTests(unittest.TestCase):
                 self.state, _ = _observe_delegation(self.state, terminal)
                 self.assertFalse(_substantive_child_completed(self.state.active_run))
                 self.assertIn('tokenless-worker', self.state.active_run.assessment['_ambiguous_child_starts'])
+
+    def test_claude_prompt_context_changes_require_exact_immutable_native_invocation(self):
+        for scenario in ('changed', 'start-absent', 'stop-absent', 'duplicate-start',
+                         'explicit-start', 'explicit-stop', 'explicit-conflict', 'unknown-kind',
+                         'role-change', 'foreign-parent', 'missing-native', 'changed-launch',
+                         'reused-native', 'before-start'):
+            with self.subTest(scenario=scenario):
+                self.begin('claude')
+                start_fields = ({'prompt_id': None} if scenario == 'start-absent' else
+                                {'turn_id': 'original'} if scenario in {'explicit-start', 'explicit-conflict'} else {})
+                self.child('worker', 'worker', False, 'root-request', hook_fields=start_fields)
+                run = self.state.active_run
+                original = dict(run.assessment['_substantive_children']['worker'])
+                fields = dict(provider='claude', session_id='root', agent_id='worker',
+                              cwd=str(self.project), role='worker', prompt_id='later-request')
+                proofs = dict(run.assessment['_substantive_children'])
+                if scenario == 'unknown-kind':
+                    modified = dict(original)
+                    modified.pop('turn_kind')
+                    proofs['worker'] = modified
+                    self.state = replace(self.state, active_run=replace(run, assessment={
+                        **run.assessment, '_substantive_children': proofs}))
+                    original = modified
+                if scenario == 'stop-absent':
+                    fields.pop('prompt_id')
+                if scenario in {'explicit-stop', 'explicit-conflict'}:
+                    fields['turn_id'] = 'different'
+                if scenario == 'duplicate-start':
+                    self.state, _ = _observe_delegation(self.state, self.event('subagent_started', **fields), self.environ)
+                    self.assertEqual(self.state.active_run.assessment['_substantive_children']['worker'], original)
+                if scenario == 'role-change':
+                    fields['role'] = 'consultant'
+                if scenario == 'foreign-parent':
+                    fields['parent_thread_id'] = 'root'
+                child = next(Path(self.environ['CLAUDE_CONFIG_DIR']).glob('projects/*/root/subagents/agent-worker.jsonl'))
+                if scenario == 'missing-native':
+                    child.with_suffix('.meta.json').unlink()
+                if scenario == 'changed-launch':
+                    meta = json.loads(child.with_suffix('.meta.json').read_text(encoding='utf-8'))
+                    meta['toolUseId'] = 'foreign-launch'
+                    child.with_suffix('.meta.json').write_text(json.dumps(meta), encoding='utf-8')
+                if scenario == 'reused-native':
+                    rows = [json.loads(line) for line in child.read_text(encoding='utf-8').splitlines()]
+                    rows.append({**rows[0], 'uuid': 'new-native-invocation'})
+                    child.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+                terminal = self.event('subagent_stopped', **fields, status='completed')
+                if scenario == 'before-start':
+                    terminal = replace(terminal, observed_at='2026-10-01T14:00:02+00:00')
+                self.state, _ = _observe_delegation(self.state, terminal, self.environ)
+                accepted = scenario in {'changed', 'start-absent', 'stop-absent', 'duplicate-start'}
+                self.assertEqual(_substantive_child_completed(self.state.active_run), accepted)
+                proof = self.state.active_run.assessment['_substantive_children']['worker']
+                for key in ('turn', 'turn_kind', 'start_event_id', 'admitted_at', 'role',
+                            'epoch', 'run_id', 'lead', 'owner_generation'):
+                    self.assertEqual(proof.get(key), original.get(key), key)
+                if accepted:
+                    self.assertEqual(self.state.terminal_receipts[-1]['turn'],
+                                     'prompt_id:later-request' if scenario != 'stop-absent' else '')
+                    self.child('lead', 'lead', True, 'lead-1')
+                    self.state, _ = reduce(self.state, self.event('stop_requested'))
+                    self.assertIsNone(self.state.active_run)
+
+    def test_native_turn_ids_and_untyped_stored_proofs_cannot_bridge_prompt_contexts(self):
+        from plugins.symphony.symphony.runtime import _substantive_turn_matches
+        for provider in ('claude', 'codex'):
+            self.assertTrue(_substantive_turn_matches(provider, 'turn_id:own', 'turn_id:own', 'turn_id', 'turn_id'))
+            self.assertFalse(_substantive_turn_matches(provider, 'turn_id:old', 'turn_id:new', 'turn_id', 'turn_id'))
+            self.assertFalse(_substantive_turn_matches(provider, '', '', 'none', 'turn_id'))
+            for kind in (None, [], {}, 'foreign'):
+                self.assertFalse(_substantive_turn_matches(provider, 'prompt_id:old', 'prompt_id:new', kind, 'prompt_id'))
+        self.assertFalse(_substantive_turn_matches('codex', 'prompt_id:old', 'prompt_id:new', 'prompt_id', 'prompt_id'))
 
     def test_assessed_native_success_needs_no_marker_but_supplied_reports_are_strict(self):
         for provider in ('codex', 'claude'):
