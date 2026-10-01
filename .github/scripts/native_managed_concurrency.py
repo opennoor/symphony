@@ -3908,7 +3908,13 @@ def failure_state(root, provider):
             spawn_probes[path.parent.name] = json.loads(path.read_text())
         except (OSError, ValueError):
             spawn_probes[path.parent.name] = {"snapshot_unreadable": True}
+    sequence_probe = root / 'sendmessage-proof.json'
+    try:
+        sequence_facts = json.loads(sequence_probe.read_text(encoding='utf-8')) if sequence_probe.is_file() else None
+    except (OSError, ValueError):
+        sequence_facts = {'snapshot_unreadable': True}
     return {"provider": provider, "cases": cases, "native_host_trace": host,
+            "sendmessage_proof": sequence_facts,
             "native_resume_status": resume_status,
             "native_resume_phase90": resume_phase,
             "gate_timeouts": gate_timeouts, "native_spawn_probes": spawn_probes,

@@ -100,6 +100,23 @@ class ClaudeSendMessageTests(unittest.TestCase):
                                      for event in completed), 1)
                 self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
 
+    def test_shared_hook_prompt_context_deduplicates_start_without_losing_native_turns(self):
+        self.prepare()
+        record = self.store.session_record('claude', SESSION)
+        self.store.finish_session_events(record, {event.event_id for event in self.events})
+        self.events = [replace(event_from_payload('claude', {
+            **event.payload, 'prompt_id': 'same-root-context'}), observed_at=event.observed_at)
+            for event in self.events]
+        self.queue()
+        self.assertEqual(len(self.store.session_record('claude', SESSION)['pending']), 3)
+        self.call()
+        state = self.store.load(self.project)
+        self.assertIsNone(state.active_run)
+        self.assertEqual(len(state.terminal_receipts), 2)
+        self.assertEqual([receipt['turn'] for receipt in state.terminal_receipts],
+                         ['prompt_id:prompt-send-0', 'prompt_id:prompt-send-1'])
+        self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
     def test_commit_before_ack_and_partial_ack_replay_only_ack_original_owner(self):
         for mode in ('crash', 'partial', 'new-owner', 'same-run-owner', 'same-run-assessment', 'old-codec'):
             with self.subTest(mode=mode):

@@ -17,6 +17,100 @@ import time
 from unittest.mock import patch
 
 
+def sequence_rejection_probe(state, events, session, project, env, evidence):
+    """Read the exact failed proof and export only fixed component facts."""
+    facts = {'pending_callbacks': len(events), 'native_readers': []}
+    sequence_code = evidence.claude_archived_sendmessage_sequence.__code__
+    reader_code = evidence._claude_native_lead_event.__code__
+
+    def trace(frame, kind, result):
+        if frame.f_code not in {sequence_code, reader_code}:
+            return None
+        if kind == 'return':
+            values = frame.f_locals
+            item = {'source_line': frame.f_lineno, 'accepted': result is not None}
+            if frame.f_code is reader_code:
+                launch = values.get('launch_input')
+                children = values.get('child_rows', ())
+                positions = values.get('prompt_indices', ())
+                item.update(metadata_reached='meta' in values, root_launch_reached='launch' in values,
+                            child_prompts_reached='prompt_indices' in values,
+                            terminal_reached='terminal' in values)
+                if isinstance(launch, dict) and positions:
+                    item['original_launch_prompt_matches'] = (
+                        launch.get('prompt') == children[positions[0]].get('message', {}).get('content'))
+                first, archived = values.get('first_prompt_at'), values.get('run')
+                if first is not None and archived is not None:
+                    boundary = evidence._instant(archived.updated_at)
+                    item['original_prompt_before_archive'] = boundary is not None and first < boundary
+                assistants = values.get('assistants')
+                lead = values.get('lead')
+                if assistants is not None and lead is not None:
+                    item['assistant_model_matches'] = all(row.get('message', {}).get('model') == lead.requested_tier
+                                                         for row in assistants)
+                    item['assistant_effort_matches'] = all((row.get('perTurnEffort') or row.get('effort')) ==
+                                                          lead.requested_effort for row in assistants)
+                if len(facts['native_readers']) < 12:
+                    facts['native_readers'].append(item)
+            else:
+                rows = values.get('rows')
+                calls, prompts = values.get('calls', ()), values.get('prompts', ())
+                item.update(root_rows_reached=rows is not None, child_rows_reached='children' in values,
+                            calls=len(calls), prompts=len(prompts), prior_prompts=len(values.get('prior_prompts', ())),
+                            native_turns=len(values.get('native_events', ())),
+                            mapped_callbacks=len(values.get('mapping', {})))
+                if rows is not None:
+                    item['all_root_rows_main_session'] = all(row.get('sessionId') == session and
+                        row.get('isSidechain') is not True and not row.get('agentId') for row in rows)
+                prior = values.get('prior_native')
+                if 'prior_native' in values:
+                    item['prearchive_native_terminal_accepted'] = prior is not None
+                delivery_facts = []
+                for index, (called, row, call) in enumerate(calls[:8]):
+                    details = call.get('input')
+                    details = details if isinstance(details, dict) else {}
+                    matches = values.get('results', {}).get(call.get('id'), ())
+                    delivery = {'literal_recipient_matches': details.get('to') == values['run'].lead_identity,
+                        'literal_message_present': isinstance(details.get('message'), str) and bool(details['message'].strip()),
+                        'paired_result_count': len(matches), 'child_prompt_available': index < len(prompts)}
+                    if index < len(prompts):
+                        delivery['message_matches_child_prompt'] = details.get('message') == prompts[index].get('message', {}).get('content')
+                    if len(matches) == 1:
+                        result_row, paired = matches[0]
+                        content = paired.get('content')
+                        if isinstance(content, list) and content and all(isinstance(block, dict) and
+                                block.get('type') == 'text' and isinstance(block.get('text'), str) for block in content):
+                            content = '\n'.join(block['text'] for block in content)
+                        try:
+                            response = json.loads(content) if isinstance(content, str) else None
+                        except ValueError:
+                            response = None
+                        returned = evidence._instant(result_row.get('timestamp'))
+                        delivery.update(result_json_object=isinstance(response, dict),
+                            result_success=isinstance(response, dict) and response.get('success') is True,
+                            result_resumed_identity_matches=isinstance(response, dict) and
+                                response.get('resumedAgentId') in {None, values['run'].lead_identity},
+                            result_is_error=paired.get('is_error') is True,
+                            result_after_call=returned is not None and returned >= called,
+                            result_before_next_call=returned is not None and
+                                (index + 1 == len(calls) or returned < calls[index + 1][0]))
+                    delivery_facts.append(delivery)
+                item['deliveries'] = delivery_facts
+                facts['sequence'] = item
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        facts['accepted'] = evidence.claude_archived_sendmessage_sequence(
+            state, tuple(events), session, project, env) is not None
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        facts['probe_error'] = True
+    finally:
+        sys.settrace(previous)
+    return facts
+
+
 def captured_sequence_sources(state, session, private_dir, adapters, evidence, model, *, sequences=None):
     runs = [run for run in (*state.active_runs.values(), *state.recent_runs)
             if run.provider == 'claude' and run.session_id == session]
@@ -188,8 +282,9 @@ def check_native_sendmessage(root, candidate, baseline_env, baseline_result, tim
                 'Do not inspect, edit, execute tools or delegate. Return exactly these lines:\n'
                 'CONTINUATION_ACK_TWO\nSYMPHONY_OUTCOME: {"status":"completed"}']
     request = ('Continue ONLY this original archived Symphony lead. Use SendMessage exactly twice, '
-               'sequentially, targeting the literal original agent ID. Await the first native result '
-               'before sending the second. Do not use Agent, names, extra messages, new tasks or tools. '
+               'sequentially, targeting the literal original agent ID. Await the first CHILD end_turn '
+               'and its CONTINUATION_ACK_ONE report before sending the second; a success:true dispatch '
+               'acknowledgment alone is not child completion. Do not use Agent, names, extra messages, new tasks or tools. '
                'Send the following exact string messages without summarizing them: ' + json.dumps([
                    {'to': lead, 'message': message} for message in messages]) +
                '. After the second native terminal, end this root turn so Stop reconciles the same owner.')
@@ -207,7 +302,17 @@ def check_native_sendmessage(root, candidate, baseline_env, baseline_result, tim
     after = store.load(project)
     run = next(run for run in after.recent_runs if run.session_id == session and run.run_id == owner['run_id'])
     before_run = next(run for run in state.recent_runs if run.run_id == owner['run_id'])
-    delta = requested_sequence_delta(before_run, run, messages)
+    try:
+        delta = requested_sequence_delta(before_run, run, messages)
+    except RuntimeError:
+        pending = store.session_record('claude', session)['pending']
+        events = [model.Event(item['event_id'], item['kind'], item['observed_at'], item['payload'])
+                  for item in pending]
+        # Evaluate the untouched pre-followup owner against the exact current
+        # native files and retained callbacks before temporary files disappear.
+        diagnostic = sequence_rejection_probe(state, events, session, project, env, host_evidence)
+        (root / 'sendmessage-proof.json').write_text(json.dumps(diagnostic), encoding='utf-8')
+        raise
     receipts = exact_delta_receipts(after, session, run, delta)
     sources = captured_sequence_sources(after, session, root / 'private-child-hooks', adapters,
                                         host_evidence, model, sequences=delta)

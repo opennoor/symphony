@@ -18,6 +18,39 @@ SPEC.loader.exec_module(probe)
 
 
 class NativeClaudeFollowupTests(unittest.TestCase):
+    def test_rejection_trace_distinguishes_exact_private_native_predicates(self):
+        from unittest.mock import patch
+        f = fixture.ClaudeSendMessageTests()
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        f.prepare()
+        before = f.store.load(f.project)
+        bytes_before = f.store._path(f.project).read_bytes()
+        pending = f.store.session_record('claude', SESSION)['pending']
+        events = [model.Event(item['event_id'], item['kind'], item['observed_at'], item['payload'])
+                  for item in pending]
+        positive = probe.sequence_rejection_probe(before, events, SESSION, f.project, f.environ, host_evidence)
+        self.assertTrue(positive['accepted'])
+        self.assertTrue(all(item['result_success'] and item['message_matches_child_prompt']
+                            for item in positive['sequence']['deliveries']))
+        self.assertTrue(all(item['original_launch_prompt_matches'] for item in positive['native_readers']))
+        original = f.parent.read_bytes()
+        rows = [json.loads(line) for line in original.splitlines()]
+        result = rows[-1]['message']['content'][0]
+        result['content'] = json.dumps({'success': False, 'message': 'token/path-private-sentinel'})
+        f.parent.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        negative = probe.sequence_rejection_probe(before, events, SESSION, f.project, f.environ, host_evidence)
+        self.assertFalse(negative['accepted'])
+        self.assertFalse(negative['sequence']['deliveries'][-1]['result_success'])
+        exported = json.dumps(negative)
+        for secret in ('token/path-private-sentinel', str(f.project), SESSION, f.events[0].event_id):
+            self.assertNotIn(secret, exported)
+        self.assertEqual(f.store._path(f.project).read_bytes(), bytes_before)
+        previous = lambda *args: None
+        with patch.object(probe.sys, 'gettrace', return_value=previous), patch.object(probe.sys, 'settrace') as traced:
+            probe.sequence_rejection_probe(before, events, SESSION, f.project, f.environ, host_evidence)
+        self.assertIs(traced.call_args.args[0], previous)
+
     def prepare(self):
         f = fixture.ClaudeSendMessageTests()
         f.setUp()
