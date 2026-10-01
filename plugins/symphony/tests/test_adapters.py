@@ -147,6 +147,45 @@ class AdapterContractTests(unittest.TestCase):
                 self.assertEqual(event.payload['model'], 'callback-model')
                 self.assertNotIn('task', event.payload)
 
+    def test_explicit_codex_callback_turn_requires_exact_context_before_task_metadata(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child', 'agent_path': '/root/worker',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message',
+                    'message': 'SYMPHONY_FAST_ROUTE: lead\nStale context task'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for token in (None, '', 0, True, [], {}, 'foreign', 'own-turn'):
+                    with self.subTest(hook=hook, native_turn=token):
+                        context = {'type': 'turn_context', 'payload': {
+                            'model': 'native-model', 'effort': 'high', 'turn_id': token}}
+                        if token is None: context['payload'].pop('turn_id')
+                        transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task)))
+                        payload = {'hook_event_name': hook, 'agent_id': 'child', 'turn_id': 'own-turn',
+                                   'agent_transcript_path': str(transcript), 'model': 'callback-model'}
+                        event = event_from_payload('codex', payload)
+                        self.assertEqual(event.payload['task_name'], 'worker')
+                        self.assertEqual(event.payload['parent_thread_id'], 'lead')
+                        if token == 'own-turn':
+                            self.assertEqual(event.payload['model'], 'native-model')
+                            self.assertIn('task', event.payload)
+                        else:
+                            self.assertEqual(event.payload['model'], 'callback-model')
+                            self.assertNotIn('model_reasoning_effort', event.payload)
+                            self.assertNotIn('task', event.payload)
+                context['payload']['turn_id'] = 'own-turn'
+                transcript.write_text('\n'.join(json.dumps(row) for row in (header, task, context)))
+                event = event_from_payload('codex', payload)
+                self.assertEqual(event.payload['model'], 'native-model')
+                self.assertNotIn('task', event.payload)
+                # A tokenless legacy callback retains header-bound native metadata.
+                context['payload'].pop('turn_id')
+                transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task)))
+                payload.pop('turn_id')
+                event = event_from_payload('codex', payload)
+                self.assertEqual(event.payload['model'], 'native-model')
+                self.assertIn('task', event.payload)
+
     def test_codex_fork_keeps_child_header_and_binds_only_its_callback_turn(self):
         # Sanitized native fork: child header, copied parent header/turn, own turn.
         rows = [

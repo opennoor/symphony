@@ -104,7 +104,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     if not isinstance(identity, str) or not identity or identity != callback_identity:
                         return {}
                     forked = bool(record_payload.get("forked_from_id"))
-                    own_turn = not forked
+                    own_turn = not forked and not callback_turn
                     spawn = record_payload
                     for key in ("source", "subagent", "thread_spawn"):
                         spawn = spawn.get(key, {}) if isinstance(spawn, dict) else {}
@@ -119,8 +119,8 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                 elif record.get("type") == "turn_context":
                     if forked:
                         own_turn = bool(callback_turn and record_payload.get("turn_id") == callback_turn)
-                    elif callback_turn and record_payload.get("turn_id"):
-                        own_turn = record_payload["turn_id"] == callback_turn
+                    elif callback_turn:
+                        own_turn = record_payload.get("turn_id") == callback_turn
                     if not own_turn:
                         continue
                     if record_payload.get("model"):

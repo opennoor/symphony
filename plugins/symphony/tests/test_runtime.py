@@ -917,7 +917,7 @@ class RuntimeTests(unittest.TestCase):
                     json.dumps(
                         {
                             "type": "turn_context",
-                            "payload": {"model": self.simple["model"], "effort": self.simple["effort"]},
+                            "payload": {"turn_id": "turn-1", "model": self.simple["model"], "effort": self.simple["effort"]},
                         }
                     ),
                 )
@@ -3241,7 +3241,7 @@ class RuntimeTests(unittest.TestCase):
 
         transcript = self.root / "corrected-lead.jsonl"
         transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": "lead-1"}}) + "\n" + json.dumps({
-            "type": "turn_context", "payload": {"model": "wrong-model", "effort": self.simple["effort"]},
+            "type": "turn_context", "payload": {"turn_id": "turn-1", "model": "wrong-model", "effort": self.simple["effort"]},
         }), encoding="utf-8")
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "agent_transcript_path": str(transcript)}, self.environ)
