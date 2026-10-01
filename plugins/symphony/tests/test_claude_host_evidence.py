@@ -396,6 +396,46 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 self.assertIsNone(state.active_run)
                 self.assertEqual(1, len(self.store.session_record("claude", alias)["pending"]))
 
+    def test_archived_claude_resume_matches_text_block_root_prompt(self):
+        for uuid in ("root-two", None, "", 123):
+            with self.subTest(uuid=uuid):
+                self.setUp()
+                _, terminal = self.prepare_archived_followup(with_start=True)
+                rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                rows[-3]["message"]["content"] = [{"type": "text", "text": "Continue the original task."}]
+                rows[-3]["uuid"] = uuid
+                self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                root = {"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}
+                result = handle(root, self.environ)
+                if uuid != "root-two":
+                    self.assertIn('"decision": "block"', result.stdout)
+                    self.assertEqual(2, len(self.store.session_record("claude", SESSION)["pending"]))
+                    continue
+                self.assertNotIn('"decision": "block"', result.stdout)
+                state = self.store.load(self.project)
+                self.assertIn("prompt_id:prompt-two", state.recent_runs[0].assessment["_terminal_turns"][LEAD])
+                handle(terminal, self.environ)
+                self.assertNotIn('"decision": "block"', handle(root, self.environ).stdout)
+                self.assertEqual(state.recent_runs, self.store.load(self.project).recent_runs)
+                self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+
+    def test_archived_claude_resume_retains_conflicting_start_route(self):
+        for field in ("agent_type", "model", "model_reasoning_effort"):
+            with self.subTest(field=field):
+                self.setUp()
+                self.prepare_archived_followup(with_start=True)
+                record = self.store.session_record("claude", SESSION)
+                record["pending"][0]["payload"][field] = (
+                    "symphony:symphony-lead-claude-opus-5-5-high" if field == "agent_type" else "wrong")
+                self.store._write_json(self.store._session_path("claude", SESSION), record)
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertIn('"decision": "block"', result.stdout)
+                state = self.store.load(self.project)
+                self.assertNotIn("prompt_id:prompt-two", state.recent_runs[0].assessment["_terminal_turns"][LEAD])
+                self.assertIsNone(state.active_run)
+                self.assertEqual(2, len(self.store.session_record("claude", SESSION)["pending"]))
+
     def test_archived_claude_resume_requires_exact_successful_evidence(self):
         for change, promptless in ((change, promptless) for change in (
                 "missing-resume", "failed-resume", "foreign-resume", "duplicate-resume",

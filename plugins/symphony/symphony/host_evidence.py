@@ -1172,8 +1172,13 @@ def _claude_root_followup(
         if row.get("sessionId") != run.session_id:
             return None
         content = (row.get("message") or {}).get("content")
-        if row.get("type") == "user" and isinstance(content, str):
+        textual = isinstance(content, str) or (isinstance(content, list) and content
+                   and all(isinstance(item, dict) and item.get("type") == "text"
+                           and isinstance(item.get("text"), str) for item in content))
+        if row.get("type") == "user" and textual:
             root_prompt = row.get("uuid")
+            if not isinstance(root_prompt, str) or not root_prompt:
+                return None
         if not isinstance(content, list):
             continue
         for item in content:
@@ -1289,7 +1294,11 @@ def archived_lead_followup(
                 return None
         elif (payload.get("parent_thread_id") not in {None, "", session}
               or payload.get("prompt_id") not in {None, "", native.payload["prompt_id"],
-                                                  native.payload.get("_symphony_root_prompt_id")}):
+                                                  native.payload.get("_symphony_root_prompt_id")}
+              or payload.get("agent_type") not in {None, "", native.payload["agent_type"]}
+              or payload.get("model") not in {None, "", native.payload["model"]}
+              or payload.get("model_reasoning_effort") not in {
+                  None, "", native.payload["model_reasoning_effort"]}):
             return None
     return run, native
 
