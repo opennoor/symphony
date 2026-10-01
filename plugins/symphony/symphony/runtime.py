@@ -594,6 +594,8 @@ def _pending_child_disposition(
     """Replay only a child lifecycle that the current run already identifies."""
     if _committed_child_start_replay(state, event, provider, session):
         return "stale"
+    if _pre_run_unmanaged_claude_child(state, event, provider, session):
+        return "stale"
     if event.payload.get("_symphony_owner_conflict"):
         return "hold"
     if event.kind not in {"subagent_started", "subagent_stopped"}:
@@ -629,6 +631,31 @@ def _pending_child_disposition(
         if any(isinstance(item, Mapping) and item.get("role") == role for item in pending):
             return "apply"
     return "hold"
+
+
+def _pre_run_unmanaged_claude_child(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """An unmarked root Agent call cannot own a run opened after its callback."""
+    if provider != "claude" or event.kind not in {"subagent_started", "subagent_stopped"}:
+        return False
+    run = state.active_runs.get(f"{provider}:{session}")
+    identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+    if (not run or not run.started_at or not identity
+            or event.observed_at >= run.started_at
+            or str(event.payload.get("session_id") or "") != session
+            or event.payload.get("parent_thread_id") or _observed_role(event.payload)
+            or str(event.payload.get("agent_type") or "").strip().lower()
+            not in {"", "general-purpose"}
+            or event.payload.get("role") or event.payload.get("task_name")
+            or event.payload.get("_symphony_child_metadata")):
+        return False
+    if any(identity in {item.lead_identity, *(child.identity for child in item.delegations)}
+           for item in (*state.active_runs.values(), *state.recent_runs)
+           if item.provider == provider):
+        return False
+    return not any(item.get("provider") == provider and item.get("agent") == identity
+                   for item in state.terminal_receipts)
 
 
 def _committed_child_terminal_replay(

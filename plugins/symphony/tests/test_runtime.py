@@ -1284,6 +1284,107 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(store.load(self.project).active_run)
         self.assertEqual([], store.session_record("codex", "codex-session")["pending"])
 
+    def test_claude_pre_run_unmarked_callbacks_do_not_block_managed_stop(self):
+        choice = route_choice(provider="claude")
+        self.seed_run(RunState(
+            "managed-run", "task", status="completing", lead_identity="managed-lead",
+            assessment={"size": "small", "complexity": "simple"},
+            delegations=(Delegation("managed-lead", "lead", "task", "completed",
+                                    choice["model"], choice["effort"]),),
+            outcome={"status": "completed"}, started_at="2026-10-01T05:05:20+00:00",
+        ), provider="claude")
+        store = StateStore(self.state_root)
+        for kind, observed_at in (
+            ("subagent_started", "2026-10-01T05:05:04+00:00"),
+            ("subagent_stopped", "2026-10-01T05:05:07+00:00"),
+        ):
+            event = Event(
+                f"generic:{kind}", kind, observed_at,
+                {"session_id": "claude-session", "agent_id": "generic-child",
+                 "prompt_id": "generic-prompt", "agent_type": ""},
+            )
+            with store.session_lock("claude", "claude-session"):
+                store.queue_session_event("claude", "claude-session", event,
+                                          ambiguous_owner=True)
+
+        with patch.object(runtime_module, "claude_recovered_lead_event", return_value=None), \
+             patch.object(runtime_module, "claude_completing_lead_turn",
+                          return_value=("complete", None)):
+            stop = handle({**self.payload("", "claude"), "hook_event_name": "Stop"},
+                          self.claude_environ)
+
+        self.assertNotEqual("block", self.output(stop).get("decision"))
+        self.assertEqual([], store.session_record("claude", "claude-session")["pending"])
+        self.assertIsNone(store.load(self.project).active_run)
+
+    def test_claude_pre_run_managed_child_conflict_still_blocks_stop(self):
+        choice = route_choice(provider="claude")
+        self.seed_run(RunState(
+            "managed-run", "task", status="completing", lead_identity="managed-lead",
+            assessment={"size": "small", "complexity": "simple"},
+            delegations=(Delegation("managed-lead", "lead", "task", "completed",
+                                    choice["model"], choice["effort"]),),
+            outcome={"status": "completed"}, started_at="2026-10-01T05:05:20+00:00",
+        ), provider="claude")
+        store = StateStore(self.state_root)
+        event = Event(
+            "managed:restart", "subagent_started", "2026-10-01T05:05:04+00:00",
+            {"session_id": "claude-session", "agent_id": "managed-lead",
+             "prompt_id": "new-lead-prompt", "agent_type": ""},
+        )
+        with store.session_lock("claude", "claude-session"):
+            store.queue_session_event("claude", "claude-session", event,
+                                      ambiguous_owner=True)
+
+        stop = handle({**self.payload("", "claude"), "hook_event_name": "Stop"},
+                      self.claude_environ)
+
+        self.assertEqual("block", self.output(stop).get("decision"))
+        self.assertEqual(1, len(store.session_record("claude", "claude-session")["pending"]))
+        self.assertIsNotNone(store.load(self.project).active_run)
+
+    def test_claude_pre_run_marked_child_conflict_still_blocks_stop(self):
+        choice = route_choice(provider="claude")
+        self.seed_run(RunState(
+            "managed-run", "task", status="completing", lead_identity="managed-lead",
+            assessment={"size": "small", "complexity": "simple"},
+            delegations=(Delegation("managed-lead", "lead", "task", "completed",
+                                    choice["model"], choice["effort"]),),
+            outcome={"status": "completed"}, started_at="2026-10-01T05:05:20+00:00",
+        ), provider="claude")
+        store = StateStore(self.state_root)
+        event = Event(
+            "managed:marked-start", "subagent_started", "2026-10-01T05:05:04+00:00",
+            {"session_id": "claude-session", "agent_id": "unknown-child",
+             "prompt_id": "marked-prompt", "agent_type": "symphony:symphony-worker",
+             "task": "SYMPHONY_ROLE: worker"},
+        )
+        with store.session_lock("claude", "claude-session"):
+            store.queue_session_event("claude", "claude-session", event,
+                                      ambiguous_owner=True)
+
+        stop = handle({**self.payload("", "claude"), "hook_event_name": "Stop"},
+                      self.claude_environ)
+
+        self.assertEqual("block", self.output(stop).get("decision"))
+        self.assertEqual(1, len(store.session_record("claude", "claude-session")["pending"]))
+        self.assertIsNotNone(store.load(self.project).active_run)
+
+    def test_claude_pre_run_malformed_agent_type_is_not_discarded(self):
+        run = self.seed_run(RunState(
+            "managed-run", "task", started_at="2026-10-01T05:05:20+00:00",
+        ), provider="claude")
+        event = Event(
+            "malformed:start", "subagent_started", "2026-10-01T05:05:04+00:00",
+            {"session_id": "claude-session", "agent_id": "unknown-child",
+             "agent_type": "symphony:symphony-unknown",
+             "_symphony_owner_conflict": True},
+        )
+        state = StateStore(self.state_root).load(self.project)
+
+        self.assertEqual("hold", runtime_module._pending_child_disposition(
+            state, event, "claude", run.session_id))
+
     def test_child_session_inbox_is_drained_by_its_verified_root_stop(self):
         choice = route_choice()
         self.seed_run(RunState("root-run", "task", lead_identity="lead", status="active",
