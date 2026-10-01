@@ -44,7 +44,9 @@ def generated(root=PLUGIN):
         path = root / "hooks" / filename
         document = json.loads(path.read_text())
         buffer = io.BytesIO()
-        with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0) as archive:
+        # Stored DEFLATE avoids differing zlib/zlib-ng compression heuristics.
+        # The complete relay still fits cmd.exe's bounded command length.
+        with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0, compresslevel=0) as archive:
             archive.write(relay.replace('__SYMPHONY_PROVIDER__', provider).encode())
         payload = base64.b64encode(buffer.getvalue()).decode()
         wrapper = ("$m=[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "'));"

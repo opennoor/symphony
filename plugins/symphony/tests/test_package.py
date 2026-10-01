@@ -52,6 +52,45 @@ class PackageContractTests(unittest.TestCase):
         for path, expected in generated().items():
             self.assertEqual(path.read_text(), expected, "run scripts/generate_hooks.py after package changes")
 
+    def test_windows_relay_uses_stored_gzip_and_fits_native_command_limit(self):
+        import base64
+        import gzip
+        import shlex
+        from plugins.symphony.scripts.generate_hooks import bootstrap, generated
+
+        relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace(
+            "$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + bootstrap().replace("'", "''") + "'")
+        for path, content in generated().items():
+            handler = json.loads(content)['hooks']['SessionStart'][0]['hooks'][0]
+            if path.name == 'codex.json':
+                command = handler['commandWindows']
+                self.assertLess(len(command), 8170)
+                provider = 'codex'
+            else:
+                command = next(token for token in shlex.split(handler['command']) if token.startswith('$m='))
+                provider = 'claude'
+            payload = base64.b64decode(re.search(r"FromBase64String\('([^']+)'", command)[1])
+            expected = relay.replace('__SYMPHONY_PROVIDER__', provider).encode()
+            self.assertEqual(gzip.decompress(payload), expected)
+            self.assertEqual(payload[:10], bytes.fromhex('1f8b08000000000000ff'))
+            self.assertEqual((payload[10] >> 1) & 3, 0, 'DEFLATE must use stored blocks')
+            self.assertEqual(len(payload), len(expected) + 23)
+
+    @unittest.skipUnless(Path('/usr/bin/python3').is_file(), 'needs a second system Python')
+    def test_generated_launchers_match_system_python_compression_backend(self):
+        import hashlib
+        from plugins.symphony.scripts.generate_hooks import generated
+
+        expected = {path.name: content for path, content in generated().items()}
+        code = ('import sys,json,hashlib;sys.path.insert(0,sys.argv[1]);'
+                'import generate_hooks as g;'
+                'print(hashlib.sha256(json.dumps({p.name:c for p,c in g.generated().items()},'
+                'sort_keys=True).encode()).hexdigest())')
+        result = subprocess.run(['/usr/bin/python3', '-c', code, str(PLUGIN / 'scripts')],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest())
+
     def test_hook_starts_when_datetime_utc_is_unavailable(self):
         """A generic python3 hook must work on Python 3.10, before UTC existed."""
         from plugins.symphony.symphony.store import StateStore
