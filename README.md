@@ -85,6 +85,8 @@ When the heartbeat is absent, `status` reports pending verification and gives th
 
 Normal completion is blocked while host-observed tracked work remains active. A stop is blocked at most once per turn: when the host reports that the stop hook is already active, Symphony releases the turn and preserves unfinished work in durable `status`. Only an explicit force stop archives it as abandoned with unreconciled identities. A prompt that never spawned a managed agent opens no run and can never hold a session open.
 
+Version 1.6.5 lets a fresh fast lead open another task after archive. It also reconciles a fresh Start and matching terminal retained by 1.6.0 when the root, parent, invocation, generation, and unused child identity agree; a normal status, SessionStart, or Stop retries that evidence. Conflicting or incomplete evidence remains retained. Retrying after a crash also requires the committed run evidence to remain in active or recent history. Resuming an already archived child with a new native turn is outside this recovery: its terminal alone cannot establish a new task owner, even if it reports success. Start later tasks with a fresh child identity. Existing sessions keep their reviewed runtime until reload or restart.
+
 User interruption and host-enforced overrides remain authoritative, so interrupted work is recovered from durable lifecycle state rather than described as uninterruptible. Neither host reports which agents are still alive. A new root session never takes over another session's run or declares its agents finished; each session resumes its own durable run.
 
 ## Routing

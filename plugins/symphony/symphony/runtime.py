@@ -142,7 +142,10 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         batch = [(event, event_generation, False) for event, event_generation in pending]
         if lifecycle_source:
             batch.append((source, generation, True))
+        recoverable = _recoverable_fast_events(state, pending, provider, session, generation, retired)
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
+            if event.event_id in recoverable:
+                event = replace(event, payload={**event.payload, "_symphony_owner_conflict": False})
             state = _hold_pending_batch(state, provider, session)
             pending_event_id = event.event_id
             if provider == "claude" and expected_owner:
@@ -194,7 +197,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 continue
             identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
             disposition = ("stale" if event_generation < generation else
-                           "hold" if identity in retired else
+                           "hold" if event_generation != generation or identity in retired else
                            _pending_child_disposition(state, event, provider, session))
             if disposition == "stale":
                 acknowledged.add(pending_event_id)
@@ -588,11 +591,72 @@ def _finish_pending_batch(
     return _merge_scope(state, scoped, next_scoped, key, provider, session)
 
 
+def _committed_fast_event(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """A committed fast result survives a crash before its inbox ACK."""
+    if (event.payload.get("provider") != provider
+            or event.payload.get("session_id") != session
+            or event.payload.get("parent_thread_id") != session
+            or not _child_turn_token(event.payload)):
+        return False
+    identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
+    for run in (*state.active_runs.values(), *state.recent_runs):
+        if (run.provider != provider or run.session_id != session
+                or run.lead_identity != identity or not run.assessment.get("_fast_route")):
+            continue
+        if (event.kind == "subagent_started"
+                and event.event_id in run.assessment.get("_start_event_ids", ())):
+            return True
+        if event.kind == "subagent_stopped":
+            result = _terminal_result_id(event)
+            if any(item == result or item.endswith(f":{result}")
+                   for item in run.assessment.get("_terminal_event_ids", ())):
+                return True
+    return False
+
+
+def _recoverable_fast_events(
+    state: ProjectState, pending: tuple[tuple[Event, int], ...], provider: str,
+    session: str, generation: int, retired: frozenset[str],
+) -> set[str]:
+    """Reconcile the fresh Start/terminal pair retained by the old archive guard.
+
+    The old ambiguous flag also represents real ownership conflicts. Override
+    it only for one ordered, exact-root invocation with an unused identity.
+    """
+    if f"{provider}:{session}" in state.active_runs:
+        return set()
+    recovered: set[str] = set()
+    for start, epoch in pending:
+        identity = start.payload.get("agent_id") or start.payload.get("subagent_id")
+        token = _child_turn_token(start.payload)
+        if (epoch != generation or identity in retired or not token
+                or not _fresh_fast_start(state, start, provider, session)
+                or _run_scope(state, start, provider) != (f"{provider}:{session}", session)):
+            continue
+        related = [(event, epoch) for event, epoch in pending
+                   if (event.payload.get("agent_id") or event.payload.get("subagent_id")) == identity
+                   and event.event_id != start.event_id]
+        if len(related) != 1:
+            continue
+        terminal, terminal_epoch = related[0]
+        if (terminal.kind == "subagent_stopped" and terminal_epoch == generation
+                and terminal.payload.get("provider") == provider
+                and terminal.payload.get("session_id") == session
+                and terminal.payload.get("parent_thread_id") == session
+                and _child_turn_token(terminal.payload) == token
+                and terminal.observed_at >= start.observed_at):
+            recovered.update((start.event_id, terminal.event_id))
+    return recovered
+
+
 def _pending_child_disposition(
     state: ProjectState, event: Event, provider: str, session: str,
 ) -> str:
     """Replay only a child lifecycle that the current run already identifies."""
-    if _committed_child_start_replay(state, event, provider, session):
+    if (_committed_child_start_replay(state, event, provider, session)
+            or _committed_fast_event(state, event, provider, session)):
         return "stale"
     if _pre_run_unmanaged_claude_child(state, event, provider, session):
         return "stale"
@@ -609,7 +673,7 @@ def _pending_child_disposition(
     if _prior_child_terminal_conflict(state, event, provider, session):
         return "hold"
     if run is None:
-        return "hold"
+        return "apply" if _fresh_fast_start(state, event, provider, session) else "hold"
     if run.started_at and event.observed_at < run.started_at:
         return "stale"
     if _run_scope(state, event, provider) != (f"{provider}:{session}", session):
@@ -680,6 +744,23 @@ def _committed_child_start_replay(
             ))
 
 
+def _fresh_fast_start(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """Only a new child with exact root lineage can open the next fast task."""
+    identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
+    return (event.kind == "subagent_started" and _fast_spawn(event.payload) and bool(identity)
+            and event.payload.get("provider") == provider
+            and event.payload.get("session_id") == session
+            and event.payload.get("parent_thread_id") == session
+            and not any(run.provider == provider and identity in {
+                run.session_id, run.lead_identity, *(item.identity for item in run.delegations)}
+                for run in (*state.active_runs.values(), *state.recent_runs))
+            and not any(item.get("provider") == provider
+                        and identity in {item.get("agent"), item.get("lead"), item.get("session")}
+                        for item in state.terminal_receipts))
+
+
 def _archived_managed_child(
     state: ProjectState, event: Event, provider: str, session: str,
 ) -> bool:
@@ -691,17 +772,7 @@ def _archived_managed_child(
     if not archived and not receipts:
         return False
     identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
-    if (event.kind == "subagent_started" and _fast_spawn(event.payload) and identity
-            and event.payload.get("session_id") == session
-            and event.payload.get("parent_thread_id") == session
-            and not any(run.provider == provider and identity in {
-                run.session_id, run.lead_identity, *(item.identity for item in run.delegations)}
-                for run in (*state.active_runs.values(), *state.recent_runs))
-            and not any(item.get("provider") == provider
-                        and identity in {item.get("agent"), item.get("lead"), item.get("session")}
-                        for item in state.terminal_receipts)):
-        # A fresh root fast lead opens the next task. Resuming an archived
-        # child with a new native turn must still retain its lifecycle.
+    if _fresh_fast_start(state, event, provider, session):
         return False
     return bool(_observed_role(event.payload) in ROLES
                 or identity and (any(identity in {run.lead_identity,

@@ -1,0 +1,273 @@
+{
+  "release": "v1.6.0",
+  "state": {
+    "activation": {
+      "codex": {
+        "accepted": {},
+        "claude_probe_attempted": false,
+        "hook_schema_version": 1,
+        "observed_at": "2026-10-01T10:02:35.170537+00:00",
+        "pending_sessions": [],
+        "plugin_root": "",
+        "plugin_version": "1.6.0",
+        "profile": "latest",
+        "session_id": "codex-session",
+        "session_profiles": [
+          {
+            "claude_probe_attempted": false,
+            "hook_schema_version": 1,
+            "observed_at": "2026-10-01T10:02:35.170537+00:00",
+            "plugin_root": "FIXTURE_PLUGIN_ROOT",
+            "plugin_version": "1.6.0",
+            "profile": "latest",
+            "runtime_root": null,
+            "session_id": "codex-session"
+          }
+        ],
+        "state": "guarded"
+      }
+    },
+    "active_run": null,
+    "active_runs": {},
+    "configuration": {},
+    "enabled": false,
+    "event_history": [
+      {
+        "event_id": "2b71e55d29dca41dce3c2d393ed5df6afce817518c6fcf7136f78c7db2fd85c0:2026-10-01T10:02:35.170537+00:00:heartbeat",
+        "kind": "session_heartbeat",
+        "observed_at": "2026-10-01T10:02:35.170537+00:00",
+        "payload": {
+          "hook_schema_version": 1,
+          "last_fault": null,
+          "plugin_root": "FIXTURE_PLUGIN_ROOT",
+          "plugin_version": "1.6.0",
+          "profile": "latest",
+          "provider": "codex",
+          "runtime_root": null,
+          "session_id": "codex-session"
+        }
+      },
+      {
+        "event_id": "709753f0cd18df0437193fe608e913e9421ec78a982de06ec34888cc15acfe7a:assessor-open:task_received",
+        "kind": "task_received",
+        "observed_at": "2026-10-01T10:02:35.173080+00:00",
+        "payload": {
+          "one_shot": true,
+          "session_id": "codex-session",
+          "task": ""
+        }
+      },
+      {
+        "event_id": "709753f0cd18df0437193fe608e913e9421ec78a982de06ec34888cc15acfe7a:lead:lead_started",
+        "kind": "lead_started",
+        "observed_at": "2026-10-01T10:02:35.173080+00:00",
+        "payload": {
+          "identity": "archived-fast",
+          "owner_generation": 1
+        }
+      },
+      {
+        "event_id": "709753f0cd18df0437193fe608e913e9421ec78a982de06ec34888cc15acfe7a:delegation:delegation_updated",
+        "kind": "delegation_updated",
+        "observed_at": "2026-10-01T10:02:35.173080+00:00",
+        "payload": {
+          "identity": "archived-fast",
+          "objective": "",
+          "requested_effort": "medium",
+          "requested_tier": "gpt-6.1-sol",
+          "role": "lead",
+          "state": "working"
+        }
+      },
+      {
+        "event_id": "4a8a70a2e876e0f11df72b60b535667c72e9c6f365a0952578a03d121b0a0af6:delegation:delegation_updated",
+        "kind": "delegation_updated",
+        "observed_at": "2026-10-01T10:02:35.175470+00:00",
+        "payload": {
+          "identity": "archived-fast",
+          "objective": "",
+          "requested_effort": "medium",
+          "requested_tier": "gpt-6.1-sol",
+          "role": "lead",
+          "state": "completed"
+        }
+      },
+      {
+        "event_id": "4a8a70a2e876e0f11df72b60b535667c72e9c6f365a0952578a03d121b0a0af6:lead-completion:lead_completed",
+        "kind": "lead_completed",
+        "observed_at": "2026-10-01T10:02:35.175470+00:00",
+        "payload": {
+          "identity": "archived-fast",
+          "outcome": {
+            "status": "completed"
+          },
+          "owner_generation": 1
+        }
+      },
+      {
+        "event_id": "4a8a70a2e876e0f11df72b60b535667c72e9c6f365a0952578a03d121b0a0af6:pending-batch:2026-10-01T10:02:35.175470+00:00",
+        "kind": "lead_completed",
+        "observed_at": "2026-10-01T10:02:35.175470+00:00",
+        "payload": {
+          "identity": "archived-fast",
+          "outcome": {
+            "status": "completed"
+          },
+          "owner_generation": 1
+        }
+      },
+      {
+        "event_id": "89f53562eea982552001f4403786b6925dda950252dfe47830f9d46d1bc59943",
+        "kind": "stop_requested",
+        "observed_at": "2026-10-01T10:02:35.178684+00:00",
+        "payload": {
+          "hook_event_name": "Stop",
+          "provider": "codex",
+          "session_id": "codex-session"
+        }
+      }
+    ],
+    "needs_reassessment": false,
+    "recent_runs": [
+      {
+        "assessment": {
+          "_fast_route": {
+            "effort": "medium",
+            "model": "gpt-6.1-sol"
+          },
+          "_lead_expected_route": {
+            "effort": "medium",
+            "identity": "archived-fast",
+            "model": "gpt-6.1-sol"
+          },
+          "_pending_parent_actions": [
+            {
+              "kind": "inject_context",
+              "payload": {
+                "text": "The lead reported completion while Symphony still tracks pending launches or unreconciled results. Reconcile this work before completing the run."
+              }
+            }
+          ],
+          "_start_event_ids": [
+            "709753f0cd18df0437193fe608e913e9421ec78a982de06ec34888cc15acfe7a"
+          ],
+          "_terminal_event_ids": [
+            "5d177ebc40b29499a2c4f7cfa93c7cad522638f3fa5c035df84f2ef42fe39b99"
+          ],
+          "_terminal_turns": {
+            "archived-fast": [
+              "turn_id:archived-fast-turn"
+            ]
+          },
+          "complexity": "simple",
+          "rationale": "fast lead verified bounded low-risk work",
+          "risk": "normal",
+          "route": {
+            "lead_effort": "medium",
+            "lead_model": "gpt-6.1-sol",
+            "profile": "latest"
+          },
+          "size": "small",
+          "topology": "direct"
+        },
+        "delegations": [
+          {
+            "identity": "archived-fast",
+            "objective": "",
+            "requested_effort": "medium",
+            "requested_tier": "gpt-6.1-sol",
+            "role": "lead",
+            "state": "completed",
+            "updated_at": "2026-10-01T10:02:35.175470+00:00"
+          }
+        ],
+        "lead_identity": "archived-fast",
+        "outcome": {
+          "status": "completed"
+        },
+        "owner_generation": 1,
+        "owner_seen_at": "2026-10-01T10:02:35.178684+00:00",
+        "provider": "codex",
+        "run_id": "709753f0cd18df0437193fe608e913e9421ec78a982de06ec34888cc15acfe7a:assessor-open:task_received",
+        "session_id": "codex-session",
+        "started_at": "2026-10-01T10:02:35.173080+00:00",
+        "status": "completed",
+        "task": "",
+        "unreconciled": [],
+        "updated_at": "2026-10-01T10:02:35.178684+00:00"
+      }
+    ],
+    "schema_version": 2,
+    "terminal_receipts": [
+      {
+        "agent": "archived-fast",
+        "lead": "archived-fast",
+        "native_agent_type": "",
+        "native_effort": "",
+        "native_launch_prompt_hash": "",
+        "native_model": "",
+        "parent": "codex-session",
+        "provider": "codex",
+        "result": "5d177ebc40b29499a2c4f7cfa93c7cad522638f3fa5c035df84f2ef42fe39b99",
+        "run_id": "709753f0cd18df0437193fe608e913e9421ec78a982de06ec34888cc15acfe7a:assessor-open:task_received",
+        "session": "codex-session",
+        "status": "completed",
+        "turn": "turn_id:archived-fast-turn"
+      }
+    ]
+  },
+  "session": {
+    "generation": 1,
+    "migrated": false,
+    "overflow": false,
+    "owner_session": "codex-session",
+    "pending": [
+      {
+        "ambiguous_owner": true,
+        "event_id": "e6b196b4adcc5729cc5de81deeaed78cb2aa1667151ad315262095fc4c41f453",
+        "generation": 1,
+        "kind": "subagent_started",
+        "observed_at": "2026-10-01T10:02:35.182132+00:00",
+        "payload": {
+          "_symphony_child_metadata": [],
+          "agent_id": "retained-fast",
+          "agent_type": "default",
+          "model": "gpt-6.1-sol",
+          "model_reasoning_effort": "medium",
+          "parent_thread_id": "codex-session",
+          "provider": "codex",
+          "session_id": "codex-session",
+          "task_name": "symphony_lead_fast_native",
+          "turn_id": "retained-fast-turn"
+        }
+      },
+      {
+        "ambiguous_owner": true,
+        "event_id": "4add645bcf4c21a7ace23ac991a59ceb435df382b6c4d4e9f86af80eab97cebf",
+        "generation": 1,
+        "kind": "subagent_stopped",
+        "observed_at": "2026-10-01T10:02:35.185972+00:00",
+        "payload": {
+          "_symphony_child_metadata": [],
+          "agent_id": "retained-fast",
+          "agent_type": "default",
+          "last_assistant_message": "SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {\"status\":\"completed\"}",
+          "model": "gpt-6.1-sol",
+          "model_reasoning_effort": "medium",
+          "parent_thread_id": "codex-session",
+          "provider": "codex",
+          "session_id": "codex-session",
+          "status": "completed",
+          "task_name": "symphony_lead_fast_native",
+          "turn_id": "retained-fast-turn"
+        }
+      }
+    ],
+    "project": "FIXTURE_PROJECT",
+    "provider": "codex",
+    "retired_agents": [],
+    "schema": 1,
+    "session": "codex-session",
+    "state_name": "FIXTURE_STATE"
+  }
+}

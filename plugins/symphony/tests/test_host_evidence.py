@@ -330,6 +330,27 @@ class HostEvidenceTests(unittest.TestCase):
                     self.transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
                 self.assertIsNone(codex_recovered_lead_event(old, ROOT_ID, self.environ))
 
+    def test_archived_followup_terminal_requires_new_task_ownership(self):
+        self.environ["SYMPHONY_PROVIDER"] = "codex"
+        self.write_turns()
+        self.write_unavailable_root(output="Followup task delivered")
+        archived = replace(self.run, status="completed", outcome={"status": "completed"})
+        self.store.save(self.project, ProjectState(recent_runs=(archived,)))
+        self.store.bind_session("codex", ROOT_ID, self.store._path(self.project), False,
+                                self.project, ROOT_ID)
+        handle({"session_id": ROOT_ID, "cwd": str(self.project),
+                "hook_event_name": "SubagentStop", "agent_id": LEAD_ID,
+                "parent_thread_id": ROOT_ID, "turn_id": NEW_TURN, "agent_type": "lead",
+                "status": "completed", "model": "gpt-6-luna", "model_reasoning_effort": "low",
+                "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}, self.environ)
+        for event, prompt in (("Stop", ""), ("UserPromptSubmit", "$symphony:symphony status")):
+            result = handle({"session_id": ROOT_ID, "cwd": str(self.project),
+                             "hook_event_name": event, "prompt": prompt}, self.environ)
+            self.assertIn("unresolved child result", result.stdout)
+        self.assertIsNone(self.store.load(self.project).active_run)
+        self.assertEqual((archived,), self.store.load(self.project).recent_runs)
+        self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
+
     def test_completed_native_followup_reconciles_same_run_at_root_stop(self):
         self.write_turns()
         result = handle({"session_id": ROOT_ID, "cwd": str(self.project),
