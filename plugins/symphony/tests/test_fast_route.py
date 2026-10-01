@@ -2,9 +2,12 @@
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from plugins.symphony.symphony.model import Event
 from plugins.symphony.symphony.runtime import handle
 from plugins.symphony.symphony.routing import Assessment, fast_lead_selection, profiles_for, resolve_tier, route_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
@@ -31,7 +34,7 @@ class FastRouteTests(unittest.TestCase):
     def run_state(self):
         return self.store.load(self.project).active_run
 
-    def start_fast(self, provider, profile=None, model=None, effort="medium"):
+    def start_fast(self, provider, profile=None, model=None, effort="medium", identity="fast-1"):
         self.hook(provider, "SessionStart", profile)
         selected = fast_lead_selection(snapshot_for(provider, profile or profiles_for(provider)[0]["id"]))
         model = model or selected["model"]
@@ -43,8 +46,8 @@ class FastRouteTests(unittest.TestCase):
                             "fork_turns": "none", "task_name": agent_type})
         prepared = self.hook(provider, "PreToolUse", profile,
                              tool_name="Agent" if provider == "claude" else "spawn_agent",
-                             tool_use_id="fast-spawn", tool_input=tool_input)
-        started = {"agent_id": "fast-1", "agent_type": agent_type, "task": packet}
+                             tool_use_id="fast-spawn-" + identity, tool_input=tool_input)
+        started = {"agent_id": identity, "agent_type": agent_type, "task": packet}
         if "deny" not in prepared.stdout and "block" not in prepared.stdout:
             self.hook(provider, "SubagentStart", profile, **started)
         return prepared, started
@@ -198,6 +201,170 @@ class FastRouteTests(unittest.TestCase):
         self.assertEqual(self.run_state().task, full_task)
         self.assertIsNone(self.run_state().outcome)
         self.assertNotIn("_retryable_lead", self.run_state().assessment)
+
+    def test_fresh_native_fast_lead_opens_after_archive_and_replay_is_idempotent(self):
+        self.hook("codex", "SessionStart")
+        choice = fast_lead_selection(snapshot_for("codex", profiles_for("codex")[0]["id"]))
+        report = 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+        starts = []
+        for identity in ("first-fast", "second-fast"):
+            started = {"agent_id": identity, "parent_thread_id": "codex-session",
+                       "turn_id": identity + "-turn", "agent_type": "default",
+                       "task_name": "symphony_lead_fast_native",
+                       "model": choice["model"], "model_reasoning_effort": choice["effort"]}
+            starts.append(started)
+            self.hook("codex", "SubagentStart", **started)
+            self.assertEqual(identity, self.run_state().lead_identity)
+            self.stop_fast("codex", started, report)
+            self.hook("codex", "Stop")
+            self.assertIsNone(self.run_state())
+        before = self.store.load(self.project)
+        self.assertEqual(2, len(before.recent_runs))
+        for started in starts:
+            self.hook("codex", "SubagentStart", **started)
+            self.stop_fast("codex", started, report)
+        after = self.store.load(self.project)
+        self.assertEqual(before.recent_runs, after.recent_runs)
+        self.assertEqual(before.terminal_receipts, after.terminal_receipts)
+        self.assertEqual([], self.store.session_record("codex", "codex-session")["pending"])
+
+    def test_archived_fast_lead_resume_and_foreign_parent_still_block(self):
+        for changes, receipt_only in (({"agent_id": "fast-1"}, False),
+                                      ({"agent_id": "fast-1"}, True),
+                                      ({"agent_id": "fresh", "parent_thread_id": "foreign-root"}, False),
+                                      ({"agent_id": "fresh", "parent_thread_id": ""}, False)):
+            with self.subTest(changes=changes, receipt_only=receipt_only):
+                self.tearDown()
+                self.setUp()
+                _, started = self.start_fast("codex")
+                report = 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+                self.stop_fast("codex", started, report)
+                self.hook("codex", "Stop")
+                if receipt_only:
+                    self.store.save(self.project, replace(self.store.load(self.project), recent_runs=()))
+                resumed = {**started, "parent_thread_id": "codex-session",
+                           "turn_id": "new-turn", **changes}
+                self.hook("codex", "SubagentStart", **resumed)
+                self.stop_fast("codex", resumed, report)
+                self.assertIsNone(self.run_state())
+                self.assertEqual(2, len(self.store.session_record("codex", "codex-session")["pending"]))
+                self.assertIn("block", self.hook("codex", "Stop").stdout)
+
+    def load_retained_fast_fixture(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/retained-fast-v1.6.0.json").read_text())
+        self.store.root.mkdir(parents=True, exist_ok=True)
+        self.store._path(self.project).write_text(json.dumps(fixture["state"]))
+        record = fixture["session"]
+        record.update(project=str(self.project), state_name=self.store._path(self.project).name)
+        self.store._write_json(self.store._session_path("codex", "codex-session"), record)
+        return record
+
+    def test_released_retained_fast_pair_recovers_at_normal_root_entry_points(self):
+        for event, fields in (("Stop", {}), ("SessionStart", {}),
+                              ("UserPromptSubmit", {"prompt": "$symphony:symphony status"})):
+            with self.subTest(event=event):
+                self.tearDown()
+                self.setUp()
+                before = self.load_retained_fast_fixture()
+                response = self.hook("codex", event, **fields)
+                self.assertNotIn('"decision": "block"', response.stdout)
+                self.hook("codex", "Stop")
+                state = self.store.load(self.project)
+                self.assertIsNone(state.active_run)
+                self.assertEqual(["archived-fast", "retained-fast"],
+                                 [run.lead_identity for run in state.recent_runs])
+                self.assertEqual("completed", state.recent_runs[-1].outcome["status"])
+                self.assertEqual([], self.store.session_record("codex", "codex-session")["pending"])
+                for item in before["pending"]:
+                    self.store.queue_session_event("codex", "codex-session", Event(
+                        item["event_id"], item["kind"], item["observed_at"], item["payload"]),
+                        ambiguous_owner=True)
+                self.hook("codex", "Stop")
+                after = self.store.load(self.project)
+                self.assertEqual(state.recent_runs, after.recent_runs)
+                self.assertEqual(state.terminal_receipts, after.terminal_receipts)
+                self.assertEqual([], self.store.session_record("codex", "codex-session")["pending"])
+
+    def test_recovered_pair_survives_commit_before_inbox_ack(self):
+        for event in ("Stop", "SessionStart", "UserPromptSubmit"):
+            with self.subTest(event=event):
+                self.tearDown()
+                self.setUp()
+                self.load_retained_fast_fixture()
+                with patch.object(StateStore, "finish_session_events", side_effect=OSError("crash")):
+                    with self.assertRaises(OSError):
+                        self.hook("codex", event, prompt="$symphony:symphony status")
+                record = self.store.session_record("codex", "codex-session")
+                # A partial ACK must also be harmless: only the terminal remains.
+                record["pending"] = record["pending"][1:]
+                record["pending"][0]["generation"] += 1
+                self.store._write_json(self.store._session_path("codex", "codex-session"), record)
+                self.assertIn('"decision": "block"', self.hook("codex", "Stop").stdout)
+                self.assertEqual(1, len(self.store.session_record("codex", "codex-session")["pending"]))
+                record["pending"][0]["generation"] -= 1
+                self.store._write_json(self.store._session_path("codex", "codex-session"), record)
+                self.assertNotIn('"decision": "block"', self.hook("codex", "Stop").stdout)
+                self.assertIsNone(self.run_state())
+                self.assertEqual(2, len(self.store.load(self.project).recent_runs))
+                self.assertEqual([], self.store.session_record("codex", "codex-session")["pending"])
+
+    def test_retained_fast_pair_requires_exact_invocation_and_ownership(self):
+        for change in ("parent", "session", "provider", "turn", "missing-turn", "identity",
+                       "generation", "retired", "receipt-only", "reversed", "conflict", "terminal-only"):
+            with self.subTest(change=change):
+                self.tearDown()
+                self.setUp()
+                record = self.load_retained_fast_fixture()
+                start, terminal = record["pending"]
+                if change in {"parent", "session", "provider", "turn"}:
+                    field = {"parent": "parent_thread_id", "session": "session_id",
+                             "provider": "provider", "turn": "turn_id"}[change]
+                    terminal["payload"][field] = "foreign"
+                elif change == "missing-turn":
+                    for item in record["pending"]:
+                        item["payload"].pop("turn_id")
+                elif change == "identity":
+                    for item in record["pending"]:
+                        item["payload"]["agent_id"] = "archived-fast"
+                elif change == "generation":
+                    terminal["generation"] += 1
+                elif change == "retired":
+                    record["retired_agents"] = ["retained-fast"]
+                elif change == "receipt-only":
+                    state = self.store.load(self.project)
+                    self.store.save(self.project, replace(state, recent_runs=()))
+                    for item in record["pending"]:
+                        item["payload"]["agent_id"] = "archived-fast"
+                elif change == "reversed":
+                    start["observed_at"], terminal["observed_at"] = terminal["observed_at"], start["observed_at"]
+                elif change == "conflict":
+                    record["pending"].append({**terminal, "event_id": "conflicting-result",
+                                              "payload": {**terminal["payload"], "status": "failed"}})
+                else:
+                    record["pending"] = [terminal]
+                self.store._write_json(self.store._session_path("codex", "codex-session"), record)
+                self.assertIn('"decision": "block"', self.hook("codex", "Stop").stdout)
+                self.assertIsNone(self.run_state())
+                self.assertEqual(record["pending"], self.store.session_record("codex", "codex-session")["pending"])
+
+    def test_claude_consecutive_fast_runs_with_ordinary_pretool_and_callbacks(self):
+        for identity in ("first-claude", "second-claude"):
+            prepared, start = self.start_fast("claude", identity=identity)
+            self.assertNotIn("deny", prepared.stdout)
+            self.assertEqual(identity, self.run_state().lead_identity)
+            self.stop_fast("claude", start,
+                           'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}')
+            self.hook("claude", "Stop")
+            self.assertIsNone(self.run_state())
+        self.assertEqual(2, len(self.store.load(self.project).recent_runs))
+        self.assertEqual([], self.store.session_record("claude", "claude-session")["pending"])
+
+    def test_sibling_session_cannot_reconcile_another_roots_retained_fast_pair(self):
+        record = self.load_retained_fast_fixture()
+        self.hook("codex", "SessionStart", session_id="sibling")
+        self.assertNotIn('"decision": "block"', self.hook("codex", "Stop", session_id="sibling").stdout)
+        self.assertEqual(record["pending"], self.store.session_record("codex", "codex-session")["pending"])
+        self.assertIsNone(self.run_state())
 
     def test_boost_denies_fast_spawn_and_native_child_cannot_complete(self):
         self.hook("codex", "SessionStart")
