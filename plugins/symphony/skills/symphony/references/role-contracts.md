@@ -33,7 +33,7 @@ Required fields:
 ```yaml
 size: small | medium | large
 complexity: simple | mixed | complex
-risk: <classification and material concerns>
+risk: normal | high
 rationale: <concise evidence-based reason>
 topology: <advisory recommendation; the matrix fixes delegated | mixed>
 abstract_role_routes:

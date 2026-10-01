@@ -117,12 +117,17 @@ class FastRouteTests(unittest.TestCase):
                                         "product judgment", "mixed work", "uncertainty"):
                         self.assertIn(substantive, text)
                     self.assertIn("SYMPHONY_FAST_DECISION: escalate", text)
+                    self.assertIn('"complexity":"simple|mixed|complex"', text)
+                    self.assertIn('"risk":"normal|high"', text)
+                    self.assertIn("substantive small work uses one worker", text)
                     self.assertIsNone(self.run_state())
         lead = BODIES["lead"]
         self.assertIn("WHOLE objective consists only of predetermined mechanical steps", lead)
         self.assertIn("assign the substantive work to one worker", lead)
         self.assertIn("assign substantive work to bounded worker packets", lead)
         self.assertNotIn("do quick glue work", lead)
+        self.assertIn('"risk":"normal|high"', BODIES["assessor"])
+        self.assertIn("substantive small work", BODIES["assessor"])
 
     def test_assessor_topology_cannot_override_worker_execution(self):
         for provider in ("codex", "claude"):

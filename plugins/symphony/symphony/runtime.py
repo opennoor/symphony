@@ -3197,7 +3197,8 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
     if state is not None and provider:
         session_id = session_id or str(state.activation.get(provider, {}).get("session_id") or "")
         fast = fast_lead_selection(_snapshot(state, provider))
-        if fast["model"] and _boost_preference(state, provider, session_id) == "off":
+        if (fast["model"] and _boost_preference(state, provider, session_id) == "off"
+                and not (state.active_run and state.active_run.assessment.get("_fast_escalated"))):
             spawn = (f"Use agent type `symphony:symphony-lead-{fast['model']}-{fast['effort']}`. "
                      if provider == "claude" else
                      f"Pass `model=\"{fast['model']}\"`, `reasoning_effort=\"{fast['effort']}\"`, "
@@ -3225,13 +3226,19 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                 "wait for native terminal results, and use normal Stop reconciliation. "
                 + ("Claude agents run in the background; end your turn after spawning and wait for the host result. "
                    if provider == "claude" else "")
-                + f"Task: {task}"
+                + "After escalation, follow this full assessment and delegation contract: "
+                + _assessed_guidance(task, provider, state, session_id)
             )
+    return _assessed_guidance(task, provider, state, session_id)
+
+
+def _assessed_guidance(task: str, provider: str, state: ProjectState | None, session_id: str) -> str:
+    """The same assessor/lead packet contract for escalation and direct assessment."""
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
         "On Codex, use `fork_turns=\"none\"` for assessor and lead, name them "
         "`symphony_<role>_<model>_<effort>`, and require the assessor's final response to contain one exact "
-        "`SYMPHONY_ASSESSMENT: {\"size\":\"...\",\"complexity\":\"...\",\"risk\":\"...\","
+        "`SYMPHONY_ASSESSMENT: {\"size\":\"small|medium|large\",\"complexity\":\"simple|mixed|complex\",\"risk\":\"normal|high\","
         "\"rationale\":\"...\",\"topology\":\"...\"}` line. "
         if provider == "codex"
         else ""
@@ -3260,6 +3267,8 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
         "and verifies results. Use the matrix for each child packet's own size/complexity. "
         "Relay the task in full: the lead cannot see this conversation, so if the request has several parts, "
         "every part goes in the packet and the acceptance check covers all of them. "
+        "The assessor packet must require the exact size/complexity/risk vocabulary above and explain that "
+        "substantive small work uses one worker; medium work uses bounded worker packets. "
         f"{boost}{codex}{claude}Task: {task}"
     )
 
