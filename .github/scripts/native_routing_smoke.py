@@ -87,13 +87,9 @@ def failure_diagnostics(provider, root, document):
     fast_calls = dict.fromkeys(('dedicated_read', 'exec_wrapper', 'shell_exec', 'edit', 'handback', 'other'), 0)
     runs = [*document.get('active_runs', {}).values(), *document.get('recent_runs', [])]
     known_children = {child.get('identity') for run in runs for child in run.get('delegations', [])}
-    fast_children = set()
-    for run in runs:
-        fast = run.get('assessment', {}).get('_fast_route', {})
-        lead = next((child for child in run.get('delegations', []) if child.get('role') == 'lead'), None)
-        if (lead and fast and lead.get('requested_tier') == fast.get('model')
-                and lead.get('requested_effort') == fast.get('effort')):
-            fast_children.add(lead.get('identity'))
+    fast_provenance = dict.fromkeys(('matching_native_candidates', 'unforked_candidates',
+                                    'forked_or_foreign_candidates', 'header_count'), 0)
+    fast_representations = []
     paths = (home / ("sessions" if provider == "codex" else "projects")).rglob("*.jsonl")
     for path in paths:
         try:
@@ -109,10 +105,18 @@ def failure_diagnostics(provider, root, document):
                 counts_for_root = raw_launch_counts(provider, rows)
                 for key in root_launches:
                     root_launches[key] += counts_for_root[key]
-            if identity in fast_children:
+            fast_candidate = any(fast_native_identity(provider, rows, identity, run, home, root / 'primary')
+                                 for run in runs)
+            if fast_candidate:
+                fast_provenance['matching_native_candidates'] += 1
+                fast_provenance['header_count'] += sum(row.get('type') == 'session_meta' for row in rows)
+                verified = worker_transcript_is_unforked(provider, rows, identity)
+                fast_provenance['unforked_candidates' if verified else 'forked_or_foreign_candidates'] += 1
+                fast_representations.append(decision_representations(provider, rows, identity))
                 categories = raw_tool_categories(provider, rows)
-                for key in fast_calls:
-                    fast_calls[key] += categories[key]
+                if verified:
+                    for key in fast_calls:
+                        fast_calls[key] += categories[key]
             for line, row in zip(lines, rows):
                 # Presence is a diagnostic, not proof that a hook delivered it.
                 native_signals["fast_guidance_text_present"] |= "Symphony fast route: the root is a courier" in line
@@ -144,7 +148,9 @@ def failure_diagnostics(provider, root, document):
             "loaded_version": activation.get("plugin_version") if re.fullmatch(r"\d+\.\d+\.\d+", str(activation.get("plugin_version"))) else "unknown",
             "boost_levels": sorted({value for value in boosts if isinstance(value, str) and value in {"off", "xhigh", "max", "ultra"}}),
             "callbacks": counts, "native_signals": native_signals,
-            'fast_raw_tool_categories': fast_calls, 'root_native_launches': root_launches,
+            'fast_raw_tool_categories': fast_calls, 'fast_native_provenance': fast_provenance,
+            'fast_decision_representations': fast_representations,
+            'root_native_launches': root_launches,
             'claude_completion': [claude_completion_probe(document, run.get('session_id'), root / 'primary', home)
                 for run in document.get('active_runs', {}).values()
                 if provider == 'claude' and run.get('provider') == provider and run.get('status') == 'completing'],
@@ -370,6 +376,115 @@ def worker_transcript_is_unforked(provider, rows, identity):
             and not headers[0].get("forked_from_id"))
 
 
+def claude_fast_launch_identity(home, project, identity, run, fast):
+    """Match the accepted fast launch to one native root Agent call."""
+    session = run.get('session_id')
+    pinned = run.get('assessment', {}).get('_claude_fast_launch_hash')
+    if (home is None or project is None or run.get('provider') != 'claude'
+            or not isinstance(pinned, str) or not re.fullmatch(r'[0-9a-f]{64}', pinned)
+            or any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', value)
+                   for value in (session, identity))):
+        return False
+    paths = list((home / 'projects').glob(f'*/{session}/subagents/agent-{identity}.jsonl'))
+    if len(paths) != 1:
+        return False
+    meta_path = paths[0].with_suffix('.meta.json')
+    try:
+        if meta_path.is_symlink() or meta_path.stat().st_size > 64 * 1024:
+            return False
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        launch_id = meta.get('toolUseId')
+        agent_type = meta.get('agentType')
+        if (type(meta.get('spawnDepth')) is not int or meta['spawnDepth'] != 1
+                or not isinstance(launch_id, str) or not launch_id
+                or hashlib.sha256(launch_id.encode()).hexdigest() != pinned
+                or not isinstance(agent_type, str)
+                or not agent_type.endswith(f"symphony-lead-{fast['model']}-{fast['effort']}")):
+            return False
+        parent = _native_jsonl(paths[0].parent.parent.with_suffix('.jsonl'))
+        if parent is None:
+            return False
+        launches = [(row, item) for row in parent
+                    for item in row.get('message', {}).get('content', [])
+                    if isinstance(item, dict) and item.get('id') == launch_id]
+        if len(launches) != 1:
+            return False
+        row, launch = launches[0]
+        values = launch.get('input')
+        cwd = row.get('cwd')
+        return (row.get('type') == 'assistant' and row.get('sessionId') == session
+                and row.get('isSidechain') is not True and not row.get('agentId')
+                and isinstance(cwd, str) and Path(cwd).is_absolute()
+                and Path(cwd).resolve() == project.resolve()
+                and launch.get('type') == 'tool_use' and launch.get('name') == 'Agent'
+                and isinstance(values, dict) and values.get('subagent_type') == agent_type
+                and ('model' not in values or values['model'] == fast['model']))
+    except (OSError, UnicodeError, ValueError, AttributeError, TypeError):
+        return False
+
+
+def fast_native_identity(provider, rows, identity, run, home=None, project=None):
+    """A shared model/effort pair cannot identify the fast child."""
+    child = next((item for item in run.get('delegations', []) if item.get('identity') == identity), None)
+    fast = run.get('assessment', {}).get('_fast_route', {})
+    if (not child or child.get('role') != 'lead' or not fast.get('model') or not fast.get('effort')
+            or (child.get('requested_tier'), child.get('requested_effort')) != (fast['model'], fast['effort'])):
+        return False
+    if provider == 'codex':
+        # Use the first own native header; copied parent headers never select a
+        # fast identity. The separate unforked gate controls usable evidence.
+        if not rows or rows[0].get('type') != 'session_meta':
+            return False
+        header = rows[0].get('payload', {})
+        spawn = header.get('source', {}).get('subagent', {}).get('thread_spawn', {})
+        expected = 'symphony_lead_fast_' + re.sub(r'\W', '_', fast['model']) + '_' + fast['effort']
+        return (header.get('id') == identity and isinstance(header.get('agent_path'), str)
+                and header['agent_path'].rsplit('/', 1)[-1] == expected
+                and spawn.get('parent_thread_id') == run.get('session_id'))
+    return (claude_fast_launch_identity(home, project, identity, run, fast)
+            and all(row.get('agentId') == identity and row.get('sessionId') == run.get('session_id')
+                    and row.get('isSidechain') is True for row in rows))
+
+
+def decision_representations(provider, rows, identity):
+    """Count native representation ambiguity without exporting IDs or text."""
+    result = dict.fromkeys(('marker_lines', 'marker_records', 'nonempty_message_ids',
+                          'own_turn_bound_records', 'equivalent_same_id_records',
+                          'conflicting_same_id_records', 'missing_message_ids'), 0)
+    result['phases'] = dict.fromkeys(('final_answer', 'commentary', 'end_turn', 'tool_use', 'other'), 0)
+    own = worker_transcript_is_unforked(provider, rows, identity)
+    current_turn = ''
+    seen = {}
+    for row in rows:
+        payload = row.get('payload', {}) if provider == 'codex' else row.get('message', {})
+        if provider == 'codex' and (row.get('type') == 'turn_context' or
+                row.get('type') == 'event_msg' and payload.get('type') == 'task_started'):
+            current_turn = payload.get('turn_id') if isinstance(payload.get('turn_id'), str) else ''
+        text = assistant_text(provider, row)
+        decisions = fast_decision_lines(text)
+        if not decisions:
+            continue
+        result['marker_records'] += 1
+        result['marker_lines'] += len(decisions)
+        phase = payload.get('phase') if provider == 'codex' else payload.get('stop_reason')
+        result['phases'][phase if phase in result['phases'] else 'other'] += 1
+        message_id = payload.get('id') if provider == 'codex' else row.get('uuid')
+        nonempty = isinstance(message_id, str) and bool(message_id)
+        result['nonempty_message_ids' if nonempty else 'missing_message_ids'] += 1
+        bound = own and bool(current_turn) if provider == 'codex' else (
+            row.get('agentId') == identity and row.get('isSidechain') is True)
+        result['own_turn_bound_records'] += bound
+        if not nonempty or not bound:
+            continue
+        key = (identity, current_turn, message_id)
+        content = (json.dumps(payload.get('content'), sort_keys=True), phase)
+        if key in seen:
+            result['equivalent_same_id_records' if seen[key] == content else 'conflicting_same_id_records'] += 1
+        else:
+            seen[key] = content
+    return result
+
+
 def worker_launch_verified(provider, evidence, worker, rows=(), parent_identity="", parent_path=""):
     matches = 0
     for name, arguments, _, output in evidence:
@@ -505,10 +620,11 @@ def fixture_edit(provider, evidence, project):
     return False
 
 
-def fast_turn_has_only_escalation(provider, rows, evidence):
+def fast_turn_has_only_escalation(provider, rows, evidence, identity=''):
     """Every raw tool call counts; even a failed command can modify a file."""
     if provider == "codex":
-        return not any(row.get("payload", {}).get("type") in {"function_call", "custom_tool_call"} for row in rows)
+        return (worker_transcript_is_unforked(provider, rows, identity)
+                and not any(row.get("payload", {}).get("type") in {"function_call", "custom_tool_call"} for row in rows))
     calls = [block for row in rows for block in row.get("message", {}).get("content", [])
              if isinstance(block, dict) and block.get("type") == "tool_use"]
     if not calls:
@@ -684,6 +800,10 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     child_rows = {item["identity"]: native_rows(provider, home, item["identity"]) for item in children}
     decisions = []
     for identity, rows in child_rows.items():
+        if not fast_native_identity(provider, rows, identity, run_state, home, project):
+            continue
+        require(worker_transcript_is_unforked(provider, rows, identity),
+                "fast transcript contains inherited or foreign rows; decision provenance is unverified")
         for row in rows:
             for decision in fast_decision_lines(assistant_text(provider, row)):
                 decisions.append((identity, decision, row.get("timestamp")))
@@ -715,7 +835,7 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
         execution = route_for(Assessment(assessment["size"], assessment["complexity"], assessment["risk"])).execution
         require(assessment["topology"] == execution == assessment["route"]["execution"],
                 "native assessed topology disagrees with the matrix")
-        require(fast_turn_has_only_escalation(provider, child_rows[fast_identity], fast_evidence),
+        require(fast_turn_has_only_escalation(provider, child_rows[fast_identity], fast_evidence, fast_identity),
                 "substantive fast turn performed tools; before-change proof is unverified")
         terminal_ns = int(datetime.fromisoformat(terminal_time.replace("Z", "+00:00")).timestamp() * 1e9)
         require(first_change_after_ns is not None and first_change_after_ns > terminal_ns,

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,37 @@ SCENARIOS = ("activation", "managed-run", "unmarked-spawn", "interrupt-resume", 
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+def _write_claude_child_launch(home, project, run, identity, role, model, effort, turn):
+    """Model the host's exact lead→Agent link for deterministic package fixtures."""
+    directory = Path(home) / 'projects' / '-fixture' / run['session_id'] / 'subagents'
+    directory.mkdir(parents=True, exist_ok=True)
+    child = directory / f'agent-{identity}.jsonl'
+    parent = directory / f"agent-{run['lead_identity']}.jsonl"
+    lead = next(item for item in run['delegations'] if item['identity'] == run['lead_identity'])
+    child_type = f'symphony:symphony-{role}-{model}-{effort}'
+    launch_id = f'toolu_{identity}_{turn}'.replace(':', '_')
+    accepted = datetime.fromisoformat(run['assessment']['substantive_contract']['accepted_at'])
+    launched = accepted + timedelta(milliseconds=1)
+    child.with_suffix('.meta.json').write_text(json.dumps({
+        'agentType': child_type, 'toolUseId': launch_id, 'spawnDepth': 2}), encoding='utf-8')
+    parent.with_suffix('.meta.json').write_text(json.dumps({
+        'agentType': f"symphony:symphony-lead-{lead['requested_tier']}-{lead['requested_effort']}",
+        'toolUseId': 'toolu_lead', 'spawnDepth': 1}), encoding='utf-8')
+    rows = [json.loads(line) for line in parent.read_text(encoding='utf-8').splitlines()] if parent.exists() else []
+    rows.append({'type': 'assistant', 'sessionId': run['session_id'], 'agentId': run['lead_identity'],
+                 'isSidechain': True, 'cwd': str(project), 'timestamp': launched.isoformat(),
+                 'message': {'content': [{'type': 'tool_use', 'name': 'Agent', 'id': launch_id,
+                                         'input': {'subagent_type': child_type}}]}})
+    parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+    child_rows = [json.loads(line) for line in child.read_text(encoding='utf-8').splitlines()] if child.exists() else []
+    child_rows.append({'type': 'user', 'sessionId': run['session_id'], 'agentId': identity,
+        'isSidechain': True, 'uuid': f'child-prompt-{turn}',
+        'timestamp': (launched + timedelta(milliseconds=1)).isoformat(),
+        'message': {'content': 'Complete the assigned bounded work.'}})
+    child.write_text(''.join(json.dumps(row) + '\n' for row in child_rows), encoding='utf-8')
+    return parent, child
 
 
 def _plugin_source(candidate: Path) -> Path:
@@ -241,8 +273,17 @@ def _run_event(
             "CLAUDE_PLUGIN_ROOT": str(root),
             "SYMPHONY_RUNTIME_DIR": str(state_dir.parent / "runtimes"),
             "SYMPHONY_PROFILE": _first_profile(root, provider)["id"],
+            "CLAUDE_CONFIG_DIR": str(state_dir.parent / 'claude-native'),
         }
     )
+    if provider == 'claude' and event == 'SubagentStart' and agent_role == 'worker':
+        run = next((document['active_runs'][f'claude:{session}']
+                   for document in _state_documents(state_dir)
+                   if f'claude:{session}' in document.get('active_runs', {})), None)
+        if run is not None and 'substantive_contract' in run.get('assessment', {}):
+            model, effort = _role_model(root, provider, agent_role)
+            _write_claude_child_launch(env['CLAUDE_CONFIG_DIR'], project, run,
+                                       'fake-worker', 'worker', model, effort, 'worker')
     completed = subprocess.run(
         argv,
         input=json.dumps(

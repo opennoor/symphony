@@ -367,6 +367,10 @@ def _substantive_child_completed(run: RunState) -> bool:
                 and proof.get('epoch') == contract['epoch']
                 and proof.get('run_id') == run.run_id
                 and proof.get('lead') == run.lead_identity
+                and proof.get('parent') == run.lead_identity
+                and proof.get('role') == child.role
+                and isinstance(proof.get('start_event_id'), str)
+                and proof['start_event_id'] in run.assessment.get('_start_event_ids', ())
                 and proof.get('owner_generation') == run.owner_generation
                 and (child.role != 'consultant' or child.identity not in run.assessment.get('_invalid_consultants', ()))):
             return True

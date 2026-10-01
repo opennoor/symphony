@@ -1,7 +1,7 @@
 """The native probe requires successful fixture edits, not transcript mentions."""
 
 import importlib.util
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
@@ -17,6 +17,69 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_claude_fast_identity_requires_the_exact_accepted_root_launch(self):
+        from plugins.symphony.tests.test_claude_host_evidence import ClaudeHostEvidenceTests, LEAD
+        fixture = ClaudeHostEvidenceTests()
+        fixture.setUp()
+        try:
+            home = Path(fixture.environ['CLAUDE_CONFIG_DIR'])
+            run = asdict(replace(fixture.run, assessment={
+                '_fast_route': {'model': 'claude-sonnet-5', 'effort': 'low'},
+                '_claude_fast_launch_hash': hashlib.sha256(b'toolu_launch').hexdigest()}))
+            rows = smoke.native_rows('claude', home, LEAD)
+            # Identity comes from the accepted launch, even without a marker.
+            self.assertTrue(smoke.fast_native_identity('claude', rows, LEAD, run, home, fixture.project))
+            marker_rows = [{**row, 'message': {'content': 'SYMPHONY_FAST_DECISION: eligible'}} for row in rows]
+            for changes in ({}, {'_claude_fast_launch_hash': 'not-a-hash'},
+                            {'_claude_fast_launch_hash': hashlib.sha256(b'foreign').hexdigest()}):
+                assessment = {'_fast_route': run['assessment']['_fast_route'], **changes}
+                self.assertFalse(smoke.fast_native_identity('claude', marker_rows, LEAD,
+                    {**run, 'assessment': assessment}, home, fixture.project))
+            parent = fixture.parent.read_text(encoding='utf-8')
+            meta = fixture.meta.read_text(encoding='utf-8')
+            for case in ('duplicate', 'root', 'cwd', 'relative-cwd', 'model', 'type', 'depth', 'launch', 'route'):
+                with self.subTest(case=case):
+                    fixture.parent.write_text(parent, encoding='utf-8')
+                    fixture.meta.write_text(meta, encoding='utf-8')
+                    row = json.loads(parent)
+                    metadata = json.loads(meta)
+                    if case == 'duplicate':
+                        fixture.parent.write_text(parent + parent, encoding='utf-8')
+                    elif case in ('root', 'cwd', 'relative-cwd', 'model', 'type'):
+                        if case == 'root':
+                            row['sessionId'] = 'foreign'
+                        if case == 'cwd':
+                            row['cwd'] = str(fixture.root)
+                        if case == 'relative-cwd':
+                            row['cwd'] = '.'
+                        if case == 'model':
+                            row['message']['content'][0]['input']['model'] = 'foreign-model'
+                        if case == 'type':
+                            row['message']['content'][0]['name'] = 'Other'
+                        fixture.parent.write_text(json.dumps(row) + '\n', encoding='utf-8')
+                    else:
+                        if case == 'depth':
+                            metadata['spawnDepth'] = 2
+                        if case == 'launch':
+                            metadata['toolUseId'] = 'foreign'
+                        if case == 'route':
+                            metadata['agentType'] = 'symphony:symphony-lead-claude-sonnet-5-high'
+                        fixture.meta.write_text(json.dumps(metadata), encoding='utf-8')
+                    self.assertFalse(smoke.fast_native_identity('claude', marker_rows, LEAD,
+                                                               run, home, fixture.project))
+            fixture.parent.write_text(parent, encoding='utf-8')
+            fixture.meta.write_text(meta, encoding='utf-8')
+            foreign = [{**row, 'agentId': 'foreign'} for row in rows]
+            self.assertFalse(smoke.fast_native_identity('claude', foreign, LEAD, run, home, fixture.project))
+            other = fixture.child.with_name(fixture.child.name).parent.parent.parent / 'other' / 'subagents'
+            other.mkdir(parents=True)
+            (other / fixture.child.name).write_text(fixture.child.read_text(encoding='utf-8'), encoding='utf-8')
+            # Only a duplicate under the exact root/session is ambiguous.
+            self.assertTrue(smoke.fast_native_identity('claude', rows, LEAD, run, home, fixture.project))
+        finally:
+            fixture.doCleanups()
+            fixture.tearDown()
+
     def test_claude_completing_probe_exports_signed_chronology_without_native_content(self):
         from plugins.symphony.tests.test_claude_host_evidence import ClaudeHostEvidenceTests, SESSION
         from plugins.symphony.symphony.model import ProjectState
@@ -109,6 +172,77 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         self.assertEqual(counts, {'calls': 2, 'successful_results': 0, 'error_results': 1, 'missing_results': 1})
         self.assertEqual(smoke.raw_tool_categories('claude', claude)['other'], 2)
         self.assertNotIn('PRIVATE', json.dumps(counts))
+
+    def test_fast_native_identity_does_not_select_an_assessed_lead_sharing_its_route(self):
+        fast = {'model': 'gpt-6.1-sol', 'effort': 'medium'}
+        run = {'session_id': 'root', 'assessment': {'_fast_route': fast}, 'delegations': [
+            {'identity': identity, 'role': 'lead', 'requested_tier': fast['model'],
+             'requested_effort': fast['effort']} for identity in ('assessed', 'fast')]}
+        header = {'type': 'session_meta', 'payload': {'id': 'fast',
+            'agent_path': '/root/symphony_lead_fast_gpt_6_1_sol_medium',
+            'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}
+        self.assertTrue(smoke.fast_native_identity('codex', [header], 'fast', run))
+        for changed in ({**header['payload'], 'id': 'assessed',
+                         'agent_path': '/root/symphony_lead_gpt_6_1_sol_medium'},
+                        {**header['payload'], 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'foreign'}}}},
+                        {**header['payload'], 'id': 'foreign'}):
+            self.assertFalse(smoke.fast_native_identity('codex', [{'type': 'session_meta', 'payload': changed}],
+                                                       changed['id'], run))
+        call = {'type': 'response_item', 'payload': {'type': 'custom_tool_call', 'name': 'functions.exec',
+                                                    'input': 'PRIVATE_SENTINEL'}}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / 'codex-baseline-home' / 'sessions'
+            sessions.mkdir(parents=True)
+            assessed = {'type': 'session_meta', 'payload': {
+                **header['payload'], 'id': 'assessed', 'agent_path': '/root/symphony_lead_gpt_6_1_sol_medium'}}
+            (sessions / 'assessed.jsonl').write_text('\n'.join(json.dumps(row) for row in (assessed, call)), encoding='utf-8')
+            (sessions / 'fast.jsonl').write_text(json.dumps(header), encoding='utf-8')
+            diagnostics = smoke.failure_diagnostics('codex', root, {'recent_runs': [run]})
+            self.assertEqual(diagnostics['fast_native_provenance']['matching_native_candidates'], 1)
+            self.assertEqual(diagnostics['fast_raw_tool_categories']['exec_wrapper'], 0)
+            self.assertNotIn('PRIVATE_SENTINEL', json.dumps(diagnostics))
+
+    def test_inherited_rows_cannot_prove_fast_decision_or_before_change_calls(self):
+        own = {'type': 'session_meta', 'payload': {'id': 'fast'}}
+        inherited = {'type': 'session_meta', 'payload': {'id': 'root'}}
+        call = {'type': 'response_item', 'payload': {'type': 'custom_tool_call', 'name': 'functions.exec'}}
+        self.assertTrue(smoke.fast_turn_has_only_escalation('codex', [own], [], 'fast'))
+        self.assertFalse(smoke.fast_turn_has_only_escalation('codex', [own, inherited, call], [], 'fast'))
+        self.assertFalse(smoke.fast_turn_has_only_escalation('codex', [own], [], 'foreign'))
+        fork = {'type': 'session_meta', 'payload': {'id': 'fast', 'forked_from_id': 'root'}}
+        self.assertFalse(smoke.fast_turn_has_only_escalation('codex', [fork], [], 'fast'))
+
+    def test_decision_representation_diagnostics_never_deduplicate_missing_or_distinct_identity(self):
+        header = {'type': 'session_meta', 'payload': {'id': 'fast'}}
+        turn = {'type': 'turn_context', 'payload': {'turn_id': 'turn'}}
+        message = {'type': 'response_item', 'payload': {'type': 'message', 'role': 'assistant', 'id': 'message',
+            'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': 'SYMPHONY_FAST_DECISION: eligible'}]}}
+        same = smoke.decision_representations('codex', [header, turn, message, message], 'fast')
+        self.assertEqual(same['marker_lines'], 2)
+        self.assertEqual(same['equivalent_same_id_records'], 1)
+        self.assertEqual(same['own_turn_bound_records'], 2)
+        self.assertEqual(same['phases']['final_answer'], 2)
+        for changed in ({**message['payload'], 'id': None}, {**message['payload'], 'id': 'distinct'},
+                        {**message['payload'], 'phase': 'commentary'},
+                        {**message['payload'], 'content': [{'type': 'output_text', 'text':
+                         'SYMPHONY_FAST_DECISION: escalate\nPRIVATE_SENTINEL'}]}):
+            result = smoke.decision_representations('codex', [header, turn, message,
+                                                    {'type': 'response_item', 'payload': changed}], 'fast')
+            self.assertEqual(result['marker_lines'], 2)
+            self.assertEqual(result['equivalent_same_id_records'], 0)
+            self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+        next_turn = {'type': 'turn_context', 'payload': {'turn_id': 'next'}}
+        other_turn = smoke.decision_representations('codex', [header, turn, message, next_turn, message], 'fast')
+        self.assertEqual(other_turn['equivalent_same_id_records'], 0)
+        unbound = smoke.decision_representations('codex', [header, message, message], 'fast')
+        self.assertEqual(unbound['equivalent_same_id_records'], 0)
+        duplicate_line = {**message, 'payload': {**message['payload'], 'content': [{'type': 'output_text',
+            'text': 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_FAST_DECISION: eligible'}]}}
+        result = smoke.decision_representations('codex', [header, turn, duplicate_line], 'fast')
+        self.assertEqual(result['marker_lines'], 2)
+        self.assertEqual(result['marker_records'], 1)
+        self.assertEqual(result['equivalent_same_id_records'], 0)
 
     def test_fixture_verification_is_observable_without_forcing_routing(self):
         instructions = smoke.FIXTURE_INSTRUCTIONS

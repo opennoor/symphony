@@ -232,7 +232,7 @@ jobs:
           print('Claude shell=False Opus probe used:', ', '.join(result['modelUsage']))
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw 'Claude same-login Opus probe failed' }
-          claude.cmd --print --model haiku --max-budget-usd 0.50 --output-format text '/symphony:start CI routing probe' | Out-File (Join-Path $env:RUNNER_TEMP 'claude-windows-start.txt')
+          python .github/scripts/claude_start_probe.py --timeout 600
           if ($LASTEXITCODE -ne 0) { throw 'Claude start control failed' }
           @'
           import json, os, pathlib

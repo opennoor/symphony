@@ -21,6 +21,7 @@ from .host_evidence import (
     archived_lead_followup,
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
+    claude_substantive_launch,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
     retained_fast_escalation_receipt,
@@ -284,7 +285,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             state, provider, session, tuple(event for event, _, _ in batch
                                            if event.event_id not in acknowledged)) if unresolved else ""
         if source.kind == "stop_requested" and unresolved:
-            return state, ((Action("block_stop", {"reason": unresolved_reason}),), acknowledged)
+            return state, (_claude_native_stop_guard(source, unresolved_reason), acknowledged)
         if (not unresolved and provider == "claude"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"claude:{session}", session, provider)
@@ -441,7 +442,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     if owners == () and bound is None and record is None:
                         actions, _ = store.update(project, lambda state: transition(state))
                         return render(provider, actions, "Stop")
-                    return render(provider, (Action("block_stop", {"reason": reason}),),
+                    return render(provider, _claude_native_stop_guard(source, reason),
                                   str(payload.get("hook_event_name") or "Stop"))
                 if source.kind in {"user_prompt", "session_heartbeat"}:
                     return render(provider, (Action("inject_context", {"text": reason}),),
@@ -550,7 +551,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                         store.queue_session_event(provider, session, source)
                         return HookResult()
                     if source.kind == "stop_requested":
-                        return render(provider, (Action("block_stop", {"reason": reason}),), "Stop")
+                        return render(provider, _claude_native_stop_guard(source, reason), "Stop")
                     if source.kind == "pre_tool_use":
                         return render(provider, (Action("block_tool", {"reason": reason}),), "PreToolUse")
                     if source.kind in {"user_prompt", "session_heartbeat"}:
@@ -578,7 +579,9 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                         return HookResult()
                     action = ("block_stop" if source.kind == "stop_requested" else
                               "block_tool" if source.kind == "pre_tool_use" else "inject_context")
-                    return render(provider, (Action(action, {"reason": reason, "text": reason}),),
+                    actions = (_claude_native_stop_guard(source, reason) if source.kind == "stop_requested"
+                               else (Action(action, {"reason": reason, "text": reason}),))
+                    return render(provider, actions,
                                   str(payload.get("hook_event_name") or "UserPromptSubmit"))
                 if source.kind == "subagent_stopped" and not pending and not bound.is_file():
                     return HookResult()
@@ -589,8 +592,8 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                           store.update_path(bound, lambda state: transition(state, pending, record["generation"],
                                                                             frozenset(record["retired_agents"]))))
                 if result is None:
-                    return render(provider, (Action("block_stop", {"reason":
-                        "Symphony's bound project state is unavailable; recover this session before completion."}),),
+                    return render(provider, _claude_native_stop_guard(source,
+                        "Symphony's bound project state is unavailable; recover this session before completion."),
                                   "Stop") if source.kind == "stop_requested" else HookResult()
                 actions, acknowledged = result
                 for source_record in records:
@@ -1635,7 +1638,8 @@ def _child_turn_token(payload: Mapping[str, object]) -> str:
 
 
 def _record_substantive_child(state: ProjectState, source: Event, role: str,
-                              pending: Mapping, *, successful: bool) -> ProjectState:
+                              pending: Mapping, *, successful: bool,
+                              environ: Mapping[str, str] | None = None) -> ProjectState:
     run = state.active_run
     if not run or not run.lead_identity:
         return state
@@ -1645,25 +1649,38 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
             or not isinstance(contract.get('accepted_at'), str)
             or source.observed_at < contract['accepted_at']):
         return state
-    if source.payload.get('parent_thread_id') not in {None, '', run.session_id, run.lead_identity}:
-        return state
     identity = str(source.payload.get('agent_id') or source.payload.get('subagent_id') or '')
     scope = {'epoch': contract['epoch'], 'lead': run.lead_identity,
              'owner_generation': run.owner_generation, 'run_id': run.run_id}
     recorded = run.assessment.get('_substantive_children', {})
     proofs = dict(recorded) if isinstance(recorded, Mapping) else {}
     proof = proofs.get(identity)
-    if (_observed_role(source.payload) != role and pending.get('role') != role
-            and not isinstance(proof, Mapping)):
-        return state
     token = _child_turn_token(source.payload)
     if source.kind == 'subagent_started':
-        proof = {**scope, 'turn': token, 'successful': False}
+        # A duplicate Start for this invocation cannot rewrite its admitted
+        # role or parent. A genuinely new turn gets its own proof epoch.
+        if (not isinstance(proof, Mapping) or proof.get('turn') != token
+                or any(proof.get(key) != value for key, value in scope.items())):
+            proof = {**scope, 'turn': token, 'role': role, 'start_event_id': source.event_id,
+                     'admitted_at': source.observed_at,
+                     'start_parent': str(source.payload.get('parent_thread_id') or ''),
+                     'successful': False}
     elif (not isinstance(proof, Mapping) or any(proof.get(key) != value for key, value in scope.items())
           or proof.get('turn') != token):
         # Role/model-only launch intents cannot identify this native child.
         return state
-    proofs[identity] = {**proof, 'successful': successful}
+    binding = None
+    consistent = (proof.get('role') == role and _observed_role(source.payload) in {'', role}
+                  and proof.get('start_parent') in ('', run.lead_identity)
+                  and source.payload.get('parent_thread_id') in (None, '', run.lead_identity))
+    if consistent and run.provider == 'codex' and proof.get('start_parent') == run.lead_identity:
+        binding = {'parent': run.lead_identity}
+    elif consistent and run.provider == 'claude' and environ is not None:
+        binding = claude_substantive_launch(run, source, role, proof['admitted_at'], environ)
+        if binding and any(proof.get(key) is not None and proof.get(key) != value for key, value in binding.items()):
+            binding = None
+    proofs[identity] = {**proof, **(binding or {}),
+                        'successful': successful and binding is not None}
     assessment = {**run.assessment, '_substantive_children': proofs}
     updated = replace(run, assessment=assessment)
     if _substantive_child_completed(updated):
@@ -2091,7 +2108,8 @@ def _observe_delegation(
         decisions = _decision_markers(source.payload.get("last_assistant_message", ""))
         state = _set_invalid_consultant(state, str(identity), not decisions)
         state = _record_substantive_child(state, source, role, pending,
-                                         successful=status.lower() in {"completed", "done", "success", "succeeded"} and bool(decisions))
+                                         successful=status.lower() in {"completed", "done", "success", "succeeded"} and bool(decisions),
+                                         environ=environ)
         if not decisions:
             actions += (
                 Action(
@@ -2122,7 +2140,8 @@ def _observe_delegation(
                     actions += completion_actions
     elif role == 'worker' or (role == 'consultant' and not terminal):
         state = _record_substantive_child(state, source, role, pending,
-                                         successful=terminal and status.lower() in {"completed", "done", "success", "succeeded"})
+                                         successful=terminal and status.lower() in {"completed", "done", "success", "succeeded"},
+                                         environ=environ)
     if role == "lead" and terminal and state.active_run:
         if str(identity) != state.active_run.lead_identity:
             return state, actions
@@ -2645,9 +2664,6 @@ def _prepare_delegation(
         if isinstance(launch_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,160}', launch_id):
             assessment = {**state.active_run.assessment,
                           '_claude_fast_launch_hash': hashlib.sha256(launch_id.encode()).hexdigest()}
-            prompt_id = source.payload.get('prompt_id')
-            if isinstance(prompt_id, str) and prompt_id:
-                assessment['_claude_fast_root_prompt_hash'] = hashlib.sha256(prompt_id.encode()).hexdigest()
             state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     return state, actions
 
@@ -3507,7 +3523,8 @@ def _governance(state: ProjectState) -> str:
 
 
 def _claude_native_stop_guard(source: Event, reason: str) -> tuple[Action, ...]:
-    if (source.kind == 'stop_requested' and source.payload.get('hook_event_name') == 'Stop'
+    if (source.payload.get('provider') == 'claude'
+            and source.kind == 'stop_requested' and source.payload.get('hook_event_name') == 'Stop'
             and source.payload.get('stop_hook_active') is True):
         # Release this host turn without treating unverifiable native work as
         # completed. Dispatching Stop here could archive the older outcome.
@@ -3591,7 +3608,10 @@ def _refresh_completion_guidance(
 
 def _substantive_recovery_guidance(run: RunState | None, provider: str) -> str:
     native = ('Use followup_task with the original underscore task_name, not its /root/ path or UUID. '
-              if provider == 'codex' else 'Use SendMessage to resume that same agent. ')
+              if provider == 'codex' else
+              'Use SendMessage to resume that same agent. Claude scoped credit requires a fresh worker or '
+              'consultant with one native prompt and an exact Agent launch by this lead. Preserve reused '
+              'child history, repair any invalid consultant decisions, then launch a fresh bounded child. ')
     return ('Resume the SAME registered lead; this assessed route needs successful substantive worker '
             'or classified consultant evidence from the current assessment and owner generation. '
             + native + 'Reconcile a verifiable current-scope worker Start, or launch a fresh bounded worker '

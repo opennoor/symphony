@@ -108,13 +108,134 @@ def _complete_native_jsonl(path: Path) -> list[dict] | None:
 def _claude_observed_fast_launch(run: RunState, launch_id: str, root_prompt: str | None) -> bool:
     """Bind a native launch predating its PreToolUse observation to that hook."""
     pinned = run.assessment.get('_claude_fast_launch_hash')
-    prompt = run.assessment.get('_claude_fast_root_prompt_hash')
     return bool(run.provider == 'claude' and _archived_fast_owner(run) and isinstance(pinned, str)
                 and re.fullmatch(r'[0-9a-f]{64}', pinned)
-                and hashlib.sha256(launch_id.encode()).hexdigest() == pinned
-                and (prompt is None or isinstance(prompt, str)
-                     and re.fullmatch(r'[0-9a-f]{64}', prompt) and isinstance(root_prompt, str)
-                     and hashlib.sha256(root_prompt.encode()).hexdigest() == prompt))
+                and hashlib.sha256(launch_id.encode()).hexdigest() == pinned)
+
+
+def claude_substantive_launch(
+    run: RunState, source: Event, role: str, started_at: str, environ: Mapping[str, str],
+) -> dict[str, str] | None:
+    """Bind an admitted child Start to an exact launch in its owning lead.
+
+    Ordinary Claude child hooks do not supply a native parent identity. The
+    child metadata and unique Agent call in the canonical lead's transcript
+    establish that parent; callback labels or queued role/model intents do not.
+    """
+    identity = str(source.payload.get('agent_id') or source.payload.get('subagent_id') or '')
+    lead_id = run.lead_identity or ''
+    contract = run.assessment.get('substantive_contract', {})
+    accepted = _instant(contract.get('accepted_at')) if isinstance(contract, Mapping) else None
+    admitted = _instant(started_at)
+    observed = _instant(source.observed_at)
+    if (run.provider != 'claude' or source.payload.get('provider') != 'claude'
+            or source.payload.get('session_id') != run.session_id
+            or role not in {'worker', 'consultant'} or accepted is None or admitted is None or observed is None
+            or any(not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', value)
+                   for value in (identity, lead_id, run.session_id))
+            or source.payload.get('parent_thread_id') not in (None, '', lead_id)
+            or not source.payload.get('cwd')):
+        return None
+    lead = next((child for child in run.delegations if child.identity == lead_id and child.role == 'lead'), None)
+    child = next((child for child in run.delegations if child.identity == identity and child.role == role), None)
+    if not lead or not child or not all((lead.requested_tier, lead.requested_effort,
+                                       child.requested_tier, child.requested_effort)):
+        return None
+    home = Path(environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+    projects = home / 'projects'
+    if projects.is_symlink() or not projects.is_dir():
+        return None
+    paths = tuple(projects.glob(f'*/{run.session_id}/subagents/agent-{identity}.jsonl'))
+    if len(paths) != 1:
+        return None
+    child_path = paths[0]
+    parent_path = child_path.parent / f'agent-{lead_id}.jsonl'
+    if any(path.is_symlink() for path in (child_path.parent, child_path.parent.parent,
+                                          child_path.parent.parent.parent)):
+        return None
+    metadata = []
+    for path in (child_path.with_suffix('.meta.json'), parent_path.with_suffix('.meta.json')):
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024:
+                return None
+            value = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError, UnicodeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        metadata.append(value)
+    child_meta, lead_meta = metadata
+    child_type = child_meta.get('agentType')
+    lead_type = lead_meta.get('agentType')
+    launch_id = child_meta.get('toolUseId')
+    if (type(child_meta.get('spawnDepth')) is not int or child_meta['spawnDepth'] != 2
+            or type(lead_meta.get('spawnDepth')) is not int or lead_meta['spawnDepth'] != 1
+            or not isinstance(child_type, str) or not child_type.endswith(
+                f'symphony-{role}-{child.requested_tier}-{child.requested_effort}')
+            or not isinstance(lead_type, str) or not lead_type.endswith(
+                f'symphony-lead-{lead.requested_tier}-{lead.requested_effort}')
+            or not isinstance(launch_id, str) or not launch_id):
+        return None
+    parent_rows, child_rows = _native_jsonl(parent_path), _native_jsonl(child_path)
+    if parent_rows is None or child_rows is None:
+        return None
+    launches = []
+    for row in parent_rows:
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        for item in content if isinstance(content, list) else ():
+            if isinstance(item, dict) and item.get('id') == launch_id:
+                launches.append((row, item))
+    if len(launches) != 1:
+        return None
+    parent, launch = launches[0]
+    values = launch.get('input')
+    launched = _instant(parent.get('timestamp'))
+    if (parent.get('type') != 'assistant' or parent.get('sessionId') != run.session_id
+            or parent.get('agentId') != lead_id or parent.get('isSidechain') is not True
+            or launch.get('type') != 'tool_use' or launch.get('name') != 'Agent'
+            or not isinstance(values, dict) or values.get('subagent_type') != child_type
+            or ('model' in values and values['model'] != child.requested_tier)
+            or launched is None or not accepted <= launched <= admitted):
+        return None
+    try:
+        source_cwd, native_cwd = source.payload.get('cwd'), parent.get('cwd')
+        if (not isinstance(source_cwd, str) or not source_cwd or not Path(source_cwd).is_absolute()
+                or not isinstance(native_cwd, str) or not native_cwd or not Path(native_cwd).is_absolute()):
+            return None
+        project = Path(source_cwd).resolve()
+        if Path(native_cwd).resolve() != project:
+            return None
+    except (OSError, ValueError):
+        return None
+    prompts = []
+    for row in child_rows:
+        if row.get('type') != 'user':
+            continue
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, str) or (isinstance(content, list) and content and all(
+                isinstance(item, dict) and item.get('type') == 'text' and isinstance(item.get('text'), str)
+                for item in content)):
+            prompts.append(row)
+        elif not (isinstance(content, list) and content and any(
+                isinstance(item, dict) and item.get('type') == 'tool_result' for item in content)
+                and all(isinstance(item, dict) and (item.get('type') == 'tool_result'
+                    or item.get('type') == 'text' and isinstance(item.get('text'), str)) for item in content)):
+            return None
+    # A fresh child has one invocation. Reused/multiple native prompt history
+    # cannot be assigned to an earlier callback just because its ID is reused.
+    if len(prompts) != 1:
+        return None
+    prompt = prompts[0]
+    when = _instant(prompt.get('timestamp'))
+    prompt_id = prompt.get('uuid')
+    if (prompt.get('sessionId') != run.session_id or prompt.get('agentId') != identity
+            or prompt.get('isSidechain') is not True or when is None or not launched <= when <= observed
+            or not isinstance(prompt_id, str) or not prompt_id):
+        return None
+    return {'parent': lead_id, 'launch_hash': hashlib.sha256(launch_id.encode()).hexdigest(),
+            'native_prompt_hash': hashlib.sha256(prompt_id.encode()).hexdigest()}
 
 
 def _claude_native_lead_event(

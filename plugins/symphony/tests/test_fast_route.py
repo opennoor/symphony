@@ -93,8 +93,7 @@ class FastRouteTests(unittest.TestCase):
                 if provider == 'claude' and launch_id == 'toolu_launch':
                     self.assertEqual(assessment['_claude_fast_launch_hash'],
                                      hashlib.sha256(launch_id.encode()).hexdigest())
-                    self.assertEqual(assessment['_claude_fast_root_prompt_hash'],
-                                     hashlib.sha256(b'root-prompt').hexdigest())
+                    self.assertNotIn('_claude_fast_root_prompt_hash', assessment)
                     blocked = self.hook(provider, 'PreToolUse', tool_name='Agent', tool_use_id='different',
                         tool_input={'subagent_type': f"symphony:symphony-lead-{assessment['_fast_route']['model']}-medium",
                                     'prompt': 'SYMPHONY_ROLE: lead\nSYMPHONY_FAST_ROUTE: lead\nRun a command'})

@@ -12,7 +12,7 @@ import tempfile
 import unittest
 
 from plugins.symphony.scripts.generate_hooks import bootstrap, generated
-from plugins.symphony.scripts.package_smoke import _payload
+from plugins.symphony.scripts.package_smoke import _payload, _role_model, _write_claude_child_launch
 
 
 PLUGIN = Path(__file__).resolve().parents[1]
@@ -81,6 +81,17 @@ class RuntimeRetentionTests(unittest.TestCase):
                "PYTHONPATH": str(directory),
                "SYMPHONY_CAPTURED_BOOTSTRAP": "raise RuntimeError('inherited bootstrap executed')",
                "CODEX_HOME": str(directory / "empty codex home")}
+        env['CLAUDE_CONFIG_DIR'] = str(directory / 'claude-native')
+        if (provider == 'claude' and payload.get('hook_event_name') == 'SubagentStart'
+                and payload.get('agent_id') == 'fake-worker'):
+            documents = [json.loads(path.read_text(encoding='utf-8'))
+                         for path in (directory / 'state').glob('*.v2.json')]
+            run = next(document['active_runs'][f"claude:{payload['session_id']}"]
+                       for document in documents
+                       if f"claude:{payload['session_id']}" in document.get('active_runs', {}))
+            model, effort = _role_model(PLUGIN, provider, 'worker')
+            _write_claude_child_launch(env['CLAUDE_CONFIG_DIR'], directory, run,
+                                       'fake-worker', 'worker', model, effort, 'worker')
         if (directory / "pin barrier" / "barrier.py").is_file():
             env["SYMPHONY_TEST_PIN_BARRIER"] = str(directory / "pin barrier" / "barrier.py")
         # Give the hook this fixture's selected interpreter on every platform,

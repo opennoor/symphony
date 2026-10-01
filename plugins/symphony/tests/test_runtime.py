@@ -134,6 +134,12 @@ class RuntimeTests(unittest.TestCase):
                   'agent_type': agent_type, 'parent_thread_id': run.lead_identity,
                   'task': 'SYMPHONY_ROLE: worker\nComplete the bounded fixture work',
                   'model': choice['lead_model'], 'model_reasoning_effort': choice['lead_effort']}
+        if provider == 'claude':
+            from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
+            home = self.root / 'claude-native'
+            environ = {**environ, 'CLAUDE_CONFIG_DIR': str(home)}
+            write_claude_child_launch(home, self.project, run, identity, 'worker',
+                choice['lead_model'], choice['lead_effort'], f'worker-{self.spawn_count}')
         handle(worker, environ)
         handle({**worker, 'hook_event_name': 'SubagentStop', 'status': 'completed'}, environ)
 
@@ -3068,6 +3074,7 @@ class RuntimeTests(unittest.TestCase):
             "hook_event_name": "SubagentStart",
             "agent_id": "consultant-1",
             "agent_type": "symphony_consultant_gpt_6_high",
+            "parent_thread_id": "lead-1",
         }
         handle(lead, self.environ)
         handle(consultant, self.environ)

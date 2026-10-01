@@ -3,7 +3,7 @@
 ## 1.7.0 — prepared 2026-10-01
 
 - Limit fast direct execution to wholly predetermined mechanical work. Tiny features, diagnosis, substantive review, and mixed run-and-fix requests require assessment before changes. Assessed small work uses a worker; the routing matrix controls execution topology.
-- Require successful child work from the current assessment and lead generation before new delegated or mixed runs complete. Preserve legacy completion and validated consultant contracts, with actionable same-lead recovery when evidence is missing.
+- Require successful child work from the current assessment and lead generation before new delegated or mixed runs complete. Preserve the admitted child role and exact lead ownership. Claude scoped credit requires a fresh native child; retained multiple-prompt history has actionable same-lead recovery through fresh bounded delegation. Legacy completion remains compatible.
 - Recover fresh leads after archived history and verified continuations of the latest archived owner through normal lifecycle entry points. Preserve exact native identity, root session, provider, model, effort, turn, and ownership checks. A new objective still requires fresh routing.
 - Bind new Claude fast runs to the exact accepted native launch so a parent call recorded before its hook can reconcile safely. Repeated native Stop releases the host turn while retaining unresolved work and displaying recovery guidance.
 - Reconcile committed archived fast-lead escalation callbacks after the actual 1.6.0 serializer removes newer receipt fields, using surviving exact run and native evidence for acknowledgement only. Missing or conflicting proof remains retained; reloading alone does not restore trimmed evidence.

@@ -110,8 +110,8 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 self.child.write_text(''.join(json.dumps(row) + '\n' for row in child))
                 state = ProjectState(active_run=run, active_runs={f'claude:{SESSION}': run})
                 event = _claude_native_lead_event(state, SESSION, self.project, self.environ, require_missing=False)
-                self.assertEqual(event is not None, case == 'valid')
-                if case == 'valid':
+                self.assertEqual(event is not None, case in {'valid', 'wrong-prompt'})
+                if case in {'valid', 'wrong-prompt'}:
                     self.assertEqual(_claude_native_prompt_activity(state, SESSION, self.project, self.environ)[0], 'single')
                     self.assertEqual(claude_completing_lead_turn(state, SESSION, self.project, self.environ)[0], 'none')
                     self.store.save(self.project, state)

@@ -3,6 +3,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import types
 import unittest
 from unittest.mock import patch
@@ -35,6 +36,11 @@ class AssessedContractTests(unittest.TestCase):
     def begin(self, provider, *, legacy=False):
         self.provider = provider
         self.sequence = 0
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.project = Path(temporary.name) / 'project'
+        self.project.mkdir()
+        self.environ = {'CLAUDE_CONFIG_DIR': str(Path(temporary.name) / 'claude')}
         self.state = ProjectState(enabled=True, active_run=RunState(
             'run', 'Implement a small feature', 'assessing', provider=provider,
             session_id='root', started_at='2026-10-01T14:00:00+00:00'))
@@ -56,14 +62,19 @@ class AssessedContractTests(unittest.TestCase):
     def child(self, identity, role, terminal, turn, *, status='completed', report='', parent=None):
         route = self.state.active_run.assessment['route']
         fields = {'provider': self.provider, 'session_id': 'root', 'agent_id': identity,
+                  'cwd': str(self.project),
                   'role': role, 'task': 'SYMPHONY_ROLE: ' + role,
                   'parent_thread_id': parent or ('root' if role == 'lead' else 'lead'),
                   'model': route['lead_model'], 'model_reasoning_effort': route['lead_effort'],
                   'turn_id' if self.provider == 'codex' else 'prompt_id': turn}
         if terminal:
             fields.update(status=status, last_assistant_message=report)
+        elif self.provider == 'claude' and role in {'worker', 'consultant'}:
+            from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
+            write_claude_child_launch(self.environ['CLAUDE_CONFIG_DIR'], self.project,
+                self.state.active_run, identity, role, fields['model'], fields['model_reasoning_effort'], turn)
         self.state, actions = _observe_delegation(self.state, self.event(
-            'subagent_stopped' if terminal else 'subagent_started', **fields))
+            'subagent_stopped' if terminal else 'subagent_started', **fields), self.environ)
         return actions
 
     def worker(self, identity='worker', turn='worker-1', *, status='completed', parent=None):
@@ -129,6 +140,16 @@ class AssessedContractTests(unittest.TestCase):
                 self.child('reviewer', 'consultant', False, 'review-2')
                 self.child('reviewer', 'consultant', True, 'review-2',
                            report='SYMPHONY_DECISION: {"size":"small","complexity":"simple"}')
+                if provider == 'claude':
+                    # Native reuse retains both prompts; classification repair
+                    # clears the invalid result but cannot assign scoped credit.
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+                    self.assertIn('with one native prompt', _recovery_guidance(self.state, provider))
+                    self.child('lead', 'lead', False, 'lead-2')
+                    self.child('fresh-reviewer', 'consultant', False, 'fresh-review')
+                    self.child('fresh-reviewer', 'consultant', True, 'fresh-review',
+                               report='SYMPHONY_DECISION: {"size":"small","complexity":"simple"}')
+                    self.child('lead', 'lead', True, 'lead-2')
                 self.assertTrue(_substantive_child_completed(self.state.active_run))
                 self.assertEqual(self.state.active_run.status, 'completing')
 
@@ -418,16 +439,138 @@ class AssessedContractTests(unittest.TestCase):
                 self.child('worker', 'worker', True, 'worker-1')
                 self.assertFalse(_substantive_child_completed(self.state.active_run))
 
+    def test_root_parent_and_role_relabeling_never_satisfy_scoped_work(self):
+        for provider in ('codex', 'claude'):
+            for scenario in ('root-parent', 'consultant-to-worker', 'worker-to-consultant', 'duplicate-start-role'):
+                with self.subTest(provider=provider, scenario=scenario):
+                    self.begin(provider)
+                    if scenario == 'root-parent':
+                        self.worker(parent='root')
+                    else:
+                        start_role = 'worker' if scenario == 'worker-to-consultant' else 'consultant'
+                        terminal_role = 'consultant' if start_role == 'worker' else 'worker'
+                        self.child('reviewer', start_role, False, 'review-1')
+                        admitted = dict(self.state.active_run.assessment['_substantive_children']['reviewer'])
+                        if scenario == 'duplicate-start-role':
+                            self.child('reviewer', terminal_role, False, 'review-1')
+                            proof = self.state.active_run.assessment['_substantive_children']['reviewer']
+                            self.assertEqual(proof['role'], start_role)
+                            self.assertEqual(proof['start_event_id'], admitted['start_event_id'])
+                        self.child('reviewer', terminal_role, True, 'review-1',
+                                   report='SYMPHONY_DECISION: {"size":"small","complexity":"simple"}')
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+                    self.child('lead', 'lead', True, 'lead-1')
+                    self.assertNotEqual(self.state.active_run.status, 'completing')
+
+    def test_reducer_requires_immutable_admitted_role_parent_and_start(self):
+        self.begin('codex')
+        self.worker()
+        run = self.state.active_run
+        original = run.assessment['_substantive_children']['worker']
+        for key, value in (('role', 'consultant'), ('parent', 'root'), ('start_event_id', 'foreign')):
+            proof = {**original, key: value}
+            updated = replace(run, assessment={**run.assessment, '_substantive_children': {'worker': proof}})
+            self.assertFalse(_substantive_child_completed(updated), key)
+
+    def test_claude_native_parent_binding_can_resolve_only_an_admitted_same_scope_start(self):
+        from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
+        for scenario in ('valid', 'missing-start', 'new-assessment', 'foreign-parent', 'missing-native',
+                         'new-turn', 'wrong-role', 'duplicate-launch', 'foreign-cwd', 'foreign-native-parent',
+                         'old-launch', 'launch-after-start', 'foreign-session', 'wrong-model', 'wrong-effort',
+                         'missing-cwd', 'relative-cwd', 'relative-source-cwd', 'model-override', 'future-prompt',
+                         'newer-string-prompt', 'newer-text-block-prompt', 'missing-prompt-id', 'malformed-prompt'):
+            with self.subTest(scenario=scenario):
+                self.begin('claude')
+                run = self.state.active_run
+                route = run.assessment['route']
+                fields = dict(provider='claude', session_id='root', agent_id='worker', role='worker',
+                              cwd=str(self.project), model=route['lead_model'],
+                              model_reasoning_effort=route['lead_effort'], prompt_id='worker-turn')
+                start = self.event('subagent_started', **fields)
+                if scenario != 'missing-start':
+                    self.state, _ = _observe_delegation(self.state, start, self.environ)
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+                parent, child = write_claude_child_launch(self.environ['CLAUDE_CONFIG_DIR'], self.project,
+                    run, 'worker', 'worker', fields['model'], fields['model_reasoning_effort'], 'worker-turn')
+                if scenario == 'new-assessment':
+                    self.assess()
+                if scenario == 'foreign-parent':
+                    fields['parent_thread_id'] = 'root'
+                if scenario == 'new-turn':
+                    fields['prompt_id'] = 'other-turn'
+                if scenario == 'wrong-role':
+                    fields['role'] = 'consultant'
+                if scenario == 'missing-native':
+                    child.with_suffix('.meta.json').unlink()
+                parent_rows = [json.loads(line) for line in parent.read_text(encoding='utf-8').splitlines()]
+                if scenario == 'duplicate-launch':
+                    parent_rows.append(parent_rows[-1])
+                if scenario == 'foreign-cwd':
+                    parent_rows[-1]['cwd'] = str(self.project.parent / 'foreign')
+                if scenario == 'missing-cwd':
+                    parent_rows[-1].pop('cwd')
+                if scenario == 'relative-cwd':
+                    parent_rows[-1]['cwd'] = '.'
+                if scenario == 'relative-source-cwd':
+                    fields['cwd'] = '.'
+                if scenario == 'model-override':
+                    parent_rows[-1]['message']['content'][0]['input']['model'] = 'foreign-model'
+                if scenario == 'foreign-native-parent':
+                    parent_rows[-1]['agentId'] = 'root'
+                if scenario == 'old-launch':
+                    parent_rows[-1]['timestamp'] = '2026-10-01T13:00:00+00:00'
+                if scenario == 'launch-after-start':
+                    parent_rows[-1]['timestamp'] = '2026-10-01T15:00:00+00:00'
+                if scenario == 'foreign-session':
+                    parent_rows[-1]['sessionId'] = 'foreign'
+                if scenario in {'wrong-model', 'wrong-effort'}:
+                    meta = json.loads(child.with_suffix('.meta.json').read_text(encoding='utf-8'))
+                    meta['agentType'] = 'symphony:symphony-worker-foreign-low'
+                    if scenario == 'wrong-effort':
+                        meta['agentType'] = f"symphony:symphony-worker-{fields['model']}-max"
+                    child.with_suffix('.meta.json').write_text(json.dumps(meta), encoding='utf-8')
+                parent.write_text(''.join(json.dumps(row) + '\n' for row in parent_rows), encoding='utf-8')
+                child_rows = [json.loads(line) for line in child.read_text(encoding='utf-8').splitlines()]
+                if scenario == 'future-prompt':
+                    child_rows[-1]['timestamp'] = '2099-01-01T00:00:00+00:00'
+                if scenario in {'newer-string-prompt', 'newer-text-block-prompt'}:
+                    child_rows.append({**child_rows[-1], 'uuid': 'newer-unfinished-prompt',
+                        'message': {'content': 'New objective' if scenario == 'newer-string-prompt'
+                                    else [{'type': 'text', 'text': 'New objective'}]}})
+                if scenario == 'missing-prompt-id':
+                    child_rows[-1].pop('uuid')
+                if scenario == 'malformed-prompt':
+                    child_rows[-1]['message']['content'] = [{'type': 'text', 'text': 1}]
+                child.write_text(''.join(json.dumps(row) + '\n' for row in child_rows), encoding='utf-8')
+                terminal = self.event('subagent_stopped', **fields, status='completed')
+                self.state, _ = _observe_delegation(self.state, terminal, self.environ)
+                self.assertEqual(_substantive_child_completed(self.state.active_run), scenario == 'valid')
+                if scenario == 'valid':
+                    proof = self.state.active_run.assessment['_substantive_children']['worker']
+                    self.assertEqual(proof['start_event_id'], start.event_id)
+                    self.assertEqual(proof['parent'], 'lead')
+                    self.child('lead', 'lead', True, 'lead-1')
+                    self.state, _ = reduce(self.state, self.event('stop_requested'))
+                    self.assertIsNone(self.state.active_run)
+
     def test_first_tokenless_invocation_uses_accepted_start_and_reused_start_stays_ambiguous(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):
                 self.begin(provider)
                 fields = {'provider': provider, 'session_id': 'root', 'agent_id': 'tokenless-worker',
-                          'parent_thread_id': 'lead', 'role': 'worker', 'task': 'SYMPHONY_ROLE: worker'}
+                          'cwd': str(self.project), 'parent_thread_id': 'lead',
+                          'role': 'worker', 'task': 'SYMPHONY_ROLE: worker'}
+                if provider == 'claude':
+                    from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
+                    route = self.state.active_run.assessment['route']
+                    fields.update(model=route['lead_model'], model_reasoning_effort=route['lead_effort'])
+                    write_claude_child_launch(self.environ['CLAUDE_CONFIG_DIR'], self.project,
+                        self.state.active_run, 'tokenless-worker', 'worker', fields['model'],
+                        fields['model_reasoning_effort'], 'tokenless')
                 start = self.event('subagent_started', **fields)
-                self.state, _ = _observe_delegation(self.state, start)
+                self.state, _ = _observe_delegation(self.state, start, self.environ)
                 terminal = self.event('subagent_stopped', **fields, status='completed')
-                self.state, _ = _observe_delegation(self.state, terminal)
+                self.state, _ = _observe_delegation(self.state, terminal, self.environ)
                 self.assertTrue(_substantive_child_completed(self.state.active_run))
                 self.assertEqual(self.state.active_run.assessment['_substantive_children']['tokenless-worker']['turn'], '')
                 self.child('lead', 'lead', True, 'lead-1')
