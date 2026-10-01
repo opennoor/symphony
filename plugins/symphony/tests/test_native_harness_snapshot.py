@@ -693,6 +693,47 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid timestamp"):
             native.timestamp_ns("not-a-timestamp")
 
+    def test_claude_live_update_allows_one_original_turn_to_finish_just_before_removal(self):
+        removed = native.timestamp_ns("2026-09-30T12:00:05+00:00")
+        prompt = "2026-09-30T12:00:00+00:00"
+        just_before = "2026-09-30T12:00:04.975+00:00"
+        just_after = "2026-09-30T12:00:05.367+00:00"
+
+        def document(lead_id, completed_at=just_after):
+            return {"event_history": [{"kind": "lead_completed", "observed_at": completed_at,
+                                       "payload": {"identity": lead_id}}]}
+
+        def trace(completed_at):
+            return {"child_prompt_shape_supported": True, "child_turns": [{
+                "child_prompt_at": prompt, "last_assistant_at": completed_at,
+                "last_stop_reason": "end_turn", "marker": "completed"}]}
+
+        first = native.require_post_removal_lead_completion(
+            document("lead-a"), "claude", "root-a", "lead-a", trace(just_after), removed,
+            require_native_span=False)
+        second = native.require_post_removal_lead_completion(
+            document("lead-b"), "claude", "root-b", "lead-b", trace(just_before), removed,
+            require_native_span=False)
+        self.assertTrue(first["native_turn_spanned_removal"])
+        self.assertFalse(second["native_turn_spanned_removal"])
+        native.require_any_native_lead_span({"a": first, "b": second})
+        with self.assertRaisesRegex(RuntimeError, "no original native lead turn"):
+            native.require_any_native_lead_span({"a": second, "b": second})
+        with self.assertRaisesRegex(RuntimeError, "durable completion"):
+            native.require_post_removal_lead_completion(
+                document("lead-b", just_before), "claude", "root-b", "lead-b",
+                trace(just_before), removed, require_native_span=False)
+        with self.assertRaisesRegex(RuntimeError, "did not span"):
+            native.require_post_removal_lead_completion(
+                document("lead-b"), "claude", "root-b", "lead-b",
+                {"child_prompt_shape_supported": True, "child_turns": [{
+                    **trace(just_before)["child_turns"][0], "marker": "blocked"}]},
+                removed, require_native_span=False)
+        with self.assertRaisesRegex(RuntimeError, "Claude-only"):
+            native.require_post_removal_lead_completion(
+                document("lead-b"), "codex", "root-b", "lead-b", {}, removed,
+                require_native_span=False)
+
     def test_claude_text_list_prompt_starts_new_turn_after_old_one_completed(self):
         before = "2026-09-30T12:00:00+00:00"
         removed = native.timestamp_ns("2026-09-30T12:00:05+00:00")

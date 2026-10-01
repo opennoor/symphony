@@ -1178,8 +1178,10 @@ def timestamp_ns(value):
 
 
 def require_post_removal_lead_completion(document, provider, session, lead_id,
-                                         native_trace, removed_ns):
-    """Prove an original child turn spans old-source removal and later reconciles."""
+                                         native_trace, removed_ns, *, require_native_span=True):
+    """Prove durable completion, and report whether the native turn crossed removal."""
+    if provider != "claude" and not require_native_span:
+        raise RuntimeError("native span relaxation is Claude-only")
     if not isinstance(removed_ns, int) or removed_ns <= 0:
         raise RuntimeError("old plugin removal boundary is missing")
     events = [event for event in document.get("event_history", ())
@@ -1201,6 +1203,12 @@ def require_post_removal_lead_completion(document, provider, session, lead_id,
     elif provider == "claude":
         if native_trace.get("child_prompt_shape_supported") is not True:
             raise RuntimeError("native Claude child prompt shape is unsupported")
+        original_terminals = [turn for turn in turns
+                              if turn.get("marker") == "completed"
+                              and turn.get("last_stop_reason") == "end_turn"
+                              and timestamp_ns(turn.get("child_prompt_at")) < removed_ns
+                              and timestamp_ns(turn.get("last_assistant_at"))
+                              >= timestamp_ns(turn.get("child_prompt_at"))]
         terminal = [turn for turn in turns
                     if turn.get("marker") == "completed"
                     and turn.get("last_stop_reason") == "end_turn"
@@ -1220,11 +1228,18 @@ def require_post_removal_lead_completion(document, provider, session, lead_id,
             and turn.get("last_stop_reason") in {None, "end_turn"})
     else:
         raise RuntimeError("unsupported native provider")
-    if not straddled or not completed_after:
+    if ((require_native_span and (not straddled or not completed_after))
+            or (not require_native_span and provider == "claude"
+                and not (original_terminals or (straddled and completed_after)))):
         raise RuntimeError("original native lead turn did not span and complete after old plugin removal")
     return {"session_id": session, "lead_id": lead_id,
             "durable_completion_after_removal": True,
-            "native_turn_spanned_removal": True}
+            "native_turn_spanned_removal": bool(straddled and completed_after)}
+
+
+def require_any_native_lead_span(evidence):
+    if not any(item["native_turn_spanned_removal"] for item in evidence.values()):
+        raise RuntimeError("no original native lead turn spanned old plugin removal")
 
 
 def codex_host_trace(home, session, lead_id, error_log, *, strict=False,
@@ -1951,7 +1966,8 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                                                   observed_leads[label]))
                 post_removal_evidence[label] = require_post_removal_lead_completion(
                     doc, provider, sessions[label], observed_leads[label], native_trace,
-                    update["old_source_removed_ns"])
+                    update["old_source_removed_ns"],
+                    require_native_span=provider != "claude")
             if not update:
                 activation = doc.get("activation", {}).get(provider, {})
                 profiles = [activation, *activation.get("session_profiles", [])]
@@ -1985,6 +2001,12 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     raise RuntimeError(f"{label}: same-session Claude resume did not load the candidate")
             require_case_recovery_events(doc, observed_leads[label], provider, update,
                                          label, pre_resume_state)
+        if update and provider == "claude":
+            # Claude's Start hook must release before the managed lead can
+            # register. A short original turn may finish during uninstall;
+            # both durable completions must follow removal, while at least one
+            # native turn must prove work crossed that boundary.
+            require_any_native_lead_span(post_removal_evidence)
         capture = codex_hook_capture_summary(root, provider)
         for label, session in sessions.items():
             gate_starts = [record for record in capture["records"]

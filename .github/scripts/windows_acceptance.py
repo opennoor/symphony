@@ -31,6 +31,7 @@ TESTS = (
     "plugins.symphony.tests.test_runtime_retention",
     "plugins.symphony.tests.test_boost",
     "plugins.symphony.tests.test_fast_route",
+    "plugins.symphony.tests.test_native_harness_snapshot.CandidateRetainedProfileTests.test_claude_live_update_allows_one_original_turn_to_finish_just_before_removal",
 )
 
 
