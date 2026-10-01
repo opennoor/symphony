@@ -79,11 +79,39 @@ def failure_diagnostics(provider, root, document):
     home = root / f"{provider}-baseline-home"
     native_signals = {"fast_guidance_text_present": False, "eligible_markers": 0, "escalate_markers": 0,
                       "spawn_unknown_model": False}
+    native_signals.update(root_eligible_markers=0, root_escalate_markers=0,
+                         bound_child_eligible_markers=0, bound_child_escalate_markers=0)
+    root_launches = dict.fromkeys(('calls', 'successful_results', 'error_results', 'missing_results'), 0)
+    fast_calls = dict.fromkeys(('dedicated_read', 'exec_wrapper', 'shell_exec', 'edit', 'handback', 'other'), 0)
+    runs = [*document.get('active_runs', {}).values(), *document.get('recent_runs', [])]
+    known_children = {child.get('identity') for run in runs for child in run.get('delegations', [])}
+    fast_children = set()
+    for run in runs:
+        fast = run.get('assessment', {}).get('_fast_route', {})
+        lead = next((child for child in run.get('delegations', []) if child.get('role') == 'lead'), None)
+        if (lead and fast and lead.get('requested_tier') == fast.get('model')
+                and lead.get('requested_effort') == fast.get('effort')):
+            fast_children.add(lead.get('identity'))
     paths = (home / ("sessions" if provider == "codex" else "projects")).rglob("*.jsonl")
     for path in paths:
         try:
-            for line in path.read_text().splitlines():
-                row = json.loads(line)
+            lines = path.read_text().splitlines()
+            rows = [json.loads(line) for line in lines]
+            header = rows[0].get('payload', {}) if provider == 'codex' and rows else {}
+            identity = header.get('id') if provider == 'codex' else next(
+                (row.get('agentId') for row in rows if row.get('agentId')), None)
+            source = header.get('source')
+            is_root = (not (isinstance(source, dict) and source.get('subagent')) if provider == 'codex'
+                       else not any(row.get('isSidechain') is True for row in rows))
+            if is_root:
+                counts_for_root = raw_launch_counts(provider, rows)
+                for key in root_launches:
+                    root_launches[key] += counts_for_root[key]
+            if identity in fast_children:
+                categories = raw_tool_categories(provider, rows)
+                for key in fast_calls:
+                    fast_calls[key] += categories[key]
+            for line, row in zip(lines, rows):
                 # Presence is a diagnostic, not proof that a hook delivered it.
                 native_signals["fast_guidance_text_present"] |= "Symphony fast route: the root is a courier" in line
                 payload = row.get("payload", {})
@@ -91,7 +119,12 @@ def failure_diagnostics(provider, root, document):
                     and str(payload.get("output", "")).startswith("Unknown model `"))
                 text = assistant_text(provider, row)
                 for decision in ("eligible", "escalate"):
-                    native_signals[decision + "_markers"] += fast_decision_lines(text).count(decision)
+                    count = fast_decision_lines(text).count(decision)
+                    native_signals[decision + "_markers"] += count
+                    if is_root:
+                        native_signals['root_' + decision + '_markers'] += count
+                    elif identity in known_children:
+                        native_signals['bound_child_' + decision + '_markers'] += count
         except (OSError, ValueError, AttributeError, TypeError):
             pass
     boosts = document.get("configuration", {}).get("assessor_boosts", {}).values()
@@ -109,7 +142,54 @@ def failure_diagnostics(provider, root, document):
             "loaded_version": activation.get("plugin_version") if re.fullmatch(r"\d+\.\d+\.\d+", str(activation.get("plugin_version"))) else "unknown",
             "boost_levels": sorted({value for value in boosts if isinstance(value, str) and value in {"off", "xhigh", "max", "ultra"}}),
             "callbacks": counts, "native_signals": native_signals,
+            'fast_raw_tool_categories': fast_calls, 'root_native_launches': root_launches,
             "lifecycle": lifecycle_diagnostics(provider, root, document), 'phases': phases}
+
+
+def raw_tool_categories(provider, rows):
+    """Count all calls, including failed/unreturned calls; publish no arguments."""
+    result = dict.fromkeys(('dedicated_read', 'exec_wrapper', 'shell_exec', 'edit', 'handback', 'other'), 0)
+    calls = ([row.get('payload', {}) for row in rows
+              if row.get('payload', {}).get('type') in {'function_call', 'custom_tool_call'}]
+             if provider == 'codex' else [block for row in rows
+                 for block in row.get('message', {}).get('content', [])
+                 if isinstance(block, dict) and block.get('type') == 'tool_use'])
+    for call in calls:
+        name = call.get('name')
+        category = ('dedicated_read' if name in {'Read', 'Glob', 'Grep', 'LS', 'view_image', 'functions.view_image', 'read_file'}
+                    else 'exec_wrapper' if name in {'exec', 'functions.exec'}
+                    else 'shell_exec' if name in {'exec_command', 'functions.exec_command', 'Bash'}
+                    else 'edit' if name in {'apply_patch', 'functions.apply_patch', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'}
+                    else 'handback' if name == 'SubagentHandback' else 'other')
+        result[category] += 1
+    return result
+
+
+def raw_launch_counts(provider, rows):
+    result = dict.fromkeys(('calls', 'successful_results', 'error_results', 'missing_results'), 0)
+    calls, outcomes = set(), {}
+    for row in rows:
+        if provider == 'claude':
+            for block in row.get('message', {}).get('content', []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get('type') == 'tool_use' and block.get('name') == 'Agent':
+                    calls.add(block.get('id'))
+                elif block.get('type') == 'tool_result':
+                    outcomes[block.get('tool_use_id')] = block.get('is_error') is not True
+        else:
+            payload = row.get('payload', {})
+            if payload.get('type') == 'function_call' and payload.get('name') == 'spawn_agent':
+                calls.add(payload.get('call_id'))
+            elif payload.get('type') == 'function_call_output':
+                # Codex plain unknown-model output is a native launch failure.
+                value = payload.get('output')
+                outcomes[payload.get('call_id')] = isinstance(value, str) and not value.startswith('Unknown model `')
+    for identity in calls - {None, ''}:
+        result['calls'] += 1
+        result['missing_results' if identity not in outcomes else
+               'successful_results' if outcomes[identity] else 'error_results'] += 1
+    return result
 
 
 def lifecycle_diagnostics(provider, root, document):
@@ -337,7 +417,7 @@ def fast_turn_has_only_escalation(provider, rows, evidence):
 
 
 def observed_composed_unittest(source, output):
-    """Two captured native verification forms; unknown JavaScript stays unverified."""
+    """Captured literal verification forms; unknown JavaScript stays unverified."""
     if not isinstance(source, str):
         return False
     try:
@@ -352,6 +432,14 @@ def observed_composed_unittest(source, output):
             return (isinstance(stdout, str) and re.match(
                 r'^-{3,}\r?\nRan [1-9]\d* tests? in \d+(?:\.\d+)?s\r?\n\r?\nOK(?:\r?\n|$)', stdout) is not None
                 and not re.search(r'FAILED|Traceback|fatal:|error:', stdout, re.IGNORECASE))
+        structured = re.fullmatch(
+            r'\s*const (?P<result>\w+)\s*=\s*await tools\.exec_command\((?P<args>\{[^{}]*\})\);'
+            r'\s*text\(JSON\.stringify\((?P=result)\)\);?\s*', source, re.DOTALL)
+        if structured and len(blocks) == 2 and blocks[1].get('type') == 'input_text':
+            result = json.loads(blocks[1].get('text', ''))
+            return (arguments(structured['args']).get('cmd') == 'python -m unittest -q'
+                    and isinstance(result, dict) and result.get('exit_code') == 0
+                    and passed(result.get('output')))
         single = re.fullmatch(
             r'\s*const (?P<result>\w+)\s*=\s*await tools\.exec_command\((?P<args>\{[^{}]*\})\);'
             r'\s*text\((?P=result)\.output\);?\s*', source, re.DOTALL)

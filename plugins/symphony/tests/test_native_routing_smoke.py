@@ -15,6 +15,24 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_raw_tool_diagnostics_include_failed_and_missing_calls_without_arguments(self):
+        rows = [{'payload': {'type': 'custom_tool_call', 'name': 'functions.exec',
+                             'input': 'PRIVATE_SENTINEL'}},
+                {'payload': {'type': 'function_call', 'name': 'apply_patch', 'call_id': 'failed'}},
+                {'payload': {'type': 'function_call_output', 'call_id': 'failed', 'output': 'failed'}}]
+        categories = smoke.raw_tool_categories('codex', rows)
+        self.assertEqual(categories['exec_wrapper'], 1)
+        self.assertEqual(categories['edit'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(categories))
+        claude = [{'message': {'content': [
+            {'type': 'tool_use', 'id': 'a', 'name': 'Agent', 'input': {'prompt': 'PRIVATE'}},
+            {'type': 'tool_use', 'id': 'b', 'name': 'Agent'},
+            {'type': 'tool_result', 'tool_use_id': 'a', 'is_error': True}]}}]
+        counts = smoke.raw_launch_counts('claude', claude)
+        self.assertEqual(counts, {'calls': 2, 'successful_results': 0, 'error_results': 1, 'missing_results': 1})
+        self.assertEqual(smoke.raw_tool_categories('claude', claude)['other'], 2)
+        self.assertNotIn('PRIVATE', json.dumps(counts))
+
     def test_fixture_verification_is_observable_without_forcing_routing(self):
         instructions = smoke.FIXTURE_INSTRUCTIONS
         self.assertIn('one standalone native', instructions)
@@ -188,6 +206,22 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         self.assertFalse(verified(code=source.replace('&& git diff -- greet.py', '&& echo fake')))
         self.assertFalse(verified(code=source.replace('text(r.output)', 'text("' + 'Ran 1 test OK' + '")')))
         self.assertFalse(smoke.unittest_verified([("exec", source, "", '')]))
+
+    def test_captured_structured_wrapper_requires_actual_successful_unittest_result(self):
+        source = 'const r = await tools.exec_command({cmd:"python -m unittest -q"});\ntext(JSON.stringify(r));\n'
+        stdout = '----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n'
+        def verified(result, code=source):
+            blocks = [{'type': 'input_text', 'text': 'Script completed\nOutput:\n'},
+                      {'type': 'input_text', 'text': json.dumps(result)}]
+            return smoke.unittest_verified([('exec', code, '', json.dumps(blocks))])
+        self.assertTrue(verified({'exit_code': 0, 'output': stdout}))
+        self.assertFalse(verified({'output': stdout}))
+        self.assertFalse(verified({'exit_code': 1, 'output': stdout}))
+        self.assertFalse(verified({'exit_code': 0, 'output': stdout.replace('OK', 'FAILED')}))
+        self.assertFalse(verified({'exit_code': 0, 'output': stdout.replace('Ran 3', 'Ran 0')}))
+        self.assertFalse(verified({'exit_code': 0, 'output': stdout}, source.replace('python -m unittest -q', 'echo fake')))
+        self.assertFalse(verified({'exit_code': 0, 'output': stdout}, source.replace('python -m unittest -q', 'python -m unittest -q || echo fake')))
+        self.assertFalse(verified({'exit_code': 0, 'output': stdout}, source.replace('JSON.stringify(r)', 'JSON.stringify({exit_code:0,output:"fake"})')))
 
     def test_captured_batch_maps_success_to_the_actual_unittest_index(self):
         source = ('const results=await Promise.all([tools.exec_command({cmd:"git diff -- greet.py test_greet.py"}),'
