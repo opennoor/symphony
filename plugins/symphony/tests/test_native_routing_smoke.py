@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import unittest
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[3] / ".github" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -17,6 +18,104 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_command_witness_diagnostics_preserve_failed_missing_and_unsafe_command_categories(self):
+        def call(identity, command):
+            return {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': identity,
+                    'name': 'Bash', 'input': {'command': command}}]}}
+        rows = [call('valid', 'python -m unittest -q'), call('missing', 'python.exe -m unittest -q'),
+                call('unsafe', 'python -m unittest -q || echo OK'),
+                {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'valid',
+                 'is_error': True, 'content': 'Ran 3 tests in 0.01s FAILED PRIVATE_SENTINEL'}]}}]
+        result = smoke.command_witness_probe('claude', rows)
+        self.assertEqual(result['exact_supported_unittest_calls'], 2)
+        self.assertEqual(result['direct_shell_calls'], 3)
+        self.assertEqual(result['missing_results'], 1)
+        self.assertEqual(result['error_results'], 1)
+        self.assertEqual(result['failed_present'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+
+    def test_fast_terminal_diagnostics_separate_turns_and_keep_duplicate_records(self):
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            identity = '00000000-0000-0000-0000-000000000002'
+            root = '00000000-0000-0000-0000-000000000001'
+            run = {'run_id': 'run', 'provider': 'codex', 'session_id': root, 'lead_identity': identity,
+                   'started_at': '2026-10-01T00:00:00+00:00', 'task': 'fixture',
+                   'assessment': {'_fast_route': {'model': 'model', 'effort': 'medium'}},
+                   'delegations': [{'identity': identity, 'role': 'lead', 'objective': 'fixture', 'state': 'completed', 'requested_tier': 'model',
+                                    'requested_effort': 'medium'}]}
+            header = {'type': 'session_meta', 'payload': {'id': identity,
+                      'source': {'subagent': {'thread_spawn': {'parent_thread_id': root}}}}}
+            rows = [header]
+            message = 'SYMPHONY_FAST_DECISION: eligible\nPRIVATE_SENTINEL'
+            for index in (1, 2):
+                token = 'turn-' + str(index)
+                timestamp = f'2026-10-01T00:00:0{index}+00:00'
+                rows.extend([
+                    {'type': 'turn_context', 'payload': {'turn_id': token, 'model': 'model', 'effort': 'medium'}},
+                    {'type': 'event_msg', 'timestamp': timestamp, 'payload': {'type': 'task_started', 'turn_id': token}},
+                    {'type': 'response_item', 'timestamp': timestamp, 'payload': {'type': 'message', 'role': 'assistant',
+                     'id': 'message-' + str(index), 'phase': 'final_answer',
+                     'content': [{'type': 'output_text', 'text': message}]}},
+                    {'type': 'event_msg', 'timestamp': timestamp, 'payload': {'type': 'task_complete',
+                     'turn_id': token, 'last_agent_message': message}}])
+            path = home / 'sessions' / '2026' / '10' / '01' / (identity + '.jsonl')
+            path.parent.mkdir(parents=True)
+
+            def probe(rows, receipts=()):
+                path.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+                return smoke.codex_fast_terminal_probe({'terminal_receipts': receipts}, run, rows, identity, home, home)
+
+            event = smoke.Event('id', 'subagent_stopped', 'now', {'provider': 'codex', 'session_id': root,
+                'agent_id': identity, 'turn_id': 'turn-2', 'status': 'completed', 'model': 'model',
+                'model_reasoning_effort': 'medium', 'last_assistant_message': message})
+            receipt = {'provider': 'codex', 'session': root, 'run_id': 'run', 'agent': identity,
+                       'turn': 'turn_id:turn-2', 'result': smoke._terminal_result_id(event)}
+            result = probe(rows, [receipt])
+            self.assertEqual(smoke.decision_representations('codex', rows, identity)['distinct_marker_turns'], 2)
+            self.assertEqual(result['started_turns'], 2)
+            self.assertEqual(result['completed_turns'], 2)
+            self.assertEqual([turn['marker_count'] for turn in result['turns']], [1, 1])
+            self.assertTrue(result['turns'][-1]['canonical_event_result_matches_receipt'])
+            self.assertFalse(result['turns'][0]['receipt_turn_matches'])
+            self.assertEqual(result['extra_turns_with_exact_root_followup'], 0)
+            duplicate = rows[:4] + [rows[3]] + rows[4:]
+            repeated = probe(duplicate)
+            self.assertEqual(repeated['turns'][0]['matching_marker_records'], 2)
+            future = rows + [{'type': 'event_msg', 'timestamp': '2026-10-01T00:00:03+00:00',
+                            'payload': {'type': 'task_started', 'turn_id': 'unfinished'}}]
+            self.assertTrue(probe(future)['newer_unfinished_turn'])
+            self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+            self.assertNotIn(identity, json.dumps(result))
+
+    def test_assessed_failure_diagnostics_separate_child_proof_and_supplied_outcome(self):
+        run = {'run_id': 'run', 'lead_identity': 'lead', 'owner_generation': 1,
+               'assessment': {'substantive_contract': {'version': 1, 'epoch': 'epoch'},
+                   '_retryable_lead': 'PRIVATE_SENTINEL', '_substantive_children': {
+                       'worker': {'role': 'worker', 'parent': 'lead', 'successful': True,
+                                  'lead': 'lead', 'run_id': 'run', 'owner_generation': 1, 'epoch': 'epoch'}}},
+               'delegations': [{'identity': 'lead', 'requested_tier': 'model'}]}
+        rows = [{'type': 'assistant', 'message': {'role': 'assistant', 'model': 'model', 'content': [
+            {'type': 'text', 'text': 'SYMPHONY_OUTCOME: {"status":"blocked","reason":"PRIVATE_SENTINEL"}'}]}}]
+        with patch.object(smoke, 'native_rows', return_value=rows):
+            result = smoke.assessed_completion_probe('claude', Path('/missing'), run)
+        self.assertTrue(result['retryable_lead_present'])
+        self.assertTrue(result['contract_version_one'])
+        self.assertEqual(result['child_proof_counts']['successful'], 1)
+        self.assertEqual(result['child_proof_counts']['parent_bound'], 1)
+        self.assertEqual(result['supplied_outcome_categories']['blocked'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+
+    def test_assessed_native_prompt_count_excludes_claude_tool_result_rows(self):
+        rows = [{'type': 'user', 'message': {'content': content}} for content in (
+            'native prompt', [{'type': 'text', 'text': 'native prompt'}],
+            [{'type': 'tool_result', 'tool_use_id': 'private', 'content': 'PRIVATE_SENTINEL'}],
+            [], [{'type': 'text', 'text': 'mixed'}, {'type': 'tool_result', 'content': 'result'}])]
+        with patch.object(smoke, 'native_rows', return_value=rows):
+            result = smoke.assessed_completion_probe('claude', Path('/missing'), {})
+        self.assertEqual(result['native_prompt_or_started_turn_count'], 2)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+
     def test_claude_fast_identity_requires_the_exact_accepted_root_launch(self):
         from plugins.symphony.tests.test_claude_host_evidence import ClaudeHostEvidenceTests, LEAD
         fixture = ClaudeHostEvidenceTests()

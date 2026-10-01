@@ -28,7 +28,9 @@ sys.path.insert(0, str(PLUGIN))
 from symphony.host_evidence import _complete_native_jsonl, _native_jsonl  # noqa: E402
 from symphony import host_evidence  # noqa: E402
 from symphony.routing import Assessment, fast_lead_selection, route_for, snapshot_for  # noqa: E402
-from symphony.store import StateStore, _state_from_dict  # noqa: E402
+from symphony.store import StateStore, _state_from_dict, _run_from_dict  # noqa: E402
+from symphony.model import Event, ProjectState  # noqa: E402
+from symphony.runtime import _terminal_result_id  # noqa: E402
 
 CASES = {
     "command": "Run python -m unittest -q and report the result.",
@@ -90,6 +92,8 @@ def failure_diagnostics(provider, root, document):
     fast_provenance = dict.fromkeys(('matching_native_candidates', 'unforked_candidates',
                                     'forked_or_foreign_candidates', 'header_count'), 0)
     fast_representations = []
+    fast_terminal_turns = []
+    fast_command_witnesses = []
     paths = (home / ("sessions" if provider == "codex" else "projects")).rglob("*.jsonl")
     for path in paths:
         try:
@@ -113,6 +117,12 @@ def failure_diagnostics(provider, root, document):
                 verified = worker_transcript_is_unforked(provider, rows, identity)
                 fast_provenance['unforked_candidates' if verified else 'forked_or_foreign_candidates'] += 1
                 fast_representations.append(decision_representations(provider, rows, identity))
+                fast_command_witnesses.append(command_witness_probe(provider, rows))
+                if provider == 'codex':
+                    bound_runs = [run for run in runs if fast_native_identity(provider, rows, identity, run, home, root / 'primary')]
+                    if len(bound_runs) == 1:
+                        fast_terminal_turns.append(codex_fast_terminal_probe(document, bound_runs[0],
+                                                  rows, identity, home, root / 'primary'))
                 categories = raw_tool_categories(provider, rows)
                 if verified:
                     for key in fast_calls:
@@ -150,6 +160,10 @@ def failure_diagnostics(provider, root, document):
             "callbacks": counts, "native_signals": native_signals,
             'fast_raw_tool_categories': fast_calls, 'fast_native_provenance': fast_provenance,
             'fast_decision_representations': fast_representations,
+            'fast_terminal_turns': fast_terminal_turns,
+            'fast_command_witnesses': fast_command_witnesses,
+            'assessed_completion': [assessed_completion_probe(provider, home, run) for run in runs
+                                    if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'root_native_launches': root_launches,
             'claude_completion': [claude_completion_probe(document, run.get('session_id'), root / 'primary', home)
                 for run in document.get('active_runs', {}).values()
@@ -455,6 +469,7 @@ def decision_representations(provider, rows, identity):
     own = worker_transcript_is_unforked(provider, rows, identity)
     current_turn = ''
     seen = {}
+    marker_turns = set()
     for row in rows:
         payload = row.get('payload', {}) if provider == 'codex' else row.get('message', {})
         if provider == 'codex' and (row.get('type') == 'turn_context' or
@@ -474,6 +489,8 @@ def decision_representations(provider, rows, identity):
         bound = own and bool(current_turn) if provider == 'codex' else (
             row.get('agentId') == identity and row.get('isSidechain') is True)
         result['own_turn_bound_records'] += bound
+        if bound and current_turn:
+            marker_turns.add(current_turn)
         if not nonempty or not bound:
             continue
         key = (identity, current_turn, message_id)
@@ -482,7 +499,183 @@ def decision_representations(provider, rows, identity):
             result['equivalent_same_id_records' if seen[key] == content else 'conflicting_same_id_records'] += 1
         else:
             seen[key] = content
+    result['distinct_marker_turns'] = len(marker_turns)
     return result
+
+
+def codex_fast_terminal_probe(document, run_values, rows, identity, home, project):
+    """Read canonical turn/report evidence for diagnostics only, never acceptance."""
+    result = {'native_reader_available': False, 'started_turns': 0, 'completed_turns': 0,
+              'failed_turns': 0, 'newer_unfinished_turn': False, 'turns': [],
+              'extra_turns_with_exact_root_followup': 0}
+    run = replace(_run_from_dict(run_values), lead_identity=identity)
+    native = host_evidence._native_lead_turns(ProjectState(active_run=run), run.session_id,
+                                             {'CODEX_HOME': str(home)})
+    if native is None:
+        return result
+    _, turns, order, latest, _ = native
+    result['native_reader_available'] = True
+    result['started_turns'] = sum(turn.get('started') is True for turn in turns.values())
+    result['completed_turns'] = sum(turn.get('completed_at') is not None for turn in turns.values())
+    result['failed_turns'] = sum(turn.get('failed') is True for turn in turns.values())
+    result['newer_unfinished_turn'] = bool(latest and not turns.get(latest, {}).get('completed_at'))
+    current = ''
+    messages, reports = {}, {}
+    for row in rows:
+        payload = row.get('payload', {})
+        if (row.get('type') == 'turn_context' or row.get('type') == 'event_msg'
+                and payload.get('type') == 'task_started'):
+            current = payload.get('turn_id', '')
+        text = assistant_text('codex', row)
+        if fast_decision_lines(text):
+            messages.setdefault(current, []).append(text)
+        if row.get('type') == 'event_msg' and payload.get('type') == 'task_complete':
+            reports[payload.get('turn_id')] = reports.get(payload.get('turn_id'), 0) + 1
+    previous = None
+    for ordinal, token in enumerate(order[:12]):
+        turn = turns[token]
+        message = turn.get('message')
+        decisions = fast_decision_lines(message) if isinstance(message, str) else []
+        bound = [receipt for receipt in document.get('terminal_receipts', [])
+                 if receipt.get('provider') == 'codex' and receipt.get('session') == run.session_id
+                 and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity
+                 and receipt.get('turn') == 'turn_id:' + token]
+        payload = {'provider': 'codex', 'session_id': run.session_id, 'agent_id': identity,
+                   'turn_id': token, 'status': 'completed', 'model': turn.get('model'),
+                   'model_reasoning_effort': turn.get('effort'), 'last_assistant_message': message}
+        event = Event('diagnostic', 'subagent_stopped',
+                      turn['completed_at'].isoformat() if turn.get('completed_at') else '', payload)
+        result['turns'].append({'ordinal': ordinal, 'report_count': reports.get(token, 0),
+            'marker_count': len(decisions), 'decision': decisions[0] if len(decisions) == 1 else 'ambiguous_or_absent',
+            'matching_marker_records': sum(text == message for text in messages.get(token, [])),
+            'marker_records': len(messages.get(token, [])), 'receipt_turn_matches': bool(bound),
+            'canonical_event_result_matches_receipt': any(receipt.get('result') == _terminal_result_id(event) for receipt in bound),
+            'model_matches': turn.get('model') == run.assessment.get('_fast_route', {}).get('model'),
+            'effort_matches': turn.get('effort') == run.assessment.get('_fast_route', {}).get('effort')})
+        if previous and turn.get('started_at') and turn.get('completed_at'):
+            followup = replace(event, payload={**payload, '_symphony_native_started_at': turn['started_at'].isoformat()})
+            result['extra_turns_with_exact_root_followup'] += host_evidence._codex_root_followup(
+                replace(run, updated_at=previous.isoformat()), followup, project, {'CODEX_HOME': str(home)})
+        if turn.get('completed_at'):
+            previous = turn['completed_at']
+    return result
+
+
+def command_witness_probe(provider, rows):
+    """Categorize direct native unittest calls/results without exporting arguments or output."""
+    result = dict.fromkeys(('direct_shell_calls', 'exact_supported_unittest_calls', 'matched_results',
+                           'missing_results', 'error_results', 'ran_tests_present', 'ok_present',
+                           'failed_present', 'explicit_exit_zero', 'explicit_exit_nonzero', 'exit_unreported'), 0)
+    calls, outputs = {}, {}
+    for row in rows:
+        value = row.get('payload', {}) if provider == 'codex' else row.get('message', {})
+        blocks = [value] if provider == 'codex' else value.get('content', [])
+        for block in blocks if isinstance(blocks, list) else ():
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') in {'tool_use', 'function_call'} and block.get('name') in {'Bash', 'exec_command'}:
+                result['direct_shell_calls'] += 1
+                args = block.get('input', block.get('arguments'))
+                try:
+                    args = json.loads(args) if isinstance(args, str) else args
+                    tokens = shlex.split(args.get('command', args.get('cmd', '')))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if (len(tokens) >= 3 and re.fullmatch(r'python(?:3|\.exe)?', tokens[0])
+                        and tokens[1:3] == ['-m', 'unittest'] and all(token in {'-q', '-v'} for token in tokens[3:])):
+                    result['exact_supported_unittest_calls'] += 1
+                    calls[block.get('id', block.get('call_id'))] = True
+            elif block.get('type') in {'tool_result', 'function_call_output'}:
+                outputs[block.get('tool_use_id', block.get('call_id'))] = block
+    for identity in calls:
+        output = outputs.get(identity) if identity else None
+        if output is None:
+            result['missing_results'] += 1
+            continue
+        result['matched_results'] += 1
+        result['error_results'] += output.get('is_error') is True or output.get('isError') is True
+        value = output.get('content', output.get('output', ''))
+        text = value if isinstance(value, str) else json.dumps(value)
+        result['ran_tests_present'] += bool(re.search(r'Ran [1-9]\d* tests?', text))
+        result['ok_present'] += 'OK' in text
+        result['failed_present'] += 'FAILED' in text
+        try:
+            structured = json.loads(text)
+            code = structured.get('exit_code') if isinstance(structured, dict) else None
+        except ValueError:
+            code = None
+        result['explicit_exit_zero' if type(code) is int and code == 0 else
+               'explicit_exit_nonzero' if type(code) is int else 'exit_unreported'] += 1
+    return result
+
+
+def assessed_completion_probe(provider, home, run):
+    """Separate admitted child proof from supplied lead-result categories."""
+    assessment = run.get('assessment', {})
+    contract = assessment.get('substantive_contract')
+    proofs = assessment.get('_substantive_children', {})
+    counts = dict.fromkeys(('worker_starts', 'consultant_starts', 'parent_bound', 'successful', 'current_scope'), 0)
+    for proof in proofs.values() if isinstance(proofs, dict) else ():
+        if not isinstance(proof, dict):
+            continue
+        for role in ('worker', 'consultant'):
+            counts[role + '_starts'] += proof.get('role') == role
+        counts['parent_bound'] += proof.get('parent') == run.get('lead_identity')
+        counts['successful'] += proof.get('successful') is True
+        counts['current_scope'] += (isinstance(contract, dict) and proof.get('epoch') == contract.get('epoch')
+            and proof.get('run_id') == run.get('run_id') and proof.get('lead') == run.get('lead_identity')
+            and proof.get('owner_generation') == run.get('owner_generation'))
+    outcome_statuses = dict.fromkeys(('completed', 'failed', 'blocked', 'malformed', 'other'), 0)
+    marker_count = 0
+    latest_model_matches = False
+    latest_effort_matches = False
+    native_prompt_count = 0
+    try:
+        rows = native_rows(provider, home, run.get('lead_identity'))
+        assistant_rows = [row for row in rows if assistant_text(provider, row)]
+        native_prompt_count = sum(row.get('type') == 'user' and (
+            isinstance(row.get('message', {}).get('content'), str) or
+            isinstance(row.get('message', {}).get('content'), list) and bool(row['message']['content'])
+            and all(isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)
+                    for block in row['message']['content'])) for row in rows) if provider == 'claude' else sum(
+            row.get('type') == 'event_msg' and row.get('payload', {}).get('type') == 'task_started' for row in rows)
+        for row in assistant_rows:
+            for line in assistant_text(provider, row).splitlines():
+                line = line.strip()
+                if not line.startswith('SYMPHONY_OUTCOME:'):
+                    continue
+                marker_count += 1
+                try:
+                    value = json.loads(line.partition(':')[2])
+                    status = value.get('status') if isinstance(value, dict) else 'malformed'
+                    category = status if status in {'completed', 'failed', 'blocked'} else 'other'
+                except (ValueError, TypeError):
+                    category = 'malformed'
+                outcome_statuses[category] += 1
+        child = next((item for item in run.get('delegations', []) if item.get('identity') == run.get('lead_identity')), {})
+        latest_model_matches = bool(assistant_rows and provider == 'claude' and
+            assistant_rows[-1].get('message', {}).get('model') == child.get('requested_tier'))
+        if provider == 'claude':
+            paths = tuple((home / 'projects').glob(f'*/{run.get("session_id")}/subagents/agent-{run.get("lead_identity")}.meta.json'))
+            if len(paths) == 1:
+                label = json.loads(paths[0].read_text(encoding='utf-8')).get('agentType')
+                latest_effort_matches = isinstance(label, str) and label.endswith(
+                    f'symphony-lead-{child.get("requested_tier")}-{child.get("requested_effort")}')
+        else:
+            contexts = [row.get('payload', {}) for row in rows if row.get('type') == 'turn_context']
+            latest_model_matches = bool(contexts and contexts[-1].get('model') == child.get('requested_tier'))
+            latest_effort_matches = bool(contexts and contexts[-1].get('effort') == child.get('requested_effort'))
+    except (OSError, ValueError, RuntimeError, TypeError):
+        pass
+    return {'contract_present': 'substantive_contract' in assessment,
+            'contract_version_one': isinstance(contract, dict) and type(contract.get('version')) is int and contract['version'] == 1,
+            'child_proof_counts': counts, 'retryable_lead_present': bool(assessment.get('_retryable_lead')),
+            'substantive_child_missing': assessment.get('_substantive_child_missing') is True,
+            'route_mismatch_present': bool(assessment.get('_lead_route_mismatch')),
+            'supplied_outcome_markers': marker_count, 'supplied_outcome_categories': outcome_statuses,
+            'native_prompt_or_started_turn_count': native_prompt_count,
+            'latest_native_assistant_model_matches': latest_model_matches,
+            'latest_native_effort_label_matches': latest_effort_matches}
 
 
 def worker_launch_verified(provider, evidence, worker, rows=(), parent_identity="", parent_path=""):

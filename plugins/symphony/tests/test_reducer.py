@@ -508,12 +508,30 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertIsNotNone(blocked.active_run)
 
         released, retry_actions = reduce(
-            blocked, event("stop_requested", event_id="stop-2", stop_hook_active=True)
+            blocked, event("stop_requested", event_id="stop-2", stop_hook_active=True,
+                           provider='claude', hook_event_name='Stop')
         )
 
         self.assertIn("permit_stop", [item.kind for item in retry_actions])
         self.assertEqual(released.active_run, blocked.active_run)
         self.assertEqual(released.recent_runs, ())
+        self.assertEqual(retry_actions[0].payload['reason'], actions[0].payload)
+
+    def test_normal_repeat_stop_requires_actual_claude_stop_and_boolean_true(self):
+        state = running_state(delegations=[delegation('w1')])
+        for provider, hook, flag in (('claude', 'Stop', 'true'), ('claude', 'Stop', 1),
+                                     ('claude', 'Stop', False), ('codex', 'Stop', 'true'), ('codex', 'Stop', 1),
+                                     ('claude', 'UserPromptSubmit', True), ('claude', '', True)):
+            with self.subTest(provider=provider, hook=hook, flag=flag):
+                blocked, actions = reduce(state, event('stop_requested', provider=provider,
+                                                      hook_event_name=hook, stop_hook_active=flag))
+                self.assertEqual(blocked.active_run, state.active_run)
+                self.assertEqual([action.kind for action in actions], ['block_stop'])
+        released, actions = reduce(state, event('stop_requested', provider='codex',
+                                               hook_event_name='Stop', stop_hook_active=True))
+        self.assertEqual(released.active_run, state.active_run)
+        self.assertEqual([action.kind for action in actions], ['permit_stop'])
+        self.assertIsInstance(actions[0].payload['reason'], dict)
 
     def test_replayed_launch_failure_removes_only_one_pending_intent(self):
         intent = {"role": "worker", "model": "model", "effort": "high"}

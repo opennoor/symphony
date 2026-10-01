@@ -3199,6 +3199,14 @@ def _render_actions(
                 if prompt_originated
                 else Action("block_stop", {"reason": text})
             )
+        elif action.kind == 'permit_stop' and action.payload.get('reason') and not prompt_originated:
+            reason = action.payload['reason']
+            if isinstance(reason, Mapping):
+                status = '/symphony:status' if provider == 'claude' else '$symphony:symphony status'
+                reason = (f'Symphony released this repeated host Stop for {scope}; unfinished work remains open. '
+                          f'Inspect `{status}` on the next turn, reconcile the tracked agents and evidence, '
+                          'and confirm durable completion before reporting success.')
+            rendered.append(Action('permit_stop', {'reason': reason}))
         elif action.kind == "permit_stop" and prompt_originated:
             rendered.append(
                 Action(

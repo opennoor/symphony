@@ -3887,7 +3887,11 @@ class RuntimeTests(unittest.TestCase):
 
         released = handle({**stop, "stop_hook_active": True}, self.environ)
 
-        self.assertEqual(released.stdout, "", "a turn retry must render an empty Stop response")
+        notice = self.output(released)
+        self.assertEqual(set(notice), {'systemMessage'})
+        self.assertIsInstance(notice['systemMessage'], str)
+        self.assertIn('$symphony:symphony status', notice['systemMessage'])
+        self.assertIn('unfinished work remains open', notice['systemMessage'])
         state = StateStore(self.state_root).load(self.project)
         self.assertIsNotNone(state.active_run)
         self.assertEqual(state.recent_runs, ())

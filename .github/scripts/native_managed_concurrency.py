@@ -9,7 +9,7 @@ import argparse
 import ast
 from collections import Counter
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import os
@@ -45,6 +45,84 @@ print("GATE_RELEASED", flush=True)
 
 
 CODEX_HOOK_CAPTURE = '''import hashlib, json, os, pathlib, re, sys, time, uuid
+def native_metadata_probe(payload):
+    facts = dict.fromkeys(("transcript_readable", "own_header_present", "own_header_identity_matches",
+                          "native_parent_matches_root", "callback_turn_context_present",
+                          "native_model_present", "native_effort_present",
+                          "assessor_model_matches_fixture", "assessor_effort_matches_fixture",
+                          "declared_assessed_lead_matches"), False)
+    facts["native_task_role"] = "unknown"
+    transcript = payload.get("agent_transcript_path") or payload.get("transcript_path")
+    if not isinstance(transcript, str):
+        return facts
+    try:
+        rows, size = [], 0
+        with pathlib.Path(transcript).open("rb") as stream:
+            for _ in range(64):
+                line = stream.readline(65537)
+                if not line:
+                    break
+                size += len(line)
+                if len(line) > 65536 or size > 1024 * 1024 or not line.endswith(b"\\n"):
+                    return facts
+                row = json.loads(line.decode("utf-8"))
+                if isinstance(row, dict):
+                    rows.append(row)
+        facts["transcript_readable"] = True
+        header = next((row.get("payload", {}) for row in rows if row.get("type") == "session_meta"), {})
+        facts["own_header_present"] = bool(header)
+        facts["own_header_identity_matches"] = bool(header.get("id") and header.get("id") == payload.get("agent_id"))
+        if not facts["own_header_identity_matches"]:
+            return facts
+        spawn = header
+        for key in ("source", "subagent", "thread_spawn"):
+            spawn = spawn.get(key, {}) if isinstance(spawn, dict) else {}
+        facts["native_parent_matches_root"] = bool(isinstance(spawn, dict) and
+            spawn.get("parent_thread_id") == payload.get("session_id"))
+        match = re.match(r"symphony_(assessor|lead|worker|consultant)_", str(header.get("agent_path") or "").rsplit("/", 1)[-1])
+        facts["native_task_role"] = match.group(1) if match else "unknown"
+        facts["declared_assessed_lead_matches"] = bool(os.environ.get("SYMPHONY_NATIVE_GATE_LEAD_NAME") and
+            str(header.get("agent_path") or "").rsplit("/", 1)[-1] == os.environ["SYMPHONY_NATIVE_GATE_LEAD_NAME"])
+        turns = [row.get("payload", {}) for row in rows if row.get("type") == "turn_context"
+                 and isinstance(row.get("payload"), dict) and payload.get("turn_id")
+                 and row["payload"].get("turn_id") == payload["turn_id"]]
+        facts["callback_turn_context_present"] = len(turns) == 1
+        if len(turns) == 1:
+            turn = turns[0]
+            facts["native_model_present"] = isinstance(turn.get("model"), str) and bool(turn["model"])
+            facts["native_effort_present"] = isinstance(turn.get("effort"), str) and bool(turn["effort"])
+            facts["assessor_model_matches_fixture"] = bool(os.environ.get("SYMPHONY_NATIVE_ASSESSOR_MODEL") and
+                turn.get("model") == os.environ["SYMPHONY_NATIVE_ASSESSOR_MODEL"])
+            facts["assessor_effort_matches_fixture"] = bool(os.environ.get("SYMPHONY_NATIVE_ASSESSOR_EFFORT") and
+                turn.get("effort") == os.environ["SYMPHONY_NATIVE_ASSESSOR_EFFORT"])
+    except (OSError, ValueError, UnicodeError, TypeError, AttributeError):
+        pass
+    return facts
+
+def admission_probe(payload):
+    facts = dict.fromkeys(("state_readable", "owner_run_present", "child_tracked", "child_start_recorded"), False)
+    facts["tracked_role"] = "unknown"
+    try:
+        key = hashlib.sha256(os.path.normcase(str(pathlib.Path(payload["cwd"]).resolve())).encode()).hexdigest()
+        path = pathlib.Path(os.environ["SYMPHONY_STATE_DIR"]) / (key + ".v2.json")
+        document = json.loads(path.read_text(encoding="utf-8"))
+        facts["state_readable"] = True
+        run = document.get("active_runs", {}).get("codex:" + payload["session_id"])
+        facts["owner_run_present"] = isinstance(run, dict)
+        if isinstance(run, dict):
+            child = next((item for item in run.get("delegations", [])
+                          if item.get("identity") == payload.get("agent_id")), None)
+            facts["child_tracked"] = child is not None
+            role = (child or {}).get("role")
+            facts["tracked_role"] = role if role in {"assessor", "lead", "worker", "consultant"} else "unknown"
+        facts["child_start_recorded"] = any(event.get("kind") in {"delegation_updated", "lead_started"}
+            and event.get("payload", {}).get("identity") == payload.get("agent_id")
+            and (event.get("kind") == "lead_started" or event.get("payload", {}).get("state") == "working")
+            for event in document.get("event_history", []))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return facts
+
 destination = pathlib.Path(sys.argv[2])
 destination.mkdir(parents=True, exist_ok=True)
 invocation = str(uuid.uuid4())
@@ -67,6 +145,11 @@ record = {"invocation_id": invocation, "event": event,
                                         else "CLAUDE_CONFIG_DIR"),
           "cwd": payload.get("cwd"), "payload_keys": sorted(payload),
           "started_ns": time.time_ns()}
+if provider == "codex" and event in {"SubagentStart", "SubagentStop"}:
+    record["native_metadata"] = native_metadata_probe(payload)
+    # Observer snapshots only: callback clock ordering can precede the
+    # product hook. These facts never authorize registration or gate release.
+    record["admission_at_capture"] = admission_probe(payload)
 if event == "SubagentStop":
     message = payload.get("last_assistant_message")
     markers = re.findall(r'^SYMPHONY_OUTCOME:\\s*(\\{[^\\n]*\\})', message, re.MULTILINE) if isinstance(message, str) else []
@@ -108,19 +191,29 @@ is_lead_start = (event == "SubagentStart" and provider == "claude"
 if (gate_dir and gate_label in {"a", "b"} and event == "SubagentStart"
         and provider == "codex" and agent_type == "default"):
     # Codex 0.159 reports both assessor and lead as agent_type=default.
-    # This fixture awaits one assessor before launching one lead, so hold
-    # the second distinct native child and verify its durable lead ID below.
+    # A valid fast attempt may precede the assessor. Gate only the declared
+    # assessed task's own native header; ordinal/default labels are ambiguous.
     gate_dir.mkdir(parents=True, exist_ok=True)
     first = gate_dir / (gate_label + ".first.json")
-    try:
-        with first.open("x") as stream:
-            json.dump({"session_id": payload.get("session_id"),
-                       "agent_id": payload.get("agent_id")}, stream)
-    except FileExistsError:
-        original = json.loads(first.read_text())
-        if original.get("session_id") != payload.get("session_id"):
-            raise SystemExit("native gate root session changed")
-        is_lead_start = original.get("agent_id") != payload.get("agent_id")
+    facts = record["native_metadata"]
+    own = facts["own_header_identity_matches"] and facts["native_parent_matches_root"]
+    if own and facts["native_task_role"] == "assessor":
+        try:
+            with first.open("x") as stream:
+                json.dump({"session_id": payload.get("session_id"), "agent_id": payload.get("agent_id")}, stream)
+        except FileExistsError:
+            original = json.loads(first.read_text())
+            if original.get("session_id") != payload.get("session_id"):
+                raise SystemExit("native gate root session changed")
+    if own and facts["declared_assessed_lead_matches"]:
+        try:
+            with (gate_dir / (gate_label + ".lead.json")).open("x") as stream:
+                json.dump({"session_id": payload.get("session_id"), "agent_id": payload.get("agent_id")}, stream)
+            is_lead_start = True
+        except FileExistsError:
+            frozen = json.loads((gate_dir / (gate_label + ".lead.json")).read_text())
+            if frozen.get("session_id") != payload.get("session_id"):
+                raise SystemExit("native gate root session changed")
 if gate_dir and gate_label in {"a", "b"} and is_lead_start:
     record["native_gate_label"] = gate_label
     record["native_gate_env_label"] = env_label if env_label in {"a", "b"} else None
@@ -255,10 +348,36 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
     assessor_role, lead_role = codex_fixture_roles(codex_profile) if provider == "codex" else ({}, {})
     control = "$symphony:symphony start" if provider == "codex" else "/symphony:start"
     route = ('{"size":"small","complexity":"complex","risk":"normal",'
-             '"rationale":"disposable native CI upgrade gate","topology":"direct"}'
+             '"rationale":"disposable native CI upgrade gate","topology":"delegated"}'
              if provider == "codex" and codex_profile != "base" else
              '{"size":"small","complexity":"simple","risk":"normal",'
-             '"rationale":"disposable native CI gate","topology":"direct"}')
+             '"rationale":"disposable native CI gate","topology":"delegated"}')
+    profiles = json.loads((Path(__file__).resolve().parents[2] / 'plugins/symphony/profiles.json').read_text(encoding='utf-8'))
+    profile_id = codex_profile if provider == 'codex' else 'sonnet-5-5'
+    profile = next(item for item in profiles['providers'][provider]['profiles'] if item['id'] == profile_id)
+    worker = profile['matrix']['small/simple']
+    worker_text = 'SYMPHONY_ROLE: worker\n' + json.dumps({
+        'objective': 'Return the literal callback report GATE_RELEASED.',
+        'ownership': 'Only this bounded literal report under the owning lead.',
+        'evidence': 'The owning lead has already returned from its native start hook.',
+        'constraints': 'Do not inspect files, execute shell commands, edit files, create worktrees or delegate.',
+        'acceptance_check': 'The native worker finishes successfully with exactly GATE_RELEASED.',
+        'return_contract': 'Return exactly GATE_RELEASED without Markdown.',
+        'size': 'small', 'complexity': 'simple'})
+    if provider == 'codex':
+        worker_packet = {'task_name': 'symphony_worker_' + re.sub(r'\W', '_', worker['model']) + '_' + worker['effort'],
+                         'model': worker['model'], 'reasoning_effort': worker['effort'], 'fork_turns': 'none',
+                         'message': worker_text}
+    else:
+        worker_packet = {'subagent_type': f"symphony:symphony-worker-{worker['model']}-{worker['effort']}",
+                         'prompt': worker_text}
+    worker_contract = (
+        'After your native start hook releases, YOU as the canonical lead must spawn exactly one bounded '
+        'worker using WORKER_SPAWN_PACKET verbatim as native spawn arguments; the root never substitutes '
+        'for this launch. Await its successful native result and verify its literal GATE_RELEASED report. '
+        'Then return your own specified GATE_RELEASED/outcome lines. Do not search for a callback command '
+        'or gate file. Preserve the successful worker result for same-task followup; do not spawn duplicate '
+        'work on routine completion reconciliation. WORKER_SPAWN_PACKET: ' + json.dumps(worker_packet) + '\n')
     recovery = (
         'The lead MUST finish its first turn after its native start hook is released, '
         'followed by the exact line '
@@ -268,7 +387,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
         'do not pass a /root/ path or agent UUID), asking it to report the gate '
         'release from its existing native start without starting another task, '
         'followed by the exact line '
-        'SYMPHONY_OUTCOME: {"status":"completed"}; await the follow-up. '
+         'SYMPHONY_OUTCOME: {"status":"completed"}; await the follow-up. '
         if recover else 'After the native start hook releases, return SYMPHONY_OUTCOME: {"status":"completed"}. '
     )
     if provider == "codex":
@@ -294,10 +413,10 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
          "NATIVE_STATUS.txt says WAIT. Do not edit that file. On the first turn "
          "report exactly GATE_RELEASED and SYMPHONY_OUTCOME: {\"status\":\"blocked\"}, each "
          "on its own line. On a later same-agent followup, read the file again: only READY permits "
-         "SYMPHONY_OUTCOME: {\"status\":\"completed\"}. Do not delegate or create a worktree."
+         "SYMPHONY_OUTCOME: {\"status\":\"completed\"}. Do not create a worktree."
          if provider == "codex" and recover and defer_recovery else
          "FIRST-TURN CONTRACT: There is no gate command or file to find or run. "
-         "After your native start hook releases, your only action is to reply with "
+         "After your native start hook releases and your worker report is verified, reply with "
          "exactly these two literal lines (no Markdown):\nGATE_RELEASED\n"
          + ('SYMPHONY_OUTCOME: {"status":"blocked"}' if recover else
             'SYMPHONY_OUTCOME: {"status":"completed"}') + "\n"
@@ -305,8 +424,9 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
             "the root will resume this same lead for completion.\n" if recover else "") +
          "The test-only native SubagentStart hook may briefly hold your first turn. "
          "GATE_RELEASED is a report line, not an operation. "
-         "Do not inspect files, run tools, delegate, or create a worktree.")
+         "Do not inspect files, execute shell commands, edit files or create a worktree.")
     )
+    lead_task += '\n' + worker_contract
     lead_relay = (
         "Pass LEAD_SPAWN_PACKET verbatim as spawn_agent arguments, including message. "
         "The child has no root context; do not expand, paraphrase, or omit its contract. "
@@ -362,6 +482,7 @@ def launch(provider, project, label, recover, env, log_dir, budget, session,
     if provider == "codex":
         codex_profile = env.get("SYMPHONY_PROFILE", "base")
         _, lead_role = codex_fixture_roles(codex_profile)
+        env = {**env, 'SYMPHONY_NATIVE_GATE_LEAD_NAME': lead_role['task_name']}
         command = [executable, "exec", "--dangerously-bypass-hook-trust",
                    "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
                    "--model", lead_role["model"], "-C", str(project),
@@ -1606,6 +1727,10 @@ def check_case(provider, root, separate, timeout, budget, update=None,
            "SYMPHONY_RUNTIME_DIR": str(case / "retained runtimes"),
            "SYMPHONY_HOOK_DECISIONS_DIR": str(case / "hook decisions"),
            "SYMPHONY_PROFILE": "base" if provider == "codex" else "sonnet-5-5"}
+    if provider == 'codex':
+        assessor, _ = codex_fixture_roles(env['SYMPHONY_PROFILE'])
+        env['SYMPHONY_NATIVE_ASSESSOR_MODEL'] = assessor['model']
+        env['SYMPHONY_NATIVE_ASSESSOR_EFFORT'] = assessor['effort']
     if provider == "claude":
         env.pop("CLAUDE_PLUGIN_ROOT", None)
     logs = case / "logs"
@@ -1707,9 +1832,12 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     raise RuntimeError(f"{label}: first native child was not this run's assessor")
                 host = codex_host_trace(Path(env.get("CODEX_HOME", Path.home() / ".codex")),
                                         sessions[label], observed_leads[label], logs / f"{label}.errors")
-                if not any(item["same_lead_id"] and item["lead_packet_metadata_matches"]
-                           for item in host["spawn_calls"]):
+                if (host.get('lead_parent_matches_root') is not True
+                        or not any(item["same_lead_id"] and item["lead_packet_metadata_matches"]
+                           for item in host["spawn_calls"])):
                     raise RuntimeError(f"{label}: native original lead spawn lacks required transport metadata")
+                require_codex_gate_lead(codex_hook_capture_summary(root)["records"],
+                                        label, sessions[label], observed_leads[label])
         # Native hosts may invoke the test hook before the package's Start
         # hook. Release only that barrier, then require the exact product
         # registration before a live update can begin.
@@ -1957,6 +2085,8 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 raise RuntimeError(f"{label}: completed run changed lead identity")
             if completed_run.get("run_id") != observed_run_ids[label]:
                 raise RuntimeError(f"{label}: active run was restarted during the native session")
+            require_literal_worker(provider, completed_run, Path(env['CODEX_HOME' if provider == 'codex' else 'CLAUDE_CONFIG_DIR']),
+                                   first if label == 'a' else second, codex_hook_capture_summary(root, provider)['records'])
             if update:
                 native_trace = (codex_host_trace(update["home"], sessions[label],
                                                  observed_leads[label], logs / f"{label}.errors",
@@ -2383,8 +2513,8 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                 raise RuntimeError(f"{label}: original managed run did not archive completed")
             durable_leads = {item.get("identity") for item in matching[0].get("delegations", [])
                              if item.get("role") == "lead"}
-            if durable_leads != {leads[label]}:
-                raise RuntimeError(f"{label}: managed run changed its lead set")
+            require_assessed_lead_set(matching[0], update['home'], first, leads[label])
+            require_literal_worker('codex', matching[0], update['home'])
             if not any(item.get("kind") == "lead_completed"
                        and item.get("payload", {}).get("identity") == leads[label]
                        for item in document.get("event_history", [])):
@@ -2475,6 +2605,164 @@ def check_codex_mixed_live_update(root, timeout, budget, update,
                     process.wait()
 
 
+def require_assessed_lead_set(run, home, project, canonical):
+    """Only one independently identified, completed fast escalation may precede the assessed owner."""
+    from native_routing_smoke import native_rows, fast_native_identity, worker_transcript_is_unforked, fast_decision_lines
+    leads = [child for child in run.get('delegations', []) if child.get('role') == 'lead']
+    extras = [child for child in leads if child.get('identity') != canonical]
+    if (run.get('lead_identity') != canonical or sum(child.get('identity') == canonical for child in leads) != 1
+            or len(extras) > 1):
+        raise RuntimeError('managed run changed its assessed lead set')
+    canonical_child = next(child for child in leads if child['identity'] == canonical)
+    canonical_rows = native_rows('codex', home, canonical)
+    header = canonical_rows[0].get('payload', {}) if canonical_rows and canonical_rows[0].get('type') == 'session_meta' else {}
+    expected = 'symphony_lead_' + re.sub(r'\W', '_', canonical_child['requested_tier']) + '_' + canonical_child['requested_effort']
+    spawn = header.get('source', {}).get('subagent', {}).get('thread_spawn', {})
+    if (header.get('id') != canonical or spawn.get('parent_thread_id') != run.get('session_id')
+            or not isinstance(header.get('agent_path'), str) or header['agent_path'].rsplit('/', 1)[-1] != expected
+            or not isinstance(header.get('cwd'), str) or not Path(header['cwd']).is_absolute()
+            or Path(header['cwd']).resolve() != project.resolve()):
+        raise RuntimeError('managed assessed lead has no exact native ownership')
+    if not extras:
+        return
+    child = extras[0]
+    rows = native_rows('codex', home, child['identity'])
+    completed = [row.get('payload', {}).get('last_agent_message') for row in rows
+                 if row.get('type') == 'event_msg' and row.get('payload', {}).get('type') == 'task_complete']
+    starts = [row for row in rows if row.get('type') == 'event_msg' and row.get('payload', {}).get('type') == 'task_started']
+    contexts = [row.get('payload', {}) for row in rows if row.get('type') == 'turn_context']
+    terminal_rows = [row for row in rows if row.get('type') == 'event_msg' and row.get('payload', {}).get('type') == 'task_complete']
+    canonical_starts = [row for row in canonical_rows if row.get('type') == 'event_msg'
+                        and row.get('payload', {}).get('type') == 'task_started']
+    failed = any(row.get('type') == 'event_msg' and row.get('payload', {}).get('type') in
+                 {'turn_aborted', 'task_failed', 'task_interrupted', 'error'} for row in rows)
+    if (child.get('state') != 'completed' or run.get('assessment', {}).get('_fast_escalated') is not True
+            or len(starts) != 1 or failed or not fast_native_identity('codex', rows, child['identity'], run)
+            or not worker_transcript_is_unforked('codex', rows, child['identity'])
+            or len(completed) != 1 or not isinstance(completed[0], str)
+            or fast_decision_lines(completed[0]) != ['escalate']):
+        raise RuntimeError('managed run has an unverified extra lead')
+    turn = starts[0].get('payload', {}).get('turn_id')
+    try:
+        chronological = (timestamp_ns(starts[0].get('timestamp')) <= timestamp_ns(terminal_rows[0].get('timestamp'))
+                         < min(timestamp_ns(row.get('timestamp')) for row in canonical_starts))
+    except (ValueError, TypeError):
+        chronological = False
+    if (not isinstance(turn, str) or not turn or len(contexts) != 1
+            or contexts[0].get('turn_id') != turn or terminal_rows[0].get('payload', {}).get('turn_id') != turn
+            or contexts[0].get('model') != child['requested_tier'] or contexts[0].get('effort') != child['requested_effort']
+            or not chronological):
+        raise RuntimeError('managed fast history lacks exact preceding native turn proof')
+
+
+def require_literal_worker(provider, run, home, project=None, captures=()):
+    """Prove the fixture's one literal child under its canonical lead, including legacy runs."""
+    from native_routing_smoke import native_rows, tool_evidence, worker_launch_verified, assistant_text, worker_transcript_is_unforked
+    workers = [child for child in run.get('delegations', []) if child.get('role') == 'worker']
+    if len(workers) != 1 or workers[0].get('state') != 'completed':
+        raise RuntimeError('literal fixture lacks exactly one successful worker')
+    worker = workers[0]
+    lead_rows = native_rows(provider, home, run['lead_identity'])
+    rows = native_rows(provider, home, worker['identity'])
+    if (not worker_transcript_is_unforked(provider, rows, worker['identity'])
+            or not worker_transcript_is_unforked(provider, lead_rows, run['lead_identity'])):
+        raise RuntimeError('literal worker has ambiguous native history')
+    parent_path = lead_rows[0].get('payload', {}).get('agent_path', '') if provider == 'codex' else ''
+    if not worker_launch_verified(provider, tool_evidence(provider, lead_rows), worker, rows,
+                                  run['lead_identity'], parent_path):
+        raise RuntimeError('literal worker launch is not bound to the canonical lead')
+    if provider == 'codex':
+        reports = [row.get('payload', {}).get('last_agent_message') for row in rows
+                   if row.get('type') == 'event_msg' and row.get('payload', {}).get('type') == 'task_complete']
+        starts = [row.get('payload', {}) for row in rows if row.get('type') == 'event_msg'
+                  and row.get('payload', {}).get('type') == 'task_started']
+        contexts = [row.get('payload', {}) for row in rows if row.get('type') == 'turn_context']
+        terminals = [row.get('payload', {}) for row in rows if row.get('type') == 'event_msg'
+                     and row.get('payload', {}).get('type') == 'task_complete']
+        literal = (len(reports) == len(starts) == len(contexts) == 1 and reports[0] == 'GATE_RELEASED'
+                   and isinstance(starts[0].get('turn_id'), str) and bool(starts[0]['turn_id'])
+                   and starts[0]['turn_id'] == contexts[0].get('turn_id') == terminals[0].get('turn_id')
+                   and contexts[0].get('model') == worker['requested_tier']
+                   and contexts[0].get('effort') == worker['requested_effort']
+                   and not any(row.get('type') == 'event_msg' and row.get('payload', {}).get('type') in
+                               {'turn_aborted', 'task_failed', 'task_interrupted', 'error'} for row in rows))
+        try:
+            started = next(row['timestamp'] for row in rows if row.get('type') == 'event_msg'
+                           and row.get('payload', {}).get('type') == 'task_started')
+            finished = next(row['timestamp'] for row in rows if row.get('type') == 'event_msg'
+                            and row.get('payload', {}).get('type') == 'task_complete')
+            literal = literal and timestamp_ns(started) <= timestamp_ns(finished)
+        except (KeyError, ValueError, TypeError, StopIteration):
+            literal = False
+    else:
+        # The native meta→Agent link is required independently of callback labels.
+        plugin = Path(__file__).resolve().parents[2] / 'plugins' / 'symphony'
+        if str(plugin) not in sys.path:
+            sys.path.insert(0, str(plugin))
+        from symphony.host_evidence import claude_substantive_launch
+        from symphony.store import _run_from_dict
+        from symphony.model import Event
+        latest = rows[-1].get('timestamp') if rows else ''
+        if project is None or not project.is_absolute():
+            raise RuntimeError('literal Claude worker has no bound fixture project')
+        proof = run.get('assessment', {}).get('_substantive_children', {}).get(worker['identity'], {})
+        admitted = proof.get('admitted_at')
+        if not isinstance(admitted, str) or not admitted:
+            starts = [record for record in captures if record.get('event') == 'SubagentStart'
+                      and record.get('session_id') == run['session_id'] and record.get('agent_id') == worker['identity']]
+            if len(starts) != 1 or type(starts[0].get('started_ns')) is not int:
+                raise RuntimeError('legacy literal Claude worker has no exact captured Start')
+            admitted = datetime.fromtimestamp(starts[0]['started_ns'] / 1e9, timezone.utc).isoformat()
+        scoped = replace(_run_from_dict(run), assessment={'substantive_contract': {'accepted_at': run['started_at']}})
+        source = Event('fixture-native-worker', 'subagent_stopped', latest, {'provider': 'claude',
+            'session_id': run['session_id'], 'agent_id': worker['identity'], 'cwd': str(project)})
+        if not claude_substantive_launch(scoped, source, 'worker', admitted, {'CLAUDE_CONFIG_DIR': str(home)}):
+            raise RuntimeError('literal Claude worker lacks exact native lead parent proof')
+        assistants = [row for row in rows if row.get('type') == 'assistant']
+        activity = [row for row in rows if row.get('type') in {'assistant', 'user'}]
+        terminal = assistants[-1] if assistants else {}
+        native_message = terminal.get('message', {})
+        closed = (bool(activity) and activity[-1] is terminal and native_message.get('stop_reason') == 'end_turn'
+                  and isinstance(terminal.get('uuid'), str) and bool(terminal['uuid'])
+                  and not any(row.get('message', {}).get('stop_reason') == 'end_turn' for row in assistants[:-1])
+                  and not any(row.get('isApiErrorMessage') is True for row in assistants))
+        final = assistant_text(provider, terminal)
+        literal = closed and final == 'GATE_RELEASED'
+        if closed and not literal and not any(line.strip().startswith('SYMPHONY_OUTCOME:') for line in final.splitlines()):
+            handbacks = [(block, row) for row in assistants[:-1] for block in row.get('message', {}).get('content', [])
+                         if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('name') == 'SubagentHandback']
+            if len(handbacks) == 1:
+                call, call_row = handbacks[0]
+                results = [(block, row) for row in rows if row.get('type') == 'user'
+                           for block in row.get('message', {}).get('content', []) if isinstance(block, dict)
+                           and block.get('type') == 'tool_result' and block.get('tool_use_id') == call.get('id')]
+                if (isinstance(call.get('id'), str) and call['id'] and len(results) == 1
+                        and results[0][0].get('is_error') is not True
+                        and call.get('input', {}).get('message') == 'GATE_RELEASED'):
+                    try:
+                        literal = (timestamp_ns(call_row.get('timestamp')) <= timestamp_ns(results[0][1].get('timestamp'))
+                                   <= timestamp_ns(terminal.get('timestamp')))
+                    except (ValueError, TypeError):
+                        literal = False
+    if not literal:
+        raise RuntimeError('literal worker has no exact successful native report')
+
+
+def require_codex_gate_lead(records, label, session_id, lead_id):
+    """The second-child scheduling heuristic cannot prove native ownership."""
+    starts = [item for item in records if item.get('event') == 'SubagentStart'
+              and item.get('native_gate_label') == label
+              and item.get('session_id') == session_id and item.get('agent_id') == lead_id]
+    if len(starts) != 1:
+        raise RuntimeError(f'{label}: native gate has no unique canonical lead Start')
+    facts = starts[0].get('native_metadata') or {}
+    if (facts.get('own_header_identity_matches') is not True
+            or facts.get('native_parent_matches_root') is not True
+            or facts.get('declared_assessed_lead_matches') is not True
+            or facts.get('native_task_role') != 'lead'):
+        raise RuntimeError(f'{label}: native gate child lacks canonical lead metadata')
+
+
 def codex_hook_capture_summary(root, provider="codex"):
     """Read independent user hooks without collecting native transcripts or payload bodies."""
     directory = root / f"{provider}-hook-capture"
@@ -2501,7 +2789,7 @@ def codex_hook_capture_summary(root, provider="codex"):
                          "native_gate_label", "native_gate_session_id",
                          "background_tasks_type", "background_tasks_count",
                          "background_task_states", "reported_outcome", "native_task_wait",
-                         "native_stop_hold_label")}
+                         "native_stop_hold_label", "native_metadata", "admission_at_capture")}
                        | {"exit_marker_written": marker.get("invocation_id") == entry.get("invocation_id"),
                           "finished_ns": marker.get("finished_ns"),
                           "native_home_matches_expected": (

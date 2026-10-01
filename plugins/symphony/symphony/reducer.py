@@ -561,10 +561,12 @@ def _stop_requested(state: ProjectState, event: Event):
             Action("archive_run", {"run_id": run.run_id}),
             Action("permit_stop"),
         )
-    if event.payload.get("stop_hook_active"):
+    if (event.payload.get('provider') in {'claude', 'codex'}
+            and event.payload.get('hook_event_name') == 'Stop'
+            and event.payload.get('stop_hook_active') is True):
         # Ending a host turn is not evidence that its children died. Release
         # the retry while keeping the run available for later host events.
-        return state, (Action("permit_stop"),)
+        return state, (Action("permit_stop", {"reason": reason}),)
     return state, (Action("block_stop", reason),)
 
 

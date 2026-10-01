@@ -199,7 +199,7 @@ def render(
                 )
             )
         return HookResult(json.dumps({"decision": "block", "reason": reason}))
-    if provider == 'claude' and hook_event_name == 'Stop':
+    if provider in {'claude', 'codex'} and hook_event_name == 'Stop':
         notice = next((action.payload.get('reason') for action in actions
                        if action.kind == 'permit_stop' and action.payload.get('reason')), None)
         if notice:

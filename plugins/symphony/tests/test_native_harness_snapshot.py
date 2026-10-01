@@ -1,6 +1,7 @@
 """The native upgrade receipt accepts only the reviewed retained candidate."""
 
 import importlib.util
+from datetime import datetime
 import io
 import json
 import os
@@ -22,12 +23,246 @@ from plugins.symphony.symphony.store import _locked
 REPO = Path(__file__).resolve().parents[3]
 PLUGIN = REPO / "plugins" / "symphony"
 HARNESS = REPO / ".github" / "scripts" / "native_managed_concurrency.py"
+sys.path.insert(0, str(HARNESS.parent))
 SPEC = importlib.util.spec_from_file_location("native_managed_concurrency", HARNESS)
 native = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_literal_claude_worker_uses_actual_admitted_start_or_exact_legacy_clock(self):
+        from dataclasses import asdict
+        from plugins.symphony.tests.test_assessed_contract import AssessedContractTests
+        fixture = AssessedContractTests()
+        fixture.begin('claude')
+        self.addCleanup(fixture.doCleanups)
+        fixture.worker()
+        run = asdict(fixture.state.active_run)
+        home = Path(fixture.environ['CLAUDE_CONFIG_DIR'])
+        directory = home / 'projects' / '-fixture' / 'root' / 'subagents'
+        parent = directory / 'agent-lead.jsonl'
+        rows = [json.loads(line) for line in parent.read_text(encoding='utf-8').splitlines()]
+        block = rows[0]['message']['content'][0]
+        block['input']['prompt'] = 'SYMPHONY_ROLE: worker\nReturn GATE_RELEASED.'
+        rows.append({'type': 'user', 'sessionId': 'root', 'agentId': 'lead', 'isSidechain': True,
+                     'timestamp': '2026-10-01T14:00:04+00:00', 'message': {'content': [
+                     {'type': 'tool_result', 'tool_use_id': block['id'], 'content': 'worker', 'is_error': False}]}})
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        child = directory / 'agent-worker.jsonl'
+        with child.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps({'type': 'assistant', 'sessionId': 'root', 'agentId': 'worker', 'isSidechain': True,
+                'uuid': 'native-terminal', 'timestamp': '2026-10-01T14:00:04+00:00',
+                'message': {'role': 'assistant', 'stop_reason': 'end_turn', 'content': [
+                {'type': 'text', 'text': 'GATE_RELEASED'}]}}) + '\n')
+        native.require_literal_worker('claude', run, home, fixture.project)
+        legacy = {**run, 'assessment': {}}
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', legacy, home, fixture.project)
+        stamp = int(datetime.fromisoformat(run['assessment']['_substantive_children']['worker']['admitted_at']).timestamp() * 1e9)
+        clock = {'event': 'SubagentStart', 'session_id': 'root', 'agent_id': 'worker', 'started_ns': stamp}
+        native.require_literal_worker('claude', legacy, home, fixture.project, [clock])
+        original = child.read_text(encoding='utf-8')
+        history = [json.loads(line) for line in original.splitlines()]
+        history[-1]['message']['stop_reason'] = None
+        later = {**history[-1], 'uuid': 'later', 'timestamp': '2026-10-01T14:00:05+00:00',
+                 'message': {'role': 'assistant', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'different result'}]}}
+        child.write_text(''.join(json.dumps(row) + '\n' for row in [*history, later]), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', run, home, fixture.project)
+        child.write_text(original, encoding='utf-8')
+        prompt = json.loads(original.splitlines()[0])
+        handback = {**history[-1], 'uuid': 'handback', 'timestamp': '2026-10-01T14:00:04+00:00',
+                    'message': {'role': 'assistant', 'stop_reason': 'tool_use', 'content': [
+                    {'type': 'tool_use', 'id': 'handback-id', 'name': 'SubagentHandback', 'input': {'message': 'GATE_RELEASED'}}]}}
+        delivered = {**prompt, 'timestamp': '2026-10-01T14:00:05+00:00', 'message': {'content': [
+            {'type': 'tool_result', 'tool_use_id': 'handback-id', 'content': 'accepted', 'is_error': False}]}}
+        goodbye = {**later, 'timestamp': '2026-10-01T14:00:06+00:00',
+                   'message': {'role': 'assistant', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Done.'}]}}
+        child.write_text(''.join(json.dumps(row) + '\n' for row in (prompt, handback, delivered, goodbye)), encoding='utf-8')
+        native.require_literal_worker('claude', run, home, fixture.project)
+        delivered['message']['content'][0]['is_error'] = True
+        child.write_text(''.join(json.dumps(row) + '\n' for row in (prompt, handback, delivered, goodbye)), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', run, home, fixture.project)
+        child.write_text(original, encoding='utf-8')
+        for captures in ([clock, clock], [{**clock, 'session_id': 'foreign'}]):
+            with self.assertRaises(RuntimeError):
+                native.require_literal_worker('claude', legacy, home, fixture.project, captures)
+        rows[0]['message']['content'][0]['input']['model'] = 'foreign'
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', run, home, fixture.project)
+
+    def test_literal_worker_acceptance_requires_exact_one_report_and_canonical_native_parent(self):
+        import native_routing_smoke as smoke
+        lead_path = '/root/symphony_lead_model_medium'
+        worker_path = lead_path + '/symphony_worker_model_medium'
+        worker = {'identity': 'worker', 'role': 'worker', 'state': 'completed',
+                  'requested_tier': 'model', 'requested_effort': 'medium'}
+        run = {'lead_identity': 'lead', 'delegations': [worker]}
+        lead_rows = [{'type': 'session_meta', 'payload': {'id': 'lead', 'agent_path': lead_path}},
+            {'type': 'response_item', 'payload': {'type': 'function_call', 'call_id': 'launch',
+             'name': 'spawn_agent', 'arguments': json.dumps({'task_name': 'symphony_worker_model_medium',
+             'model': 'model', 'reasoning_effort': 'medium', 'fork_turns': 'none', 'message': 'SYMPHONY_ROLE: worker\nfixture'})}},
+            {'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'launch',
+             'output': json.dumps({'task_name': worker_path})}}]
+        rows = [{'type': 'session_meta', 'payload': {'id': 'worker', 'agent_path': worker_path,
+                 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}},
+                {'type': 'turn_context', 'payload': {'turn_id': 'worker-turn', 'model': 'model', 'effort': 'medium'}},
+                {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:01+00:00', 'payload': {'type': 'task_started', 'turn_id': 'worker-turn'}},
+                {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:02+00:00', 'payload': {'type': 'task_complete', 'turn_id': 'worker-turn', 'last_agent_message': 'GATE_RELEASED'}}]
+
+        def check(values, child_rows):
+            with patch.object(smoke, 'native_rows', side_effect=[lead_rows, child_rows]):
+                native.require_literal_worker('codex', values, Path('/native'))
+
+        check(run, rows)
+        for values, child_rows in (({**run, 'delegations': [worker, worker]}, rows),
+                                  ({**run, 'delegations': [{**worker, 'state': 'failed'}]}, rows),
+                                  (run, [*rows[:-1], {'type': 'event_msg', 'payload': {'type': 'task_complete', 'last_agent_message': 'claimed'}}]),
+                                  (run, [{**rows[0], 'payload': {**rows[0]['payload'], 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}, *rows[1:]]),
+                                  (run, [rows[0], {**rows[1], 'payload': {**rows[1]['payload'], 'model': 'foreign'}}, *rows[2:]]),
+                                  (run, [*rows, {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'future'}}]),
+                                  (run, [*rows[:-1], {**rows[-1], 'timestamp': '2026-10-01T00:00:00+00:00'}]),
+                                  (run, [*rows, {'type': 'event_msg', 'payload': {'type': 'error', 'turn_id': 'worker-turn'}}])):
+            with self.assertRaises(RuntimeError):
+                check(values, child_rows)
+
+    def test_assessed_lead_set_excludes_only_exact_completed_native_fast_escalation(self):
+        import native_routing_smoke as smoke
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            lead = {'identity': 'lead', 'role': 'lead', 'state': 'completed', 'requested_tier': 'model', 'requested_effort': 'medium'}
+            fast = {**lead, 'identity': 'fast'}
+            run = {'lead_identity': 'lead', 'session_id': 'root', 'delegations': [lead, fast],
+                   'assessment': {'_fast_escalated': True, '_fast_route': {'model': 'model', 'effort': 'medium'}}}
+            def header(identity, name, parent='root'):
+                return {'type': 'session_meta', 'payload': {'id': identity, 'cwd': str(project),
+                    'agent_path': '/root/' + name, 'source': {'subagent': {'thread_spawn': {'parent_thread_id': parent}}}}}
+            canonical = [header('lead', 'symphony_lead_model_medium'), {'type': 'event_msg',
+                         'timestamp': '2026-10-01T00:00:03+00:00', 'payload': {'type': 'task_started', 'turn_id': 'assessed'}}]
+            rows = [header('fast', 'symphony_lead_fast_model_medium'),
+                    {'type': 'turn_context', 'payload': {'turn_id': 'turn', 'model': 'model', 'effort': 'medium'}},
+                    {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:01+00:00', 'payload': {'type': 'task_started', 'turn_id': 'turn'}},
+                    {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:02+00:00', 'payload': {'type': 'task_complete', 'turn_id': 'turn',
+                     'last_agent_message': 'SYMPHONY_FAST_DECISION: escalate'}}]
+            def check(values, fast_rows):
+                with patch.object(smoke, 'native_rows', side_effect=[canonical, fast_rows]):
+                    native.require_assessed_lead_set(values, project, project, 'lead')
+            check(run, rows)
+            for values, other in (({**run, 'delegations': [lead, fast, {**fast, 'identity': 'extra'}]}, rows),
+                                  ({**run, 'delegations': [lead, {**fast, 'state': 'failed'}]}, rows),
+                                  (run, [header('fast', 'symphony_lead_model_medium'), *rows[1:]]),
+                                  (run, [header('fast', 'symphony_lead_fast_model_medium', 'foreign'), *rows[1:]]),
+                                  (run, rows + [{'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'future'}}]),
+                                  (run, [*rows[:-1], {**rows[-1], 'payload': {**rows[-1]['payload'], 'turn_id': 'foreign'}}]),
+                                  (run, [*rows[:-1], {**rows[-1], 'timestamp': '2026-10-01T00:00:04+00:00'}])):
+                with self.assertRaises(RuntimeError):
+                    check(values, other)
+
+    def test_second_child_schedule_requires_exact_native_canonical_lead_proof(self):
+        record = {'event': 'SubagentStart', 'native_gate_label': 'a', 'session_id': 'root',
+                  'agent_id': 'lead', 'native_metadata': {'own_header_identity_matches': True,
+                  'native_parent_matches_root': True, 'native_task_role': 'lead', 'declared_assessed_lead_matches': True}}
+        native.require_codex_gate_lead([record], 'a', 'root', 'lead')
+        for field, value in (('own_header_identity_matches', False),
+                             ('native_parent_matches_root', False), ('native_task_role', 'worker'),
+                             ('declared_assessed_lead_matches', False)):
+            with self.subTest(field=field):
+                bad = {**record, 'native_metadata': {**record['native_metadata'], field: value}}
+                with self.assertRaises(RuntimeError):
+                    native.require_codex_gate_lead([bad], 'a', 'root', 'lead')
+        for rows in ([], [record, record], [{**record, 'session_id': 'foreign'}],
+                     [{**record, 'agent_id': 'worker'}]):
+            with self.assertRaises(RuntimeError):
+                native.require_codex_gate_lead(rows, 'a', 'root', 'lead')
+
+    def test_assessed_fixture_lead_owns_one_literal_worker_and_keeps_recovery(self):
+        from plugins.symphony.symphony.routing import Assessment, route_for
+        profiles = json.loads((PLUGIN / 'profiles.json').read_text(encoding='utf-8'))['providers']
+        for provider, profile_id in (('codex', 'base'), ('codex', 'full'), ('codex', 'latest'),
+                                     ('claude', 'sonnet-5-5')):
+            for recover in (False, True):
+                with self.subTest(provider=provider, profile=profile_id, recover=recover):
+                    root = native.prompt(provider, 'a', recover, Path('/tmp/fixture'), codex_profile=profile_id)
+                    if provider == 'codex':
+                        lead = json.loads(re.search(r'^LEAD_SPAWN_PACKET: (.+)$', root, re.MULTILINE)[1])['message']
+                    else:
+                        lead = json.loads(re.search(r'LEAD_TASK_TEXT: (.+)$', root, re.MULTILINE)[1])
+                    route = json.loads(re.search(r'^SYMPHONY_ROUTE: (.+)$', lead, re.MULTILINE)[1])
+                    self.assertEqual(route['topology'], route_for(Assessment(
+                        route['size'], route['complexity'], risk=route['risk'])).execution)
+                    packet = json.loads(re.search(r'WORKER_SPAWN_PACKET: (.+)$', lead, re.MULTILINE)[1])
+                    profile = next(p for p in profiles[provider]['profiles'] if p['id'] == profile_id)
+                    selected = profile['matrix']['small/simple']
+                    if provider == 'codex':
+                        self.assertEqual((packet['model'], packet['reasoning_effort']),
+                                         (selected['model'], selected['effort']))
+                        self.assertEqual(packet['fork_turns'], 'none')
+                        self.assertEqual(packet['task_name'], 'symphony_worker_' +
+                                         re.sub(r'\W', '_', selected['model']) + '_' + selected['effort'])
+                    else:
+                        self.assertEqual(packet['subagent_type'],
+                                         f"symphony:symphony-worker-{selected['model']}-{selected['effort']}")
+                    message = packet.get('message', packet.get('prompt'))
+                    self.assertTrue(message.startswith('SYMPHONY_ROLE: worker\n'))
+                    own = json.loads(message.split('\n', 1)[1])
+                    self.assertEqual((own['size'], own['complexity']), ('small', 'simple'))
+                    self.assertEqual(own['return_contract'], 'Return exactly GATE_RELEASED without Markdown.')
+                    self.assertIn('YOU as the canonical lead must spawn exactly one', lead)
+                    self.assertIn('Await its successful native result and verify', lead)
+                    self.assertIn('do not spawn duplicate work', lead)
+                    self.assertNotIn('Do not delegate or create a worktree.', lead)
+                    self.assertIn('the root never substitutes', lead)
+                    self.assertIn('Only the external harness releases', root)
+                    if recover:
+                        self.assertIn('SYMPHONY_OUTCOME: {"status":"blocked"}', lead)
+                        self.assertIn('SAME lead', root)
+
+    def test_assessor_capture_exports_metadata_and_admission_facts_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / 'project'
+            project.mkdir()
+            state = root / 'state'
+            state.mkdir()
+            script = root / 'capture.py'
+            script.write_text(native.CODEX_HOOK_CAPTURE, encoding='utf-8')
+            transcript = root / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'assessor-a',
+                'agent_path': '/root/symphony_assessor_gpt_6_luna_high',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root-a'}}}}}
+            turn = {'type': 'turn_context', 'payload': {'turn_id': 'turn-a',
+                                                     'model': 'gpt-6-luna', 'effort': 'high'}}
+            secret = {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                'content': [{'type': 'input_text', 'text': 'PRIVATE_AUTH_SENTINEL'}]}}
+            payload = {'cwd': str(project), 'session_id': 'root-a', 'agent_id': 'assessor-a',
+                       'agent_type': 'default', 'turn_id': 'turn-a', 'agent_transcript_path': str(transcript)}
+            path = native.state_file(state, project)
+            env = {**os.environ, 'SYMPHONY_STATE_DIR': str(state),
+                   'SYMPHONY_NATIVE_ASSESSOR_MODEL': 'gpt-6-luna', 'SYMPHONY_NATIVE_ASSESSOR_EFFORT': 'high'}
+            for admitted, rows in ((False, [header, turn, secret]), (True, [header, turn, secret]),
+                                    (False, [header, secret])):
+                transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+                run = {'delegations': [{'identity': 'assessor-a', 'role': 'assessor'}]}
+                event = {'kind': 'delegation_updated', 'payload': {'identity': 'assessor-a', 'state': 'working'}}
+                path.write_text(json.dumps({'active_runs': {'codex:root-a': run} if admitted else {},
+                                            'event_history': [event] if admitted else []}), encoding='utf-8')
+                result = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart',
+                                         str(root / 'codex-hook-capture'), 'codex'],
+                                        input=json.dumps(payload), env=env, capture_output=True,
+                                        text=True, encoding='utf-8', timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                records = native.codex_hook_capture_summary(root)['records']
+                capture = records[-1]
+                self.assertTrue(capture['native_metadata']['own_header_identity_matches'])
+                self.assertTrue(capture['native_metadata']['native_parent_matches_root'])
+                self.assertEqual(capture['native_metadata']['native_task_role'], 'assessor')
+                self.assertEqual(capture['native_metadata']['callback_turn_context_present'], len(rows) == 3)
+                self.assertEqual(capture['admission_at_capture']['owner_run_present'], admitted)
+                self.assertEqual(capture['admission_at_capture']['child_start_recorded'], admitted)
+                self.assertNotIn('PRIVATE_AUTH_SENTINEL', json.dumps(records))
+                self.assertNotIn('symphony_assessor_gpt_6_luna_high', json.dumps(capture['native_metadata']))
     def test_codex_native_spawn_packets_follow_packaged_base_matrix(self):
         base = next(item for item in json.loads((PLUGIN / "profiles.json").read_text())
                     ["providers"]["codex"]["profiles"] if item["id"] == "base")
@@ -102,12 +337,21 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             native.observer_locked_read(Mock(side_effect=ValueError("invalid state")))
 
-    def test_codex_native_hook_gate_holds_second_distinct_default_agent(self):
+    def test_codex_native_hook_gate_holds_declared_assessed_task_not_fast_or_workers(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "capture.py"
             script.write_text(native.CODEX_HOOK_CAPTURE)
             gate, capture = root / "gate", root / "codex-hook-capture"
+            env = {**os.environ, 'SYMPHONY_NATIVE_GATE_DIR': str(gate),
+                   'SYMPHONY_NATIVE_GATE_LABEL': 'a', 'SYMPHONY_NATIVE_GATE_LEAD_NAME': 'symphony_lead_fixture'}
+
+            def payload(identity, task):
+                path = root / (identity + '.jsonl')
+                path.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': identity,
+                    'agent_path': '/root/' + task, 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root-a'}}}}}) + '\n')
+                return {'session_id': 'root-a', 'agent_id': identity, 'agent_type': 'default',
+                        'agent_transcript_path': str(path)}
             root_start = subprocess.run(
                 [sys.executable, "-I", str(script), "SessionStart", str(capture), "codex"],
                 input=json.dumps({"session_id": "root-a"}),
@@ -116,12 +360,16 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 text=True, capture_output=True, timeout=5)
             self.assertEqual(root_start.returncode, 0)
             self.assertEqual(json.loads((gate / "a.root.json").read_text())["session_id"], "root-a")
+            for identity, task in (('fast', 'symphony_lead_fast_model_medium'), ('foreign', 'symphony_lead_other')):
+                result = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'codex'],
+                    input=json.dumps(payload(identity, task)), env=env, text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0)
+                self.assertFalse((gate / 'a.first.json').exists())
+                self.assertFalse((gate / 'a.ready').exists())
             first = subprocess.run(
                 [sys.executable, "-I", str(script), "SubagentStart", str(capture), "codex"],
-                input=json.dumps({"session_id": "root-a", "agent_id": "assessor-a",
-                                  "agent_type": "default"}),
-                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
-                     "SYMPHONY_NATIVE_GATE_LABEL": "a"},
+                input=json.dumps(payload('assessor-a', 'symphony_assessor_fixture')),
+                env=env,
                 text=True, capture_output=True, timeout=5)
             self.assertEqual(first.returncode, 0)
             self.assertFalse((gate / "a.ready").exists())
@@ -131,12 +379,9 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 [sys.executable, "-I", str(script), "SubagentStart", str(capture), "codex"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
-                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
-                     "SYMPHONY_NATIVE_GATE_LABEL": "a"})
+                env=env)
             try:
-                process.stdin.write(json.dumps({
-                    "session_id": "root-a", "agent_id": "lead-a",
-                    "agent_type": "default"}))
+                process.stdin.write(json.dumps(payload('lead-a', 'symphony_lead_fixture')))
                 process.stdin.close()
                 deadline = time.monotonic() + 5
                 while not (gate / "a.ready").is_file():
@@ -144,6 +389,16 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     time.sleep(.01)
                 self.assertIsNone(process.poll())
                 self.assertEqual(json.loads((gate / "a.ready").read_text())["agent_id"], "lead-a")
+                frozen = (gate / 'a.ready').read_bytes()
+                for later in ('worker-a', 'lead-a'):
+                    replay = subprocess.run(
+                        [sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'codex'],
+                        input=json.dumps(payload(later, 'symphony_lead_fixture' if later == 'lead-a' else 'symphony_worker_fixture')),
+                        env=env, text=True, capture_output=True, timeout=5)
+                    self.assertEqual(replay.returncode, 0, replay.stderr)
+                    self.assertEqual((gate / 'a.ready').read_bytes(), frozen)
+                    self.assertEqual(json.loads((gate / 'a.lead.json').read_text())['agent_id'], 'lead-a')
+                self.assertIsNone(process.poll(), 'later callbacks must not release the original barrier')
                 (gate / "release").touch()
                 self.assertEqual(process.wait(timeout=5), 0)
             finally:
@@ -959,7 +1214,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertIn("GATE_RELEASED\nSYMPHONY_OUTCOME", child_message)
                     self.assertIn("There is no gate command or file to find or run", child_message)
                     self.assertIn("GATE_RELEASED is a report line, not an operation", child_message)
-                    self.assertIn("Do not inspect files, run tools", child_message)
+                    self.assertIn("Do not inspect files, execute shell commands", child_message)
                     self.assertNotIn("gate.py", child_message)
                     self.assertEqual("none", packet["fork_turns"])
                     self.assertEqual(("gpt-6-luna", "low"),

@@ -6,13 +6,39 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from plugins.symphony.symphony.adapters import event_from_payload
-from plugins.symphony.symphony.model import Delegation, ProjectState, RunState
-from plugins.symphony.symphony.runtime import handle
+from plugins.symphony.symphony.adapters import event_from_payload, render
+from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
+from plugins.symphony.symphony.reducer import reduce
+from plugins.symphony.symphony.runtime import handle, _render_actions
 from plugins.symphony.symphony.store import StateStore
 
 
 class ClaudeStopGuardTests(unittest.TestCase):
+    def test_normal_reducer_retry_renders_only_actionable_system_message(self):
+        state = ProjectState(active_run=RunState('run', 'unfinished', provider='claude',
+            lead_identity='lead', delegations=(Delegation('worker', 'worker', 'task', 'working', '', ''),)))
+        first = Event('first', 'stop_requested', '2026-10-01T00:00:00+00:00',
+                      {'provider': 'claude', 'hook_event_name': 'Stop'})
+        blocked, actions = reduce(state, first)
+        output = json.loads(render('claude', _render_actions(actions, blocked, 'claude', first.kind), 'Stop').stdout)
+        self.assertEqual(output['decision'], 'block')
+        retry = Event('retry', 'stop_requested', first.observed_at, {**first.payload, 'stop_hook_active': True})
+        released, actions = reduce(blocked, retry)
+        output = json.loads(render('claude', _render_actions(actions, released, 'claude', retry.kind), 'Stop').stdout)
+        self.assertEqual(set(output), {'systemMessage'})
+        self.assertIsInstance(output['systemMessage'], str)
+        self.assertIn('/symphony:status', output['systemMessage'])
+        self.assertNotIn('blocked', output['systemMessage'])
+        self.assertEqual(released.active_run, state.active_run)
+        self.assertEqual(released.recent_runs, ())
+        codex = Event('codex-retry', 'stop_requested', first.observed_at,
+                      {'provider': 'codex', 'hook_event_name': 'Stop', 'stop_hook_active': True})
+        released, actions = reduce(state, codex)
+        output = json.loads(render('codex', _render_actions(actions, released, 'codex', codex.kind), 'Stop').stdout)
+        self.assertEqual(set(output), {'systemMessage'})
+        self.assertIn('$symphony:symphony status', output['systemMessage'])
+        self.assertEqual(released.active_run, state.active_run)
+
     def test_every_pre_reducer_guard_preserves_state_and_releases_only_native_claude_retry(self):
         for provider in ('claude', 'codex'):
             for scenario in ('queued-conflict', 'owner-unavailable', 'multiple-owners',
