@@ -25,6 +25,101 @@ REPORT = 'SYMPHONY_OUTCOME: {"status":"completed"}'
 
 
 class ClaudeHostEvidenceTests(unittest.TestCase):
+    def test_unknown_native_stop_retry_releases_turn_without_archiving_or_losing_evidence(self):
+        self.write_root_prompt()
+        run = replace(self.run, status='completing', started_at='2026-09-29T02:01:00.001+00:00',
+            outcome={'status': 'completed'}, delegations=(replace(self.run.delegations[0], state='completed'),))
+        self.store.save(self.project, ProjectState(active_run=run))
+        request = {'session_id': SESSION, 'cwd': str(self.project), 'hook_event_name': 'Stop'}
+        for value in (False, 'true', 1):
+            blocked = handle({**request, 'stop_hook_active': value}, self.environ)
+            self.assertEqual(json.loads(blocked.stdout).get('decision'), 'block')
+        explicit = handle({**request, 'hook_event_name': 'UserPromptSubmit',
+                           'prompt': '/symphony:stop', 'stop_hook_active': True}, self.environ)
+        self.assertEqual(json.loads(explicit.stdout).get('decision'), 'block')
+        before = self.store.load(self.project)
+        released = handle({**request, 'stop_hook_active': True}, self.environ)
+        self.assertEqual(set(json.loads(released.stdout)), {'systemMessage'})
+        self.assertNotIn('additionalContext', released.stdout)
+        self.assertIn('host turn only', released.stdout)
+        after = self.store.load(self.project)
+        self.assertEqual(after.active_run, before.active_run)
+        self.assertEqual(after.recent_runs, before.recent_runs)
+        self.assertEqual(after.terminal_receipts, before.terminal_receipts)
+        self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+        self.assertIn('without an outcome marker', released.stdout)
+        self.assertNotIn('exact marker', released.stdout)
+        accepted = replace(run, assessment={**run.assessment,
+            '_fast_route': {'model': 'claude-sonnet-5', 'effort': 'low'},
+            '_claude_fast_launch_hash': hashlib.sha256(b'toolu_launch').hexdigest()})
+        self.store.save(self.project, replace(after, active_run=accepted,
+            active_runs={f'claude:{SESSION}': accepted}))
+        archived = handle(request, self.environ)
+        self.assertNotIn('block', archived.stdout)
+        self.assertIsNone(self.store.load(self.project).active_run)
+
+    def test_observed_fast_launch_can_precede_hook_but_not_its_native_child(self):
+        from plugins.symphony.symphony.host_evidence import (
+            _claude_native_lead_event, _claude_native_prompt_activity, claude_completing_lead_turn)
+        for case in ('valid', 'missing-id', 'wrong-id', 'empty-id', 'wrong-prompt', 'legacy', 'assessed',
+                     'duplicate-id', 'foreign-root', 'foreign-cwd', 'foreign-provider', 'foreign-session',
+                     'child-before-hook', 'terminal-before-hook', 'wrong-model', 'wrong-effort', 'wrong-route'):
+            with self.subTest(case=case):
+                self.write_native()
+                self.write_root_prompt()
+                assessment = {'_fast_route': {'model': 'claude-sonnet-5', 'effort': 'low'},
+                    '_claude_fast_launch_hash': hashlib.sha256(b'toolu_launch').hexdigest(),
+                    '_claude_fast_root_prompt_hash': hashlib.sha256(b'root-prompt').hexdigest(),
+                    '_claude_native_recovery': 'prompt_id:prompt-one'}
+                if case == 'missing-id':
+                    assessment.pop('_claude_fast_launch_hash')
+                if case == 'wrong-id':
+                    assessment['_claude_fast_launch_hash'] = hashlib.sha256(b'foreign').hexdigest()
+                if case == 'empty-id':
+                    assessment['_claude_fast_launch_hash'] = ''
+                if case == 'wrong-prompt':
+                    assessment['_claude_fast_root_prompt_hash'] = hashlib.sha256(b'foreign').hexdigest()
+                if case == 'legacy':
+                    assessment.pop('_fast_route')
+                if case == 'assessed':
+                    assessment['_fast_escalated'] = True
+                if case == 'wrong-route':
+                    assessment['_fast_route']['effort'] = 'medium'
+                run = replace(self.run, status='completing', started_at='2026-09-29T02:01:00.001+00:00',
+                    assessment=assessment, outcome={'status': 'completed'},
+                    provider='codex' if case == 'foreign-provider' else 'claude',
+                    session_id='foreign' if case == 'foreign-session' else SESSION,
+                    delegations=(replace(self.run.delegations[0], state='completed'),))
+                parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                child = [json.loads(line) for line in self.child.read_text().splitlines()]
+                if case == 'duplicate-id':
+                    parent.append(parent[-1])
+                if case == 'foreign-root':
+                    parent[-1]['sessionId'] = 'foreign'
+                if case == 'foreign-cwd':
+                    parent[-1]['cwd'] = str(self.root / 'foreign')
+                if case == 'child-before-hook':
+                    child[0]['timestamp'] = '2026-09-29T02:01:00.000500Z'
+                if case == 'terminal-before-hook':
+                    child[-1]['timestamp'] = '2026-09-29T02:01:00.000500Z'
+                if case == 'wrong-model':
+                    child[-1]['message']['model'] = 'foreign'
+                if case == 'wrong-effort':
+                    child[-1]['effort'] = 'medium'
+                self.parent.write_text(''.join(json.dumps(row) + '\n' for row in parent))
+                self.child.write_text(''.join(json.dumps(row) + '\n' for row in child))
+                state = ProjectState(active_run=run, active_runs={f'claude:{SESSION}': run})
+                event = _claude_native_lead_event(state, SESSION, self.project, self.environ, require_missing=False)
+                self.assertEqual(event is not None, case == 'valid')
+                if case == 'valid':
+                    self.assertEqual(_claude_native_prompt_activity(state, SESSION, self.project, self.environ)[0], 'single')
+                    self.assertEqual(claude_completing_lead_turn(state, SESSION, self.project, self.environ)[0], 'none')
+                    self.store.save(self.project, state)
+                    result = handle({'session_id': SESSION, 'cwd': str(self.project),
+                                     'hook_event_name': 'Stop'}, self.environ)
+                    self.assertNotIn('block', result.stdout)
+                    self.assertIsNone(self.store.load(self.project).active_run)
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -31,6 +31,27 @@ class StateStoreTests(unittest.TestCase):
     def legacy_path(self) -> Path:
         return self.data / f"{project_key(self.project)}.json"
 
+    def test_native_escalation_receipt_roundtrip_and_strict_optional_boolean(self):
+        from plugins.symphony.symphony.store import _receipt_from_dict
+        receipt = {key: key for key in ('provider', 'session', 'agent', 'run_id',
+                                       'turn', 'result', 'parent', 'lead')}
+        legacy = _receipt_from_dict(receipt)
+        self.assertNotIn('native_fast_escalation', legacy)
+        self.assertNotIn('native_followup_start_id', legacy)
+        for start in ('', 'a' * 64 + ':followup-start'):
+            self.assertEqual(_receipt_from_dict({**receipt, 'native_followup_start_id': start})[
+                'native_followup_start_id'], start)
+        for malformed in (None, False, 1, [], {}):
+            with self.assertRaises(ValueError):
+                _receipt_from_dict({**receipt, 'native_followup_start_id': malformed})
+        for flag in (False, True):
+            self.store.save(self.project, ProjectState(terminal_receipts=(
+                {**receipt, 'native_fast_escalation': flag},)))
+            self.assertIs(self.store.load(self.project).terminal_receipts[0]['native_fast_escalation'], flag)
+        for malformed in (None, 1, 0, 'true', {}, []):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                _receipt_from_dict({**receipt, 'native_fast_escalation': malformed})
+
     def test_round_trips_the_complete_domain_model_as_json(self):
         event = Event("event-1", "task_received", "2026-09-17T10:00:00+00:00", {"task": "ship"})
         delegation = Delegation(

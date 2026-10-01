@@ -199,6 +199,13 @@ def render(
                 )
             )
         return HookResult(json.dumps({"decision": "block", "reason": reason}))
+    if provider == 'claude' and hook_event_name == 'Stop':
+        notice = next((action.payload.get('reason') for action in actions
+                       if action.kind == 'permit_stop' and action.payload.get('reason')), None)
+        if notice:
+            # additionalContext would continue Claude's Stop loop. The common
+            # systemMessage field displays a warning without requesting a turn.
+            return HookResult(json.dumps({'systemMessage': notice}))
     if context:
         return HookResult(
             json.dumps(

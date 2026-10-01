@@ -1,6 +1,8 @@
 """The native probe requires successful fixture edits, not transcript mentions."""
 
 import importlib.util
+from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -15,6 +17,48 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_claude_completing_probe_exports_signed_chronology_without_native_content(self):
+        from plugins.symphony.tests.test_claude_host_evidence import ClaudeHostEvidenceTests, SESSION
+        from plugins.symphony.symphony.model import ProjectState
+        fixture = ClaudeHostEvidenceTests()
+        fixture.setUp()
+        try:
+            fixture.write_root_prompt()
+            run = replace(fixture.run, status='completing',
+                          started_at='2026-09-29T02:01:00.001+00:00', outcome={'status': 'completed'})
+            fixture.store.save(fixture.project, ProjectState(active_run=run))
+            document = json.loads(fixture.store._path(fixture.project).read_text())
+            home = Path(fixture.environ['CLAUDE_CONFIG_DIR'])
+            rejected = smoke.claude_completion_probe(document, SESSION, fixture.project, home)
+            self.assertEqual(rejected['freshness'], 'unknown')
+            self.assertEqual(rejected['prompt_activity']['launch_minus_run_start_ms'], -1)
+            self.assertEqual(rejected['prompt_activity']['stage'], 'launch_before_hook')
+            run = replace(run, assessment={**run.assessment,
+                '_fast_route': {'model': 'claude-sonnet-5', 'effort': 'low'},
+                '_claude_fast_launch_hash': hashlib.sha256(b'toolu_launch').hexdigest()})
+            fixture.store.save(fixture.project, ProjectState(active_run=run))
+            document = json.loads(fixture.store._path(fixture.project).read_text())
+            accepted = smoke.claude_completion_probe(document, SESSION, fixture.project, home)
+            self.assertEqual(accepted['freshness'], 'none')
+            self.assertEqual(accepted['prompt_activity']['stage'], 'accepted')
+            self.assertEqual(accepted['prompt_activity']['launch_minus_run_start_ms'], -1)
+            self.assertNotIn(SESSION, json.dumps(accepted))
+            self.assertNotIn('toolu_launch', json.dumps(accepted))
+            self.assertNotIn(str(fixture.project), json.dumps(accepted))
+            rows = [json.loads(line) for line in fixture.child.read_text().splitlines()]
+            rows[-1]['message']['model'] = 'foreign-model'
+            fixture.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            run = replace(run, assessment={**run.assessment, '_claude_native_recovery': 'prompt_id:prompt-one'})
+            fixture.store.save(fixture.project, ProjectState(active_run=run))
+            later_rejection = smoke.claude_completion_probe(json.loads(
+                fixture.store._path(fixture.project).read_text()), SESSION, fixture.project, home)
+            self.assertEqual(later_rejection['freshness'], 'unknown')
+            self.assertTrue(later_rejection['native_reader']['accepted_fast_launch_anchor_matches'])
+            self.assertEqual(later_rejection['native_reader']['stage'], 'terminal')
+        finally:
+            fixture.doCleanups()
+            fixture.tearDown()
+
     def test_raw_tool_diagnostics_include_failed_and_missing_calls_without_arguments(self):
         rows = [{'payload': {'type': 'custom_tool_call', 'name': 'functions.exec',
                              'input': 'PRIVATE_SENTINEL'}},

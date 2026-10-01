@@ -156,6 +156,8 @@ class PackageSmokeTests(unittest.TestCase):
             "Stop",
             "Stop",
             "Stop",
+            "SubagentStart",
+            "SubagentStop",
             "SubagentStop",
             "Stop",
         ]

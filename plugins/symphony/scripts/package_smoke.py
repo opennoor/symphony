@@ -191,6 +191,8 @@ def _payload(
         }
     elif event in ("SubagentStart", "SubagentStop"):
         payload["agent_id"] = f"fake-{agent_role}"
+        if agent_role == 'worker':
+            payload['parent_thread_id'] = 'fake-lead'
         if provider == "codex":
             # Codex exposes the child's own model and effort on the event.
             payload.update(
@@ -429,6 +431,8 @@ def _exercise(
             raise SmokeFailure("a repeated Stop must release the session, never loop")
         if not any(_has_active_run(document) for document in _state_documents(state_dir)):
             raise SmokeFailure("the released turn lost its unfinished durable run")
+        send('SubagentStart', agent_role='worker')
+        send('SubagentStop', agent_role='worker')
         send("SubagentStop")
         if _blocks_stop(send("Stop")):
             raise SmokeFailure("a returned native lead still blocked Stop")
@@ -504,6 +508,8 @@ def _exercise(
             send("SubagentStart", "old-session", agent_role="assessor")
             send("SubagentStop", "old-session", agent_role="assessor")
             send("SubagentStart", "old-session")
+            send('SubagentStart', 'old-session', agent_role='worker')
+            send('SubagentStop', 'old-session', agent_role='worker')
         stale_argv = _command_argv(
             _event_command(_hook_config(old_root, provider), "SubagentStop"), old_root, provider
         )

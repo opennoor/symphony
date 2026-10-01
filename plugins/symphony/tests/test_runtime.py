@@ -120,6 +120,23 @@ class RuntimeTests(unittest.TestCase):
         ))
         return run
 
+    def complete_substantive_worker(self, provider='codex', environ=None):
+        """Supply native child work for newly assessed completion fixtures."""
+        environ = environ or (self.claude_environ if provider == 'claude' else self.environ)
+        run = StateStore(self.state_root).load(self.project).active_run
+        choice = resolve_tier(route_for(Assessment('small', 'simple')),
+                              snapshot_for(provider, run.assessment['route']['profile']))
+        self.spawn_count += 1
+        identity = f'fixture-worker-{self.spawn_count}'
+        agent_type = (claude_agent_type('worker', {'model': choice['lead_model'], 'effort': choice['lead_effort']})
+                      if provider == 'claude' else codex_agent_type('worker', choice['lead_model'], choice['lead_effort']))
+        worker = {**self.payload('', provider), 'provider': provider, 'hook_event_name': 'SubagentStart', 'agent_id': identity,
+                  'agent_type': agent_type, 'parent_thread_id': run.lead_identity,
+                  'task': 'SYMPHONY_ROLE: worker\nComplete the bounded fixture work',
+                  'model': choice['lead_model'], 'model_reasoning_effort': choice['lead_effort']}
+        handle(worker, environ)
+        handle({**worker, 'hook_event_name': 'SubagentStop', 'status': 'completed'}, environ)
+
     def test_enable_persists_and_next_task_requests_bounded_assessment(self):
         enabled = handle(self.payload("$symphony:symphony enable"), self.environ)
         self.assertIn("enabled", self.context(enabled).lower())
@@ -516,6 +533,7 @@ class RuntimeTests(unittest.TestCase):
             }
         )
         handle(started, self.environ)
+        self.complete_substantive_worker()
         stopped = {**started, "hook_event_name": "SubagentStop", "status": "completed"}
         handle(stopped, self.environ)
 
@@ -631,6 +649,7 @@ class RuntimeTests(unittest.TestCase):
             "model_reasoning_effort": self.simple["effort"],
         }
         handle(replacement, self.environ)
+        self.complete_substantive_worker()
         replaced = StateStore(self.state_root).load(self.project).active_run
         self.assertEqual(replaced.lead_identity, "lead-2")
         self.assertEqual(replaced.owner_generation, 2)
@@ -706,6 +725,7 @@ class RuntimeTests(unittest.TestCase):
             "model": expected["lead_model"], "model_reasoning_effort": expected["lead_effort"],
         }
         handle(lead, self.environ)
+        self.complete_substantive_worker()
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Avalon task done"}, self.environ)
         self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "completing")
@@ -808,6 +828,7 @@ class RuntimeTests(unittest.TestCase):
                                 "model": model, "model_reasoning_effort": effort,
                             }
                             handle(lead, environ)
+                            self.complete_substantive_worker(provider, environ)
                             handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                                     "last_assistant_message": "Completed"}, environ)
                             completing = StateStore(self.state_root).load(self.project)
@@ -905,6 +926,7 @@ class RuntimeTests(unittest.TestCase):
             "transcript_path": str(lead_transcript),
         }
         handle(lead, self.environ)
+        self.complete_substantive_worker()
         handle(
             {
                 **lead,
@@ -3142,6 +3164,7 @@ class RuntimeTests(unittest.TestCase):
             "agent_type": "consultant",
         }
         handle(lead, self.environ)
+        self.complete_substantive_worker()
         handle(consultant, self.environ)
         handle(
             {
@@ -3272,6 +3295,7 @@ class RuntimeTests(unittest.TestCase):
         handle({**self.payload(""), "hook_event_name": "Interrupt"}, self.environ)
         replacement = {**lead, "agent_id": "lead-2"}
         handle(replacement, self.environ)
+        self.complete_substantive_worker()
         self.assertNotIn(
             "_pending_lead_completion",
             StateStore(self.state_root).load(self.project).active_run.assessment,

@@ -346,6 +346,33 @@ def _valid_outcome(outcome) -> bool:
     return isinstance(status, str) and status.lower() in {"completed", "done", "success", "succeeded"}
 
 
+def _substantive_child_completed(run: RunState) -> bool:
+    """Legacy routes have no contract; present contracts require scoped proof."""
+    if 'substantive_contract' not in run.assessment:
+        return True
+    contract = run.assessment['substantive_contract']
+    if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int
+            or contract['version'] != 1
+            or not isinstance(contract.get('epoch'), str) or not contract['epoch']
+            or not isinstance(contract.get('accepted_at'), str) or not contract['accepted_at']):
+        return False
+    proofs = run.assessment.get('_substantive_children', {})
+    if not isinstance(proofs, Mapping):
+        return False
+    for child in run.delegations:
+        proof = proofs.get(child.identity)
+        if (child.role in {'worker', 'consultant'}
+                and child.state.lower() in {'completed', 'done', 'success', 'succeeded'}
+                and isinstance(proof, Mapping) and proof.get('successful') is True
+                and proof.get('epoch') == contract['epoch']
+                and proof.get('run_id') == run.run_id
+                and proof.get('lead') == run.lead_identity
+                and proof.get('owner_generation') == run.owner_generation
+                and (child.role != 'consultant' or child.identity not in run.assessment.get('_invalid_consultants', ()))):
+            return True
+    return False
+
+
 def _lead_completed(state: ProjectState, event: Event):
     run = state.active_run
     if not run:
@@ -360,6 +387,13 @@ def _lead_completed(state: ProjectState, event: Event):
     outcome = event.payload.get("outcome")
     if not _valid_outcome(outcome):
         return state, (Action("block_completion", {"reason": "outcome_missing"}),)
+    if not _substantive_child_completed(run):
+        assessment = {**run.assessment, '_substantive_child_missing': True}
+        token = event.payload.get('turn_token') or run.assessment.get('_active_turns', {}).get(identity)
+        return _lead_failed(replace(state, active_run=replace(run, assessment=assessment)),
+                            replace(event, kind='lead_failed', payload={"identity": identity,
+                                    "reason": "substantive_child_missing",
+                                    **({'turn_token': token} if isinstance(token, str) and token else {})}))
     active = [item for item in _active_identities(run) if item != identity]
     unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
                   and (item.role != "lead" or item.identity == run.lead_identity)]
@@ -400,6 +434,8 @@ def _lead_failed(state: ProjectState, event: Event):
         assessment["_retryable_lead"] = ""
         assessment.pop("_retryable_lead_turn", None)
     recovering = replace(run, status="recovering", outcome=None, assessment=assessment, updated_at=event.observed_at)
+    if event.payload.get('reason') == 'substantive_child_missing':
+        return replace(state, active_run=recovering), (Action('request_substantive_work', {}),)
     return replace(state, active_run=recovering), (
         Action("replace_lead", {"owner_generation": run.owner_generation + 1}),
     )
@@ -482,6 +518,8 @@ def _stop_block_reason(run: RunState) -> dict | None:
     mismatch = run.assessment.get("_lead_route_mismatch")
     if mismatch:
         return {"reason": mismatch}
+    if not _substantive_child_completed(run):
+        return {"reason": "substantive_child_missing"}
     if not _valid_outcome(run.outcome):
         return {"reason": "lead_outcome_missing" if run.lead_identity else "lead_not_started"}
     return None

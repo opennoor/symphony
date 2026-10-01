@@ -109,23 +109,16 @@ def _delegation_from_dict(value: Any) -> Delegation:
     )
 
 
-def _receipt_from_dict(value: Any) -> dict[str, object]:
+def _receipt_from_dict(value: Any) -> dict[str, str]:
     receipt = _object(value, "terminal receipt")
     required = ("provider", "session", "agent", "run_id",
                 "turn", "result", "parent", "lead")
     optional = ("status", "native_agent_type", "native_model", "native_effort",
                 "native_launch_prompt_hash")
-    if 'native_fast_escalation' in receipt and type(receipt['native_fast_escalation']) is not bool:
-        raise ValueError('terminal receipt.native_fast_escalation must be a boolean')
     return {**{key: _text(receipt.get(key), f"terminal receipt.{key}")
                for key in required},
             **{key: _text(receipt.get(key, ""), f"terminal receipt.{key}")
-               for key in optional},
-            **({'native_followup_start_id': _text(receipt['native_followup_start_id'],
-                    'terminal receipt.native_followup_start_id')}
-               if 'native_followup_start_id' in receipt else {}),
-            **({'native_fast_escalation': receipt['native_fast_escalation']}
-               if 'native_fast_escalation' in receipt else {})}
+               for key in optional}}
 
 
 def _run_from_dict(value: Any) -> RunState:

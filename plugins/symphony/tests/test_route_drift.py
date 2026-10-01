@@ -64,6 +64,13 @@ class RouteDriftTests(unittest.TestCase):
             "model": "codex-model",
         }
 
+    def complete_worker(self, lead: dict, profile: str):
+        worker = {**lead, "agent_id": "route-worker", "agent_type": "worker",
+                  "parent_thread_id": lead["agent_id"], "task": "SYMPHONY_ROLE: worker",
+                  "turn_id": "worker-turn"}
+        handle(worker, self.env(profile))
+        handle({**worker, "hook_event_name": "SubagentStop", "status": "completed"}, self.env(profile))
+
     def output(self, result) -> dict:
         return json.loads(result.stdout) if result.stdout else {}
 
@@ -202,6 +209,7 @@ class RouteDriftTests(unittest.TestCase):
             "model_reasoning_effort": BASE_ROUTE["effort"],
         }
         handle(lead, self.env("base"))
+        self.complete_worker(lead, "base")
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("base"))
         state = StateStore(self.state_root).load(self.project)
@@ -223,6 +231,8 @@ class RouteDriftTests(unittest.TestCase):
         handle(lead, self.env("full"))
         self.start("base", "stranger")
         self.assertEqual(StateStore(self.state_root).load(self.project).active_run.session_id, "session-1")
+
+        self.complete_worker(lead, "full")
 
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("full"))
@@ -254,6 +264,7 @@ class RouteDriftTests(unittest.TestCase):
             "model": BASE_ROUTE["model"], "model_reasoning_effort": BASE_ROUTE["effort"],
         }
         handle(replacement, self.env("base"))
+        self.complete_worker(replacement, "base")
         handle({**replacement, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("base"))
         state = StateStore(self.state_root).load(self.project)

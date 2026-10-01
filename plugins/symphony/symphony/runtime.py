@@ -17,14 +17,16 @@ from typing import Mapping
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
 from .host_evidence import (
+    _archived_fast_owner,
     archived_lead_followup,
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
+    retained_fast_escalation_receipt,
 )
 from .model import Action, Delegation, Event, ProjectState, RunState
-from .reducer import _ACTIVE_STATES, _stop_block_reason, reduce
+from .reducer import _ACTIVE_STATES, _stop_block_reason, _substantive_child_completed, reduce
 from .routing import (
     Assessment,
     EFFORTS,
@@ -181,10 +183,18 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 if followup is not None and provider == "claude" and event.kind == "subagent_stopped":
                     # Preserve the inbox ID until pending_event_id is captured;
                     # claude_current_native_lead_event below supplies the native ID.
-                    event = replace(event, payload=followup[1].payload)
+                    event = replace(event, payload={**followup[1].payload, '_symphony_native_recovery': True})
+                elif (followup is not None and event.kind == 'subagent_stopped'
+                      and followup[1].payload.get('_symphony_archived_fast_escalation') is True):
+                    event = replace(event, payload={**event.payload, '_symphony_native_recovery': True,
+                                                   '_symphony_archived_native_event_id': followup[1].event_id,
+                                                   '_symphony_archived_fast_escalation': True})
                 event = replace(event, payload={**event.payload, "_symphony_owner_conflict": False})
             state = _hold_pending_batch(state, provider, session)
             pending_event_id = event.event_id
+            if followup is not None and provider == 'claude' and event.kind == 'subagent_stopped':
+                # ACK the inbox ID, but commit the exact proven native event.
+                event = followup[1]
             if not current:
                 identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
                 if event_generation < generation:
@@ -282,9 +292,9 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 recovered = claude_recovered_lead_event(scoped, session, project, environ)
             except Exception:
                 if source.kind == "stop_requested" and scoped.active_run is not None:
-                    return state, ((Action("block_stop", {"reason":
+                    return state, (_claude_native_stop_guard(source,
                         "Symphony could not verify the tracked lead's native Claude result. "
-                        "Return to this session after its result is available."}),), acknowledged)
+                        "Return to this session after its result is available."), acknowledged)
                 recovered = None
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
@@ -296,12 +306,12 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                         scoped, session, project, environ)
                 except Exception:
                     if scoped.active_run is not None:
-                        return state, ((Action("block_stop", {"reason":
-                            _claude_unknown_turn_guidance(scoped.active_run)}),), acknowledged)
+                        return state, (_claude_native_stop_guard(source,
+                            _claude_unknown_turn_guidance(scoped.active_run)), acknowledged)
                     freshness, native_turn = "none", None
                 if freshness == "unknown":
-                    return state, ((Action("block_stop", {"reason":
-                        _claude_unknown_turn_guidance(scoped.active_run)}),), acknowledged)
+                    return state, (_claude_native_stop_guard(source,
+                        _claude_unknown_turn_guidance(scoped.active_run)), acknowledged)
                 if native_turn is not None:
                     state = _hold_pending_batch(state, provider, session)
                     state, _ = dispatch(state, native_turn)
@@ -657,10 +667,35 @@ def _finish_pending_batch(
 def _unresolved_child_guidance(
     state: ProjectState, provider: str, session: str, events: tuple[Event, ...],
 ) -> str:
+    if any('native_fast_escalation' not in receipt and 'native_followup_start_id' not in receipt
+           and receipt.get('provider') == provider and receipt.get('session') == session
+           and receipt.get('native_model') and receipt.get('native_effort')
+           and receipt.get('agent') == receipt.get('lead')
+           and any((event.payload.get('agent_id') or event.payload.get('subagent_id')) == receipt.get('agent')
+                   and (provider == 'claude' or _child_turn_token(event.payload) in {'', receipt.get('turn')})
+                   and re.findall(r'^SYMPHONY_FAST_DECISION: (eligible|escalate)[ \t]*\r?$',
+                                  str(event.payload.get('last_assistant_message') or ''), re.MULTILINE) == ['escalate']
+                   for event in events)
+           for receipt in state.terminal_receipts):
+        return ('Symphony retained an escalation callback whose acknowledgment proof is unavailable. '
+                'An older runtime may have removed its receipt metadata, and the retained run does not '
+                'supply all required anchors. Preserve the callback and reconcile it with its original '
+                'native turn before completion. Finish live work before reloading onto one runtime; '
+                'reloading alone does not restore missing proof.')
     history = [run for run in state.recent_runs
                if run.provider == provider and run.session_id == session]
     if history and f"{provider}:{session}" not in state.active_runs:
         run = history[-1]
+        if (_archived_fast_owner(run)
+                and any(event.kind == 'subagent_stopped'
+                        and (event.payload.get('agent_id') or event.payload.get('subagent_id')) == run.lead_identity
+                        and re.findall(r'^SYMPHONY_FAST_DECISION: (eligible|escalate)[ \t]*\r?$',
+                                       str(event.payload.get('last_assistant_message') or ''), re.MULTILINE) == ['escalate']
+                        for event in events)):
+            return ('Symphony retained an archived fast-lead escalation report; it cannot complete work '
+                    'under the old direct route. Request a fresh independent assessment for the full current '
+                    'objective. The retained native turn still needs exact lineage and outcome reconciliation; '
+                    'do not invent its outcome or claim completion.')
         superseded = {item.identity for item in run.delegations
                       if item.role == "lead" and item.identity != run.lead_identity}
         if any((event.payload.get("agent_id") or event.payload.get("subagent_id")) in superseded
@@ -752,6 +787,30 @@ def _pending_child_disposition(
     state: ProjectState, event: Event, provider: str, session: str,
 ) -> str:
     """Replay only a child lifecycle that the current run already identifies."""
+    if provider == 'codex' and event.kind in {'subagent_started', 'subagent_stopped'}:
+        canonical = replace(event, payload={**event.payload, 'session_id': session})
+        result = _terminal_result_id(canonical)
+        token = _child_turn_token(event.payload)
+        # This receipt was admitted by archived native/root proof. ACK only;
+        # a subsequent assessment or owner cannot inherit its transition.
+        if (token and event.payload.get('provider') == provider
+                and event.payload.get('session_id') in {session, event.payload.get('agent_id')}
+                and event.payload.get('parent_thread_id') == session
+                and any(receipt.get('native_fast_escalation') is True
+                        and receipt.get('provider') == provider and receipt.get('session') == session
+                        and receipt.get('agent') == event.payload.get('agent_id')
+                        and receipt.get('lead') == receipt.get('agent')
+                        and receipt.get('turn') == token
+                        and ((event.kind == 'subagent_stopped' and receipt.get('result') == result)
+                             or (event.kind == 'subagent_started' and _observed_role(event.payload) in {'', 'lead'}
+                                 and event.payload.get('model') in {None, '', receipt.get('native_model')}
+                                 and event.payload.get('model_reasoning_effort') in {None, '', receipt.get('native_effort')}
+                                 and receipt.get('native_followup_start_id') == hashlib.sha256(
+                                     f"codex-host-turn\0{receipt['agent']}\0{event.payload.get('turn_id')}".encode()
+                                 ).hexdigest() + ':followup-start'))
+                        for receipt in (retained_fast_escalation_receipt(state, item)
+                                        for item in state.terminal_receipts))):
+            return 'stale'
     if (_committed_child_start_replay(state, event, provider, session)
             or _committed_lead_event(state, event, provider, session)):
         return "stale"
@@ -1444,6 +1503,11 @@ def _handle_prompt(
             actions += (
                 Action("inject_context", {"text": _task_guidance(next_state, argument, provider, str(source.payload.get("session_id") or ""))}),
             )
+        else:
+            actions += (Action('inject_context', {'text':
+                'The enable control has already been applied. This control-only invocation is handled '
+                'at the root; report its result. It creates no managed task: do not spawn a fast lead, '
+                'assessor, lead or worker for the control.'}),)
         return next_state, actions
     if name == "start":
         if not argument:
@@ -1570,6 +1634,43 @@ def _child_turn_token(payload: Mapping[str, object]) -> str:
     return ""
 
 
+def _record_substantive_child(state: ProjectState, source: Event, role: str,
+                              pending: Mapping, *, successful: bool) -> ProjectState:
+    run = state.active_run
+    if not run or not run.lead_identity:
+        return state
+    contract = run.assessment.get('substantive_contract')
+    if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int or contract['version'] != 1
+            or not isinstance(contract.get('epoch'), str) or not contract['epoch']
+            or not isinstance(contract.get('accepted_at'), str)
+            or source.observed_at < contract['accepted_at']):
+        return state
+    if source.payload.get('parent_thread_id') not in {None, '', run.session_id, run.lead_identity}:
+        return state
+    identity = str(source.payload.get('agent_id') or source.payload.get('subagent_id') or '')
+    scope = {'epoch': contract['epoch'], 'lead': run.lead_identity,
+             'owner_generation': run.owner_generation, 'run_id': run.run_id}
+    recorded = run.assessment.get('_substantive_children', {})
+    proofs = dict(recorded) if isinstance(recorded, Mapping) else {}
+    proof = proofs.get(identity)
+    if (_observed_role(source.payload) != role and pending.get('role') != role
+            and not isinstance(proof, Mapping)):
+        return state
+    token = _child_turn_token(source.payload)
+    if source.kind == 'subagent_started':
+        proof = {**scope, 'turn': token, 'successful': False}
+    elif (not isinstance(proof, Mapping) or any(proof.get(key) != value for key, value in scope.items())
+          or proof.get('turn') != token):
+        # Role/model-only launch intents cannot identify this native child.
+        return state
+    proofs[identity] = {**proof, 'successful': successful}
+    assessment = {**run.assessment, '_substantive_children': proofs}
+    updated = replace(run, assessment=assessment)
+    if _substantive_child_completed(updated):
+        assessment.pop('_substantive_child_missing', None)
+    return replace(state, active_run=updated)
+
+
 def _observe_delegation(
     state: ProjectState, source: Event, environ: Mapping[str, str] | None = None,
 ) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -1689,7 +1790,9 @@ def _observe_delegation(
             receipt["native_agent_type"] = str(source.payload.get("agent_type") or "")
             receipt["native_model"] = str(source.payload.get("model") or "")
             receipt["native_effort"] = str(source.payload.get("model_reasoning_effort") or "")
-            followup_start = f"{source.event_id}:followup-start"
+            if source.payload.get('_symphony_archived_fast_escalation') is True:
+                receipt['native_fast_escalation'] = True
+            followup_start = f"{source.payload.get('_symphony_archived_native_event_id', source.event_id)}:followup-start"
             if followup_start in state.active_run.assessment.get("_start_event_ids", ()):
                 receipt["native_followup_start_id"] = followup_start
             if (source.payload.get("provider") == "claude"
@@ -1987,6 +2090,8 @@ def _observe_delegation(
     if role == "consultant" and terminal and state.active_run:
         decisions = _decision_markers(source.payload.get("last_assistant_message", ""))
         state = _set_invalid_consultant(state, str(identity), not decisions)
+        state = _record_substantive_child(state, source, role, pending,
+                                         successful=status.lower() in {"completed", "done", "success", "succeeded"} and bool(decisions))
         if not decisions:
             actions += (
                 Action(
@@ -2015,6 +2120,9 @@ def _observe_delegation(
                         _derived(state, source, "lead_completed", dict(pending), "deferred-lead-completion"),
                     )
                     actions += completion_actions
+    elif role == 'worker' or (role == 'consultant' and not terminal):
+        state = _record_substantive_child(state, source, role, pending,
+                                         successful=terminal and status.lower() in {"completed", "done", "success", "succeeded"})
     if role == "lead" and terminal and state.active_run:
         if str(identity) != state.active_run.lead_identity:
             return state, actions
@@ -2025,6 +2133,11 @@ def _observe_delegation(
         outcome = {"status": status}
         report = str(source.payload.get("last_assistant_message") or "")
         fast_pending = bool(state.active_run.assessment.get("_fast_pending"))
+        fast_continuation = bool(not fast_pending and source.payload.get('_symphony_native_recovery')
+                                 and _archived_fast_owner(state.active_run))
+        continuation_decisions = [line.strip().removeprefix('SYMPHONY_FAST_DECISION:').strip()
+                                  for line in report.splitlines()
+                                  if line.strip().startswith('SYMPHONY_FAST_DECISION:')] if fast_continuation else []
         decisions = [line.strip().removeprefix("SYMPHONY_FAST_DECISION:").strip()
                      for line in report.splitlines()
                      if line.strip().startswith("SYMPHONY_FAST_DECISION:")] if fast_pending else []
@@ -2072,7 +2185,9 @@ def _observe_delegation(
         outcome_lines = [line for line in report.splitlines() if line.strip().startswith("SYMPHONY_OUTCOME:")]
         if outcome_lines:
             try:
-                reported = json.loads(outcome_lines[-1].strip().removeprefix("SYMPHONY_OUTCOME:").strip())
+                if len(outcome_lines) != 1:
+                    raise ValueError('multiple outcome reports')
+                reported = json.loads(outcome_lines[0].strip().removeprefix("SYMPHONY_OUTCOME:").strip())
                 reported_status = reported.get("status") if isinstance(reported, Mapping) else None
                 if not isinstance(reported_status, str) or not reported_status:
                     raise ValueError("outcome status missing")
@@ -2081,12 +2196,15 @@ def _observe_delegation(
             except (TypeError, ValueError):
                 successful = False
                 actions += (Action("inject_context", {"text":
-                    "The lead ended with a malformed SYMPHONY_OUTCOME report. Reconcile its result or retry the lead; the run remains recoverable."}),)
+                    "The lead ended with a malformed or duplicate SYMPHONY_OUTCOME report. Reconcile its result or retry the lead; the run remains recoverable."}),)
         elif fast_pending:
             successful = False
             actions += (Action("inject_context", {"text":
                 "Fast lead completion requires an explicit SYMPHONY_OUTCOME report."}),)
         if fast_pending and len(outcome_lines) != 1:
+            successful = False
+        if continuation_decisions and (len(continuation_decisions) != 1
+                                       or continuation_decisions[0] not in {'eligible', 'escalate'}):
             successful = False
         if fast_pending and successful and fast_decision == "eligible":
             selected = state.active_run.assessment["_fast_route"]
@@ -2182,6 +2300,14 @@ def _observe_delegation(
             updated_assessment.pop("_lead_route_mismatch", None)
             updated_assessment.pop("_lead_route_mismatch_owner", None)
             state = replace(state, active_run=replace(state.active_run, assessment=updated_assessment))
+        if (successful and continuation_decisions == ['escalate'] and
+                (len(outcome_lines) == 1 or
+                 source.payload.get('_symphony_archived_fast_escalation') is True and not outcome_lines)):
+            state = _escalate_fast_run(state, source, fresh_assessment=True)
+            return state, actions + (Action('inject_context', {'text':
+                'The archived fast lead escalated this continuation. Its old direct route cannot complete '
+                'substantive work. Spawn an independent assessor for the full current objective, then the '
+                'new matrix-selected lead; preserve lifecycle ownership while reassessing.'}),)
         # 1.5.0 persisted lead failures without the retry marker. Its latest
         # recovery event still distinguishes a failed lead from a later failed
         # worker, whose old lead result must stay invalid.
@@ -2226,6 +2352,11 @@ def _observe_delegation(
                 ),
             )
             return state, actions
+        if successful and not _substantive_child_completed(state.active_run):
+            assessment = dict(state.active_run.assessment)
+            assessment['_substantive_child_missing'] = True
+            state = replace(state, active_run=replace(state.active_run, assessment=assessment))
+            successful = False
         completion_kind = "lead_completed" if successful else "lead_failed"
         # Only the lifecycle fact is recorded. The lead's prose belongs to the
         # host transcript, not to Symphony's durable state.
@@ -2239,6 +2370,8 @@ def _observe_delegation(
                     "identity": str(identity),
                     "owner_generation": state.active_run.owner_generation,
                     "outcome": outcome,
+                    **({'reason': 'substantive_child_missing'} if completion_kind == 'lead_failed'
+                       and state.active_run.assessment.get('_substantive_child_missing') else {}),
                     **({"turn_token": token} if completion_kind == "lead_failed" and token else {}),
                     **({"native_host_failed": True} if completion_kind == "lead_failed"
                         and terminal_matches_active_start
@@ -2292,11 +2425,17 @@ def _mark_fast_run(state: ProjectState, selection: Mapping[str, str], provider: 
     return replace(state, active_run=replace(run, assessment=assessment))
 
 
-def _escalate_fast_run(state: ProjectState, source: Event) -> ProjectState:
+def _escalate_fast_run(state: ProjectState, source: Event, *, fresh_assessment: bool = False) -> ProjectState:
     run = state.active_run
     if not run:
         return state
     assessment = dict(run.assessment)
+    if fresh_assessment:
+        for key in ('size', 'complexity', 'risk', 'rationale', 'topology', 'route',
+                    'substantive_contract', '_substantive_children', '_substantive_child_missing'):
+            assessment.pop(key, None)
+        if source.payload.get('_symphony_archived_fast_escalation') is True:
+            assessment['_archived_fast_escalation_turn'] = _child_turn_token(source.payload)
     assessment.pop("_fast_pending", None)
     assessment["_fast_escalated"] = True
     assessment.pop("_lead_expected_route", None)
@@ -2501,6 +2640,15 @@ def _prepare_delegation(
         # changes subsequent assessors, not an already queued native spawn.
         launch_selection = dict(selected, model=model, effort=effort)
     state = _queue_pending_delegation(state, role, objective, model, effort, launch_selection)
+    if provider == 'claude' and fast_launch:
+        launch_id = source.payload.get('tool_use_id')
+        if isinstance(launch_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,160}', launch_id):
+            assessment = {**state.active_run.assessment,
+                          '_claude_fast_launch_hash': hashlib.sha256(launch_id.encode()).hexdigest()}
+            prompt_id = source.payload.get('prompt_id')
+            if isinstance(prompt_id, str) and prompt_id:
+                assessment['_claude_fast_root_prompt_hash'] = hashlib.sha256(prompt_id.encode()).hexdigest()
+            state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     return state, actions
 
 
@@ -2724,6 +2872,9 @@ def _accept_assessment(
         "topology": route.execution,
         "route": route_data,
     }
+    if route.execution in {'delegated', 'mixed'}:
+        accepted['substantive_contract'] = {'version': 1, 'epoch': source.event_id,
+                                            'accepted_at': source.observed_at}
     return reduce(state, _derived(state, source, "assessment_accepted", accepted, "assessment"))
 
 
@@ -2994,6 +3145,8 @@ def _stop_block_text(
         reason = "the tracked lead has no reconciled outcome; inspect its ended or interrupted result and recover or retry it"
     elif reason == "lead_not_started":
         reason = "assessment work has ended; reconcile its result and launch the selected lead"
+    elif reason == 'substantive_child_missing':
+        reason = 'resume the SAME registered lead to delegate substantive work, integrate and verify its result, then report completion'
     force = "/symphony:stop --force" if provider == "claude" else "$symphony:symphony stop --force"
     return (
         f"Symphony stop is blocked for {scope}: {reason}. Let the tracked agents finish, "
@@ -3017,8 +3170,14 @@ def _render_actions(
     for action in actions:
         if action.kind in {"inject_context", "block_tool"}:
             rendered.append(action)
+        elif action.kind == 'request_substantive_work':
+            rendered.append(Action('inject_context', {'text': _substantive_recovery_guidance(state.active_run, provider)}))
         elif action.kind == "block_stop":
             text = _stop_block_text(action.payload, provider, scope)
+            if (state.active_run and state.active_run.assessment.get('_fast_escalated')
+                    and not state.active_run.assessment.get('size')):
+                text += (' Request a fresh independent assessment of the full current objective, '
+                         'then launch its matrix-selected lead; the old direct route cannot complete it.')
             rendered.append(
                 Action("inject_context", {"text": text})
                 if prompt_originated
@@ -3043,7 +3202,8 @@ def _render_actions(
                 )
             )
         elif action.kind == "project_enabled":
-            rendered.append(Action("inject_context", {"text": "Symphony is enabled for this project; hooks are guarded."}))
+            rendered.append(Action("inject_context", {"text": "Symphony is enabled for this project; hooks are guarded. "
+                "Enabling alone creates no managed task or child spawn; route an accompanying task only through its separate guidance."}))
         elif action.kind == "project_disabled":
             rendered.append(Action("inject_context", {"text": "Symphony is disabled for future tasks in this project."}))
         elif action.kind == "request_assessment":
@@ -3099,9 +3259,9 @@ def _render_actions(
                 "assign substantive implementation, diagnosis, design, review tasks, and product judgment to workers "
                 "or consultants; small tasks need one worker, medium tasks need bounded worker packets, "
                 "and large tasks delegate project work. The lead coordinates, reviews integration, and verifies results. "
-                "Use the matrix for each child packet's own size/complexity. Require the lead's final response "
-                "to end with one exact `SYMPHONY_OUTCOME: {\"status\":\"completed\"}` line only after "
-                "verification and all children have returned; use blocked or failed when work remains."}))
+                "Use the matrix for each child packet's own size/complexity. After verification and all children "
+                "have returned, native successful assessed completion is sufficient. If supplied, a `SYMPHONY_OUTCOME:` "
+                "report must be one valid JSON line; use blocked or failed when work remains."}))
         elif action.kind == "reject_lead_replacement":
             lead = state.active_run.lead_identity if state.active_run else "the registered lead"
             rendered.append(Action("inject_context", {"text":
@@ -3155,6 +3315,23 @@ def _provider_cells(snapshot, role: str) -> list[str]:
 
 def _lead_guidance(state: ProjectState, provider: str) -> str:
     """Give the starting lead its children's exact provider spawn contract."""
+    if state.active_run and (state.active_run.assessment.get('_fast_pending')
+                             or _archived_fast_owner(state.active_run)):
+        return (
+            'You are the registered Symphony fast lead. Before any changes, decide whether the WHOLE '
+            'objective consists only of predetermined mechanical steps with an expected result, bounded '
+            'scope, clear requirements, low risk, available required tools, and concrete verification. '
+            'A brief request or supplied command alone does not establish eligibility. Implementation, '
+            'diagnosis, design, substantive review, product judgment, mixed work, or uncertainty requires '
+            'escalation before any changes, including tiny features and run-and-fix objectives. '
+            'Do not spawn workers, consultants, assessors, or any other descendants. '
+            'If eligible, perform the mechanical steps, verify the result, and return exactly one '
+            '`SYMPHONY_FAST_DECISION: eligible` line and one valid '
+            '`SYMPHONY_OUTCOME: {"status":"completed"}` line. Otherwise make no changes and return '
+            'exactly one `SYMPHONY_FAST_DECISION: escalate` line without a completion outcome. '
+            'The root then requests independent assessment. A resumed fast turn only reconciles the same '
+            'bounded mechanical task; a new or substantive objective requires fresh assessment before changes.'
+        )
     snapshot = _snapshot(state, provider)
     protocol = (
         'Every worker spawn must pass explicit `model` and `reasoning_effort`, `fork_turns="none"`, '
@@ -3288,8 +3465,10 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         "assign substantive work to workers or consultants; small tasks need one worker, medium tasks need "
         "bounded worker packets, and large tasks delegate project work. The lead coordinates, integrates, "
         "and verifies results. Use the matrix for each child packet's own size/complexity. "
-        "Require the lead's final response to end with one exact `SYMPHONY_OUTCOME: {\"status\":\"completed\"}` "
-        "line only after verification and all children have returned; use blocked or failed when work remains. "
+        "After verification and all children have returned, native successful assessed completion is sufficient. "
+        "If supplied, a `SYMPHONY_OUTCOME:` report must be one valid JSON line; use blocked or failed when work remains. "
+        "Archived followup only reconciles the same bounded task. A new or substantive objective starts a fresh "
+        "assessment and delegation scope; never credit previous-task workers to it. "
         "Relay the task in full: the lead cannot see this conversation, so if the request has several parts, "
         "every part goes in the packet and the acceptance check covers all of them. "
         "The assessor packet must require the exact size/complexity/risk vocabulary above and explain that "
@@ -3327,13 +3506,28 @@ def _governance(state: ProjectState) -> str:
     return "enabled" if state.enabled else "transactional"
 
 
+def _claude_native_stop_guard(source: Event, reason: str) -> tuple[Action, ...]:
+    if (source.kind == 'stop_requested' and source.payload.get('hook_event_name') == 'Stop'
+            and source.payload.get('stop_hook_active') is True):
+        # Release this host turn without treating unverifiable native work as
+        # completed. Dispatching Stop here could archive the older outcome.
+        return (Action('permit_stop', {'reason': reason +
+            ' This repeated Stop releases the host turn only; the run and unresolved evidence remain open.'}),)
+    return (Action('block_stop', {'reason': reason}),)
+
+
 def _claude_unknown_turn_guidance(run: RunState) -> str:
     lead = run.lead_identity
+    repair = (
+        'If it has ended without a standalone SYMPHONY_OUTCOME marker, make at most one native '
+        f'SendMessage repair request to `to: {lead}` for its actual final result and exact marker. '
+        if run.assessment.get('_fast_pending') or _archived_fast_owner(run) else
+        f'If its actual final result is unavailable, make at most one native SendMessage request to `to: {lead}` '
+        'for that result. Ordinary assessed completion accepts successful native terminal status without '
+        'an outcome marker; an archived continuation retains its stricter marker contract. ')
     return (
         "Symphony could not verify the tracked lead's latest native Claude turn. "
-        f"Inspect the latest result for original lead `{lead}`. If it has ended without "
-        "a standalone SYMPHONY_OUTCOME marker, make at most one native SendMessage "
-        f"repair request to `to: {lead}` for its actual final result and exact marker. "
+        f"Inspect the latest result for original lead `{lead}`. " + repair +
         "Await that same agent's response, then invoke normal `/symphony:stop` once. "
         "If this repair was already attempted or its response is still unverifiable, "
         "do not repeat SendMessage or Stop in this turn. Report the unresolved result "
@@ -3395,8 +3589,20 @@ def _refresh_completion_guidance(
     )
 
 
+def _substantive_recovery_guidance(run: RunState | None, provider: str) -> str:
+    native = ('Use followup_task with the original underscore task_name, not its /root/ path or UUID. '
+              if provider == 'codex' else 'Use SendMessage to resume that same agent. ')
+    return ('Resume the SAME registered lead; this assessed route needs successful substantive worker '
+            'or classified consultant evidence from the current assessment and owner generation. '
+            + native + 'Reconcile a verifiable current-scope worker Start, or launch a fresh bounded worker '
+            'whose Start and successful terminal are observed. Integrate and verify its result, then let '
+            'that lead report completion again. Preserve this run and ownership.')
+
+
 def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     run = state.active_run
+    if run and run.assessment.get('_substantive_child_missing'):
+        return _substantive_recovery_guidance(run, provider)
     if not run:
         return "Symphony has no active run."
     if run.assessment.get("_fast_escalated") and not run.assessment.get("size"):

@@ -196,6 +196,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                             cwd=directory, env={**env, "CODEX_SESSION_ID": session},
                             capture_output=True, text=True, check=False)
                         self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
+                    for event in ('SubagentStart', 'SubagentStop'):
+                        payload = _payload(new_root, provider, event, directory, session, 'worker')
+                        result, _ = self.run_hook(commands[event], root, provider, directory, payload)
+                        self.assertEqual(0, result.returncode, result.stderr)
                     payload = _payload(new_root, provider, "SubagentStop", directory, session, "lead")
                     payload["last_assistant_message"] = 'SYMPHONY_OUTCOME: {"status":"completed"}'
                     result, _ = self.run_hook(commands["SubagentStop"], root, provider, directory, payload)
@@ -253,6 +257,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                                              cwd=directory, env={**env, "CODEX_SESSION_ID": "old-session"},
                                              capture_output=True, text=True, check=False)
                     self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+                for event in ('SubagentStart', 'SubagentStop'):
+                    worker = _payload(new_root, provider, event, directory, 'old-session', 'worker')
+                    result, _ = self.run_hook(commands[event], root, provider, directory, worker)
+                    self.assertEqual(result.returncode, 0, result.stderr)
                 for event in ("SubagentStop", "UserPromptSubmit"):
                     result, env = self.run_hook(commands[event], root, provider, directory, payloads[event])
                     self.assertEqual(result.returncode, 0, result.stderr)

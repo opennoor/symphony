@@ -6,6 +6,7 @@ Only compact evidence is exported. Raw transcripts and credentials stay temporar
 """
 
 import argparse
+from dataclasses import replace
 from datetime import datetime
 import hashlib
 import json
@@ -25,8 +26,9 @@ from native_managed_concurrency import prepare_baseline_capture, projects, run_g
 PLUGIN = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
 sys.path.insert(0, str(PLUGIN))
 from symphony.host_evidence import _complete_native_jsonl, _native_jsonl  # noqa: E402
+from symphony import host_evidence  # noqa: E402
 from symphony.routing import Assessment, fast_lead_selection, route_for, snapshot_for  # noqa: E402
-from symphony.store import StateStore  # noqa: E402
+from symphony.store import StateStore, _state_from_dict  # noqa: E402
 
 CASES = {
     "command": "Run python -m unittest -q and report the result.",
@@ -143,7 +145,68 @@ def failure_diagnostics(provider, root, document):
             "boost_levels": sorted({value for value in boosts if isinstance(value, str) and value in {"off", "xhigh", "max", "ultra"}}),
             "callbacks": counts, "native_signals": native_signals,
             'fast_raw_tool_categories': fast_calls, 'root_native_launches': root_launches,
+            'claude_completion': [claude_completion_probe(document, run.get('session_id'), root / 'primary', home)
+                for run in document.get('active_runs', {}).values()
+                if provider == 'claude' and run.get('provider') == provider and run.get('status') == 'completing'],
             "lifecycle": lifecycle_diagnostics(provider, root, document), 'phases': phases}
+
+
+def claude_completion_probe(document, session, project, home):
+    """Trace completing freshness using fixed facts, never native IDs or text."""
+    state = _state_from_dict(document)
+    run = state.active_runs.get(f'claude:{session}')
+    if run is None:
+        return {'freshness': 'no_active_run'}
+    state = replace(state, active_run=run)
+    captured = {'has_recovery_anchor': bool(run.assessment.get('_claude_native_recovery'))}
+    readers = {host_evidence._claude_native_lead_event.__code__: 'native_reader',
+               host_evidence._claude_native_prompt_activity.__code__: 'prompt_activity'}
+    def trace(frame, event, value):
+        kind = readers.get(frame.f_code)
+        if kind is None:
+            return None
+        if event == 'return':
+            values = frame.f_locals
+            facts = {'source_line': frame.f_lineno,
+                     'result': value[0] if kind == 'prompt_activity' else 'accepted' if value else 'rejected'}
+            launched, started = values.get('launched_at'), values.get('started_at')
+            if isinstance(launched, datetime) and isinstance(started, datetime):
+                facts['launch_minus_run_start_ms'] = round((launched - started).total_seconds() * 1000, 3)
+                facts['launch_before_run_start'] = launched < started
+            meta, launch = values.get('meta'), values.get('launch')
+            if isinstance(meta, dict) and isinstance(launch, dict):
+                facts['root_launch_id_matches_meta'] = launch.get('id') == meta.get('toolUseId')
+                facts['accepted_fast_launch_anchor_matches'] = host_evidence._claude_observed_fast_launch(
+                    run, str(meta.get('toolUseId') or ''),
+                    values.get('root_prompt_id', values.get('root_prompt')))
+            parent = values.get('parent')
+            if isinstance(parent, dict):
+                facts['root_cwd_match'] = Path(str(parent.get('cwd') or '')).resolve() == project.resolve()
+            prompts = [row for row in values.get('child_rows', ()) if row.get('type') == 'user'
+                       and isinstance(row.get('message', {}).get('content'), str)]
+            first = host_evidence._instant(prompts[0].get('timestamp')) if prompts else None
+            if first and isinstance(started, datetime):
+                facts['first_child_prompt_before_run_start'] = first < started
+            facts['stage'] = ('accepted' if facts['result'] in {'accepted', 'single', 'multiple'} else
+                'child_before_hook' if facts.get('first_child_prompt_before_run_start') else
+                'launch_before_hook' if facts.get('launch_before_run_start')
+                    and not facts.get('accepted_fast_launch_anchor_matches') else
+                'terminal' if 'terminal' in values else 'child_turn' if 'prompt_indices' in values or 'prompts' in values else
+                'root_launch' if 'launches' in values else 'metadata' if 'meta' in values else
+                'paths' if 'paths' in values else 'state')
+            captured[kind] = facts
+        return trace
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        captured['freshness'] = host_evidence.claude_completing_lead_turn(
+            state, session, project, {'CLAUDE_CONFIG_DIR': str(home)})[0]
+    except (OSError, TypeError, ValueError, AttributeError) as error:
+        captured['freshness'] = 'probe_error'
+        captured['error_type'] = type(error).__name__
+    finally:
+        sys.settrace(previous)
+    return captured
 
 
 def raw_tool_categories(provider, rows):

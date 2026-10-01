@@ -49,6 +49,31 @@ def _reported_status(message: object) -> str | None:
     return status if isinstance(status, str) and status else None
 
 
+def _archived_fast_escalation(message: object) -> bool:
+    """An escalation report authorizes reassessment, never completion."""
+    if not isinstance(message, str):
+        return False
+    lines = [line.strip() for line in message.splitlines()]
+    return (not any(line.startswith('SYMPHONY_OUTCOME:') for line in lines)
+            and [line for line in lines if line.startswith('SYMPHONY_FAST_DECISION:')]
+            == ['SYMPHONY_FAST_DECISION: escalate'])
+
+
+def _archived_fast_owner(run: RunState) -> bool:
+    """Old fast attempt metadata cannot authorize an assessed replacement."""
+    fast = run.assessment.get('_fast_route')
+    lead = next((child for child in run.delegations
+                 if child.identity == run.lead_identity and child.role == 'lead'), None)
+    route = run.assessment.get('route', {})
+    return bool(isinstance(fast, dict) and fast.get('model') and fast.get('effort')
+        and not run.assessment.get('_fast_escalated')
+        and run.assessment.get('topology') in {None, '', 'direct'}
+        and lead and (lead.requested_tier, lead.requested_effort) == (fast['model'], fast['effort'])
+        and isinstance(route, dict)
+        and route.get('lead_model', fast['model']) == fast['model']
+        and route.get('lead_effort', fast['effort']) == fast['effort'])
+
+
 def _native_jsonl(path: Path) -> list[dict] | None:
     """Read one complete, bounded native transcript without following aliases."""
     try:
@@ -80,9 +105,22 @@ def _complete_native_jsonl(path: Path) -> list[dict] | None:
         return None
 
 
+def _claude_observed_fast_launch(run: RunState, launch_id: str, root_prompt: str | None) -> bool:
+    """Bind a native launch predating its PreToolUse observation to that hook."""
+    pinned = run.assessment.get('_claude_fast_launch_hash')
+    prompt = run.assessment.get('_claude_fast_root_prompt_hash')
+    return bool(run.provider == 'claude' and _archived_fast_owner(run) and isinstance(pinned, str)
+                and re.fullmatch(r'[0-9a-f]{64}', pinned)
+                and hashlib.sha256(launch_id.encode()).hexdigest() == pinned
+                and (prompt is None or isinstance(prompt, str)
+                     and re.fullmatch(r'[0-9a-f]{64}', prompt) and isinstance(root_prompt, str)
+                     and hashlib.sha256(root_prompt.encode()).hexdigest() == prompt))
+
+
 def _claude_native_lead_event(
     state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
     *, require_missing: bool, target_prompt: str | None = None,
+    allow_fast_escalation: bool = False,
 ) -> Event | None:
     """Validate one lead terminal against Claude's native parent and child turns.
 
@@ -161,7 +199,7 @@ def _claude_native_lead_event(
     except (OSError, ValueError):
         return None
     launched_at = _instant(parent.get("timestamp"))
-    if launched_at is None or launched_at < started_at:
+    if launched_at is None:
         return None
     # Claude's SubagentStop prompt_id identifies the root prompt that launched
     # Agent, while the child transcript uses a separate prompt uuid. Keep both
@@ -184,6 +222,8 @@ def _claude_native_lead_event(
                 return None
             root_prompts.append(prompt_id)
     root_prompt_id = root_prompts[-1] if root_prompts else None
+    if launched_at < started_at and not _claude_observed_fast_launch(run, launch_id, root_prompt_id):
+        return None
     # A tool-result user row belongs to the current turn. A new textual user
     # prompt starts a new turn and invalidates an older completed report.
     prompt_indices = []
@@ -194,6 +234,9 @@ def _claude_native_lead_event(
         if row.get("type") == "user" and isinstance((row.get("message") or {}).get("content"), str):
             prompt_indices.append(index)
     if not prompt_indices:
+        return None
+    first_prompt_at = _instant(child_rows[prompt_indices[0]].get('timestamp'))
+    if first_prompt_at is None or first_prompt_at < started_at:
         return None
     if target_prompt is None:
         prompt_index = len(prompt_indices) - 1
@@ -240,7 +283,8 @@ def _claude_native_lead_event(
     final_status = _reported_status(final_text)
     if "SYMPHONY_OUTCOME:" in final_text and final_status != "completed":
         return None
-    reports = [final_text] if final_status == "completed" else []
+    reports = [final_text] if (final_status == "completed" or
+        allow_fast_escalation and _archived_fast_escalation(final_text)) else []
     if not reports:
         # Background agents hand their result to the parent and then end with
         # a brief goodbye. Only the current turn's successful handback counts.
@@ -260,7 +304,8 @@ def _claude_native_lead_event(
                    and item.get("tool_use_id") == handback_id]
         if (not isinstance(handback_id, str) or len(results) != 1
                 or results[0].get("is_error") is True
-                or _reported_status(report) != "completed"):
+                or not (_reported_status(report) == "completed" or
+                        allow_fast_escalation and _archived_fast_escalation(report))):
             return None
         reports = [report]
     # A later worker failure or restart supersedes this result, even when its
@@ -316,7 +361,7 @@ def _claude_native_prompt_activity(
     """Classify child turns without using callback arrival as native turn order."""
     run = state.active_run
     lead_id = run.lead_identity if run else None
-    if (not run or run.session_id != session or not isinstance(lead_id, str)
+    if (not run or run.provider != 'claude' or run.session_id != session or not isinstance(lead_id, str)
             or not _CLAUDE_ID.fullmatch(lead_id)):
         return "absent", None
     lead = next((item for item in run.delegations
@@ -356,18 +401,18 @@ def _claude_native_prompt_activity(
     if parent_rows is None or child_rows is None:
         return "unknown", None
     launches = []
-    for row in parent_rows:
+    for index, row in enumerate(parent_rows):
         if row.get("type") != "assistant" or row.get("sessionId") != session:
             continue
         message = row.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list) or any(not isinstance(item, dict) for item in content):
             return "unknown", None
-        launches.extend((row, item) for item in content
+        launches.extend((index, row, item) for item in content
                         if item.get("id") == meta["toolUseId"])
     if len(launches) != 1:
         return "unknown", None
-    parent, launch = launches[0]
+    parent_index, parent, launch = launches[0]
     details = launch.get("input")
     if (launch.get("type") != "tool_use" or launch.get("name") != "Agent"
             or not isinstance(details, dict)
@@ -379,8 +424,23 @@ def _claude_native_prompt_activity(
     except (OSError, ValueError):
         return "unknown", None
     launched_at = _instant(parent.get("timestamp"))
-    if launched_at is None or launched_at < started_at:
+    if launched_at is None:
         return "unknown", None
+    if launched_at < started_at:
+        root_prompts = []
+        for row in parent_rows[:parent_index]:
+            message = row.get('message')
+            content = message.get('content') if isinstance(message, dict) else None
+            textual = isinstance(content, str) or (isinstance(content, list) and content
+                and all(isinstance(item, dict) and item.get('type') == 'text'
+                        and isinstance(item.get('text'), str) for item in content))
+            when = _instant(row.get('timestamp'))
+            if (row.get('type') == 'user' and row.get('sessionId') == session
+                    and textual and when is not None and when <= launched_at):
+                root_prompts.append(row.get('uuid'))
+        root_prompt = root_prompts[-1] if root_prompts else None
+        if not _claude_observed_fast_launch(run, meta['toolUseId'], root_prompt):
+            return "unknown", None
     prompts = []
     for row in child_rows:
         if (row.get("sessionId") != session or row.get("agentId") != lead_id
@@ -409,7 +469,7 @@ def _claude_native_prompt_activity(
             prompt_id = row.get("uuid")
             when = _instant(row.get("timestamp"))
             if (not isinstance(prompt_id, str) or not prompt_id or when is None
-                    or when < launched_at or prompts and when <= prompts[-1][1]):
+                    or when < launched_at or when < started_at or prompts and when <= prompts[-1][1]):
                 return "unknown", None
             prompts.append((prompt_id, when))
     if not prompts:
@@ -419,6 +479,7 @@ def _claude_native_prompt_activity(
 
 def claude_completing_lead_turn(
     state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
+    *, allow_fast_escalation: bool = False,
 ) -> tuple[str, Event | None]:
     """Prevent Stop from archiving an older recovered Claude outcome."""
     run = state.active_run
@@ -434,7 +495,8 @@ def claude_completing_lead_turn(
             return "unknown", None
         try:
             event = _claude_native_lead_event(
-                state, session, project, environ, require_missing=False)
+                state, session, project, environ, require_missing=False,
+                allow_fast_escalation=allow_fast_escalation)
         except (AttributeError, OSError, TypeError, ValueError):
             return "unknown", None
         if event is None or event.payload["prompt_id"] != latest:
@@ -442,7 +504,8 @@ def claude_completing_lead_turn(
         return "completed", event
     try:
         event = _claude_native_lead_event(
-            state, session, project, environ, require_missing=False)
+            state, session, project, environ, require_missing=False,
+            allow_fast_escalation=allow_fast_escalation)
     except (AttributeError, OSError, TypeError, ValueError):
         return "unknown", None
     if event is None:
@@ -455,6 +518,7 @@ def claude_completing_lead_turn(
 
 def _claude_callback_matches_native(
     source: Event, native: Event, session: str, *, allow_conflict: bool = False,
+    allow_fast_escalation: bool = False,
 ) -> bool:
     identity = native.payload["agent_id"]
     payload = source.payload
@@ -473,7 +537,8 @@ def _claude_callback_matches_native(
         and payload.get("model") in {None, "", native.payload["model"]}
         and payload.get("model_reasoning_effort") in {
             None, "", native.payload["model_reasoning_effort"]}
-        and isinstance(report, str) and _reported_status(report) == "completed"
+        and isinstance(report, str) and (_reported_status(report) == "completed" or
+            allow_fast_escalation and _archived_fast_escalation(report))
         and native.payload["last_assistant_message"] in report
     )
 
@@ -499,6 +564,84 @@ def claude_current_native_lead_event(
     return native
 
 
+def retained_fast_escalation_receipt(state: ProjectState, receipt: Mapping) -> dict:
+    """Recover ACK metadata lost by the released 1.6.0 codec, never lifecycle."""
+    if ('native_fast_escalation' in receipt or 'native_followup_start_id' in receipt
+            or receipt.get('provider') not in {'codex', 'claude'}
+            or receipt.get('agent') != receipt.get('lead')
+            or receipt.get('parent') != receipt.get('session')
+            or receipt.get('status') != 'completed'
+            or not all(isinstance(receipt.get(key), str) and receipt[key] for key in (
+                'run_id', 'agent', 'session', 'turn', 'result',
+                'native_agent_type', 'native_model', 'native_effort'))):
+        return dict(receipt)
+    runs = (*state.active_runs.values(), *((state.active_run,) if state.active_run else ()),
+            *state.recent_runs)
+    for run in runs:
+        turns = run.assessment.get('_terminal_turns', {})
+        results = run.assessment.get('_terminal_event_ids', ())
+        starts = run.assessment.get('_start_event_ids', ())
+        if (run.provider != receipt['provider'] or run.session_id != receipt['session']
+                or run.run_id != receipt['run_id']
+                or run.assessment.get('_archived_fast_escalation_turn') != receipt['turn']
+                or not isinstance(turns, Mapping) or not isinstance(turns.get(receipt['agent']), (tuple, list))
+                or receipt['turn'] not in turns[receipt['agent']]
+                or not isinstance(results, (tuple, list)) or receipt['result'] not in results
+                or not isinstance(starts, (tuple, list))
+                or not any(lead.identity == receipt['agent'] and lead.role == 'lead'
+                           and lead.requested_tier == receipt['native_model']
+                           and lead.requested_effort == receipt['native_effort']
+                           for lead in run.delegations)):
+            continue
+        if receipt['provider'] == 'codex':
+            if not receipt['turn'].startswith('turn_id:'):
+                continue
+            event_id = hashlib.sha256(('codex-host-turn\0' + receipt['agent'] + '\0' +
+                                      receipt['turn'].removeprefix('turn_id:')).encode()).hexdigest()
+            starts = (event_id + ':followup-start',) if event_id + ':followup-start' in starts else ()
+        else:
+            # The Claude terminal UUID is native-only. The existing reader
+            # must match its exact event ID against this retained Start set.
+            starts = tuple(item for item in starts if isinstance(item, str)
+                           and re.fullmatch(r'[0-9a-f]{64}:followup-start', item))
+        if starts:
+            return {**receipt, 'native_fast_escalation': True,
+                    '_retained_followup_start_ids': starts,
+                    **({'native_followup_start_id': starts[0]} if receipt['provider'] == 'codex' else {})}
+    return dict(receipt)
+
+
+def _claude_receipt_runs(state: ProjectState, session: str, identity: str) -> list[RunState]:
+    """Reconstruct pinned native proof for ACK only after display/owner changes."""
+    runs = []
+    for original in state.terminal_receipts:
+        receipt = retained_fast_escalation_receipt(state, original)
+        if (receipt.get("provider") != "claude" or receipt.get("session") != session
+                or receipt.get("agent") != identity or receipt.get("lead") != identity
+                or receipt.get("status") != "completed"
+                or not str(receipt.get("turn") or "").startswith("prompt_id:")
+                or not all(receipt.get(field) for field in (
+                    "native_agent_type", "native_model", "native_effort", "run_id"))):
+            continue
+        runs.append(RunState(
+            str(receipt["run_id"]), "", status="completed", session_id=session,
+            provider="claude", lead_identity=str(identity),
+            started_at="1970-01-01T00:00:00+00:00",
+            assessment={"_claude_native_recovery": receipt["turn"],
+                        '_archived_fast_escalation_turn': receipt['turn']
+                            if receipt.get('native_fast_escalation') is True else '',
+                        "_start_event_ids": receipt.get('_retained_followup_start_ids',
+                            (receipt.get("native_followup_start_id", ""),)),
+                        "_claude_lead_start_identity": str(identity),
+                        "_claude_lead_start_prompt_hash": receipt.get(
+                            "native_launch_prompt_hash", "")},
+            delegations=(Delegation(str(identity), "lead", "", "completed",
+                                    str(receipt["native_model"]),
+                                    str(receipt["native_effort"])),),
+        ))
+    return runs
+
+
 def claude_committed_native_terminal_replay(
     state: ProjectState, source: Event, session: str, project: Path,
     environ: Mapping[str, str],
@@ -520,7 +663,7 @@ def claude_committed_native_terminal_replay(
         # owned by this archive merely because the agent ID and prompt match.
         return False
     report = source.payload.get("last_assistant_message")
-    if _reported_status(report) != "completed":
+    if _reported_status(report) != "completed" and not _archived_fast_escalation(report):
         return False
     current = state.active_runs.get(f"claude:{session}")
     if (current is None and state.active_run and state.active_run.provider == "claude"
@@ -536,37 +679,21 @@ def claude_committed_native_terminal_replay(
     candidates = ([current] if current else []) + list(state.recent_runs)
     # Recent runs are a bounded display archive. The atomic terminal receipt
     # is the lifetime proof for a root that may resume after that trim.
-    for receipt in state.terminal_receipts:
-        if (receipt.get("provider") != "claude" or receipt.get("session") != session
-                or receipt.get("agent") != identity or receipt.get("lead") != identity
-                or receipt.get("status") != "completed"
-                or not str(receipt.get("turn") or "").startswith("prompt_id:")
-                or not all(receipt.get(field) for field in (
-                    "native_agent_type", "native_model", "native_effort", "run_id"))):
-            continue
-        candidates.append(RunState(
-            str(receipt["run_id"]), "", status="completed", session_id=session,
-            provider="claude", lead_identity=str(identity),
-            started_at="1970-01-01T00:00:00+00:00",
-            assessment={"_claude_native_recovery": receipt["turn"],
-                        "_start_event_ids": (receipt.get("native_followup_start_id", ""),),
-                        "_claude_lead_start_identity": str(identity),
-                        "_claude_lead_start_prompt_hash": receipt.get(
-                            "native_launch_prompt_hash", "")},
-            delegations=(Delegation(str(identity), "lead", "", "completed",
-                                    str(receipt["native_model"]),
-                                    str(receipt["native_effort"])),),
-        ))
+    candidates.extend(_claude_receipt_runs(state, session, str(identity)))
     for run in candidates:
         if not run or run.provider != "claude" or run.session_id != session or run.lead_identity != identity:
             continue
         anchor = run.assessment.get("_claude_native_recovery")
         if not isinstance(anchor, str) or not anchor:
             continue
+        escalation = (run.assessment.get('_archived_fast_escalation_turn') == anchor
+                      and _archived_fast_escalation(report))
+        if _reported_status(report) != 'completed' and not escalation:
+            continue
         native = _claude_native_lead_event(
             ProjectState(active_run=run, event_history=state.event_history),
             session, project, environ, require_missing=False,
-            target_prompt=anchor.removeprefix("prompt_id:"))
+            target_prompt=anchor.removeprefix("prompt_id:"), allow_fast_escalation=escalation)
         if native is None or anchor != f"prompt_id:{native.payload['prompt_id']}":
             continue
         followup_callback = False
@@ -615,7 +742,8 @@ def claude_committed_native_terminal_replay(
                                                 "prompt_id": native.payload["prompt_id"]})
         if _claude_callback_matches_native(
                 callback, native, session,
-                allow_conflict=root_callback or launch_callback or followup_callback):
+                allow_conflict=root_callback or launch_callback or followup_callback,
+                allow_fast_escalation=escalation):
             return True
     return False
 
@@ -686,6 +814,9 @@ def _native_lead_turns(
                     turn["completed_at"] = _instant(record.get("timestamp"))
                     turn["message"] = payload.get("last_agent_message")
                     turn["outcome"] = _reported_status(turn["message"])
+                elif record.get('type') == 'event_msg' and payload.get('type') in {
+                        'turn_aborted', 'task_failed', 'task_interrupted', 'error'}:
+                    turn['failed'] = True
     except (OSError, TypeError, ValueError, json.JSONDecodeError, AttributeError):
         return None
     return run, turns, turn_order, latest_started, started_at
@@ -1014,6 +1145,7 @@ def codex_recovered_lead_event(
 
 def codex_completing_lead_turn(
     state: ProjectState, session: str, environ: Mapping[str, str],
+    *, allow_fast_escalation: bool = False,
 ) -> tuple[str, Event | None]:
     """Check for a newer native lead turn before root Stop archives success.
 
@@ -1057,7 +1189,8 @@ def codex_completing_lead_turn(
     if not isinstance(message, str) or len(message) > 100_000:
         return "unknown", None
     outcome = _reported_status(message)
-    status = "completed" if outcome == "completed" else "blocked"
+    status = "completed" if (outcome == "completed" or allow_fast_escalation
+        and not turn.get('failed') and _archived_fast_escalation(message)) else "blocked"
     payload = {
         "provider": "codex", "session_id": session, "agent_id": lead_id,
         "parent_thread_id": session, "turn_id": latest_started, "status": status,
@@ -1257,13 +1390,16 @@ def archived_lead_followup(
                    for other in state.active_runs.values() if other.provider == provider)):
         return None
     scoped = replace(state, active_run=replace(run, status="completing"))
+    allow_escalation = _archived_fast_owner(run)
     if provider == "codex":
-        _, native = codex_completing_lead_turn(scoped, session, environ)
+        _, native = codex_completing_lead_turn(scoped, session, environ,
+                                             allow_fast_escalation=allow_escalation)
         if (native is None or native.payload.get("status") != "completed"
                 or not _codex_root_followup(run, native, project, environ)):
             return None
     elif provider == "claude":
-        _, native = claude_completing_lead_turn(scoped, session, project, environ)
+        _, native = claude_completing_lead_turn(scoped, session, project, environ,
+                                              allow_fast_escalation=allow_escalation)
         if native is None:
             return None
         native = _claude_root_followup(run, native, project, environ)
@@ -1294,7 +1430,8 @@ def archived_lead_followup(
         elif event.kind == "subagent_stopped":
             if (payload.get("prompt_id") not in {None, "", native.payload["prompt_id"],
                                                         native.payload.get("_symphony_root_prompt_id")}
-                    or not _claude_callback_matches_native(event, native, session, allow_conflict=True)):
+                    or not _claude_callback_matches_native(event, native, session, allow_conflict=True,
+                                                          allow_fast_escalation=allow_escalation)):
                 return None
         elif (payload.get("parent_thread_id") not in {None, "", session}
               or payload.get("prompt_id") not in {None, "", native.payload["prompt_id"],
@@ -1304,6 +1441,8 @@ def archived_lead_followup(
               or payload.get("model_reasoning_effort") not in {
                   None, "", native.payload["model_reasoning_effort"]}):
             return None
+    if allow_escalation and _archived_fast_escalation(native.payload.get('last_assistant_message')):
+        native = replace(native, payload={**native.payload, '_symphony_archived_fast_escalation': True})
     return run, native
 
 
@@ -1319,14 +1458,21 @@ def claude_committed_native_start_replay(
             or payload.get("_symphony_verified_alias") is True)))
     if (source.kind != "subagent_started" or payload.get("provider") != "claude"
             or not owned_session
-            or payload.get("parent_thread_id") not in {None, "", session}):
+            or payload.get("parent_thread_id") not in {None, "", session}
+            or payload.get('role') not in {None, '', 'lead'}
+            or any(re.search(r'^SYMPHONY_ROLE: (worker|consultant|assessor)[ \t]*$', value, re.MULTILINE)
+                   for value in payload.values() if isinstance(value, str))):
         return False
-    for run in (*state.active_runs.values(), *state.recent_runs):
+    for run in (*state.active_runs.values(), *state.recent_runs,
+                *_claude_receipt_runs(state, session, str(identity))):
+        anchor = run.assessment.get('_claude_native_recovery')
+        escalation = bool(anchor and run.assessment.get('_archived_fast_escalation_turn') == anchor)
         if (run.provider != "claude" or run.session_id != session or run.lead_identity != identity
-                or run.status not in {"completing", "completed"}):
+                or run.status not in {"completing", "completed"} and not escalation):
             continue
         native = _claude_native_lead_event(
-            replace(state, active_run=run), session, project, environ, require_missing=False)
+            replace(state, active_run=run), session, project, environ, require_missing=False,
+            allow_fast_escalation=escalation)
         if (native is None or run.assessment.get("_claude_native_recovery") !=
                 f"prompt_id:{native.payload['prompt_id']}"
                 or f"{native.event_id}:followup-start" not in run.assessment.get("_start_event_ids", ())):
