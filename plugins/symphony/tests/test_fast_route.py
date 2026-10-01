@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -198,6 +199,54 @@ class FastRouteTests(unittest.TestCase):
         self.assertEqual(self.run_state().task, full_task)
         self.assertIsNone(self.run_state().outcome)
         self.assertNotIn("_retryable_lead", self.run_state().assessment)
+
+    def test_fresh_native_fast_lead_opens_after_archive_and_replay_is_idempotent(self):
+        self.hook("codex", "SessionStart")
+        choice = fast_lead_selection(snapshot_for("codex", profiles_for("codex")[0]["id"]))
+        report = 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+        starts = []
+        for identity in ("first-fast", "second-fast"):
+            started = {"agent_id": identity, "parent_thread_id": "codex-session",
+                       "turn_id": identity + "-turn", "agent_type": "default",
+                       "task_name": "symphony_lead_fast_native",
+                       "model": choice["model"], "model_reasoning_effort": choice["effort"]}
+            starts.append(started)
+            self.hook("codex", "SubagentStart", **started)
+            self.assertEqual(identity, self.run_state().lead_identity)
+            self.stop_fast("codex", started, report)
+            self.hook("codex", "Stop")
+            self.assertIsNone(self.run_state())
+        before = self.store.load(self.project)
+        self.assertEqual(2, len(before.recent_runs))
+        for started in starts:
+            self.hook("codex", "SubagentStart", **started)
+            self.stop_fast("codex", started, report)
+        after = self.store.load(self.project)
+        self.assertEqual(before.recent_runs, after.recent_runs)
+        self.assertEqual(before.terminal_receipts, after.terminal_receipts)
+        self.assertEqual([], self.store.session_record("codex", "codex-session")["pending"])
+
+    def test_archived_fast_lead_resume_and_foreign_parent_still_block(self):
+        for changes, receipt_only in (({"agent_id": "fast-1"}, False),
+                                      ({"agent_id": "fast-1"}, True),
+                                      ({"agent_id": "fresh", "parent_thread_id": "foreign-root"}, False),
+                                      ({"agent_id": "fresh", "parent_thread_id": ""}, False)):
+            with self.subTest(changes=changes, receipt_only=receipt_only):
+                self.tearDown()
+                self.setUp()
+                _, started = self.start_fast("codex")
+                report = 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+                self.stop_fast("codex", started, report)
+                self.hook("codex", "Stop")
+                if receipt_only:
+                    self.store.save(self.project, replace(self.store.load(self.project), recent_runs=()))
+                resumed = {**started, "parent_thread_id": "codex-session",
+                           "turn_id": "new-turn", **changes}
+                self.hook("codex", "SubagentStart", **resumed)
+                self.stop_fast("codex", resumed, report)
+                self.assertIsNone(self.run_state())
+                self.assertEqual(2, len(self.store.session_record("codex", "codex-session")["pending"]))
+                self.assertIn("block", self.hook("codex", "Stop").stdout)
 
     def test_boost_denies_fast_spawn_and_native_child_cannot_complete(self):
         self.hook("codex", "SessionStart")

@@ -691,6 +691,18 @@ def _archived_managed_child(
     if not archived and not receipts:
         return False
     identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
+    if (event.kind == "subagent_started" and _fast_spawn(event.payload) and identity
+            and event.payload.get("session_id") == session
+            and event.payload.get("parent_thread_id") == session
+            and not any(run.provider == provider and identity in {
+                run.session_id, run.lead_identity, *(item.identity for item in run.delegations)}
+                for run in (*state.active_runs.values(), *state.recent_runs))
+            and not any(item.get("provider") == provider
+                        and identity in {item.get("agent"), item.get("lead"), item.get("session")}
+                        for item in state.terminal_receipts)):
+        # A fresh root fast lead opens the next task. Resuming an archived
+        # child with a new native turn must still retain its lifecycle.
+        return False
     return bool(_observed_role(event.payload) in ROLES
                 or identity and (any(identity in {run.lead_identity,
                                                    *(item.identity for item in run.delegations)}
