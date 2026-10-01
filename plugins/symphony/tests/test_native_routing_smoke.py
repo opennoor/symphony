@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from tempfile import TemporaryDirectory
 
 SCRIPTS = Path(__file__).resolve().parents[3] / ".github" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -14,6 +15,47 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_fast_decision_allows_horizontal_whitespace_but_keeps_exact_line_and_count(self):
+        for suffix in ('', '  ', '\t', ' \t\r'):
+            self.assertEqual(smoke.fast_decision_lines('SYMPHONY_FAST_DECISION: eligible' + suffix), ['eligible'])
+        for text in ('SYMPHONY_FAST_DECISION: eligible extra', 'SYMPHONY_FAST_DECISION: yes',
+                     'quoted SYMPHONY_FAST_DECISION: eligible'):
+            self.assertEqual(smoke.fast_decision_lines(text), [])
+        duplicated = 'SYMPHONY_FAST_DECISION: eligible  \nSYMPHONY_FAST_DECISION: eligible'
+        self.assertEqual(len(smoke.fast_decision_lines(duplicated)), 2)
+
+    def test_failure_diagnostics_export_categories_without_native_secrets(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / 'codex-hook-capture'
+            capture.mkdir()
+            (capture / 'event.json').write_text(json.dumps({'event': 'UserPromptSubmit', 'prompt': 'PRIVATE_SENTINEL'}))
+            sessions = root / 'codex-baseline-home' / 'sessions'
+            sessions.mkdir(parents=True)
+            (sessions / 'root.jsonl').write_text(json.dumps({'payload': {
+                'type': 'function_call_output', 'output': 'Unknown model `PRIVATE_SENTINEL` for spawn_agent.'}}))
+            document = {'enabled': True, 'activation': {'codex': {'state': 'guarded', 'profile': 'full',
+                        'plugin_version': '1.7.0', 'private_key': 'PRIVATE_SENTINEL'}},
+                        'configuration': {'assessor_boosts': {'session': 'PRIVATE_SENTINEL'}}}
+            result = smoke.failure_diagnostics('codex', root, document)
+            self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+            self.assertEqual(result['callbacks']['UserPromptSubmit'], 1)
+            self.assertTrue(result['native_signals']['spawn_unknown_model'])
+            self.assertEqual(result['profile'], 'full')
+
+    def test_documented_enable_precedes_plain_objectives_and_requires_durable_state(self):
+        self.assertEqual(smoke.setup_prompt('codex'), '$symphony:symphony enable')
+        self.assertEqual(smoke.setup_prompt('claude'), '/symphony:enable')
+        self.assertTrue(all(not prompt.startswith(('$symphony', '/symphony')) for prompt in smoke.CASES.values()))
+        document = {'enabled': True, 'activation': {'claude': {
+            'state': 'guarded', 'profile': 'opus-5-5', 'plugin_version': '1.7.0'}}}
+        smoke.assert_enabled_fixture(document, 'claude', 'opus-5-5', '1.7.0')
+        for changed in ({**document, 'enabled': False}, {**document, 'active_run': {'status': 'working'}},
+                        {**document, 'recent_runs': [{'status': 'completed'}]},
+                        {**document, 'activation': {'claude': {'state': 'guarded', 'profile': 'old', 'plugin_version': '1.7.0'}}}):
+            with self.assertRaises(RuntimeError):
+                smoke.assert_enabled_fixture(changed, 'claude', 'opus-5-5', '1.7.0')
+
     def test_worker_origin_rejects_forked_calls_and_requires_explicit_native_route(self):
         own = {"type": "session_meta", "payload": {"id": "worker",
                "agent_path": "/root/lead/symphony_worker_gpt_6_luna_low",
@@ -101,6 +143,7 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         def verified(code=source, text=stdout):
             return smoke.unittest_verified([("exec", code, "", result(text))])
         self.assertTrue(verified())
+        self.assertTrue(verified(text=stdout.replace('\n', '\r\n')))
         for text in (stdout.replace('Ran 1', 'Ran 0'), 'diff --git\n+' + stdout,
                      stdout.replace('OK', 'FAILED'), stdout + 'fatal: git diff failed', ''):
             self.assertFalse(verified(text=text))

@@ -1168,6 +1168,7 @@ def _claude_root_followup(
         return None
     calls, results = [], {}
     root_prompt = None
+    root_prompt_at = None
     for row in rows:
         if row.get("sessionId") != run.session_id:
             return None
@@ -1177,7 +1178,8 @@ def _claude_root_followup(
                            and isinstance(item.get("text"), str) for item in content))
         if row.get("type") == "user" and textual:
             root_prompt = row.get("uuid")
-            if not isinstance(root_prompt, str) or not root_prompt:
+            root_prompt_at = _instant(row.get("timestamp"))
+            if not isinstance(root_prompt, str) or not root_prompt or root_prompt_at is None:
                 return None
         if not isinstance(content, list):
             continue
@@ -1190,7 +1192,7 @@ def _claude_root_followup(
                         and details.get("resume") == run.lead_identity):
                     if not isinstance(item.get("id"), str) or not item["id"]:
                         return None
-                    calls.append((row, item, root_prompt))
+                    calls.append((row, item, root_prompt, root_prompt_at))
             elif row.get("type") == "user" and item.get("type") == "tool_result":
                 result_id = item.get("tool_use_id")
                 if not isinstance(result_id, str) or not result_id:
@@ -1198,21 +1200,23 @@ def _claude_root_followup(
                 results.setdefault(result_id, []).append((row, item))
     archived = _instant(run.updated_at)
     if not replay:
-        calls = [(row, call, prompt) for row, call, prompt in calls
+        calls = [(row, call, prompt, prompt_at) for row, call, prompt, prompt_at in calls
                  if archived and _instant(row.get("timestamp"))
                  and _instant(row["timestamp"]) > archived]
     if not calls and replay and allow_original_launch:
         return native
     if not calls or (not replay and len(calls) != 1):
         return None
-    row, call, root_prompt = calls[-1]
-    if sum(item.get("id") == call.get("id") for _, item, _ in calls) != 1:
+    row, call, root_prompt, root_prompt_at = calls[-1]
+    if sum(item.get("id") == call.get("id") for _, item, _, _ in calls) != 1:
         return None
     matching = results.get(call.get("id"), ())
     began = _instant(native.payload.get("_symphony_native_started_at"))
     archived = _instant(run.updated_at)
     called_at = _instant(row.get("timestamp"))
     if (len(matching) != 1 or not began or (not replay and not archived) or not called_at
+            or not root_prompt_at or root_prompt_at > called_at
+            or (not replay and root_prompt_at <= archived)
             or not called_at <= began or (not replay and called_at <= archived)
             or not isinstance(row.get("cwd"), str) or not row["cwd"].strip()
             or not Path(row["cwd"]).is_absolute()

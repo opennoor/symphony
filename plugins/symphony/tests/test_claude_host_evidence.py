@@ -436,6 +436,39 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 self.assertIsNone(state.active_run)
                 self.assertEqual(2, len(self.store.session_record("claude", SESSION)["pending"]))
 
+    def test_archived_claude_resume_requires_prompt_after_archive_and_before_call(self):
+        for timestamp in (None, "invalid", "2026-09-29T02:02:00Z", "2026-09-29T02:02:01Z",
+                          "2026-09-29T02:03:00.000001Z", "2026-09-29T02:03:00Z"):
+            with self.subTest(timestamp=timestamp):
+                self.setUp()
+                archived, _ = self.prepare_archived_followup(with_start=True)
+                rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                rows[-3]["timestamp"] = timestamp
+                self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                if timestamp == "2026-09-29T02:03:00Z":
+                    self.assertNotIn('"decision": "block"', result.stdout)
+                    self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+                else:
+                    self.assertIn('"decision": "block"', result.stdout)
+                    self.assertEqual((archived,), self.store.load(self.project).recent_runs)
+                    self.assertEqual(2, len(self.store.session_record("claude", SESSION)["pending"]))
+
+    def test_committed_claude_resume_replay_rejects_missing_or_future_prompt_time(self):
+        _, terminal = self.prepare_archived_followup(with_start=True)
+        handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
+        archived = self.store.load(self.project)
+        source = event_from_payload("claude", terminal)
+        self.assertTrue(claude_committed_native_terminal_replay(archived, source, SESSION, self.project, self.environ))
+        rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+        for timestamp in (None, "invalid", "2026-09-29T02:03:00.000001Z"):
+            with self.subTest(timestamp=timestamp):
+                rows[-3]["timestamp"] = timestamp
+                self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    archived, source, SESSION, self.project, self.environ))
+
     def test_archived_claude_resume_requires_exact_successful_evidence(self):
         for change, promptless in ((change, promptless) for change in (
                 "missing-resume", "failed-resume", "foreign-resume", "duplicate-resume",

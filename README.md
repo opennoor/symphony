@@ -10,6 +10,8 @@ Symphony is a Codex and Claude Code plugin that keeps the root agent thin, selec
 
 ### Codex
 
+Native routing with the `latest` profile (`gpt-6.1-sol`) is tested on Codex CLI 0.159.3. CLI 0.158.0 rejects `gpt-6.1-sol` in `spawn_agent`; the `latest` profile requires a host that can spawn that model. On CLI 0.158.0, set `SYMPHONY_PROFILE=full` in the environment of the Codex process to select `gpt-6-sol`, which that host supports. Verify the available spawn models before using another CLI version.
+
 ```bash
 codex plugin marketplace add opennoor/symphony
 codex plugin add symphony@symphony

@@ -41,6 +41,62 @@ class GreetingTests(unittest.TestCase):
 """
 
 
+def setup_prompt(provider):
+    return "$symphony:symphony enable" if provider == "codex" else "/symphony:enable"
+
+
+def fast_decision_lines(text):
+    return re.findall(r"^SYMPHONY_FAST_DECISION: (eligible|escalate)[ \t]*\r?$", text, re.MULTILINE)
+
+
+def assert_enabled_fixture(document, provider, profile, version):
+    activation = document.get("activation", {}).get(provider, {})
+    require(document.get("enabled") is True, "documented enable did not enable the fixture")
+    require(activation.get("state") == "guarded" and activation.get("profile") == profile
+            and activation.get("plugin_version") == version,
+            "enabled fixture has no matching installed build/profile heartbeat")
+    require(not document.get("active_runs") and not document.get("active_run")
+            and not document.get("recent_runs"), "enable unexpectedly opened a run")
+
+
+def failure_diagnostics(provider, root, document):
+    """Export fixed categories and counts, never native message/config contents."""
+    activation = document.get("activation", {}).get(provider, {})
+    counts = {event: 0 for event in ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop")}
+    for path in (root / f"{provider}-hook-capture").glob("*.json"):
+        try:
+            event = json.loads(path.read_text()).get("event")
+            if event in counts:
+                counts[event] += 1
+        except (OSError, ValueError, AttributeError):
+            pass
+    home = root / f"{provider}-baseline-home"
+    native_signals = {"fast_guidance_text_present": False, "eligible_markers": 0, "escalate_markers": 0,
+                      "spawn_unknown_model": False}
+    paths = (home / ("sessions" if provider == "codex" else "projects")).rglob("*.jsonl")
+    for path in paths:
+        try:
+            for line in path.read_text().splitlines():
+                row = json.loads(line)
+                # Presence is a diagnostic, not proof that a hook delivered it.
+                native_signals["fast_guidance_text_present"] |= "Symphony fast route: the root is a courier" in line
+                payload = row.get("payload", {})
+                native_signals["spawn_unknown_model"] |= (payload.get("type") == "function_call_output"
+                    and str(payload.get("output", "")).startswith("Unknown model `"))
+                text = assistant_text(provider, row)
+                for decision in ("eligible", "escalate"):
+                    native_signals[decision + "_markers"] += fast_decision_lines(text).count(decision)
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+    boosts = document.get("configuration", {}).get("assessor_boosts", {}).values()
+    return {"enabled": document.get("enabled") is True,
+            "activation_guarded": activation.get("state") == "guarded",
+            "profile": activation.get("profile") if activation.get("profile") in {"latest", "full", "opus-5-5"} else "unknown",
+            "loaded_version": activation.get("plugin_version") if re.fullmatch(r"\d+\.\d+\.\d+", str(activation.get("plugin_version"))) else "unknown",
+            "boost_levels": sorted({value for value in boosts if isinstance(value, str) and value in {"off", "xhigh", "max", "ultra"}}),
+            "callbacks": counts, "native_signals": native_signals}
+
+
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
@@ -230,7 +286,7 @@ def observed_composed_unittest(source, output):
             return json.loads(re.sub(r'([{,]\s*)([A-Za-z_]\w*)(\s*:)', r'\1"\2"\3', literal))
         def passed(stdout):
             return (isinstance(stdout, str) and re.match(
-                r'^-{3,}\nRan [1-9]\d* tests? in \d+(?:\.\d+)?s\n\nOK(?:\n|$)', stdout) is not None
+                r'^-{3,}\r?\nRan [1-9]\d* tests? in \d+(?:\.\d+)?s\r?\n\r?\nOK(?:\r?\n|$)', stdout) is not None
                 and not re.search(r'FAILED|Traceback|fatal:|error:', stdout, re.IGNORECASE))
         single = re.fullmatch(
             r'\s*const (?P<result>\w+)\s*=\s*await tools\.exec_command\((?P<args>\{[^{}]*\})\);'
@@ -277,7 +333,7 @@ def unittest_verified(evidence):
     return False
 
 
-def check_case(provider, root, candidate, case, timeout, budget):
+def check_case(provider, root, candidate, case, timeout, budget, requested_profile=None):
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("SYMPHONY_") and key not in {"CODEX_SESSION_ID", "CLAUDECODE"}}
     env.update(prepare_baseline_capture(provider, root, candidate))
@@ -292,7 +348,7 @@ def check_case(provider, root, candidate, case, timeout, budget):
     run_git("commit", "-m", "greeting fixture", cwd=project)
     initial_hash = fingerprint(greeting)
     state_dir = root / "state"
-    profile = "latest" if provider == "codex" else "opus-5-5"
+    profile = requested_profile or ("latest" if provider == "codex" else "opus-5-5")
     fast = fast_lead_selection(snapshot_for(provider, profile))
     require(bool(fast["model"]), "semantic probe profile has no capable/medium fast route")
     env.update(SYMPHONY_STATE_DIR=str(state_dir), SYMPHONY_PROFILE=profile,
@@ -300,7 +356,7 @@ def check_case(provider, root, candidate, case, timeout, budget):
     executable = shutil.which(provider)
     require(bool(executable), "native CLI executable is unavailable")
     session = str(uuid.uuid4())
-    prompt = ("$symphony:symphony " if provider == "codex" else "/symphony:symphony ") + CASES[case]
+    prompt = CASES[case]
     logs = root / "logs"
     logs.mkdir()
     deadline = time.monotonic() + timeout
@@ -333,12 +389,16 @@ def check_case(provider, root, candidate, case, timeout, budget):
                 time.sleep(.1)
         require(process.returncode == 0, "native semantic CLI failed")
 
-    run(prompt)
-    if provider == "codex":
-        match = re.search(r"^session id: ([0-9a-f-]+)$", (logs / "stderr").read_text(), re.MULTILINE)
-        require(match is not None, "native root session is missing")
-        session = match.group(1)
+    run(setup_prompt(provider))
     state_path = state_file(state_dir, project)
+    require(state_path.is_file(), "installed enable hook did not create durable state")
+    version = json.loads((candidate / ".codex-plugin" / "plugin.json").read_text())["version"]
+    assert_enabled_fixture(json.loads(state_path.read_text()), provider, profile, version)
+    run(prompt, provider == "claude")
+    if provider == "codex":
+        matches = re.findall(r"^session id: ([0-9a-f-]+)$", (logs / "stderr").read_text(), re.MULTILINE)
+        require(len(matches) == 2 and matches[0] != matches[1], "native enable/objective sessions are missing or reused")
+        session = matches[-1]
     require(state_path.is_file(), "installed native hooks did not create durable state")
     document = json.loads(state_path.read_text())
     owner = f"{provider}:{session}"
@@ -368,7 +428,7 @@ def check_case(provider, root, candidate, case, timeout, budget):
     decisions = []
     for identity, rows in child_rows.items():
         for row in rows:
-            for decision in re.findall(r"^SYMPHONY_FAST_DECISION: (eligible|escalate)$", assistant_text(provider, row), re.MULTILINE):
+            for decision in fast_decision_lines(assistant_text(provider, row)):
                 decisions.append((identity, decision, row.get("timestamp")))
     expected = "eligible" if case == "command" else "escalate"
     require(len(decisions) == 1 and decisions[0][1] == expected, "native fast lead made the wrong semantic decision")
@@ -436,6 +496,8 @@ def check_case(provider, root, candidate, case, timeout, budget):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", choices=("codex", "claude"), required=True)
+    parser.add_argument("--profile", choices=("latest", "full", "opus-5-5"),
+                        help="Explicit shipped profile; Codex latest requires an observed compatible spawn roster")
     parser.add_argument("--candidate-plugin-root", type=Path, default=PLUGIN)
     parser.add_argument("--timeout", type=int, default=600, help="Seconds per plain objective")
     parser.add_argument("--budget", type=float, default=6)
@@ -449,7 +511,7 @@ def main():
             with tempfile.TemporaryDirectory(prefix="symphony-native-routing-") as scratch:
                 try:
                     receipt["native_routing"].append(check_case(args.provider, Path(scratch),
-                        args.candidate_plugin_root.resolve(), case, args.timeout, args.budget))
+                        args.candidate_plugin_root.resolve(), case, args.timeout, args.budget, args.profile))
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                     if args.private_failure_dir:
                         destination = args.private_failure_dir / f"{args.provider}-{case}-{uuid.uuid4().hex[:8]}"
@@ -462,6 +524,7 @@ def main():
                         receipt["private_failure_path"] = str(destination)
                     for path in (Path(scratch) / "state").glob("*.v2.json"):
                         document = json.loads(path.read_text())
+                        receipt["fixture_diagnostics"] = failure_diagnostics(args.provider, Path(scratch), document)
                         runs = [*document.get("active_runs", {}).values(), *document.get("recent_runs", [])]
                         receipt["observed"] = [{"status": run.get("status"), "outcome": run.get("outcome"),
                             "recovery_reasons": [key for key in run.get("assessment", {}) if key.startswith("_retryable") or key == "_pending_lead_completion"],

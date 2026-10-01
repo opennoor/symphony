@@ -82,7 +82,7 @@ jobs:
           }
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex@0.158.0
+        run: npm install -g @openai/codex@0.159.3
 
       - name: Verify installed native Codex activation checker as a standard user
         timeout-minutes: 15
@@ -322,7 +322,26 @@ jobs:
           claude plugin validate plugins/symphony
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex@0.158.0
+        run: npm install -g @openai/codex@0.159.3
+
+      - name: Verify Codex 0.158.0 with its compatible full profile
+        id: linux_codex_legacy
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            if [ "$GITHUB_REF" = refs/heads/main ]; then
+              echo "::error::OPENAI_API_KEY is required for release verification"
+              exit 1
+            fi
+            echo "::notice::SKIP compatible-profile Codex smoke: credential unavailable"
+            exit 0
+          fi
+          npm install --prefix "$RUNNER_TEMP/codex-0158" @openai/codex@0.158.0
+          export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-legacy-diagnostics"
+          PATH="$RUNNER_TEMP/codex-0158/node_modules/.bin:$PATH" \
+            python3 .github/scripts/native_routing_smoke.py --provider codex --profile full --case command --timeout 600
 
       - name: Run real Codex control smoke when a credential is available
         id: linux_codex_native
@@ -411,7 +430,7 @@ jobs:
           fi
 
       - name: Preserve Linux Codex native failure after Claude checks
-        if: ${{ always() && steps.linux_codex_native.outcome == 'failure' }}
+        if: ${{ always() && (steps.linux_codex_native.outcome == 'failure' || steps.linux_codex_legacy.outcome == 'failure') }}
         run: |
           echo '::error::Linux Codex native checks failed; Claude checks were allowed to run'
           exit 1
@@ -421,7 +440,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-native-managed-diagnostics
-          path: ${{ runner.temp }}/symphony-native-diagnostics/*.json
+          path: |
+            ${{ runner.temp }}/symphony-native-diagnostics/*.json
+            ${{ runner.temp }}/symphony-native-legacy-diagnostics/*.json
           if-no-files-found: ignore
 
   release:
