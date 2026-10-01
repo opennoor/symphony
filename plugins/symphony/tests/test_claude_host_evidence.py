@@ -311,6 +311,27 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                     self.assertEqual((archived,), self.store.load(self.project).recent_runs)
                     self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
 
+    def test_archived_claude_resume_accepts_background_ack_before_child_terminal(self):
+        for explicit_background in (False, True):
+            with self.subTest(explicit_background=explicit_background):
+                self.setUp()
+                self.prepare_archived_followup(promptless=True)
+                rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                if explicit_background:
+                    rows[-2]["message"]["content"][0]["input"]["run_in_background"] = True
+                # Background is also the host default. The Agent result proves
+                # dispatch; only the separate child native terminal proves success.
+                rows[-1]["timestamp"] = "2026-09-29T02:03:00.500Z"
+                rows[-1]["message"]["content"][0]["content"] = "Agent launched in background"
+                rows[-1]["toolUseResult"] = {"status": "async_launched", "agentId": LEAD}
+                self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                result = handle({"cwd": str(self.project), "session_id": SESSION,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertNotIn('"decision": "block"', result.stdout)
+                self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+                self.assertIn("prompt_id:prompt-two",
+                              self.store.load(self.project).recent_runs[0].assessment["_terminal_turns"][LEAD])
+
     def test_archived_claude_resume_requires_exact_successful_evidence(self):
         for change, promptless in ((change, promptless) for change in (
                 "missing-resume", "failed-resume", "foreign-resume", "duplicate-resume",

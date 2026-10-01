@@ -449,6 +449,33 @@ class HostEvidenceTests(unittest.TestCase):
                     self.assertEqual((archived,), self.store.load(self.project).recent_runs)
                     self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
 
+    def test_archived_followup_rejects_conflicting_activity_chronology(self):
+        for change in ("spawn-before-call", "spawn-after-archive", "result-before-delivery", "wrong-spawn-path", "duplicate-start"):
+            with self.subTest(change=change):
+                self.tearDown()
+                self.setUp()
+                archived, _, root = self.load_archived_followup_fixture()
+                rows = [json.loads(line) for line in root.read_text().splitlines()]
+                started = next(row for row in rows if row["payload"].get("item", {}).get("kind") == "started")
+                if change == "spawn-before-call":
+                    started["timestamp"] = "2026-10-01T09:06:16Z"
+                elif change == "spawn-after-archive":
+                    started["timestamp"] = "2026-10-01T09:50:32Z"
+                elif change == "result-before-delivery":
+                    result = next(row for row in rows if row["payload"].get("type") == "function_call_output"
+                                  and row["payload"].get("call_id") == "followup")
+                    result["timestamp"] = "2026-10-01T09:50:32Z"
+                elif change == "wrong-spawn-path":
+                    started["payload"]["item"]["agent_path"] = "/root/another-lead"
+                else:
+                    rows.append(started)
+                root.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                result = handle({"cwd": str(self.project), "session_id": ROOT_ID,
+                                 "hook_event_name": "Stop"}, self.environ)
+                self.assertIn('"decision": "block"', result.stdout)
+                self.assertEqual((archived,), self.store.load(self.project).recent_runs)
+                self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
+
     def test_archived_followup_requires_successful_exact_native_evidence(self):
         for change in ("missing-root", "failed-call", "wrong-target", "wrong-child", "foreign-project",
                        "foreign-root", "missing-result", "duplicate-call", "later-followup", "markerless",

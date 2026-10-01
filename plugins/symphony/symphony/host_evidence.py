@@ -1121,9 +1121,12 @@ def _codex_root_followup(
                     and item.get("kind") == "started" for item, _ in activity)]
     if len(spawns) != 1:
         return False
-    _, spawn, spawned_at = spawns[0]
+    spawn_id, spawn, spawned_at = spawns[0]
     task = spawn.get("task_name")
+    starts = [(item, when) for item, when in activity
+              if item.get("id") == spawn_id and item.get("kind") == "started"]
     if (not isinstance(task, str) or not re.fullmatch(r"[a-z0-9_]{1,128}", task)
+            or len(starts) != 1 or starts[0][0].get("agent_path") != f"/root/{task}"
             or spawn.get("model") != native.payload["model"]
             or spawn.get("reasoning_effort") != native.payload["model_reasoning_effort"]):
         return False
@@ -1144,8 +1147,8 @@ def _codex_root_followup(
     archived = _instant(run.updated_at)
     return bool(response and response[0] == "" and len(deliveries) == 1
                 and began and completed and archived
-                and spawned_at < archived < called_at <= deliveries[0] <= began
-                and called_at <= response[1])
+                and spawned_at <= starts[0][1] < archived < called_at <= deliveries[0] <= began
+                and deliveries[0] <= response[1])
 
 
 def _claude_root_followup(
@@ -1210,6 +1213,8 @@ def _claude_root_followup(
         return None
     result_row, result = matching[0]
     returned_at = _instant(result_row.get("timestamp"))
+    # Background Agent results acknowledge dispatch before the child finishes.
+    # Completion is established independently by the exact native child turn.
     if result.get("is_error") is True or returned_at is None or returned_at < called_at:
         return None
     return replace(native, payload={**native.payload, "_symphony_root_prompt_id": root_prompt})
