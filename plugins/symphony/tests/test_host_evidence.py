@@ -401,6 +401,20 @@ class HostEvidenceTests(unittest.TestCase):
                 self.assertEqual(1, len(self.store.load(self.project).recent_runs))
                 self.assertEqual([], self.store.session_record("codex", ROOT_ID)["pending"])
 
+    def test_archived_followup_tool_result_may_arrive_after_child_completion(self):
+        self.load_archived_followup_fixture()
+        root = self.transcript.with_name(f"rollout-2026-09-29-{ROOT_ID}.jsonl")
+        rows = [json.loads(line) for line in root.read_text().splitlines()]
+        for row in rows:
+            if (row["payload"].get("type") == "function_call_output"
+                    and row["payload"].get("call_id") == "followup"):
+                row["timestamp"] = "2026-10-01T09:50:55Z"
+        root.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        result = handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": "Stop"}, self.environ)
+        self.assertNotIn('"decision": "block"', result.stdout)
+        self.assertIsNone(self.store.load(self.project).active_run)
+        self.assertEqual([], self.store.session_record("codex", ROOT_ID)["pending"])
+
     def test_archived_followup_requires_successful_exact_native_evidence(self):
         for change in ("missing-root", "failed-call", "wrong-target", "wrong-child", "foreign-project",
                        "foreign-root", "missing-result", "duplicate-call", "later-followup", "markerless",

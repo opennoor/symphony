@@ -1127,7 +1127,7 @@ def _codex_root_followup(
     return bool(response and response[0] == "" and len(deliveries) == 1
                 and began and completed and archived
                 and spawned_at < archived < called_at <= deliveries[0] <= began
-                and called_at <= response[1] <= completed)
+                and called_at <= response[1])
 
 
 def _claude_root_followup(
