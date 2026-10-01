@@ -157,6 +157,9 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                 self.assertEqual(7, state.recent_runs[0].owner_generation)
                 self.assertIn("prompt_id:prompt-two", state.recent_runs[0].assessment["_terminal_turns"][LEAD])
                 self.assertEqual([], self.store.session_record("claude", SESSION)["pending"])
+                receipt = next(item for item in state.terminal_receipts if item["turn"] == "prompt_id:prompt-two")
+                self.assertIn(receipt["native_followup_start_id"], state.recent_runs[0].assessment["_start_event_ids"])
+                self.assertTrue(receipt["native_followup_start_id"].endswith(":followup-start"))
                 self.store.queue_session_event("claude", SESSION, event_from_payload("claude", terminal), ambiguous_owner=True)
                 handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
                 self.assertEqual(state.recent_runs, self.store.load(self.project).recent_runs)
@@ -239,22 +242,25 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         self.assertIn('"decision": "block"', result.stdout)
         self.assertEqual(1, len(self.store.session_record("claude", SESSION)["pending"]))
 
-    def test_promptless_followup_receipt_replay_checks_latest_root_and_child(self):
-        _, terminal = self.prepare_archived_followup(promptless=True)
-        handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
-        state = replace(self.store.load(self.project), recent_runs=())
-        self.store.save(self.project, state)
-        source = event_from_payload("claude", terminal)
-        source = replace(source, payload={**source.payload, "_symphony_owner_conflict": True})
-        self.assertTrue(claude_committed_native_terminal_replay(
-            state, source, SESSION, self.project, self.environ))
-        rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
-        resume = rows[-2]
-        rows.append({**resume, "timestamp": "2026-10-02T02:00:00Z",
-                     "message": {"content": [{**resume["message"]["content"][0], "id": "new-resume"}]}})
-        self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        self.assertFalse(claude_committed_native_terminal_replay(
-            state, source, SESSION, self.project, self.environ))
+    def test_followup_receipt_replay_checks_latest_root_and_child(self):
+        for promptless in (False, True):
+            with self.subTest(promptless=promptless):
+                self.setUp()
+                _, terminal = self.prepare_archived_followup(promptless=promptless)
+                handle({"cwd": str(self.project), "session_id": SESSION, "hook_event_name": "Stop"}, self.environ)
+                state = replace(self.store.load(self.project), recent_runs=())
+                self.store.save(self.project, state)
+                source = event_from_payload("claude", terminal)
+                source = replace(source, payload={**source.payload, "_symphony_owner_conflict": True})
+                self.assertTrue(claude_committed_native_terminal_replay(
+                    state, source, SESSION, self.project, self.environ))
+                rows = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                resume = rows[-2]
+                rows.append({**resume, "timestamp": "2026-10-02T02:00:00Z",
+                             "message": {"content": [{**resume["message"]["content"][0], "id": "new-resume"}]}})
+                self.parent.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    state, source, SESSION, self.project, self.environ))
 
     def test_promptless_archived_followup_accepts_successful_native_handback(self):
         for failed in (False, True):

@@ -1113,6 +1113,8 @@ def _codex_root_followup(
             item = payload.get("item")
             if (isinstance(item, dict) and item.get("type") == "SubAgentActivity"
                     and item.get("agent_thread_id") == run.lead_identity):
+                if payload.get("thread_id") != run.session_id:
+                    return False
                 activity.append((item, when))
     spawns = [(call_id, args, when) for call_id, (name, args, when) in calls.items()
               if name == "spawn_agent" and any(item.get("id") == call_id

@@ -179,6 +179,8 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
             if event.event_id in recoverable:
                 if followup is not None and provider == "claude" and event.kind == "subagent_stopped":
+                    # Preserve the inbox ID until pending_event_id is captured;
+                    # claude_current_native_lead_event below supplies the native ID.
                     event = replace(event, payload=followup[1].payload)
                 event = replace(event, payload={**event.payload, "_symphony_owner_conflict": False})
             state = _hold_pending_batch(state, provider, session)

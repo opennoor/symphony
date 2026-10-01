@@ -431,6 +431,24 @@ class HostEvidenceTests(unittest.TestCase):
                 self.assertEqual((archived,), self.store.load(self.project).recent_runs)
                 self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
 
+    def test_archived_followup_rejects_foreign_or_missing_delivery_root(self):
+        for kind in ("started", "interacted"):
+            for owner in (None, "foreign-root"):
+                with self.subTest(kind=kind, owner=owner):
+                    self.tearDown()
+                    self.setUp()
+                    archived, _, root = self.load_archived_followup_fixture()
+                    rows = [json.loads(line) for line in root.read_text().splitlines()]
+                    for row in rows:
+                        if row["payload"].get("item", {}).get("kind") == kind:
+                            row["payload"]["thread_id"] = owner
+                    root.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                    result = handle({"cwd": str(self.project), "session_id": ROOT_ID,
+                                     "hook_event_name": "Stop"}, self.environ)
+                    self.assertIn('"decision": "block"', result.stdout)
+                    self.assertEqual((archived,), self.store.load(self.project).recent_runs)
+                    self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
+
     def test_archived_followup_requires_successful_exact_native_evidence(self):
         for change in ("missing-root", "failed-call", "wrong-target", "wrong-child", "foreign-project",
                        "foreign-root", "missing-result", "duplicate-call", "later-followup", "markerless",
