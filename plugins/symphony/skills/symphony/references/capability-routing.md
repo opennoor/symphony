@@ -20,6 +20,8 @@ The fixed matrix and these risk rules are authoritative for topology; an assesso
 
 ## Capability resolution
 
+Before the matrix, the fast route may launch one lead at the current entitlement profile's `capable` model with `medium` effort. It is available only when that model and effort are shipped for the provider and the reviewed model policy ranks it at least 2. This excludes the economy floor without naming a particular provider model. An explicit assessor boost uses the assessor route directly. The fast lead checks the full task before writes; uncertainty escalates to an independent strongest/high assessor and the matrix below. The fast route does not change entitlement clamps on the later assessed route.
+
 Resolve each cell through the selected shipped profile's model and effort choices. Profiles without cell choices fall back to the abstract tiers `economy`, `balanced`, `capable`, and `strongest`. Neither host gives a hook a model inventory, so there is no runtime discovery to attempt; the map is maintained at release time by a scheduled workflow that verifies every model against the provider before shipping it.
 
 If no suitable assessor is available, disclose and use the conservative shipped route—the root does not improvise an assessment.
@@ -28,6 +30,20 @@ If no suitable assessor is available, disclose and use the conservative shipped 
 
 <!-- generated routes: start -->
 The tables below are generated from `profiles.json` with the runtime resolver. The last profile for each provider is the fallback when entitlement is unknown.
+
+### Codex: `latest`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| small / mixed | `gpt-6.1-sol/medium` | `gpt-6.1-sol/high` |
+| small / complex | `gpt-6-astra/high` | `gpt-6-astra/high` |
+| medium / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| medium / mixed | `gpt-6-luna/medium` | `gpt-6-luna/high` |
+| medium / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
+| large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
+| large / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
 
 ### Codex: `full`
 
@@ -42,6 +58,34 @@ The tables below are generated from `profiles.json` with the runtime resolver. T
 | large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
 | large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
 | large / complex | `gpt-6-sol/high` | `gpt-6-sol/high` |
+
+### Codex: `luna-sol-6-1`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| small / mixed | `gpt-6.1-sol/medium` | `gpt-6.1-sol/high` |
+| small / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
+| medium / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| medium / mixed | `gpt-6-luna/medium` | `gpt-6-luna/high` |
+| medium / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
+| large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
+| large / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
+
+### Codex: `sol-6-1`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `gpt-6.1-sol/low` | `gpt-6.1-sol/medium` |
+| small / mixed | `gpt-6.1-sol/medium` | `gpt-6.1-sol/high` |
+| small / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
+| medium / simple | `gpt-6.1-sol/low` | `gpt-6.1-sol/medium` |
+| medium / mixed | `gpt-6.1-sol/medium` | `gpt-6.1-sol/high` |
+| medium / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
+| large / simple | `gpt-6.1-sol/low` | `gpt-6.1-sol/medium` |
+| large / mixed | `gpt-6.1-sol/medium` | `gpt-6.1-sol/medium` |
+| large / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
 
 ### Codex: `luna-sol`
 
@@ -84,6 +128,48 @@ The tables below are generated from `profiles.json` with the runtime resolver. T
 | large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
 | large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
 | large / complex | `gpt-6-luna/high` | `gpt-6-luna/high` |
+
+### Claude Code: `fable-5-5`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| small / mixed | `claude-opus-5-5/medium` | `claude-opus-5-5/high` |
+| small / complex | `claude-fable-5-1/high` | `claude-fable-5-1/high` |
+| medium / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| medium / mixed | `claude-opus-5-5/medium` | `claude-opus-5-5/high` |
+| medium / complex | `claude-opus-5-5/high` | `claude-opus-5-5/high` |
+| large / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| large / mixed | `claude-sonnet-5-5/medium` | `claude-sonnet-5-5/medium` |
+| large / complex | `claude-opus-5-5/medium` | `claude-opus-5-5/medium` |
+
+### Claude Code: `opus-5-5`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| small / mixed | `claude-opus-5-5/medium` | `claude-opus-5-5/high` |
+| small / complex | `claude-opus-5-5/high` | `claude-opus-5-5/high` |
+| medium / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| medium / mixed | `claude-opus-5-5/medium` | `claude-opus-5-5/high` |
+| medium / complex | `claude-opus-5-5/high` | `claude-opus-5-5/high` |
+| large / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| large / mixed | `claude-sonnet-5-5/medium` | `claude-sonnet-5-5/medium` |
+| large / complex | `claude-opus-5-5/medium` | `claude-opus-5-5/medium` |
+
+### Claude Code: `sonnet-5-5`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| small / mixed | `claude-sonnet-5-5/medium` | `claude-sonnet-5-5/high` |
+| small / complex | `claude-sonnet-5-5/high` | `claude-sonnet-5-5/high` |
+| medium / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| medium / mixed | `claude-sonnet-5-5/medium` | `claude-sonnet-5-5/high` |
+| medium / complex | `claude-sonnet-5-5/high` | `claude-sonnet-5-5/high` |
+| large / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| large / mixed | `claude-sonnet-5-5/medium` | `claude-sonnet-5-5/medium` |
+| large / complex | `claude-sonnet-5-5/medium` | `claude-sonnet-5-5/medium` |
 
 ### Claude Code: `fable`
 

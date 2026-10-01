@@ -129,5 +129,10 @@ class ProjectState:
     # remains a compatibility view for older callers and state files.
     active_runs: Mapping[str, RunState] = field(default_factory=dict)
     recent_runs: tuple[RunState, ...] = ()
+    # Accepted child terminals survive the bounded visible run archive for as
+    # long as this root can resume. Never trim these receipts silently: an old
+    # callback could otherwise complete a newer run that reused its child ID.
+    # Each receipt contains only identities and a result hash, not message text.
+    terminal_receipts: tuple[Mapping[str, str], ...] = ()
     event_history: tuple[Event, ...] = ()
     needs_reassessment: bool = False

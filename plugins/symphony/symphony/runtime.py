@@ -1,7 +1,9 @@
 """Fast, offline hook runtime for Symphony's canonical lifecycle."""
 
 from dataclasses import replace
+from contextlib import ExitStack
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,13 +16,20 @@ from typing import Mapping
 
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
-from .model import Action, Delegation, Event, ProjectState
-from .reducer import reduce
+from .host_evidence import (
+    claude_committed_native_terminal_replay, claude_completing_lead_turn,
+    claude_current_native_lead_event, claude_recovered_lead_event,
+    codex_completing_lead_turn, codex_recovered_lead_event,
+    codex_unavailable_lead_proof,
+)
+from .model import Action, Delegation, Event, ProjectState, RunState
+from .reducer import _ACTIVE_STATES, _stop_block_reason, reduce
 from .routing import (
     Assessment,
     EFFORTS,
     NO_PROFILE,
     assessor_selection,
+    fast_lead_selection,
     clamp_against_best,
     model_is_weaker,
     profiles_for,
@@ -49,6 +58,31 @@ ROLES = {"assessor", "consultant", "lead", "worker"}
 HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
 
 
+def _retained_activation_command(retained: str, original: str) -> str:
+    """Give Codex a short checker that verifies the pinned tree before import."""
+    digest = Path(retained).name
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return ""
+    code = (
+        "import hashlib,pathlib,runpy,sys;"
+        "r=pathlib.Path(sys.argv[1]);f=sorted(r.rglob(\"*\"),key=lambda p:p.relative_to(r).as_posix());"
+        "assert r.is_dir() and not r.is_symlink() and not any(p.is_symlink() for p in f);"
+        "d=hashlib.sha256(b\"\".join(p.relative_to(r).as_posix().encode()+bytes(1)"
+        "+hashlib.sha256(p.read_bytes()).digest() for p in f if p.is_file())).hexdigest();"
+        f"assert d==\"{digest}\";"
+        "sys.argv=[str(r/\"scripts/check_activation.py\"),\"--plugin-root\",sys.argv[2]];"
+        "runpy.run_path(sys.argv[0],run_name=\"__main__\")"
+    )
+    if os.name == "nt":
+        # Windows PowerShell 5.1 strips double quotes inside native arguments.
+        # Single-quoted Python literals survive its legacy argument passing.
+        code = code.replace('"', "'")
+    executable = "python.exe" if os.name == "nt" else "python3"
+    arguments = [executable, "-I", "-c", code, retained, original]
+    return ("& " + " ".join("'" + value.replace("'", "''") + "'" for value in arguments)
+            if os.name == "nt" else shlex.join(arguments))
+
+
 def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
     if environ.get("SYMPHONY_CLAUDE_PROBE"):
         return HookResult()
@@ -64,49 +98,707 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         legacy_roots,
     )
     source = event_from_payload(provider, payload)
+    # A graceful user control is a Stop request for ownership, inbox replay,
+    # and native-turn freshness as well as for the reducer. Keeping it as a
+    # user_prompt until _handle_control would bypass those shared guards.
+    explicit_stop = (source.kind == "user_prompt" and
+                     _parse_control(str(source.payload.get("prompt") or "")) == ("stop", ""))
+    if explicit_stop:
+        source = replace(source, kind="stop_requested")
+    expected_owner = ""
 
-    def transition(state: ProjectState) -> tuple[ProjectState, tuple[Action, ...]]:
+    def dispatch(state: ProjectState, event: Event) -> tuple[ProjectState, tuple[Action, ...]]:
         # Select the owning run under the store lock so parallel hooks cannot
         # observe a stale project roster.
-        current_scope = _run_scope(state, source, provider)
+        current_scope = _run_scope(state, event, provider)
         if current_scope is None:
             return state, ()
+        if expected_owner and current_scope != (f"{provider}:{expected_owner}", expected_owner):
+            return state, ()
         current_key, current_session = current_scope
-        current_payload = {**payload, "session_id": current_session}
-        current_source = replace(source, payload={**source.payload, "session_id": current_session})
+        current_payload = {**event.payload, "session_id": current_session}
+        current_source = replace(event, payload=current_payload)
         scoped = _scope_state(state, current_key, current_session, provider)
         next_scoped, actions = _transition(scoped, current_source, provider, current_payload, environ)
-        rendered = _render_actions(actions, next_scoped, provider, source.kind)
+        rendered = _render_actions(actions, next_scoped, provider, event.kind)
         merged = _merge_scope(state, scoped, next_scoped, current_key, provider, current_session)
-        control = _parse_control(str(payload.get("prompt") or "")) if source.kind == "user_prompt" else None
-        if next_scoped.active_run or source.kind == "stop_requested" or (control and control[0] in {"disable", "stop"}):
+        control = _parse_control(str(event.payload.get("prompt") or "")) if event.kind == "user_prompt" else None
+        if next_scoped.active_run or event.kind == "stop_requested" or (control and control[0] in {"disable", "stop"}):
             merged = _release_pending_session(merged, provider, current_session)
         return merged, rendered
 
-    actions = store.update(project, transition)
+    def transition(
+        state: ProjectState, pending: tuple[tuple[Event, int], ...] = (), generation: int = 1,
+        retired: frozenset[str] = frozenset(),
+    ) -> tuple[ProjectState, tuple[tuple[Action, ...], set[str]]]:
+        acknowledged: set[str] = set()
+        unresolved = False
+        lifecycle_source = source.kind in {"subagent_started", "subagent_stopped"}
+        source_actions: tuple[Action, ...] = ()
+        # The triggering lifecycle callback was timestamped before it waited
+        # for this session lock. A newer callback may have entered an inbox in
+        # the meantime, so sort it with the retained events, then hold archival
+        # until every relevant event has been considered.
+        batch = [(event, event_generation, False) for event, event_generation in pending]
+        if lifecycle_source:
+            batch.append((source, generation, True))
+        for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
+            state = _hold_pending_batch(state, provider, session)
+            pending_event_id = event.event_id
+            if provider == "claude" and expected_owner:
+                scoped = _scope_state(state, f"claude:{expected_owner}", expected_owner, provider)
+                native = claude_current_native_lead_event(
+                    scoped, event, expected_owner, project, environ)
+                if native is not None:
+                    event = native
+            if (provider == "claude" and expected_owner
+                    and claude_committed_native_terminal_replay(
+                        state, event, expected_owner, project, environ)):
+                if not current:
+                    acknowledged.add(pending_event_id)
+                continue
+            if current:
+                if (expected_owner and _committed_child_start_replay(
+                        state, event, provider, expected_owner)):
+                    continue
+                if (expected_owner and _committed_child_terminal_replay(
+                        state, event, provider, expected_owner, allow_active=True)):
+                    # A callback retried after archive cannot complete a
+                    # newer run that reused the same child identity.
+                    continue
+                if (expected_owner and event.kind in {"subagent_started", "subagent_stopped"}
+                        and f"{provider}:{expected_owner}" not in state.active_runs
+                        and not (event.kind == "subagent_started"
+                                 and _observed_role(event.payload) == "assessor")
+                        and _archived_managed_child(state, event, provider, expected_owner)):
+                    # A non-replay child turn after archive has no run to own
+                    # it. Retain the Start as well as its terminal, so a
+                    # later root task cannot silently inherit either one.
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    unresolved = True
+                    continue
+                if (expected_owner and _prior_child_terminal_conflict(
+                        state, event, provider, expected_owner)):
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    unresolved = True
+                    continue
+                if (expected_owner and _run_scope(state, event, provider)
+                        != (f"{provider}:{expected_owner}", expected_owner)):
+                    # Retain the source before this project transaction can
+                    # commit. A settled root may otherwise dispatch a child
+                    # terminal into another active run in the same file.
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    unresolved = True
+                    continue
+                state, source_actions = dispatch(state, event)
+                continue
+            identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+            disposition = ("stale" if event_generation < generation else
+                           "hold" if identity in retired else
+                           _pending_child_disposition(state, event, provider, session))
+            if disposition == "stale":
+                acknowledged.add(pending_event_id)
+            elif disposition == "apply":
+                state, _ = dispatch(state, event)
+                acknowledged.add(pending_event_id)
+            else:
+                unresolved = True
+        if source.kind == "stop_requested" and unresolved:
+            return state, ((Action("block_stop", {"reason":
+                "Symphony retained an unresolved child result for this session. "
+                "Retry this turn after its owning run is reconciled."}),), acknowledged)
+        if (not unresolved and provider == "claude"
+                and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
+            scoped = _scope_state(state, f"claude:{session}", session, provider)
+            try:
+                recovered = claude_recovered_lead_event(scoped, session, project, environ)
+            except Exception:
+                if source.kind == "stop_requested" and scoped.active_run is not None:
+                    return state, ((Action("block_stop", {"reason":
+                        "Symphony could not verify the tracked lead's native Claude result. "
+                        "Return to this session after its result is available."}),), acknowledged)
+                recovered = None
+            if recovered is not None:
+                state = _hold_pending_batch(state, provider, session)
+                state, _ = dispatch(state, recovered)
+            if source.kind == "stop_requested":
+                scoped = _scope_state(state, f"claude:{session}", session, provider)
+                try:
+                    freshness, native_turn = claude_completing_lead_turn(
+                        scoped, session, project, environ)
+                except Exception:
+                    if scoped.active_run is not None:
+                        return state, ((Action("block_stop", {"reason":
+                            _claude_unknown_turn_guidance(scoped.active_run)}),), acknowledged)
+                    freshness, native_turn = "none", None
+                if freshness == "unknown":
+                    return state, ((Action("block_stop", {"reason":
+                        _claude_unknown_turn_guidance(scoped.active_run)}),), acknowledged)
+                if native_turn is not None:
+                    state = _hold_pending_batch(state, provider, session)
+                    state, _ = dispatch(state, native_turn)
+        if (not unresolved and provider == "codex"
+                and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
+            scoped = _scope_state(state, f"codex:{session}", session, provider)
+            try:
+                recovered = codex_recovered_lead_event(scoped, session, environ)
+            except Exception:
+                if source.kind == "stop_requested" and scoped.active_run is not None:
+                    return state, ((Action("block_stop", {"reason":
+                        "Symphony could not verify the tracked lead's native Codex result. "
+                        "Return to this session after its result is available."}),), acknowledged)
+                recovered = None
+            if recovered is not None:
+                state = _hold_pending_batch(state, provider, session)
+                state, _ = dispatch(state, recovered)
+            if source.kind == "stop_requested":
+                scoped = _scope_state(state, f"codex:{session}", session, provider)
+                try:
+                    freshness, native_turn = codex_completing_lead_turn(scoped, session, environ)
+                except Exception:
+                    if scoped.active_run is not None:
+                        return state, ((Action("block_stop", {"reason":
+                            "Symphony could not verify the tracked lead's latest native Codex turn. "
+                            "Return to this session after its result is available."}),), acknowledged)
+                    freshness, native_turn = "none", None
+                if freshness in {"running", "unknown"}:
+                    reason = ("The tracked lead has a newer native turn still running. "
+                              "Wait for its result before completing this run."
+                              if freshness == "running" else
+                              "Symphony could not verify the tracked lead's latest native turn. "
+                              "Return to this session after its result is available.")
+                    return state, ((Action("block_stop", {"reason": reason}),), acknowledged)
+                if native_turn is not None:
+                    state = _hold_pending_batch(state, provider, session)
+                    state, _ = dispatch(state, native_turn)
+        # A new turn delivered in this same hook can supersede an earlier
+        # queued completion. Include it before releasing the archive hold.
+        if source.kind != "stop_requested":
+            if pending and not lifecycle_source:
+                state = _hold_pending_batch(state, provider, session)
+            if lifecycle_source:
+                actions = source_actions
+            else:
+                state, actions = dispatch(state, source)
+            if not unresolved:
+                before_finish = state
+                state = _finish_pending_batch(state, provider, session, source)
+                actions = _refresh_completion_guidance(
+                    actions, before_finish, state, source, provider)
+        else:
+            if not unresolved:
+                state = _finish_pending_batch(state, provider, session, source)
+            state, actions = dispatch(state, source)
+        if unresolved and source.kind in {"session_heartbeat", "user_prompt"}:
+            actions += (Action("inject_context", {"text":
+                "Symphony retained an unresolved child result for this session; "
+                "completion stays blocked until it is reconciled."}),)
+        return state, (actions, acknowledged)
+
+    session = str(source.payload.get("session_id") or "")
+    if session:
+        with store.session_lock(provider, session):
+            record = store.session_record(provider, session)
+            bound = store.root / record["state_name"] if record and record["state_name"] else None
+            ambiguous_scope = False
+            owners = (store.active_owner_paths(provider, session,
+                                               include_ancestry=not _is_root_origin(source))
+                      if bound is None or record["migrated"] else ())
+            if (bound is None and owners == () and source.kind in {"subagent_started", "subagent_stopped", "pre_tool_use"}):
+                parent = str(source.payload.get("parent_thread_id") or "")
+                if parent:
+                    owners = store.active_owner_paths(provider, session, parent, include_ancestry=True)
+            if owners is not None and len(owners) == 1 and bound is None:
+                origin = project if store._path(project) == owners[0] and _is_root_origin(source) else None
+                owner_state = store.read_path(owners[0])
+                scope = _run_scope(owner_state, source, provider) if owner_state else None
+                if scope is not None:
+                    record = store.bind_session(provider, session, owners[0], True, origin,
+                                                scope[1])
+                    bound = owners[0]
+                else:
+                    ambiguous_scope = True
+            if (owners == () and bound is None and _is_root_origin(source)):
+                record = store.bind_session(provider, session, store._path(project),
+                                            bool(record and record["pending"]), project)
+                bound = store._path(project)
+            if (bound is not None and record is not None and bound != store._path(project)
+                    and owners == () and _starts_new_root_task(source)
+                    and not record["pending"] and not record["overflow"]):
+                old_state = store.read_path(bound)
+                if old_state is not None and _settled_for_rebind(old_state, provider, session):
+                    retired = {agent for run in old_state.recent_runs
+                               if run.provider == provider and run.session_id == session
+                               for agent in (run.lead_identity,
+                                             *(item.identity for item in run.delegations)) if agent}
+                    record = store.rebind_session(record, project, retired)
+                    bound = store._path(project)
+            conflict = (owners is None or len(owners) > 1
+                        or (bound is not None and owners and owners[0] != bound))
+            if record and record["owner_session"] and record["owner_session"] != session:
+                # Repair an alias record persisted by an older candidate or
+                # interrupted before its discovery pointer was published.
+                store._register_alias(provider, record["owner_session"], session)
+            if conflict or bound is None:
+                # A root session cannot safely own two active project files.
+                # A real Stop must still block, and controls must explain the
+                # conflict instead of silently hiding the unfinished work.
+                reason = (("Symphony could not verify this root session's project owner because "
+                           "a state snapshot was unavailable. Retry this turn after the other hook finishes.")
+                          if owners is None else
+                          ("Symphony found this root session active in multiple project states. "
+                           "Inspect and reconcile those runs before completing this session.")
+                          if conflict else
+                          ("Symphony has not yet verified this child event's root project. "
+                           "Return to the root session to reconcile it."))
+                if source.kind in {"subagent_started", "subagent_stopped"}:
+                    store.queue_session_event(
+                        provider, session, source,
+                        ambiguous_owner=ambiguous_scope or bool(owners and (len(owners) > 1 or
+                            (bound is not None and owners[0] != bound))),
+                    )
+                    return HookResult()
+                if source.kind == "pre_tool_use":
+                    return render(provider, (Action("block_tool", {"reason": reason}),),
+                                  str(payload.get("hook_event_name") or "PreToolUse"))
+                if source.kind == "stop_requested":
+                    if owners == () and bound is None and record is None:
+                        actions, _ = store.update(project, lambda state: transition(state))
+                        return render(provider, actions, "Stop")
+                    return render(provider, (Action("block_stop", {"reason": reason}),),
+                                  str(payload.get("hook_event_name") or "Stop"))
+                if source.kind in {"user_prompt", "session_heartbeat"}:
+                    return render(provider, (Action("inject_context", {"text": reason}),),
+                                  str(payload.get("hook_event_name") or "UserPromptSubmit"))
+                return HookResult()
+            expected_owner = str(record["owner_session"] or session)
+            if (source.kind in {"subagent_started", "subagent_stopped"}
+                    and str(source.payload.get("agent_id") or source.payload.get("subagent_id") or "")
+                    in record["retired_agents"]):
+                store.queue_session_event(provider, session, source)
+                return HookResult()
+            if (record["owner_session"] != session
+                    and source.kind in {"subagent_started", "subagent_stopped"}):
+                # A child-session callback may belong to the root run, but it
+                # must share the root's pending batch and project transaction.
+                store.queue_session_event(provider, session, source)
+                return HookResult()
+            with ExitStack() as aliases:
+                records = [record]
+                unresolved_alias = False
+                if record["owner_session"] == session:
+                    roster = store.read_path(bound)
+                    own_run = roster.active_runs.get(f"{provider}:{session}") if roster else None
+                    ancestry = ({session, own_run.lead_identity,
+                                 *(item.identity for item in own_run.delegations)}
+                                if own_run else {session})
+                    names = set(ancestry)
+                    try:
+                        for parent in sorted(name for name in ancestry if name):
+                            names.update(store.aliases_for_owner(provider, parent))
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                        unresolved_alias = True
+                    for alias in sorted(name for name in names if name and name != session):
+                        try:
+                            aliases.enter_context(store.session_lock(provider, alias, timeout=0.1))
+                        except TimeoutError:
+                            unresolved_alias = True
+                            break
+                        alias_record = store.session_record(provider, alias)
+                        if alias_record and (alias_record["pending"] or alias_record["overflow"]):
+                            if alias_record["owner_session"] not in {None, session}:
+                                # The pointer is only a discovery hint. An
+                                # authoritative binding to another root must
+                                # not block this independent session.
+                                continue
+                            if any(item.get("ambiguous_owner") and not (
+                                roster is not None and (
+                                    _committed_child_start_replay(
+                                        roster, Event(item["event_id"], item["kind"],
+                                                      item["observed_at"], item["payload"]),
+                                        provider, session,
+                                    ) or _committed_child_terminal_replay(
+                                        roster, Event(item["event_id"], item["kind"],
+                                                      item["observed_at"], item["payload"]),
+                                        provider, session,
+                                    ) or (provider == "claude" and
+                                          claude_committed_native_terminal_replay(
+                                              roster, Event(item["event_id"], item["kind"],
+                                                            item["observed_at"], item["payload"]),
+                                              session, Path(record["project"] or project), environ))
+                                )) for item in alias_record["pending"]):
+                                unresolved_alias = True
+                                continue
+                            exact_owner = (alias_record["owner_session"] == session
+                                           and alias_record["state_name"] == bound.name)
+                            native_parent = (alias_record["owner_session"] is None
+                                             and bool(alias_record["pending"])
+                                             and all(item["payload"].get("parent_thread_id") in ancestry
+                                                     for item in alias_record["pending"])
+                                             and store.active_owner_paths(
+                                                 provider, alias,
+                                                 str(alias_record["pending"][0]["payload"].get(
+                                                     "parent_thread_id") or ""),
+                                                 include_ancestry=True,
+                                             ) == (bound,))
+                            archived_replay = (alias_record["owner_session"] is None
+                                               and bool(alias_record["pending"])
+                                               and roster is not None
+                                               and all(
+                                                   _committed_child_start_replay(
+                                                       roster,
+                                                       Event(item["event_id"], item["kind"],
+                                                             item["observed_at"], item["payload"]),
+                                                       provider, session,
+                                                   ) or _committed_child_terminal_replay(
+                                                       roster,
+                                                       Event(item["event_id"], item["kind"],
+                                                             item["observed_at"], item["payload"]),
+                                                       provider, session,
+                                                   ) or (provider == "claude" and
+                                                         claude_committed_native_terminal_replay(
+                                                             roster,
+                                                             Event(item["event_id"], item["kind"],
+                                                                   item["observed_at"], item["payload"]),
+                                                             session, Path(record["project"] or project),
+                                                             environ))
+                                                   for item in alias_record["pending"]))
+                            if exact_owner or native_parent or archived_replay:
+                                records.append(alias_record)
+                            else:
+                                unresolved_alias = True
+                if unresolved_alias:
+                    reason = ("Symphony retained a child result whose root ownership is unresolved. "
+                              "Return to this session after its lifecycle is reconciled.")
+                    if source.kind in {"subagent_started", "subagent_stopped"}:
+                        store.queue_session_event(provider, session, source)
+                        return HookResult()
+                    if source.kind == "stop_requested":
+                        return render(provider, (Action("block_stop", {"reason": reason}),), "Stop")
+                    if source.kind == "pre_tool_use":
+                        return render(provider, (Action("block_tool", {"reason": reason}),), "PreToolUse")
+                    if source.kind in {"user_prompt", "session_heartbeat"}:
+                        return render(provider, (Action("inject_context", {"text": reason}),),
+                                      str(payload.get("hook_event_name") or "UserPromptSubmit"))
+                    return HookResult()
+                pending = tuple(
+                    (Event(item["event_id"], item["kind"], item["observed_at"],
+                           {**item["payload"], "_symphony_owner_conflict":
+                            bool(item.get("ambiguous_owner")),
+                            "_symphony_verified_alias": source_record is not record
+                            and source_record["owner_session"] == session
+                            and source_record["state_name"] == bound.name}),
+                     # Alias counters are local to that child session. Its
+                     # verified parent/owner and active run establish the
+                     # root generation; comparing raw counters drops events.
+                     item["generation"] if source_record is record else record["generation"])
+                    for source_record in records for item in source_record["pending"]
+                )
+                if any(item["overflow"] for item in records):
+                    reason = ("Symphony retained more unresolved child events than it can safely replay. "
+                              "Inspect this session before completion.")
+                    if source.kind in {"subagent_started", "subagent_stopped"}:
+                        store.queue_session_event(provider, session, source)
+                        return HookResult()
+                    action = ("block_stop" if source.kind == "stop_requested" else
+                              "block_tool" if source.kind == "pre_tool_use" else "inject_context")
+                    return render(provider, (Action(action, {"reason": reason, "text": reason}),),
+                                  str(payload.get("hook_event_name") or "UserPromptSubmit"))
+                if source.kind == "subagent_stopped" and not pending and not bound.is_file():
+                    return HookResult()
+                result = (store.update(Path(record["project"]),
+                                       lambda state: transition(state, pending, record["generation"],
+                                                                frozenset(record["retired_agents"])))
+                          if record["project"] else
+                          store.update_path(bound, lambda state: transition(state, pending, record["generation"],
+                                                                            frozenset(record["retired_agents"]))))
+                if result is None:
+                    return render(provider, (Action("block_stop", {"reason":
+                        "Symphony's bound project state is unavailable; recover this session before completion."}),),
+                                  "Stop") if source.kind == "stop_requested" else HookResult()
+                actions, acknowledged = result
+                for source_record in records:
+                    fresh = store.session_record(provider, source_record["session"])
+                    if fresh is not None:
+                        store.finish_session_events(fresh, acknowledged)
+    else:
+        actions, _ = store.update(project, lambda state: transition(state))
     return render(provider, actions, str(payload.get("hook_event_name") or "UserPromptSubmit"))
+
+
+def _is_root_origin(source: Event) -> bool:
+    """Only root-entry hooks may establish a CWD-based session binding."""
+    return (source.kind in {"session_heartbeat", "user_prompt"}
+            and not any(source.payload.get(field) for field in
+                        ("agent_id", "subagent_id", "parent_thread_id", "agent_transcript_path")))
+
+
+def _starts_new_root_task(source: Event) -> bool:
+    if not _is_root_origin(source) or source.kind != "user_prompt":
+        return False
+    # A settled session's next root prompt (including a project-scoped
+    # control) establishes the user's new project context. SessionStart alone
+    # can be a resume/compaction heartbeat and cannot move it.
+    return bool(str(source.payload.get("prompt") or "").strip())
+
+
+def _settled_for_rebind(state: ProjectState, provider: str, session: str) -> bool:
+    if f"{provider}:{session}" in state.active_runs:
+        return False
+    return not any(run.provider == provider and run.session_id == session and run.unreconciled
+                   for run in state.recent_runs)
+
+
+def _hold_pending_batch(state: ProjectState, provider: str, session: str) -> ProjectState:
+    key = f"{provider}:{session}"
+    run = state.active_runs.get(key)
+    if not run or run.assessment.get("_batch_pending"):
+        return state
+    held = replace(run, assessment={**run.assessment, "_batch_pending": True})
+    runs = {**state.active_runs, key: held}
+    return replace(state, active_runs=runs,
+                   active_run=held if state.active_run == run else state.active_run)
+
+
+def _finish_pending_batch(
+    state: ProjectState, provider: str, session: str, source: Event,
+) -> ProjectState:
+    key = f"{provider}:{session}"
+    run = state.active_runs.get(key)
+    if not run or not run.assessment.get("_batch_pending"):
+        return state
+    assessment = dict(run.assessment)
+    assessment.pop("_batch_pending", None)
+    settled = replace(run, assessment=assessment)
+    state = replace(state, active_runs={**state.active_runs, key: settled},
+                    active_run=settled if state.active_run == run else state.active_run)
+    lead = next((item for item in settled.delegations
+                 if item.identity == settled.lead_identity and item.role == "lead"), None)
+    if (settled.status != "completing" or not settled.outcome or not lead
+            or lead.state.lower() not in {"completed", "done", "success", "succeeded"}):
+        return state
+    scoped = _scope_state(state, key, session, provider)
+    final = Event(
+        f"{source.event_id}:pending-batch:{source.observed_at}", "lead_completed",
+        source.observed_at,
+        {"identity": settled.lead_identity, "owner_generation": settled.owner_generation,
+         "outcome": settled.outcome},
+    )
+    next_scoped, _ = reduce(scoped, final)
+    return _merge_scope(state, scoped, next_scoped, key, provider, session)
+
+
+def _pending_child_disposition(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> str:
+    """Replay only a child lifecycle that the current run already identifies."""
+    if _committed_child_start_replay(state, event, provider, session):
+        return "stale"
+    if _pre_run_unmanaged_claude_child(state, event, provider, session):
+        return "stale"
+    if event.payload.get("_symphony_owner_conflict"):
+        return "hold"
+    if event.kind not in {"subagent_started", "subagent_stopped"}:
+        return "hold"
+    identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+    if not identity:
+        return "hold"
+    run = state.active_runs.get(f"{provider}:{session}")
+    if _committed_child_terminal_replay(state, event, provider, session, allow_active=True):
+        return "stale"
+    if _prior_child_terminal_conflict(state, event, provider, session):
+        return "hold"
+    if run is None:
+        return "hold"
+    if run.started_at and event.observed_at < run.started_at:
+        return "stale"
+    if _run_scope(state, event, provider) != (f"{provider}:{session}", session):
+        # One project file can contain several roots with the same child or
+        # parent ID. Never ACK an event dispatch would reject or misroute.
+        return "hold"
+    parent = str(event.payload.get("parent_thread_id") or "")
+    known = {run.session_id, run.lead_identity,
+             *(item.identity for item in run.delegations)}
+    if parent and parent not in known:
+        return "hold"
+    if not parent and str(event.payload.get("session_id") or "") not in known:
+        return "hold"
+    if identity in known:
+        return "apply"
+    if event.kind == "subagent_started":
+        role = _observed_role(event.payload)
+        pending = run.assessment.get("_pending_delegations", ())
+        if any(isinstance(item, Mapping) and item.get("role") == role for item in pending):
+            return "apply"
+    return "hold"
+
+
+def _pre_run_unmanaged_claude_child(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """An unmarked root Agent call cannot own a run opened after its callback."""
+    if provider != "claude" or event.kind not in {"subagent_started", "subagent_stopped"}:
+        return False
+    run = state.active_runs.get(f"{provider}:{session}")
+    identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+    if (not run or not run.started_at or not identity
+            or event.observed_at >= run.started_at
+            or str(event.payload.get("session_id") or "") != session
+            or event.payload.get("parent_thread_id") or _observed_role(event.payload)
+            or str(event.payload.get("agent_type") or "").strip().lower()
+            not in {"", "general-purpose"}
+            or event.payload.get("role") or event.payload.get("task_name")
+            or event.payload.get("_symphony_child_metadata")):
+        return False
+    if any(identity in {item.lead_identity, *(child.identity for child in item.delegations)}
+           for item in (*state.active_runs.values(), *state.recent_runs)
+           if item.provider == provider):
+        return False
+    return not any(item.get("provider") == provider and item.get("agent") == identity
+                   for item in state.terminal_receipts)
+
+
+def _committed_child_terminal_replay(
+    state: ProjectState, event: Event, provider: str, session: str,
+    *, allow_active: bool = False,
+) -> bool:
+    return _prior_child_terminal_disposition(
+        state, event, provider, session, allow_active=allow_active) == "replay"
+
+
+def _committed_child_start_replay(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """An exact archived start is a retry, even if it arrived after archive."""
+    return (event.kind == "subagent_started"
+            and f"{provider}:{session}" not in state.active_runs
+            and bool(event.payload.get("turn_id") or event.payload.get("prompt_id"))
+            and any(
+                item.provider == provider and item.session_id == session
+                and event.event_id in item.assessment.get("_start_event_ids", ())
+                for item in state.recent_runs
+            ))
+
+
+def _archived_managed_child(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """An old managed owner or role must exist before retaining a late child."""
+    archived = tuple(run for run in state.recent_runs
+                     if run.provider == provider and run.session_id == session)
+    receipts = tuple(item for item in state.terminal_receipts
+                     if item.get("provider") == provider and item.get("session") == session)
+    if not archived and not receipts:
+        return False
+    identity = event.payload.get("agent_id") or event.payload.get("subagent_id")
+    return bool(_observed_role(event.payload) in ROLES
+                or identity and (any(identity in {run.lead_identity,
+                                                   *(item.identity for item in run.delegations)}
+                                     for run in archived)
+                                 or any(item.get("agent") == identity for item in receipts)))
+
+
+def _prior_child_terminal_conflict(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    return _prior_child_terminal_disposition(
+        state, event, provider, session, allow_active=True) == "conflict"
+
+
+def _prior_child_terminal_disposition(
+    state: ProjectState, event: Event, provider: str, session: str,
+    *, allow_active: bool,
+) -> str:
+    """Classify old terminal evidence before it can change a newer run."""
+    if (event.kind != "subagent_stopped" or event.payload.get("_symphony_owner_conflict")
+            or (not allow_active and f"{provider}:{session}" in state.active_runs)):
+        return "unknown"
+    identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
+    if not identity:
+        return "unknown"
+    parent = str(event.payload.get("parent_thread_id") or "")
+    if (not parent and str(event.payload.get("session_id") or "") != session
+            and not event.payload.get("_symphony_verified_alias")):
+        return "unknown"
+    if parent != session and parent and any(
+        item.provider == provider and item.session_id != session
+        and parent in {item.session_id, item.lead_identity,
+                       *(child.identity for child in item.delegations)}
+        for item in state.active_runs.values()
+    ):
+        return "unknown"
+    canonical = replace(event, payload={**event.payload, "session_id": session})
+    result_id = _terminal_result_id(canonical)
+    token = _child_turn_token(canonical.payload)
+    current = state.active_runs.get(f"{provider}:{session}")
+    receipts = tuple(item for item in state.terminal_receipts
+                     if item["provider"] == provider and item["session"] == session
+                     and item["agent"] in {identity, "*"}
+                     and (current is None or item["run_id"] != current.run_id)
+                     and (not parent or parent in {session, item["parent"],
+                                                   item["lead"], identity}))
+    if any(item["result"] == result_id for item in receipts):
+        return "replay"
+    owned_receipts = tuple(item for item in receipts if item["agent"] == identity)
+    if owned_receipts and (not token or any(item["turn"] == token for item in owned_receipts)):
+        return "conflict"
+    archived = tuple(run for run in state.recent_runs if
+        run.provider == provider and run.session_id == session
+        and (not parent or parent in {session, run.lead_identity,
+                                      *(item.identity for item in run.delegations)})
+        and any(item.identity == identity for item in run.delegations))
+    if any(any(item == result_id or item.endswith(f":{result_id}")
+               for item in run.assessment.get("_terminal_event_ids", ()))
+           for run in archived):
+        return "replay"
+    if archived and (not token or any(token in run.assessment.get(
+            "_terminal_turns", {}).get(identity, ()) for run in archived)):
+        return "conflict"
+    return "unknown"
 
 
 def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, str] | None:
     """Find the owning root without ever borrowing another session's run."""
     session = str(source.payload.get("session_id") or "")
+    key = f"{provider}:{session}" if session else ""
     parent = str(source.payload.get("parent_thread_id") or "")
     agent = str(source.payload.get("agent_id") or source.payload.get("subagent_id") or "")
     if source.kind in {"subagent_started", "subagent_stopped"}:
+        session_matches = [
+            (owned_key, run.session_id or session) for owned_key, run in state.active_runs.items()
+            if owned_key.startswith(f"{provider}:")
+            and session in {run.session_id, run.lead_identity,
+                            *(item.identity for item in run.delegations)}
+        ] if session else []
         if parent:
             matches = [
-                (key, run.session_id or parent) for key, run in state.active_runs.items()
-                if key.startswith(f"{provider}:")
+                (owned_key, run.session_id or parent) for owned_key, run in state.active_runs.items()
+                if owned_key.startswith(f"{provider}:")
                 and parent in {run.session_id, run.lead_identity,
                                *(item.identity for item in run.delegations)}
             ]
             if len(matches) == 1:
+                if ((key in state.active_runs and key != matches[0][0])
+                        or (session_matches and all(owner != matches[0][0]
+                                                    for owner, _ in session_matches))):
+                    return None
                 return matches[0]
             if matches:
+                owned = [match for match in matches if match in session_matches]
+                if len(owned) == 1 and (key not in state.active_runs or owned[0][0] == key):
+                    return owned[0]
+                return None
+            if session_matches:
                 return None
             if source.kind == "subagent_started":
                 return f"{provider}:{parent}", parent
             return None
+        if len(session_matches) == 1:
+            return session_matches[0]
+        if session_matches:
+            return None
+        if source.kind == "subagent_started" and session and _observed_role(source.payload) == "assessor":
+            return key, session
         if agent:
             matches = [
                 (key, run.session_id or session) for key, run in state.active_runs.items()
@@ -129,13 +821,13 @@ def _run_scope(state: ProjectState, source: Event, provider: str) -> tuple[str, 
             return None
     if not session:
         return None
-    key = f"{provider}:{session}"
     if key in state.active_runs:
         return key, session
     if source.kind in {"subagent_started", "subagent_stopped"}:
         # A child with no known parent/run cannot claim an arbitrary project
         # run. An assessor may open a new run under its reported session.
-        if source.kind == "subagent_started" and _observed_role(source.payload) == "assessor":
+        if source.kind == "subagent_started" and (_observed_role(source.payload) == "assessor"
+                                                   or _fast_spawn(source.payload)):
             return key, session
         return None
     return key, session
@@ -231,17 +923,14 @@ def _transition(
         retained = environ.get("SYMPHONY_PINNED_RUNTIME")
         original = str(heartbeat.payload["plugin_root"])
         if retained and (source.kind == "session_heartbeat" or not Path(original).is_dir()):
-            executable = "python.exe" if os.name == "nt" else "python3"
             text = (
                 f"Symphony retained the reviewed runtime at {retained}. "
                 "If the loaded plugin cache disappears, use this retained root for Symphony references. "
             )
-            bootstrap = environ.get("SYMPHONY_BOOTSTRAP_CODE")
-            if provider == "codex" and bootstrap:
-                arguments = [executable, "-I", "-c", bootstrap, original, provider, "--check-activation"]
-                command = ("& " + " ".join("'" + value.replace("'", "''") + "'" for value in arguments)
-                           if os.name == "nt" else shlex.join(arguments))
-                text += f"Check activation through the verified launcher: {command}"
+            if provider == "codex":
+                command = _retained_activation_command(retained, original)
+                if command:
+                    text += f"Check activation through the verified launcher: {command}"
             actions += (Action("inject_context", {"text": text}),)
 
     # Every event from the owning session is evidence it is still alive, which
@@ -261,7 +950,7 @@ def _transition(
         state, resume_actions = _reconcile_session(state, source, payload)
         actions += resume_actions
         if state.active_run:
-            actions += (Action("inject_context", {"text": _recovery_guidance(state)}),)
+            actions += (Action("inject_context", {"text": _recovery_guidance(state, provider)}),)
     elif source.kind == "pre_tool_use":
         state, delegation_actions = _prepare_delegation(state, source, provider)
         actions += delegation_actions
@@ -269,7 +958,7 @@ def _transition(
         if source.kind == "subagent_started":
             state, deferred = _consume_parent_actions(state)
             actions += deferred
-        state, observed_actions = _observe_delegation(state, source)
+        state, observed_actions = _observe_delegation(state, source, environ)
         if source.kind == "subagent_stopped":
             # Neither host accepts injected context on a subagent-stop result,
             # so corrective guidance waits for the next event that does. Render
@@ -449,7 +1138,7 @@ def _claude_entitlement(environ: Mapping[str, str], *, probe: bool = False) -> s
     explicit = {model.strip() for model in models.split(",") if model.strip()}
     if explicit or not probe:
         return explicit or None
-    targets = ("claude-sonnet-5", "claude-opus-5-5")
+    targets = ("claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5")
     available = set()
     for model in targets:
         if model not in available and _claude_accepts(model):
@@ -468,7 +1157,8 @@ def _claude_accepts(model: str) -> bool:
              "--tools", "", "--disallowedTools", "mcp__*",
              "--system-prompt", "Reply ok.", "--model", model,
              "--max-budget-usd", "0.25", "--output-format", "json", "Reply ok."],
-            capture_output=True, text=True, timeout=15,
+            # Three probes leave 15 seconds of the 45-second hook budget for bookkeeping.
+            capture_output=True, text=True, timeout=10,
             env={**os.environ, "SYMPHONY_CLAUDE_PROBE": "1"},
         )
         if completed.returncode:
@@ -623,7 +1313,7 @@ def _task_guidance(state: ProjectState, task: str, provider: str, session_id: st
     if _applied_profile(state, provider) == NO_PROFILE:
         return "Symphony has no launchable route in this account's available model roster."
     if state.active_run:
-        return _recovery_guidance(state)
+        return _recovery_guidance(state, provider)
     return _assessment_guidance(task, provider, state, session_id)
 
 
@@ -683,28 +1373,115 @@ def _derived(
     return Event(candidate, kind, source.observed_at, payload or {})
 
 
-def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectState, tuple[Action, ...]]:
+def _terminal_result_id(source: Event) -> str:
+    """Identify a child result across hook retries without merging new turns."""
+    payload = source.payload
+    fields = ("provider", "session_id", "agent_id", "subagent_id", "turn_id",
+              "prompt_id", "status", "last_assistant_message", "agent_transcript_path",
+              "agent_type", "task_name", "role", "model", "model_reasoning_effort")
+    stable = {key: payload[key] for key in fields if key in payload}
+    stable["observed_role"] = _observed_role(payload)
+    return hashlib.sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _child_turn_token(payload: Mapping[str, object]) -> str:
+    for field in ("turn_id", "prompt_id"):
+        if payload.get(field):
+            return f"{field}:{payload[field]}"
+    return ""
+
+
+def _observe_delegation(
+    state: ProjectState, source: Event, environ: Mapping[str, str] | None = None,
+) -> tuple[ProjectState, tuple[Action, ...]]:
     identity = source.payload.get("agent_id") or source.payload.get("subagent_id")
     if not identity:
         return state, ()
     opening: tuple[Action, ...] = ()
     if not state.active_run:
-        if source.kind != "subagent_started" or _observed_role(source.payload) != "assessor":
+        fast = _fast_spawn(source.payload)
+        if source.kind != "subagent_started" or (_observed_role(source.payload) != "assessor" and not fast):
             return state, ()
         state, opening = _open_run(
-            state, source, str(source.payload.get("task") or source.payload.get("objective") or "")
+            state, source, (_tool_objective({"message": source.payload.get("task")}) if fast else
+                            str(source.payload.get("task") or source.payload.get("objective") or ""))
         )
+        if fast and state.active_run:
+            selection = fast_lead_selection(_snapshot(state, str(source.payload.get("provider") or "codex")))
+            state = _mark_fast_run(state, selection, str(source.payload.get("provider") or "codex"))
+            if not selection["model"]:
+                opening += (Action("inject_context", {"text":
+                    "The fast lead floor is unavailable. Stop this tracked child and spawn an independent assessor."}),)
         if not state.active_run:
             return state, opening
     current = next(
         (item for item in state.active_run.delegations if item.identity == str(identity)),
         None,
     )
-    if source.kind == "subagent_stopped" and any(
-        record.event_id == f"{source.event_id}:delegation:delegation_updated"
-        for record in state.event_history
-    ):
-        return state, opening
+    assessment = state.active_run.assessment
+    token = _child_turn_token(source.payload)
+    terminal_matches_active_start = False
+    if source.kind == "subagent_started":
+        if source.event_id in assessment.get("_start_event_ids", ()):
+            if not token and current and current.state.lower() not in {"working", "pending", "interrupted"}:
+                # A host without invocation IDs cannot distinguish a replay
+                # from a fresh byte-identical start. Preserve unfinished work.
+                updated = dict(assessment)
+                updated["_ambiguous_child_starts"] = (*updated.get("_ambiguous_child_starts", ()),
+                                                       str(identity))
+                delegations = tuple(replace(item, state="interrupted", updated_at=source.observed_at)
+                                    if item.identity == str(identity) else item
+                                    for item in state.active_run.delegations)
+                run = replace(state.active_run, assessment=updated, delegations=delegations)
+                if current.role == "lead":
+                    run = replace(run, outcome=None, status="recovering")
+                state = replace(state, active_run=run)
+            return state, opening
+        terminal_turns = assessment.get("_terminal_turns", {})
+        if current and token and token in terminal_turns.get(str(identity), ()):
+            return state, opening
+        updated = dict(assessment)
+        updated["_start_event_ids"] = (*assessment.get("_start_event_ids", ()), source.event_id)
+        if source.payload.get("provider") == "codex":
+            active_turns = dict(assessment.get("_active_turns", {}))
+            # An accepted start without a native turn ID is still a new epoch.
+            # Never inherit the prior turn's identity for a later failure.
+            active_turns[str(identity)] = token
+            updated["_active_turns"] = active_turns
+        if current and current.state.lower() not in {"working", "pending"}:
+            epochs = dict(assessment.get("_terminal_epochs", {}))
+            epochs[str(identity)] = epochs.get(str(identity), 0) + 1
+            updated["_terminal_epochs"] = epochs
+        state = replace(state, active_run=replace(state.active_run, assessment=updated))
+    if source.kind == "subagent_stopped":
+        # A terminal with a different native turn from the latest accepted
+        # start cannot fail that working turn or authorize replacement.
+        terminal_turns = assessment.get("_terminal_turns", {})
+        active_turn = assessment.get("_active_turns", {}).get(str(identity))
+        terminal_matches_active_start = bool(
+            source.payload.get("provider") == "codex" and token and active_turn == token)
+        if (source.payload.get("provider") == "codex" and current
+                and str(identity) in assessment.get("_active_turns", {})
+                and token != active_turn):
+            if token not in terminal_turns.get(str(identity), ()):
+                updated = dict(assessment)
+                ambiguous = tuple(updated.get("_ambiguous_child_stops", ()))
+                if str(identity) not in ambiguous:
+                    updated["_ambiguous_child_stops"] = (*ambiguous, str(identity))
+                    state = replace(state, active_run=replace(state.active_run, assessment=updated))
+            return state, opening
+        seen = assessment.get("_terminal_event_ids", ())
+        epoch = assessment.get("_terminal_epochs", {}).get(str(identity), 0)
+        base_result_id = _terminal_result_id(source)
+        result_id = base_result_id
+        if not token and epoch:
+            result_id = f"{epoch}:{result_id}"
+        if (result_id in seen or source.event_id in seen or
+                (not seen and any(record.event_id == f"{source.event_id}:delegation:delegation_updated"
+                                  for record in state.event_history))):
+            return state, opening
+        if not token and epoch:
+            source = replace(source, event_id=f"{source.event_id}:terminal-epoch:{epoch}")
     pending: Mapping[str, object] = {}
     if current is None:
         state, pending = _consume_pending_delegation(state, source.payload)
@@ -719,13 +1496,108 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         # plugin's. Recording those as workers buried the real delegations
         # under dozens of anonymous entries.
         return state, opening
+    if source.kind == "subagent_stopped":
+        receipt = {
+            "provider": str(source.payload.get("provider") or ""),
+            "session": str(source.payload.get("session_id") or ""),
+            "agent": str(identity), "run_id": state.active_run.run_id,
+            "turn": token, "result": base_result_id,
+            "parent": str(source.payload.get("parent_thread_id") or ""),
+            "lead": str(state.active_run.lead_identity or ""),
+            "status": str(source.payload.get("status") or "completed").lower(),
+        }
+        if source.payload.get("_symphony_native_recovery"):
+            receipt["native_agent_type"] = str(source.payload.get("agent_type") or "")
+            receipt["native_model"] = str(source.payload.get("model") or "")
+            receipt["native_effort"] = str(source.payload.get("model_reasoning_effort") or "")
+            if (source.payload.get("provider") == "claude"
+                    and str(identity) == state.active_run.lead_identity
+                    and state.active_run.assessment.get("_claude_lead_start_identity") == str(identity)):
+                receipt["native_launch_prompt_hash"] = str(
+                    state.active_run.assessment.get("_claude_lead_start_prompt_hash") or "")
+        state = replace(state, terminal_receipts=(*state.terminal_receipts, receipt))
+        assessment = dict(state.active_run.assessment)
+        assessment["_terminal_event_ids"] = (*assessment.get("_terminal_event_ids", ()),
+                                              result_id)
+        if source.payload.get("provider") == "codex":
+            active_turns = dict(assessment.get("_active_turns", {}))
+            if str(identity) in active_turns and active_turns[str(identity)] == token:
+                active_turns.pop(str(identity), None)
+                if active_turns:
+                    assessment["_active_turns"] = active_turns
+                else:
+                    assessment.pop("_active_turns", None)
+        ambiguous = tuple(item for item in assessment.get("_ambiguous_child_starts", ())
+                          if item != str(identity))
+        if ambiguous:
+            assessment["_ambiguous_child_starts"] = ambiguous
+        else:
+            assessment.pop("_ambiguous_child_starts", None)
+        ambiguous_stops = tuple(item for item in assessment.get("_ambiguous_child_stops", ())
+                                if item != str(identity))
+        if ambiguous_stops:
+            assessment["_ambiguous_child_stops"] = ambiguous_stops
+        else:
+            assessment.pop("_ambiguous_child_stops", None)
+        if token:
+            terminal_turns = dict(assessment.get("_terminal_turns", {}))
+            terminal_turns[str(identity)] = (*terminal_turns.get(str(identity), ()), token)
+            assessment["_terminal_turns"] = terminal_turns
+            if (role := _observed_role(source.payload)) == "lead" and source.payload.get(
+                    "_symphony_native_recovery") and token:
+                assessment["_claude_native_recovery"] = token
+        state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     terminal = source.kind == "subagent_stopped"
     status = str(source.payload.get("status") or ("completed" if terminal else "working"))
     role = str(pending.get("role") or _observed_role(source.payload) or (current.role if current else "worker"))
+    retryable_replacement = (
+        role == "lead" and source.kind == "subagent_started"
+        and state.active_run.provider == "codex"
+        and state.active_run.status == "recovering"
+        and state.active_run.lead_identity
+        and state.active_run.lead_identity != str(identity)
+        and state.active_run.assessment.get("_retryable_lead")
+            == state.active_run.lead_identity
+        and state.active_run.assessment.get("_lead_route_mismatch_owner") != {
+            "identity": state.active_run.lead_identity,
+            "generation": state.active_run.owner_generation,
+        }
+    )
+    unavailable_proof = None
+    if retryable_replacement and environ is not None and current is None:
+        try:
+            unavailable_proof = codex_unavailable_lead_proof(
+                state, state.active_run.session_id, environ, str(identity))
+        except Exception:
+            # A malformed or partial native transcript cannot transfer an
+            # owner; the already-created child is still tracked below.
+            unavailable_proof = None
+    if current and current.role == "rejected_lead":
+        role = "rejected_lead"
+    elif (role == "lead" and source.kind == "subagent_started"
+            and state.active_run.lead_identity
+            and state.active_run.lead_identity != str(identity)
+            and (state.active_run.status == "completing"
+                 or (state.active_run.assessment.get("_fast_escalated")
+                     and not state.active_run.assessment.get("size"))
+                 or (retryable_replacement and unavailable_proof is None))):
+        # A Codex SubagentStart can arrive without PreToolUse after the root
+        # completed its lead, or while the original lead is retryable. The
+        # child already exists: track it until terminal without transferring
+        # the original lead's ownership or outcome.
+        role = "rejected_lead"
+        opening += (
+            Action("reject_lead_replacement", {"identity": str(identity)}),
+        )
     if role == "lead" and (source.kind == "subagent_started" or not state.active_run.lead_identity):
+        if unavailable_proof is not None:
+            assessment = dict(state.active_run.assessment)
+            assessment["_codex_unavailable_proof"] = unavailable_proof
+            state = replace(state, active_run=replace(state.active_run, assessment=assessment))
         owner_generation = state.active_run.owner_generation
         if (
-            state.active_run.status in {"interrupted", "recovering"}
+            (state.active_run.status in {"interrupted", "recovering"}
+             or state.active_run.assessment.get("_fast_escalated"))
             and state.active_run.lead_identity
             and state.active_run.lead_identity != str(identity)
         ):
@@ -736,7 +1608,11 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                 state,
                 source,
                 "lead_started",
-                {"identity": str(identity), "owner_generation": owner_generation},
+                {"identity": str(identity), "owner_generation": owner_generation,
+                 **({"safe_boundary": True} if state.active_run.assessment.get("_fast_escalated")
+                    and state.active_run.assessment.get("size") else {}),
+                 **({"unavailability_digest": unavailable_proof["digest"]}
+                    if unavailable_proof is not None else {})},
                 "lead",
             ),
         )
@@ -762,6 +1638,9 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             resolved_profile = None
             if pending.get("role") == "lead" and pending.get("model") and pending.get("effort"):
                 selected = f"{pending['model']}/{pending['effort']}"
+            elif state.active_run.assessment.get("_fast_pending"):
+                selected = "/".join(str(state.active_run.assessment.get("_fast_route", {}).get(key) or "")
+                                    for key in ("model", "effort"))
             elif (session_profile is not None and state.active_run.assessment.get("size")
                   and state.active_run.assessment.get("complexity")):
                 recorded = state.active_run.assessment
@@ -799,6 +1678,15 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                         expected["approval_required"] = blocked.payload["reason"]
                 assessment["_lead_expected_route"] = expected
                 state = replace(state, active_run=replace(state.active_run, assessment=assessment))
+        if (source.kind == "subagent_started" and source.payload.get("provider") == "claude"
+                and state.active_run and state.active_run.lead_identity == str(identity)
+                and isinstance(source.payload.get("prompt_id"), str)
+                and source.payload["prompt_id"]):
+            assessment = dict(state.active_run.assessment)
+            assessment["_claude_lead_start_identity"] = str(identity)
+            assessment["_claude_lead_start_prompt_hash"] = hashlib.sha256(
+                source.payload["prompt_id"].encode()).hexdigest()
+            state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     else:
         actions = opening
     update = {
@@ -873,7 +1761,10 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
             observed_assessor.requested_tier != expected.get("model")
             or observed_assessor.requested_effort != expected.get("effort")
         ))
-        if mismatch:
+        if status.lower() not in {"completed", "done", "success", "succeeded"}:
+            actions += (Action("inject_context", {"text":
+                "The independent assessor did not complete successfully. Retry assessment before selecting a lead."}),)
+        elif mismatch:
             actions += (Action("inject_context", {"text":
                 f"Assessor boost was not observed at {expected['model']}/{expected['effort']}. "
                 "Retry with the effective boosted route before selecting a lead."}),)
@@ -945,9 +1836,57 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
     if role == "lead" and terminal and state.active_run:
         if str(identity) != state.active_run.lead_identity:
             return state, actions
+        if state.active_run.assessment.get("_fast_escalated"):
+            return state, actions + (Action("inject_context", {"text":
+                "The fast lead already handed off. Await the independent assessment and replacement lead."}),)
         successful = status.lower() in {"completed", "done", "success", "succeeded"}
         outcome = {"status": status}
         report = str(source.payload.get("last_assistant_message") or "")
+        fast_pending = bool(state.active_run.assessment.get("_fast_pending"))
+        decisions = [line.strip().removeprefix("SYMPHONY_FAST_DECISION:").strip()
+                     for line in report.splitlines()
+                     if line.strip().startswith("SYMPHONY_FAST_DECISION:")] if fast_pending else []
+        fast_decision = decisions[0] if len(decisions) == 1 else ""
+        if fast_pending and not state.active_run.assessment.get("_fast_route", {}).get("model"):
+            successful = False
+        fast_route = state.active_run.assessment.get("_fast_route", {}) if fast_pending else {}
+        fast_observed = next((item for item in state.active_run.delegations
+                              if item.identity == str(identity)), None)
+        fast_verified = bool(fast_observed and fast_route.get("model")
+                             and fast_observed.requested_tier == fast_route["model"]
+                             and fast_observed.requested_effort == fast_route["effort"])
+        fast_disallowed = bool(state.active_run.assessment.get("_fast_disallowed"))
+        descendants = [item for item in state.active_run.delegations
+                       if item.identity != str(identity)]
+        unsettled = [item.identity for item in descendants
+                     if item.state.lower() in _ACTIVE_STATES | {"interrupted"}]
+        if (fast_pending and status.lower() in {"completed", "done", "success", "succeeded", "failed"}
+                and (fast_disallowed or not fast_verified)
+                and not unsettled):
+            state = _escalate_fast_run(state, source)
+            return state, actions + (Action("inject_context", {"text":
+                "The fast lead was not authorized at its native route. Its result cannot complete "
+                "the task; inspect any partial work and spawn an independent assessor."}),)
+        if fast_pending and not fast_verified:
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead route could not be verified at the capable/medium floor."}),)
+        if fast_pending and (unsettled or (fast_decision == "eligible" and descendants)):
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead cannot finish while descendants remain, and direct completion "
+                "is invalid after any descendant: "
+                + ", ".join(item.identity for item in descendants)}),)
+        if fast_pending and successful and fast_verified and fast_decision == "escalate":
+            state = _escalate_fast_run(state, source)
+            return state, actions + (Action("inject_context", {"text":
+                "Fast lead handed off. Inspect any partial work, then spawn an independent "
+                "assessor for the full task."}),)
+        if fast_pending and fast_decision != "eligible":
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead decision missing or invalid. Recover the same lead's terminal decision; "
+                "an assessor can start only after an explicit escalation."}),)
         outcome_lines = [line for line in report.splitlines() if line.strip().startswith("SYMPHONY_OUTCOME:")]
         if outcome_lines:
             try:
@@ -961,6 +1900,22 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                 successful = False
                 actions += (Action("inject_context", {"text":
                     "The lead ended with a malformed SYMPHONY_OUTCOME report. Reconcile its result or retry the lead; the run remains recoverable."}),)
+        elif fast_pending:
+            successful = False
+            actions += (Action("inject_context", {"text":
+                "Fast lead completion requires an explicit SYMPHONY_OUTCOME report."}),)
+        if fast_pending and len(outcome_lines) != 1:
+            successful = False
+        if fast_pending and successful and fast_decision == "eligible":
+            selected = state.active_run.assessment["_fast_route"]
+            accepted = dict(state.active_run.assessment)
+            accepted.pop("_fast_pending", None)
+            accepted.update({"size": "small", "complexity": "simple", "risk": "normal",
+                             "topology": "direct", "rationale": "fast lead verified bounded low-risk work",
+                             "route": {"lead_model": selected["model"],
+                                       "lead_effort": selected["effort"],
+                                       "profile": _applied_profile(state, str(source.payload.get("provider") or "codex"))}})
+            state = replace(state, active_run=replace(state.active_run, assessment=accepted))
         assessment = state.active_run.assessment
         if not successful and str(identity) == state.active_run.lead_identity and assessment.get("_pending_lead_completion"):
             assessment = dict(assessment)
@@ -1012,6 +1967,10 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                 mismatch += f". {approval_required}"
             updated_assessment = dict(state.active_run.assessment)
             updated_assessment["_lead_route_mismatch"] = mismatch
+            updated_assessment["_lead_route_mismatch_owner"] = {
+                "identity": str(identity),
+                "generation": state.active_run.owner_generation,
+            }
             updated_assessment.pop("_pending_lead_completion", None)
             state = replace(
                 state, active_run=replace(state.active_run, assessment=updated_assessment)
@@ -1039,6 +1998,7 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
         if successful and state.active_run.lead_identity == str(identity) and assessment.get("_lead_route_mismatch"):
             updated_assessment = dict(assessment)
             updated_assessment.pop("_lead_route_mismatch", None)
+            updated_assessment.pop("_lead_route_mismatch_owner", None)
             state = replace(state, active_run=replace(state.active_run, assessment=updated_assessment))
         # 1.5.0 persisted lead failures without the retry marker. Its latest
         # recovery event still distinguishes a failed lead from a later failed
@@ -1097,6 +2057,11 @@ def _observe_delegation(state: ProjectState, source: Event) -> tuple[ProjectStat
                     "identity": str(identity),
                     "owner_generation": state.active_run.owner_generation,
                     "outcome": outcome,
+                    **({"turn_token": token} if completion_kind == "lead_failed" and token else {}),
+                    **({"native_host_failed": True} if completion_kind == "lead_failed"
+                        and terminal_matches_active_start
+                        and status.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}
+                        else {}),
                 },
                 "lead-completion",
             ),
@@ -1133,6 +2098,32 @@ def _open_run(
     return state, tuple(item for item in opened if item.kind != "request_assessment")
 
 
+def _mark_fast_run(state: ProjectState, selection: Mapping[str, str], provider: str) -> ProjectState:
+    run = state.active_run
+    if not run:
+        return state
+    assessment = {**run.assessment, "_fast_pending": True,
+                  "_fast_route": dict(selection),
+                  "_lead_expected_route": dict(selection)}
+    if _boost_preference(state, provider, run.session_id) != "off" or not selection["model"]:
+        assessment["_fast_disallowed"] = True
+    return replace(state, active_run=replace(run, assessment=assessment))
+
+
+def _escalate_fast_run(state: ProjectState, source: Event) -> ProjectState:
+    run = state.active_run
+    if not run:
+        return state
+    assessment = dict(run.assessment)
+    assessment.pop("_fast_pending", None)
+    assessment["_fast_escalated"] = True
+    assessment.pop("_lead_expected_route", None)
+    return replace(state, active_run=replace(
+        run, status="assessing", assessment=assessment, outcome=None,
+        updated_at=source.observed_at,
+    ))
+
+
 def _observed_role(payload: Mapping[str, object]) -> str:
     for value in payload.values():
         if not isinstance(value, str):
@@ -1156,6 +2147,18 @@ def _observed_role(payload: Mapping[str, object]) -> str:
     return ""
 
 
+def _fast_spawn(payload: Mapping[str, object]) -> bool:
+    if _observed_role(payload) != "lead":
+        return False
+    if _marker_value(payload, "SYMPHONY_FAST_ROUTE:") == "lead":
+        return True
+    # Codex's collaboration path may emit only a native Start, with the
+    # packet unavailable to PreToolUse. The explicit host task name carries
+    # the route; it is a role label, not a task-content classifier.
+    return (payload.get("provider") == "codex"
+            and str(payload.get("task_name") or "").startswith("symphony_lead_fast_"))
+
+
 def _prepare_delegation(
     state: ProjectState, source: Event, provider: str
 ) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -1175,7 +2178,8 @@ def _prepare_delegation(
         return state, (_block_tool("Symphony capability profiles are invalid; repair the shipped profiles before spawning."),)
     if _applied_profile(state, provider) == NO_PROFILE:
         return state, (_block_tool("Symphony has no launchable route in this account's available model roster."),)
-    if not state.active_run and role != "assessor":
+    fast_launch = role == "lead" and _marker_value(values, "SYMPHONY_FAST_ROUTE:") == "lead"
+    if not state.active_run and role != "assessor" and not fast_launch:
         return state, (
             _block_tool(
                 "Spawn the Symphony assessor first; a run begins when the assessor starts."
@@ -1201,6 +2205,8 @@ def _prepare_delegation(
             )
     if role == "assessor" and effort not in HIGH_EFFORTS:
         return state, (_block_tool("The Symphony assessor requires a strong model at high effort or above."),)
+    if role == "assessor" and state.active_run and state.active_run.assessment.get("_fast_pending"):
+        return state, (_block_tool("Wait for the fast lead's terminal decision before spawning an assessor."),)
     if role == "assessor":
         session_id = str(source.payload.get("session_id") or "")
         requested = _boost_preference(state, provider, session_id)
@@ -1216,16 +2222,45 @@ def _prepare_delegation(
 
     actions: tuple[Action, ...] = ()
     objective = _tool_objective(values)
+    if fast_launch:
+        if provider == "codex" and isinstance(values, Mapping) and not str(values.get("task_name") or "").startswith("symphony_lead_fast_"):
+            return state, (_block_tool("Name the Codex fast lead `symphony_lead_fast_<model>_<effort>`."),)
+        if _boost_preference(state, provider, str(source.payload.get("session_id") or "")) != "off":
+            return state, (_block_tool("An assessor boost is active; spawn the selected boosted assessor first."),)
+        if state.active_run:
+            return state, (_block_tool("A run already owns this task; continue its recorded route."),)
+        selection = fast_lead_selection(_snapshot(state, provider))
+        if not selection["model"]:
+            return state, (_block_tool("The capable/medium fast lead floor is unavailable; spawn an independent assessor."),)
+        if (model, effort) != (selection["model"], selection["effort"]):
+            return state, (_block_tool(
+                f"Fast lead route mismatch: expected {selection['model']}/{selection['effort']}."
+            ),)
+        state, actions = _open_run(state, source, objective)
+        state = _mark_fast_run(state, selection, provider)
     if role == "assessor" and not state.active_run:
         state, actions = _open_run(state, source, objective)
     if role == "lead":
+        if state.active_run.assessment.get("_fast_pending") and not fast_launch:
+            return state, (_block_tool("Recover the fast lead's decision before another lead can start."),)
+        if state.active_run.status == "completing" and state.active_run.lead_identity:
+            return state, (_block_tool(
+                "The tracked lead has already completed this run. Invoke the normal "
+                f"`{_control_name('stop', provider)}` control to verify and archive it "
+                "before starting another task."
+            ),)
+        if state.active_run.assessment.get("_fast_escalated") and not state.active_run.assessment.get("size"):
+            return state, (_block_tool("The fast lead escalated. Wait for an independent accepted assessment before another lead starts."),)
         if state.active_run.assessment.get("_boost_assessment_pending"):
             return state, (_block_tool("A valid boosted assessor result is required before selecting the lead."),)
-        assessment = _assessment_from_marker(values, "SYMPHONY_ROUTE:")
-        if assessment is None:
+        assessment = _assessment_from_marker(values, "SYMPHONY_ROUTE:") if not fast_launch else None
+        if assessment is None and not fast_launch:
             return state, (_block_tool("Add a valid SYMPHONY_ROUTE JSON line to the lead packet, then retry."),)
         recorded = state.active_run.assessment
-        if recorded.get("size") and recorded.get("complexity"):
+        if fast_launch:
+            route = None
+            required_model, required_effort = model, effort
+        elif recorded.get("size") and recorded.get("complexity"):
             if (
                 assessment.size != recorded.get("size")
                 or assessment.complexity != recorded.get("complexity")
@@ -1245,17 +2280,18 @@ def _prepare_delegation(
         else:
             route = route_for(assessment)
         spawn_session = str(source.payload.get("session_id") or "")
-        snapshot = _snapshot(state, provider)
-        resolved = resolve_tier(route, snapshot)
-        required_model = str(resolved["lead_model"])
-        required_effort = str(resolved["lead_effort"])
+        if not fast_launch:
+            snapshot = _snapshot(state, provider)
+            resolved = resolve_tier(route, snapshot)
+            required_model = str(resolved["lead_model"])
+            required_effort = str(resolved["lead_effort"])
         drift = _route_drift(recorded, required_model, required_effort)
         if drift and drift["weaker"]:
             if _accepted_route(state, provider, spawn_session) != f"{required_model}/{required_effort}":
                 return state, (_drift_block(provider, drift),)
         elif drift:
             actions += (_drift_notice(drift),)
-        clamp = _clamp_actions(state, provider, route, spawn_session)
+        clamp = () if fast_launch else _clamp_actions(state, provider, route, spawn_session)
         if any(item.kind == "block_tool" for item in clamp):
             return state, clamp
         actions += clamp
@@ -1266,9 +2302,12 @@ def _prepare_delegation(
                     f"observed {model}/{effort}. Spawn the selected lead with the expected route, then retry."
                 ),
             )
-        if not (recorded.get("size") and recorded.get("complexity")):
+        if not fast_launch and not (recorded.get("size") and recorded.get("complexity")):
             state, accepted = _accept_assessment(state, source, provider, values, assessment)
             actions += accepted
+    elif role in {"worker", "consultant"} and (state.active_run.assessment.get("_fast_pending")
+                                                or state.active_run.assessment.get("_fast_escalated")):
+        return state, (_block_tool("Wait for the fast decision and, if escalated, its assessed replacement lead before spawning descendants."),)
     elif role in {"worker", "consultant"} and not state.active_run.lead_identity:
         return state, (_block_tool(f"Register the selected lead before spawning a Symphony {role}."),)
     if role == "consultant" and not _decision_markers(values):
@@ -1380,8 +2419,8 @@ def _clamp_actions(
             f"Your plan routes this work to {clamp['actual_model']} instead of the "
             f"matrix-selected {clamp['intended_model']}"
             + (" and no entitlement could be read" if not profile else "")
-            + f". Run `{control}` to accept the weaker route for this session, or "
-            "upgrade the plan and start a new session."
+            + f". Run `{control}` to accept the weaker route and continue this "
+            "session. Model availability is checked again in a new session."
         )
         return (_block_tool(reason),)
     if clamp["effort_clamped"]:
@@ -1836,14 +2875,35 @@ def _render_actions(
                 )
             )
         elif action.kind == "run_already_active":
-            rendered.append(Action("inject_context", {"text": _recovery_guidance(state)}))
+            rendered.append(Action("inject_context", {"text": _recovery_guidance(state, provider)}))
         elif action.kind == "preserve_recovery_context":
             rendered.append(Action("inject_context", {"text": "Symphony recorded the interruption for safe reconciliation on resume."}))
         elif action.kind == "stop_delegations":
             identities = ", ".join(map(str, action.payload.get("active", ())))
             rendered.append(Action("inject_context", {"text": f"Stop these tracked Symphony agents and verify their host status: {identities}."}))
         elif action.kind == "replace_lead":
-            rendered.append(Action("inject_context", {"text": "The observed lead is unavailable. Spawn one safe replacement at the recorded owner generation."}))
+            run = state.active_run
+            if (provider == "codex" and run and run.lead_identity
+                    and run.assessment.get("_retryable_lead") == run.lead_identity):
+                mismatch_owner = run.assessment.get("_lead_route_mismatch_owner") == {
+                    "identity": run.lead_identity, "generation": run.owner_generation}
+                rendered.append(Action("inject_context", {"text": (
+                    "The registered lead used the wrong route. Spawn one replacement with the recorded "
+                    "model and effort; the prior lead cannot change its native route."
+                    if mismatch_owner else
+                    "The registered lead ended a retryable turn. Continue that same lead first with "
+                    "followup_task using the original task_name from spawn_agent (lowercase letters, "
+                    "digits, and underscores), not a /root/ path or agent UUID. A completed host roster "
+                    "entry alone does not prove the agent unavailable; do not call spawn_agent for the same "
+                    "task_name. Await the original lead's new result, then finish this root turn so native Stop "
+                    "can reconcile its actual outcome. A missing marker in the returned text is not permission "
+                    "to spawn another lead. Only if followup_task returns an "
+                    "explicit unavailable error may you spawn one replacement at the recorded route; "
+                    "Symphony verifies the original spawn, exact error, and turn lineage before accepting it."
+                )}))
+            else:
+                rendered.append(Action("inject_context", {"text":
+                    "The observed lead is unavailable. Spawn one safe replacement at the recorded owner generation."}))
         elif action.kind == "route_run":
             route = state.active_run.assessment.get("route", {}) if state.active_run else {}
             model, effort = _required_lead_route(state.active_run.assessment) if state.active_run else ("", "")
@@ -1857,8 +2917,8 @@ def _render_actions(
             lead = state.active_run.lead_identity if state.active_run else "the registered lead"
             rendered.append(Action("inject_context", {"text":
                 f"Symphony refused to register {action.payload.get('identity')} as lead: this run already "
-                f"has one ({lead}). Stop the extra agent and let the registered lead finish. Symphony is "
-                "not tracking the extra agent's work, so anything it does will go unreconciled."}))
+                f"has one ({lead}). Stop the extra agent and let the registered lead finish. "
+                "The extra child is tracked until it ends but cannot replace the accepted lead or outcome."}))
         elif action.kind == "ignore_stale_owner":
             rendered.append(Action("inject_context", {"text":
                 f"Symphony ignored a lifecycle report from {action.payload.get('identity')}, which is not "
@@ -1945,6 +3005,31 @@ def _claude_guidance(state: ProjectState | None, session_id: str = "") -> str:
 def _assessment_guidance(task: str, provider: str = "", state: ProjectState | None = None, session_id: str = "") -> str:
     if state is not None and provider:
         session_id = session_id or str(state.activation.get(provider, {}).get("session_id") or "")
+        fast = fast_lead_selection(_snapshot(state, provider))
+        if fast["model"] and _boost_preference(state, provider, session_id) == "off":
+            spawn = (f"Use agent type `symphony:symphony-lead-{fast['model']}-{fast['effort']}`. "
+                     if provider == "claude" else
+                     f"Pass `model=\"{fast['model']}\"`, `reasoning_effort=\"{fast['effort']}\"`, "
+                     "`fork_turns=\"none\"`, and name `symphony_lead_fast_<model>_<effort>` "
+                     "using underscores for the model. ")
+            return (
+                "Symphony fast route: the root is a courier. Spawn one capable lead at "
+                f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
+                "`SYMPHONY_FAST_ROUTE: lead` on separate lines. " + spawn +
+                "Relay the entire task and its acceptance checks. Before any writes, the lead must "
+                "decide whether scope is bounded, requirements clear, risk low, required tools "
+                "(including browser or computer control when needed) available, and verification concrete. "
+                "If all hold, work directly end-to-end and finish with exact lines "
+                "`SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`. "
+                "If any check fails or is uncertain, make no changes and finish with exact line "
+                "`SYMPHONY_FAST_DECISION: escalate`; then spawn an independent strongest/high assessor "
+                "for the original task, followed by the matrix-selected lead. "
+                "The fast lead cannot spawn descendants before deciding. Preserve the same run, "
+                "wait for native terminal results, and use normal Stop reconciliation. "
+                + ("Claude agents run in the background; end your turn after spawning and wait for the host result. "
+                   if provider == "claude" else "")
+                + f"Task: {task}"
+            )
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
         "On Codex, use `fork_turns=\"none\"` for assessor and lead, name them "
@@ -2007,19 +3092,124 @@ def _governance(state: ProjectState) -> str:
     return "enabled" if state.enabled else "transactional"
 
 
-def _recovery_guidance(state: ProjectState) -> str:
+def _claude_unknown_turn_guidance(run: RunState) -> str:
+    lead = run.lead_identity
+    return (
+        "Symphony could not verify the tracked lead's latest native Claude turn. "
+        f"Inspect the latest result for original lead `{lead}`. If it has ended without "
+        "a standalone SYMPHONY_OUTCOME marker, make at most one native SendMessage "
+        f"repair request to `to: {lead}` for its actual final result and exact marker. "
+        "Await that same agent's response, then invoke normal `/symphony:stop` once. "
+        "If this repair was already attempted or its response is still unverifiable, "
+        "do not repeat SendMessage or Stop in this turn. Report the unresolved result "
+        "and ask for direction while keeping this run open. Do not start a new lead "
+        "or force stop."
+    )
+
+
+def _completion_ready_guidance(run: RunState, provider: str) -> str:
+    if run.status != "completing" or _stop_block_reason(run) is not None:
+        return ""
+    host = provider or run.provider or "codex"
+    if host == "codex":
+        return (
+            "The lead outcome and tracked work are reconciled. Finish this root turn "
+            "now so the native Stop hook can verify and archive the run, then check "
+            "durable status. Do not type a stop control as assistant prose, call "
+            "list_agents, or spawn or follow up a completed lead solely because this "
+            "run remains completing."
+        )
+    stop = _control_name("stop", host)
+    return (
+        "The lead outcome and tracked work are reconciled. Invoke the normal "
+        f"`{stop}` control in this same session now, then check durable status. "
+        "The Stop guard verifies native freshness before archiving. Do not follow up "
+        "or replace a completed lead solely because this run remains completing."
+    )
+
+
+def _refresh_completion_guidance(
+    actions: tuple[Action, ...], before: ProjectState, after: ProjectState,
+    source: Event, provider: str,
+) -> tuple[Action, ...]:
+    """Render guidance from the committed batch, after its temporary archive hold clears."""
+    if not after.active_run or not _completion_ready_guidance(after.active_run, provider):
+        return actions
+    if not before.active_run or _completion_ready_guidance(before.active_run, provider):
+        return actions
+    if source.kind == "session_heartbeat":
+        old, new = _recovery_guidance(before, provider), _recovery_guidance(after, provider)
+    elif source.kind == "user_prompt":
+        prompt = str(source.payload.get("prompt") or "").strip()
+        control = _parse_control(prompt)
+        if control and control[0] in {"status", "agents"}:
+            history = control[0] == "agents" and control[1] == "--all"
+            session = str(source.payload.get("session_id") or "")
+            old = _status(before, history, provider, session)
+            new = _status(after, history, provider, session)
+        elif control is None or control[0] == "start":
+            old, new = _recovery_guidance(before, provider), _recovery_guidance(after, provider)
+        else:
+            return actions
+    else:
+        return actions
+    return tuple(
+        Action("inject_context", {**action.payload, "text": new})
+        if action.kind == "inject_context" and action.payload.get("text") == old else action
+        for action in actions
+    )
+
+
+def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     run = state.active_run
     if not run:
         return "Symphony has no active run."
+    if run.assessment.get("_fast_escalated") and not run.assessment.get("size"):
+        assessor = assessor_selection(_snapshot(state, provider),
+                                      _boost_preference(state, provider, run.session_id))
+        return (f"Fast lead {run.lead_identity} escalated this run before writes. "
+                f"Spawn one independent assessor at {assessor['model']}/{assessor['effort']} "
+                "with `SYMPHONY_ROLE: assessor` and the full original task. Await its valid "
+                "SYMPHONY_ASSESSMENT result before spawning the matrix-selected replacement lead. "
+                "Preserve this run and reconcile tracked children before Stop.")
+    completion = _completion_ready_guidance(run, provider)
+    if completion:
+        return f"Symphony run {run.run_id} remains completing. {completion}"
     records = ", ".join(f"{item.role} {item.identity} ({item.state})" for item in run.delegations)
     pending = run.assessment.get("_pending_delegations", ())
     awaiting = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
     lead = f" Lead {run.lead_identity} [{_governance(state)}]." if run.lead_identity else " Lead not yet observed."
+    route_mismatch = run.assessment.get("_lead_route_mismatch_owner") == {
+        "identity": run.lead_identity, "generation": run.owner_generation}
+    retry = ("For this retryable Codex lead, call followup_task on the original spawn_agent "
+             "task_name (lowercase letters, digits, and underscores), not its /root/ path or UUID. "
+             "A completed host roster entry alone does not prove the agent unavailable; do not spawn "
+             "another lead for that name. After its result, finish this root turn so native Stop can "
+             "reconcile the actual outcome; a missing text marker alone never authorizes replacement. "
+             "Only an explicit unavailable error from followup_task can "
+             "authorize one replacement; Symphony verifies the original spawn, exact error, and native "
+             "turn lineage at the new child's Start. If verification fails, the extra child stays rejected. "
+             if run.provider == "codex" and run.lead_identity
+             and run.assessment.get("_retryable_lead") == run.lead_identity
+             and not route_mismatch else "")
+    if route_mismatch:
+        retry = "The registered lead used the wrong native route; spawn one replacement at the required model and effort. "
+    claude_retry = (
+        f"For this Claude lead, await an active background result. If its native turn has ended "
+        f"without a reconciled outcome, use SendMessage with `to: {run.lead_identity}` to resume "
+        "that same agent and ask it to report its observed result with one exact "
+        "SYMPHONY_OUTCOME JSON line. Await its returned result before normal Stop. "
+        "Do not start another task or invent a missing outcome. "
+        if run.provider == "claude" and run.lead_identity and run.status in {"active", "recovering"}
+        and not route_mismatch
+        and any(item.identity == run.lead_identity and item.state in {"working", "pending", "failed"}
+                for item in run.delegations) else ""
+    )
     return (
         f"Symphony run {run.run_id} remains {run.status}.{lead} "
         f"Observed agents: {records or 'none'}. "
         + (f"Awaiting host launch confirmation: {awaiting}. " if awaiting else "")
-        + "Reconcile returned or interrupted results, preserve ownership, and continue unfinished work. "
+        + retry + claude_retry + "Reconcile returned or interrupted results, preserve ownership, and continue unfinished work. "
         "An ended host turn does not complete this run; report completion only when durable status confirms it."
     )
 
@@ -2100,7 +3290,10 @@ def _status(
         if pending:
             roles = ", ".join(str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping))
             lines.append(f"Awaiting host launch confirmation: {roles}")
-        if state.active_run.outcome:
+        completion = _completion_ready_guidance(state.active_run, provider)
+        if completion:
+            lines.append(completion)
+        elif state.active_run.outcome:
             lines.append("Lead outcome recorded; tracked work still requires reconciliation.")
         if not state.enabled:
             control = _control_name("enable", provider) if provider else "enable"
@@ -2186,6 +3379,50 @@ def _record_fault(error: BaseException, environ: Mapping[str, str]) -> None:
         pass
 
 
+def _record_hook_decision(payload: Mapping[str, object], result: HookResult,
+                          environ: Mapping[str, str]) -> None:
+    """Record a bounded Stop decision in an explicitly opted-in test home."""
+    destination = environ.get("SYMPHONY_HOOK_DECISIONS_DIR")
+    if not destination or payload.get("hook_event_name") != "Stop":
+        return
+    try:
+        response = json.loads(result.stdout) if result.stdout else {}
+        if not isinstance(response, dict):
+            response = {}
+        reason = str(response.get("reason") or "")
+        categories = (
+            ("root ownership is unresolved", "owner_unresolved"),
+            ("active in multiple project states", "owner_conflict"),
+            ("state snapshot was unavailable", "owner_snapshot_unavailable"),
+            ("bound project state is unavailable", "bound_state_unavailable"),
+            ("unresolved child result", "pending_child"),
+            ("child lifecycle reconciliation", "batch_pending"),
+            ("child start has no invocation ID", "ambiguous_start"),
+            ("active work remains", "active_work"),
+            ("newer native turn still running", "native_running"),
+            ("latest native Claude turn", "native_unknown"),
+            ("latest native turn", "native_unknown"),
+            ("interrupted work still requires reconciliation", "interrupted_work"),
+            ("waiting for host launch confirmation", "launch_pending"),
+            ("consultant results still require", "consultant_pending"),
+            ("tracked lead has no reconciled outcome", "lead_outcome_missing"),
+            ("assessment work has ended", "lead_not_started"),
+        )
+        category = next((label for phrase, label in categories if phrase in reason),
+                        "other_block" if response.get("decision") == "block" else "permit")
+        record = {"session_id": str(payload.get("session_id") or ""),
+                  "category": category,
+                  "reason_hash": hashlib.sha256(reason.encode()).hexdigest()[:12] if reason else None,
+                  "observed_at": datetime.now(timezone.utc).isoformat(),
+                  "plugin_version": PLUGIN_VERSION}
+        path = Path(destination)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{os.getpid()}-{datetime.now(timezone.utc).timestamp():.9f}.json").write_text(
+            json.dumps(record), encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -2194,6 +3431,7 @@ def main() -> int:
         sys.stderr.write(f"Symphony hook fault: {type(error).__name__}\n")
         _record_fault(error, os.environ)
         return 0
+    _record_hook_decision(payload, result, os.environ)
     if result.stdout:
         sys.stdout.write(result.stdout)
     return 0

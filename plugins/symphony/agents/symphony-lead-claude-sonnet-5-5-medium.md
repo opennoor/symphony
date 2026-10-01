@@ -1,7 +1,7 @@
 ---
-name: symphony-lead-claude-opus-5-5-medium
+name: symphony-lead-claude-sonnet-5-5-medium
 description: Leads Symphony work at the matrix-selected route.
-model: claude-opus-5-5
+model: claude-sonnet-5-5
 effort: medium
 ---
 

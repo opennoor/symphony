@@ -26,6 +26,7 @@ jobs:
 
   windows-hooks:
     runs-on: windows-latest
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -33,8 +34,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify shipped hook digest is stable on Windows
+        run: python plugins/symphony/scripts/generate_hooks.py --check
       - name: Execute Windows hooks under Restricted PowerShell policy
-        run: python -m unittest plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs plugins.symphony.tests.test_runtime_retention plugins.symphony.tests.test_boost -v
+        run: python .github/scripts/windows_acceptance.py
+
+      - name: Replay released 1.5.1 recovering state through candidate Stop on Windows
+        # The immutable 1.5.1 Codex host may complete a fixture lead before its
+        # requested WAIT turn. This checks candidate migration independently.
+        run: python -m unittest plugins.symphony.tests.test_host_evidence.HostEvidenceTests.test_released_151_recovering_state_reconciles_unique_native_followup
 
       - name: Execute Windows hooks as a standard user
         timeout-minutes: 5
@@ -57,7 +65,7 @@ jobs:
             $stderr = Join-Path $testRoot 'stderr.log'
             $test = Start-Process -FilePath $python -WorkingDirectory $env:GITHUB_WORKSPACE `
               -Credential $credential -LoadUserProfile -PassThru `
-              -ArgumentList '-m unittest plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs plugins.symphony.tests.test_runtime_retention plugins.symphony.tests.test_boost -v' `
+              -ArgumentList '.github/scripts/windows_acceptance.py' `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
             if (-not $test.WaitForExit(120000)) {
               Get-Content $stdout,$stderr -ErrorAction SilentlyContinue
@@ -71,9 +79,11 @@ jobs:
           }
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex
+        run: npm install -g @openai/codex@0.158.0
 
       - name: Run real Windows Codex control smoke
+        id: windows_codex_native
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -114,11 +124,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Codex heartbeat missing' }
           python plugins/symphony/scripts/native_effort_smoke.py --provider codex
           if ($LASTEXITCODE -ne 0) { throw 'Native Codex ultra effort failed' }
+          $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
+          python .github/scripts/native_managed_concurrency.py --provider codex --timeout 600
+          if ($LASTEXITCODE -ne 0) { throw 'Native Codex managed concurrency failed' }
 
       - name: Install Claude Code
         run: npm.cmd install -g @anthropic-ai/claude-code
 
       - name: Run real Windows Claude control smoke
+        id: windows_claude_native
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -179,12 +193,43 @@ jobs:
           import json, os, pathlib
           root = pathlib.Path(os.environ['SYMPHONY_STATE_DIR'])
           documents = (json.loads(path.read_text()) for path in root.rglob('*.json'))
-          assert any(doc.get('activation', {}).get('claude', {}).get('profile') == 'opus' for doc in documents), 'Claude hook did not select Opus profile'
+          assert any(doc.get('activation', {}).get('claude', {}).get('profile') in {'opus-5-5', 'opus'} for doc in documents), 'Claude hook did not select Opus profile'
           print('Claude installed hook selected Opus profile')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw 'Claude runtime profile check failed' }
           python plugins/symphony/scripts/native_effort_smoke.py --provider claude
           if ($LASTEXITCODE -ne 0) { throw 'Native packaged Claude max assessor failed' }
+          $env:SYMPHONY_NATIVE_DIAGNOSTICS_DIR = Join-Path $env:RUNNER_TEMP 'symphony-native-diagnostics'
+          python .github/scripts/claude_isolated_worktree.py --timeout 300
+          $isolatedExit = $LASTEXITCODE
+          python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600
+          $managedExit = $LASTEXITCODE
+          $oldCheckout = Join-Path $env:RUNNER_TEMP 'symphony-old-release'
+          if (-not (Test-Path (Join-Path $oldCheckout 'plugins/symphony/hooks/hooks.json'))) {
+            git fetch origin tag v1.5.1
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch released 1.5.1 source' }
+            git worktree add --detach $oldCheckout v1.5.1
+            if ($LASTEXITCODE -ne 0) { throw 'Could not materialize released 1.5.1 source' }
+          }
+          python .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 `
+            --live-update --old-plugin-root (Join-Path $oldCheckout 'plugins/symphony') `
+            --candidate-plugin-root (Join-Path $env:GITHUB_WORKSPACE 'plugins/symphony')
+          $updateExit = $LASTEXITCODE
+          if ($isolatedExit -ne 0 -or $managedExit -ne 0 -or $updateExit -ne 0) {
+            throw "Native Claude checks failed: isolated=$isolatedExit managed=$managedExit update=$updateExit"
+          }
+
+      - name: Preserve Windows Codex native failure after Claude checks
+        if: ${{ always() && steps.windows_codex_native.outcome == 'failure' }}
+        run: throw 'Windows Codex native checks failed; Claude checks were allowed to run'
+
+      - name: Retain sanitized native failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-managed-diagnostics
+          path: ${{ runner.temp }}/symphony-native-diagnostics/*.json
+          if-no-files-found: ignore
 
   verify:
     runs-on: ubuntu-latest
@@ -230,9 +275,11 @@ jobs:
           claude plugin validate plugins/symphony
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex
+        run: npm install -g @openai/codex@0.158.0
 
       - name: Run real Codex control smoke when a credential is available
+        id: linux_codex_native
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -262,8 +309,16 @@ jobs:
             '$symphony:symphony help'
           python3 .github/scripts/assert_heartbeat.py codex
           python3 plugins/symphony/scripts/native_effort_smoke.py --provider codex
+          git fetch origin tag v1.5.1
+          git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
+          export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          python3 .github/scripts/native_managed_concurrency.py --provider codex --timeout 600 \
+            --live-update \
+            --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
+            --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
 
       - name: Run real Claude control smoke when credential is available
+        id: linux_claude_native
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -287,6 +342,38 @@ jobs:
             '/symphony:help' > "$RUNNER_TEMP/claude-help.txt"
           python3 .github/scripts/assert_heartbeat.py claude
           python3 plugins/symphony/scripts/native_effort_smoke.py --provider claude
+          if [ ! -d "$RUNNER_TEMP/symphony-old-release/plugins/symphony" ]; then
+            git fetch origin tag v1.5.1
+            git worktree add --detach "$RUNNER_TEMP/symphony-old-release" v1.5.1
+          fi
+          export SYMPHONY_NATIVE_DIAGNOSTICS_DIR="$RUNNER_TEMP/symphony-native-diagnostics"
+          set +e
+          python3 .github/scripts/claude_isolated_worktree.py --timeout 300
+          isolated_exit=$?
+          python3 .github/scripts/native_managed_concurrency.py --provider claude --timeout 600 \
+            --live-update \
+            --old-plugin-root "$RUNNER_TEMP/symphony-old-release/plugins/symphony" \
+            --candidate-plugin-root "$GITHUB_WORKSPACE/plugins/symphony"
+          update_exit=$?
+          set -e
+          if [ "$isolated_exit" -ne 0 ] || [ "$update_exit" -ne 0 ]; then
+            echo "::error::Claude native checks failed: isolated=$isolated_exit update=$update_exit"
+            exit 1
+          fi
+
+      - name: Preserve Linux Codex native failure after Claude checks
+        if: ${{ always() && steps.linux_codex_native.outcome == 'failure' }}
+        run: |
+          echo '::error::Linux Codex native checks failed; Claude checks were allowed to run'
+          exit 1
+
+      - name: Retain sanitized Linux native failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-managed-diagnostics
+          path: ${{ runner.temp }}/symphony-native-diagnostics/*.json
+          if-no-files-found: ignore
 
   release:
     needs: [verify, windows-hooks, dockur-windows]

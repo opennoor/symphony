@@ -21,7 +21,7 @@ from plugins.symphony.symphony import PLUGIN_VERSION
 from plugins.symphony.symphony.model import RunState
 from plugins.symphony.symphony.store import StateStore
 
-CODEX_FULL_SNAPSHOT = snapshot_for("codex", "full")
+CODEX_FULL_SNAPSHOT = snapshot_for("codex", profiles_for("codex")[0]["id"])
 CODEX_BASE_SNAPSHOT = snapshot_for("codex", "base")
 CODEX_DRIFT_CELL = next(
     cell for cell in CODEX_FULL_SNAPSHOT.matrix
@@ -129,7 +129,22 @@ class EntitlementProbeTests(unittest.TestCase):
     def test_a_complete_roster_selects_the_full_profile(self):
         required = profiles_for("codex")[0].get("requires_all", [])
         environ = self.codex_home(roster(*required))
-        self.assertEqual(self.heartbeat(environ).get("profile"), "full")
+        self.assertEqual(self.heartbeat(environ).get("profile"), "latest")
+
+    def test_new_models_route_without_losing_legacy_entitlements(self):
+        for index, (provider, models, expected) in enumerate((
+            ("codex", ("gpt-6-astra", "gpt-6-luna", "gpt-6.1-sol"), "latest"),
+            ("codex", ("gpt-6-astra", "gpt-6-luna", "gpt-6-sol"), "full"),
+            ("claude", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"), "fable-5-5"),
+            ("claude", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5"), "fable"),
+        )):
+            with self.subTest(provider=provider, models=models):
+                self.state_root = self.root / f"new-model-{index}"
+                environ = (self.codex_home(roster(*models)) if provider == "codex" else {
+                    "SYMPHONY_STATE_DIR": str(self.state_root),
+                    "SYMPHONY_CLAUDE_AVAILABLE_MODELS": ",".join(models),
+                })
+                self.assertEqual(self.heartbeat(environ, provider).get("profile"), expected)
 
     def test_a_missing_model_falls_back_to_the_base_profile(self):
         required = profiles_for("codex")[0].get("requires_all", [])
@@ -226,7 +241,7 @@ class EntitlementProbeTests(unittest.TestCase):
         # Remove the roster: a second heartbeat in the same session must not
         # re-probe, so the recorded answer survives.
         (Path(environ["CODEX_HOME"]) / "models_cache.json").unlink()
-        self.assertEqual(self.heartbeat(environ).get("profile"), "full")
+        self.assertEqual(self.heartbeat(environ).get("profile"), "latest")
 
     def test_an_old_claude_profile_is_not_reused_after_upgrade(self):
         store = StateStore(self.state_root)
@@ -243,8 +258,8 @@ class EntitlementProbeTests(unittest.TestCase):
                 "session_id": "claude-session", "cwd": str(self.project),
                 "hook_event_name": "UserPromptSubmit", "prompt": "/symphony:start ship it",
             }, environ)
-        self.assertEqual(probe.call_count, 2)
-        self.assertEqual(store.load(self.project).activation["claude"]["profile"], "opus")
+        self.assertEqual(probe.call_count, 3)
+        self.assertEqual(store.load(self.project).activation["claude"]["profile"], "opus-5-5")
 
     def test_a_current_claude_profile_is_reused_within_its_session(self):
         store = StateStore(self.state_root)
@@ -277,6 +292,23 @@ class EntitlementProbeTests(unittest.TestCase):
                 }
                 self.assertEqual(self.heartbeat(environ, "claude").get("profile"), expected)
 
+    def test_native_claude_probe_selects_sonnet_5_5_profiles(self):
+        for index, (models, expected) in enumerate((
+            ({"claude-sonnet-5-5"}, "sonnet-5-5"),
+            ({"claude-sonnet-5-5", "claude-opus-5-5"}, "opus-5-5"),
+        )):
+            with self.subTest(models=models):
+                self.state_root = self.root / f"native-sonnet-5-5-{index}"
+                environ = {"SYMPHONY_STATE_DIR": str(self.state_root)}
+                payload = {"session_id": "claude-session", "cwd": str(self.project),
+                           "hook_event_name": "UserPromptSubmit", "prompt": "/symphony:start fix it"}
+                with patch("plugins.symphony.symphony.runtime._claude_accepts",
+                           side_effect=lambda model: model in models) as probe:
+                    handle(payload, environ)
+                self.assertEqual(StateStore(self.state_root).load(self.project).activation["claude"]["profile"], expected)
+                self.assertEqual({call.args[0] for call in probe.call_args_list},
+                                 {"claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5"})
+
     def test_first_claude_task_probes_the_active_login_once_for_an_opus_route(self):
         environ = {"SYMPHONY_STATE_DIR": str(self.state_root)}
 
@@ -294,9 +326,9 @@ class EntitlementProbeTests(unittest.TestCase):
         with patch("plugins.symphony.symphony.runtime.shutil.which", return_value="claude"), \
              patch("plugins.symphony.symphony.runtime.subprocess.run", side_effect=probe) as run:
             handle(payload, environ)
-            self.assertEqual(StateStore(self.state_root).load(self.project).activation["claude"]["profile"], "opus")
+            self.assertEqual(StateStore(self.state_root).load(self.project).activation["claude"]["profile"], "opus-5-5")
             handle(payload, environ)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
 
     def test_session_model_is_not_proof_of_access(self):
         environ = {"SYMPHONY_STATE_DIR": str(self.state_root), "SYMPHONY_PROVIDER": "claude"}
@@ -313,8 +345,8 @@ class EntitlementProbeTests(unittest.TestCase):
         with patch("plugins.symphony.symphony.runtime.shutil.which", return_value="claude"), \
              patch("plugins.symphony.symphony.runtime.subprocess.run", side_effect=probe) as run:
             handle(payload, environ)
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(StateStore(self.state_root).load(self.project).activation["claude"]["profile"], "opus")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(StateStore(self.state_root).load(self.project).activation["claude"]["profile"], "opus-5-5")
 
     def test_claude_probe_rejects_a_substituted_model_and_does_not_retry(self):
         environ = {"SYMPHONY_STATE_DIR": str(self.state_root)}
@@ -335,7 +367,7 @@ class EntitlementProbeTests(unittest.TestCase):
             self.assertEqual(activation["profile"], "sonnet")
             self.assertTrue(activation["claude_probe_attempted"])
             handle(payload, environ)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
 
     def test_claude_probe_timeout_uses_visible_fallback_once(self):
         import subprocess
@@ -348,11 +380,13 @@ class EntitlementProbeTests(unittest.TestCase):
                    side_effect=subprocess.TimeoutExpired("claude", 15)) as run:
             result = handle(payload, environ)
             handle(payload, environ)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
         self.assertIn("Sonnet fallback", result.stdout)
         activation = StateStore(self.state_root).load(self.project).activation["claude"]
         self.assertFalse(activation.get("profile"))
         self.assertTrue(activation["claude_probe_attempted"])
+        # Leave 15 seconds of the 45-second hook budget for fallback and persistence.
+        self.assertLessEqual(sum(call.kwargs["timeout"] for call in run.call_args_list), 30)
 
     def test_pending_claude_root_does_not_reprobe_after_other_starts(self):
         environ = {"SYMPHONY_STATE_DIR": str(self.state_root)}
@@ -365,12 +399,12 @@ class EntitlementProbeTests(unittest.TestCase):
                       "hook_event_name": "UserPromptSubmit", "prompt": "Continue the task"}
             handle(oldest, environ)
 
-        self.assertEqual(probe.call_count, 12)
+        self.assertEqual(probe.call_count, 18)
         activation = StateStore(self.state_root).load(self.project).activation["claude"]
         self.assertIn("starting-0", activation["pending_sessions"])
         self.assertEqual(
             next(item for item in activation["session_profiles"]
-                 if item["session_id"] == "starting-0")["profile"], "opus",
+                 if item["session_id"] == "starting-0")["profile"], "opus-5-5",
         )
 
     def test_other_session_does_not_replace_active_owner_profile(self):
@@ -385,10 +419,10 @@ class EntitlementProbeTests(unittest.TestCase):
                     "hook_event_name": "SessionStart"}, environ)
             handle({**owner, "hook_event_name": "UserPromptSubmit",
                     "prompt": "Continue the active run"}, environ)
-        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(probe.call_count, 3)
         activation = store.load(self.project).activation["claude"]
-        self.assertEqual(activation["profile"], "opus")
-        self.assertEqual({item["session_id"]: item["profile"] for item in activation["session_profiles"]}["owner"], "opus")
+        self.assertEqual(activation["profile"], "opus-5-5")
+        self.assertEqual({item["session_id"]: item["profile"] for item in activation["session_profiles"]}["owner"], "opus-5-5")
 
     def test_one_shot_owner_reprobe_persists_boolean_attempt(self):
         store = StateStore(self.state_root)
@@ -397,10 +431,10 @@ class EntitlementProbeTests(unittest.TestCase):
         with patch("plugins.symphony.symphony.runtime._claude_accepts", return_value=True) as probe:
             handle({"session_id": "owner", "cwd": str(self.project),
                     "hook_event_name": "UserPromptSubmit", "prompt": "Continue the active run"}, environ)
-        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(probe.call_count, 3)
         activation = store.load(self.project).activation["claude"]
         self.assertIs(activation["claude_probe_attempted"], True)
-        self.assertEqual(activation["profile"], "opus")
+        self.assertEqual(activation["profile"], "opus-5-5")
 
     def test_owner_lead_spawn_uses_its_profile_without_another_prompt(self):
         environ = {"SYMPHONY_STATE_DIR": str(self.state_root)}
@@ -421,7 +455,7 @@ class EntitlementProbeTests(unittest.TestCase):
                                        "prompt": "SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: "
                                                  '{"size":"small","complexity":"complex","risk":"normal"}'}},
                        environ)
-        self.assertEqual(store.load(self.project).activation["claude"]["profile"], "opus")
+        self.assertEqual(store.load(self.project).activation["claude"]["profile"], "opus-5-5")
         self.assertIn("claude-opus-5-5", spawn.stdout)
 
     def test_probe_child_cannot_reenter_symphony_when_hook_disabling_is_ignored(self):
@@ -438,12 +472,13 @@ class EntitlementProbeTests(unittest.TestCase):
         handle({**owner, "hook_event_name": "SessionStart"}, environ)
         handle({**owner, "hook_event_name": "UserPromptSubmit", "prompt": "/symphony:proceed"}, environ)
         other = {"session_id": "other", "cwd": str(self.project)}
+        handle({**other, "hook_event_name": "SessionStart"}, environ)
         handle({**other, "hook_event_name": "PreToolUse", "tool_name": "Agent",
                 "tool_input": {}}, environ)
         activation = StateStore(self.state_root).load(self.project).activation["claude"]
         self.assertEqual(set(activation["accepted"]), {"owner"})
         self.assertEqual(activation["accepted"]["owner"]["profile"], "sonnet")
-        self.assertFalse(activation["accepted_profile"])
+        self.assertFalse(activation.get("accepted_profile"))
 
     def test_legacy_flat_consent_migrates_to_original_session(self):
         store = StateStore(self.state_root)
@@ -456,11 +491,13 @@ class EntitlementProbeTests(unittest.TestCase):
         ))
         environ = {"SYMPHONY_STATE_DIR": str(self.state_root), "SYMPHONY_PROVIDER": "claude"}
         handle({"session_id": "other", "cwd": str(self.project),
+                "hook_event_name": "SessionStart"}, environ)
+        handle({"session_id": "other", "cwd": str(self.project),
                 "hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_input": {}}, environ)
         activation = store.load(self.project).activation["claude"]
         self.assertEqual(set(activation["accepted"]), {"owner"})
         self.assertEqual(activation["accepted"]["owner"]["route"], "small/complex")
-        self.assertFalse(activation["accepted_profile"])
+        self.assertFalse(activation.get("accepted_profile"))
 
     def test_an_explicit_claude_profile_pin_is_an_opt_in(self):
         environ = {
@@ -609,7 +646,7 @@ class ClampGateTests(unittest.TestCase):
         )
 
     def test_a_fully_entitled_account_is_never_gated(self):
-        _, result = self.open_and_spawn_lead("full")
+        _, result = self.open_and_spawn_lead("latest")
         self.assertNotEqual(self.output(result).get("decision"), "block")
 
     def test_a_tier_clamp_blocks_and_names_the_control(self):
@@ -619,6 +656,9 @@ class ClampGateTests(unittest.TestCase):
         self.assertIn(CODEX_BASE_ROUTE["model"], output["reason"])
         self.assertIn(CODEX_FULL_ROUTE["model"], output["reason"])
         self.assertIn("$symphony:symphony proceed", output["reason"])
+        self.assertIn("continue this session", output["reason"])
+        self.assertIn("availability is checked again in a new session", output["reason"])
+        self.assertNotIn("start a new session", output["reason"])
 
     def test_accepting_the_clamp_unblocks_the_rest_of_the_session(self):
         environ, blocked = self.open_and_spawn_lead("base")
@@ -662,7 +702,7 @@ class ClampGateTests(unittest.TestCase):
         )
 
     def test_proceed_without_a_clamped_route_says_so(self):
-        environ = self.environ("full")
+        environ = self.environ("latest")
         result = self.send(
             environ, hook_event_name="UserPromptSubmit", prompt="$symphony:symphony proceed"
         )

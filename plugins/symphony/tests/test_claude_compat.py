@@ -54,7 +54,7 @@ class ClaudeCompatTests(unittest.TestCase):
         )
 
     def test_fable_is_the_strongest_claude_model(self):
-        self.assertEqual(CLAUDE_FULL["id"], "fable")
+        self.assertEqual(CLAUDE_FULL["id"], "fable-5-5")
         self.assertEqual(STRONGEST, "claude-fable-5-1")
 
     def test_guidance_names_the_exact_agent_types_and_how_to_wait(self):
@@ -62,10 +62,9 @@ class ClaudeCompatTests(unittest.TestCase):
         text = self.hook("UserPromptSubmit", prompt="/symphony:start Build the feature")[
             "hookSpecificOutput"
         ]["additionalContext"]
-        self.assertIn(f"`symphony:symphony-assessor-{STRONGEST}-high`", text)
-        self.assertIn("medium/mixed `symphony:symphony-lead-", text)
+        self.assertIn("`symphony:symphony-lead-claude-opus-5-5-medium`", text)
+        self.assertIn("SYMPHONY_FAST_DECISION: escalate", text)
         self.assertIn("end your turn", text)
-        self.assertIn("superpowers:brainstorming", text)
 
     def test_assessment_marker_is_read_from_the_handback_report(self):
         self.spawn_assessor()

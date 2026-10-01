@@ -138,10 +138,14 @@ ASSESSMENT_MARKER = (
 )
 
 
+def _first_profile(root: Path, provider: str) -> dict[str, Any]:
+    profiles = json.loads((root / "profiles.json").read_text(encoding="utf-8"))["providers"][provider]["profiles"]
+    return profiles[0]
+
+
 def _role_model(root: Path, provider: str, agent_role: str) -> tuple[str, str]:
     """The model and effort this role must run at, per the shipped matrix."""
-    profiles = json.loads((root / "profiles.json").read_text(encoding="utf-8"))["providers"][provider]["profiles"]
-    profile = profiles[0]
+    profile = _first_profile(root, provider)
     if agent_role == "assessor":
         return profile["tiers"]["strongest"], "high"
     choice = profile["matrix"]["small/simple"]
@@ -234,6 +238,7 @@ def _run_event(
             "PLUGIN_ROOT": str(root),
             "CLAUDE_PLUGIN_ROOT": str(root),
             "SYMPHONY_RUNTIME_DIR": str(state_dir.parent / "runtimes"),
+            "SYMPHONY_PROFILE": _first_profile(root, provider)["id"],
         }
     )
     completed = subprocess.run(
@@ -275,6 +280,7 @@ def _send_raw(
             "PLUGIN_ROOT": str(root),
             "CLAUDE_PLUGIN_ROOT": str(root),
             "SYMPHONY_RUNTIME_DIR": str(state_dir.parent / "runtimes"),
+            "SYMPHONY_PROFILE": _first_profile(root, provider)["id"],
         }
     )
     completed = subprocess.run(

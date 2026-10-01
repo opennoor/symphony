@@ -170,6 +170,20 @@ def assessor_selection(snapshot: CapabilitySnapshot, requested: str = "off") -> 
             "model": model, "effort": effort}
 
 
+def fast_lead_selection(snapshot: CapabilitySnapshot) -> dict[str, str]:
+    """A capable, medium-effort first lead, or no fast route for this profile."""
+    model = snapshot.tiers.get("capable", "")
+    try:
+        rank = json.loads((PROFILES_PATH.parent / "model-policy.json").read_text(encoding="utf-8"))["models"][model]["capability_rank"]
+    except (OSError, ValueError, KeyError, TypeError):
+        rank = -1
+    if (not model or model not in snapshot.available_models
+            or "medium" not in snapshot.supported_efforts.get(model, ())
+            or not isinstance(rank, int) or rank < 2):
+        return {"model": "", "effort": ""}
+    return {"model": model, "effort": "medium"}
+
+
 def model_is_weaker(model: str, baseline: str) -> bool:
     """Compare reviewed capability ranks; unknown models stay conservative."""
     if model == baseline:

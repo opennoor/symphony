@@ -1,8 +1,8 @@
 ---
-name: symphony-lead-claude-opus-5-5-medium
-description: Leads Symphony work at the matrix-selected route.
-model: claude-opus-5-5
-effort: medium
+name: symphony-lead-claude-sonnet-5-5-low
+description: Administers large simple Symphony work through bounded delegation.
+model: claude-sonnet-5-5
+effort: low
 ---
 
 If the packet has `SYMPHONY_FAST_ROUTE: lead`, decide before any writes whether the entire task is bounded, clear, low risk, required tools (including browser or computer control when needed) are available, and has a concrete verification check. If uncertain or ineligible, make no changes and end with `SYMPHONY_FAST_DECISION: escalate`; the root will hand the original task to an independent assessor. Do not spawn children on this route. If eligible, work directly and end with `SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {"status":"completed"}`.

@@ -364,7 +364,12 @@ def validate_matrix(provider: str, result: dict, current: list[dict], roster: li
                 raise SystemExit(f"::error::{provider} {cell} model is absent from its roster/order: {model!r}")
             if limited_models and model not in limited_models:
                 raise SystemExit(f"::error::{provider} {profile['id']} must preserve its gated model coverage")
-            if _older_without_price_advantage(provider, model, set(models)):
+            # A gated legacy profile serves accounts without its replacement.
+            # Compare only models that profile can actually select.
+            comparable = (set(models) if profile["id"] == expected_ids[0]
+                          else set(prior.get("requires_all", ())) or
+                          {item["model"] for item in matrix.values()})
+            if _older_without_price_advantage(provider, model, comparable):
                 raise SystemExit(f"::error::{provider} {cell} selects older {model} without a token-rate advantage")
             if effort not in models[model] or effort not in declared_efforts.get(model, ()):
                 raise SystemExit(f"::error::{provider} unsupported effort {effort!r} for {model}")
@@ -423,6 +428,10 @@ def validate_matrix(provider: str, result: dict, current: list[dict], roster: li
             raise SystemExit(f"::error::{provider} full profile must improve at least one cell over the fallback")
         if provider == "claude":
             for stronger, weaker in zip(normalized_profiles, normalized_profiles[1:]):
+                upper_gate = set(next(item for item in current if item["id"] == stronger["id"]).get("requires_all", ()))
+                lower_gate = set(next(item for item in current if item["id"] == weaker["id"]).get("requires_all", ()))
+                if upper_gate and lower_gate and not lower_gate <= upper_gate:
+                    continue  # Incomparable provider entitlements have no shared ordering.
                 upper, lower = stronger["matrix"], weaker["matrix"]
                 if any(rank[upper[cell]["model"]] < rank[lower[cell]["model"]] for cell in CELLS):
                     raise SystemExit("::error::Claude profile capability must not fall with greater entitlement")

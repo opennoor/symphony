@@ -3,13 +3,14 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.store import StateStore, project_key
+from plugins.symphony.symphony.store import StateStore, _locked, project_key
 
 
 class StateStoreTests(unittest.TestCase):
@@ -76,6 +77,167 @@ class StateStoreTests(unittest.TestCase):
 
         self.assertEqual(project_key(alias), project_key(self.project.resolve()))
         self.assertNotEqual(project_key(other), project_key(self.project))
+
+    def test_owner_scan_coordinates_with_project_writer_on_windows(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        self.store.save(self.project, ProjectState(active_run=run,
+                                                   active_runs={"codex:root": run}))
+        reading = threading.Event()
+        release = threading.Event()
+        writing = threading.Event()
+        written = threading.Event()
+        errors = []
+        matches = []
+        original = Path.read_text
+
+        def paused_read(path, *args, **kwargs):
+            if path == self.state_path() and threading.current_thread().name == "owner-scan":
+                reading.set()
+                if not release.wait(5):
+                    raise TimeoutError("owner scan was not released")
+            return original(path, *args, **kwargs)
+
+        def scan():
+            try:
+                matches.extend(self.store.active_owner_paths("codex", "root"))
+            except BaseException as error:
+                errors.append(error)
+
+        def write():
+            writing.set()
+            try:
+                self.store.update(self.project, lambda state: (state, None))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                written.set()
+
+        with patch.object(Path, "read_text", paused_read):
+            scanner = threading.Thread(target=scan, name="owner-scan")
+            writer = threading.Thread(target=write, name="other-session-writer")
+            scanner.start()
+            self.assertTrue(reading.wait(5))
+            writer.start()
+            self.assertTrue(writing.wait(5))
+            if os.name == "nt":
+                self.assertFalse(written.wait(0.1), "Windows writer bypassed the snapshot lock")
+            else:
+                self.assertTrue(written.wait(1), "POSIX snapshot blocked a project writer")
+            release.set()
+            scanner.join(5)
+            writer.join(5)
+        self.assertFalse(scanner.is_alive() or writer.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual([self.state_path()], matches)
+        self.assertTrue(written.is_set())
+
+    def test_owner_scan_defers_on_busy_unrelated_windows_project(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        self.store.save(self.project, ProjectState(active_run=run,
+                                                   active_runs={"codex:root": run}))
+        other = self.root / "other"
+        other.mkdir()
+        self.store.save(other, ProjectState(enabled=True))
+        other_path = self.store._path(other)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_other():
+            with _locked(other_path):
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_other)
+        holder.start()
+        try:
+            self.assertTrue(held.wait(5))
+            owners = self.store.active_owner_paths("codex", "root")
+            self.assertEqual(None if os.name == "nt" else (self.state_path(),), owners)
+        finally:
+            release.set()
+            holder.join(5)
+        self.assertFalse(holder.is_alive())
+
+    def test_new_duplicate_owner_after_prior_lookup_is_not_hidden(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        state = ProjectState(active_run=run, active_runs={"codex:root": run})
+        self.store.save(self.project, state)
+        self.assertEqual((self.state_path(),), self.store.active_owner_paths("codex", "root"))
+        other = self.root / "other"
+        other.mkdir()
+        self.store.save(other, state)
+        self.assertEqual({self.state_path(), self.store._path(other)},
+                         set(self.store.active_owner_paths("codex", "root")))
+
+    def test_snapshot_scan_and_atomic_replace_remain_compatible(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        self.store.save(self.project, ProjectState(active_run=run,
+                                                   active_runs={"codex:root": run}))
+        errors = []
+        start = threading.Event()
+        stop = threading.Event()
+        progress = {"writer": 0, "reader": 0, "max_write_seconds": 0.0,
+                    "max_read_seconds": 0.0, "writer_inflight_since": None}
+
+        def write():
+            start.wait(5)
+            try:
+                for _ in range(300):
+                    if stop.is_set():
+                        break
+                    begun = time.monotonic()
+                    progress["writer_inflight_since"] = begun
+                    self.store.update(self.project, lambda state: (state, None))
+                    progress["writer"] += 1
+                    progress["max_write_seconds"] = max(
+                        progress["max_write_seconds"], time.monotonic() - begun)
+                    progress["writer_inflight_since"] = None
+            except BaseException as error:
+                errors.append(("writer", repr(error)))
+
+        writer = threading.Thread(target=write)
+        writer.start()
+        start.set()
+        stalled = False
+        snapshot = {}
+        try:
+            for _ in range(300):
+                begun = time.monotonic()
+                try:
+                    self.assertIn(self.store.active_owner_paths("codex", "root"),
+                                  (None, (self.state_path(),)))
+                    progress["reader"] += 1
+                    progress["max_read_seconds"] = max(
+                        progress["max_read_seconds"], time.monotonic() - begun)
+                except BaseException as error:
+                    errors.append(("reader", repr(error)))
+                    break
+            writer.join(10)
+            stalled = writer.is_alive()
+            snapshot = progress.copy()
+            if snapshot["writer_inflight_since"] is not None:
+                snapshot["inflight_seconds"] = round(
+                    time.monotonic() - snapshot["writer_inflight_since"], 3)
+        finally:
+            if stalled:
+                print(f"Snapshot stress: {snapshot}, errors={errors}", flush=True)
+            stop.set()
+            writer.join()
+        self.assertFalse(stalled, f"writer exceeded 10s after reader: {snapshot}, errors={errors}")
+        self.assertFalse(errors, errors)
+        self.assertEqual((self.state_path(),), self.store.active_owner_paths("codex", "root"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows path aliases")
+    def test_windows_project_key_collapses_case_and_short_path_aliases(self):
+        self.assertEqual(project_key(self.project), project_key(Path(str(self.project).swapcase())))
+
+        spaced = self.root / "Project With Spaces"
+        spaced.mkdir()
+        import ctypes
+        short_name = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(spaced), short_name, len(short_name))
+        if length and length < len(short_name) and short_name.value != str(spaced):
+            self.assertEqual(project_key(spaced), project_key(Path(short_name.value)))
 
     def test_save_atomically_replaces_a_sibling_temporary_file(self):
         self.store.save(self.project, ProjectState(enabled=False))
@@ -246,11 +408,45 @@ store.update(project, add)
             [sys.executable, "-c", script, str(self.data), str(self.project), session],
             cwd=Path(__file__).resolve().parents[3],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        ) for session in ("one", "two")]
+        ) for session in (f"worker-{index}" for index in range(8))]
         for process in processes:
             _, stderr = process.communicate(timeout=15)
             self.assertEqual(process.returncode, 0, stderr)
-        self.assertEqual(set(self.store.load(self.project).active_runs), {"codex:one", "codex:two"})
+        self.assertEqual(set(self.store.load(self.project).active_runs),
+                         {f"codex:worker-{index}" for index in range(8)})
+
+    @unittest.skipUnless(os.name == "nt", "Windows byte-range lock behavior")
+    def test_empty_windows_lockfile_contends_and_recovers_after_process_exit(self):
+        path = self.data / "fresh-state.json"
+        lock_path = path.with_name(path.name + ".lock")
+        lock_path.parent.mkdir(parents=True)
+        ready = self.root / "ready"
+        script = """
+import msvcrt, sys, time
+from pathlib import Path
+with Path(sys.argv[1]).open('a+b') as handle:
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    Path(sys.argv[2]).write_text('ready')
+    time.sleep(10)
+"""
+        holder = subprocess.Popen([sys.executable, "-c", script, str(lock_path), str(ready)],
+                                  stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(500):
+                if ready.exists() or holder.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), holder.stderr.read() if holder.poll() is not None else "")
+            with self.assertRaises(TimeoutError):
+                with _locked(path, timeout=0.1):
+                    pass
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+            holder.communicate(timeout=5)
+        with _locked(path, timeout=5):
+            self.assertEqual(0, lock_path.stat().st_size)
 
     def test_persistence_redacts_secret_values_and_credential_text(self):
         state = ProjectState(

@@ -83,13 +83,15 @@ Reviewed hooks retain their exact runtime at `~/.symphony/runtimes/<content dige
 
 When the heartbeat is absent, `status` reports pending verification and gives the provider-native recovery step. A missing packaged executable or nonzero hook exit is reported as a fault, not as a trust problem. Symphony never silently labels an unverified run guarded; an unguarded one-shot route must be explicit.
 
-Normal completion is blocked while host-observed tracked work remains active. A stop is blocked at most once per turn: when the host reports that the stop hook is already active, Symphony releases the turn and preserves unfinished work in durable `status`. Only an explicit force stop archives it as abandoned with unreconciled identities. A prompt that never spawned an assessor opens no run and can never hold a session open.
+Normal completion is blocked while host-observed tracked work remains active. A stop is blocked at most once per turn: when the host reports that the stop hook is already active, Symphony releases the turn and preserves unfinished work in durable `status`. Only an explicit force stop archives it as abandoned with unreconciled identities. A prompt that never spawned a managed agent opens no run and can never hold a session open.
 
 User interruption and host-enforced overrides remain authoritative, so interrupted work is recovered from durable lifecycle state rather than described as uninterruptible. Neither host reports which agents are still alive. A new root session never takes over another session's run or declares its agents finished; each session resumes its own durable run.
 
 ## Routing
 
 Assessment treats task size and complexity as separate axes. The fixed route is resolved against the capability map shipped with the installed version. Hooks are given no model inventory by either host, so the map is maintained at release time rather than discovered at runtime.
+
+For new tasks with an available capable/medium route, Symphony first sends the full request to one lead. That lead checks scope, clarity, risk, required tools, and verification before making changes. Bounded, clear, low-risk work runs directly; uncertainty or larger work is handed to an independent assessor. A missing or malformed lead decision cannot complete the run. An explicit assessor boost uses the assessor path directly. This before-write check is performed by the lead; current host hooks enforce the route and final disposition but cannot observe every tool action inside an agent.
 
 Symphony ships several profiles per provider and routes through the best one your plan is entitled to, falling back to a conservative floor when entitlement cannot be read. When your plan clamps a task to a weaker model, the lead spawn stops and waits for `proceed`, so quality never degrades silently; a reduced effort on the same model is announced and continues.
 
@@ -103,7 +105,7 @@ On Claude Code, the first substantive Symphony task checks Sonnet 5 and Opus 5.5
 
 Claude Code's Agent hook can reject an invalid spawn before launch. On Symphony's currently supported Codex collaboration path, a mis-routed spawn is detected after the child starts. Codex documents `PreToolUse` for ordinary `spawn_agent`, but Symphony has not verified pre-spawn enforcement on its exact collaboration path. Claude's packaged hooks match Agent calls, not Skill calls, so optional-capability practice is reported and checked by agents rather than host-enforced.
 
-The assessor is bounded, read-only, and separate from the lead. The lead route never inherits the assessor's expensive model or effort. Large-task leads administer dependency-aware work and reserve capacity for narrow consultant decisions. Small-task leads do straightforward work directly and delegate only genuinely independent or mechanical units.
+The assessor is bounded, read-only, and separate from the assessed lead. The assessed lead route never inherits the assessor's expensive model or effort. Large-task leads administer dependency-aware work and reserve capacity for narrow consultant decisions. Small-task leads do straightforward work directly and delegate only genuinely independent or mechanical units.
 
 `reassess` updates subsequent work at a safe evidence boundary. It does not duplicate an active lead or rewrite completed work.
 

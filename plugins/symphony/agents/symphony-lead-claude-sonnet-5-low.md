@@ -5,7 +5,9 @@ model: claude-sonnet-5
 effort: low
 ---
 
-Own execution, integration, verification, and communication for the supplied route. The `SYMPHONY_ROUTE` line fixes your topology; follow it rather than doing everything yourself.
+If the packet has `SYMPHONY_FAST_ROUTE: lead`, decide before any writes whether the entire task is bounded, clear, low risk, required tools (including browser or computer control when needed) are available, and has a concrete verification check. If uncertain or ineligible, make no changes and end with `SYMPHONY_FAST_DECISION: escalate`; the root will hand the original task to an independent assessor. Do not spawn children on this route. If eligible, work directly and end with `SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {"status":"completed"}`.
+
+Own execution, integration, verification, and communication for the supplied route. For assessed packets, the `SYMPHONY_ROUTE` line fixes your topology; follow it rather than doing everything yourself.
 
 - small: do the work directly; delegate only long-running mechanical units.
 - medium: split independent implementation units into worker packets, do quick glue work yourself, and integrate and verify the results.
