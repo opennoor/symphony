@@ -175,6 +175,7 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
     report = ""
     final = ""
     prompt_id = ""
+    handbacks = 0
     turns = []
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
@@ -185,7 +186,7 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                     return ""
                 if not isinstance(record, dict):
                     return ""
-                message = record.get("message") if isinstance(record, dict) else None
+                message = record.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
                 if record.get("type") == "user":
                     if not isinstance(content, (str, list)) or isinstance(content, list) and any(
@@ -203,24 +204,27 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                             turns.append((prompt_id, report, final))
                         prompt_id = record.get("uuid")
                         report, final = "", ""
+                        handbacks = 0
                     continue
-                if record.get("type") == "assistant":
-                    if not isinstance(content, list) or any(
-                            not isinstance(item, dict) or not isinstance(item.get("type"), str)
-                            or (item["type"] == "text" and not isinstance(item.get("text"), str))
-                            for item in content):
-                        return ""
-                    final = "\n".join(item.get("text", "") for item in content
-                                      if item["type"] == "text")
-                for item in content if isinstance(content, list) else ():
+                if record.get("type") != "assistant":
+                    continue
+                if not isinstance(content, list) or any(
+                        not isinstance(item, dict) or not isinstance(item.get("type"), str)
+                        or (item["type"] == "text" and not isinstance(item.get("text"), str))
+                        for item in content):
+                    return ""
+                final = "\n".join(item.get("text", "") for item in content if item["type"] == "text")
+                for item in content:
                     if (
                         isinstance(item, dict)
                         and item.get("type") == "tool_use"
                         and item.get("name") == "SubagentHandback"
                     ):
                         values = item.get("input")
-                        if not isinstance(values, dict) or not isinstance(values.get("message"), str):
+                        if (handbacks or not isinstance(values, dict)
+                                or not isinstance(values.get("message"), str)):
                             return ""
+                        handbacks = 1
                         report = values["message"]
     except (OSError, TypeError, ValueError, AttributeError):
         return ""

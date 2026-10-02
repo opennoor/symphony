@@ -334,6 +334,24 @@ class PackageContractTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), '123')
                 self.assertFalse(marker.exists(), 'drive-root PATH searched the current project')
 
+    @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
+    def test_empty_windows_path_never_launches_discovery(self):
+        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / 'discovery-ran'
+            code = 'from pathlib import Path;Path(' + repr(str(marker)) + ').write_text("ran")'
+            relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text(), code)
+            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                for path in ('', os.pathsep.join(('', '.', 'C:relative'))):
+                    with self.subTest(provider=provider, path=path):
+                        result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                            "$env:PATH='" + path.replace("'", "''") + "';"
+                            + relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                            text=True, timeout=10, env={**os.environ, variable: temporary})
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('No candidates', result.stderr)
+                        self.assertFalse(marker.exists(), 'unlisted interpreter discovery ran')
+
     @unittest.skipUnless(Path('/usr/bin/python3').is_file(), 'needs a second system Python')
     def test_generated_launchers_match_system_python_compression_backend(self):
         import hashlib

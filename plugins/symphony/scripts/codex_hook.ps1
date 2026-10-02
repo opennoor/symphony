@@ -7,7 +7,7 @@ $w='No candidates'
 function N($d) {$d=$d.TrimEnd('\','/');if($d -match '^[a-z]:$') {$d+='\'};$d}
 $ds=@($env:PATH -split [IO.Path]::PathSeparator | ForEach-Object {$d=$_.Trim();if($d.StartsWith('"') -and $d.EndsWith('"')) {$d=$d.Trim('"')};if([IO.Path]::IsPathRooted($d) -and ($d -match '^(?:[a-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::DirectorySeparatorChar -eq '/') -and $d -notmatch '["\x00-\x1f]') {N $d}})
 $ds=@($ds | Where-Object {$_ -notlike '\\*'})+@($ds | Where-Object {$_ -like '\\*'})
-$ps=@('');foreach($d in $ds) {if($ps[-1].Length+$d.Length -gt 3000) {$ps+='';};$ps[-1]+=$d+';'}
+$ps=@();foreach($d in $ds) {if(!$ps -or $ps[-1].Length+$d.Length -gt 3000) {$ps+=''};$ps[-1]+=$d+';'}
 $all=@();$cs=@();$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);$end=[DateTime]::UtcNow.AddSeconds(3)
 foreach($part in $ps) {
 $p=$null

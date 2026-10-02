@@ -14,6 +14,7 @@ TESTS = (
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_discovery_timeout_preserves_candidates_without_running_the_hook_twice",
     "plugins.symphony.tests.test_package.PackageContractTests.test_native_windows_discovery_preserves_unicode_and_metacharacters_without_cwd_search",
     "plugins.symphony.tests.test_package.PackageContractTests.test_native_windows_discovery_keeps_drive_root_absolute",
+    "plugins.symphony.tests.test_package.PackageContractTests.test_empty_windows_path_never_launches_discovery",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_launcher_propagates_runtime_failure_without_reexecuting_hook",
     "plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path",
     "plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs",
