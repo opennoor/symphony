@@ -233,6 +233,35 @@ class AdapterContractTests(unittest.TestCase):
                 self.assertEqual(event.payload['model'], 'native-model')
                 self.assertIn('task', event.payload)
 
+    def test_explicit_codex_turn_requires_one_unique_native_context(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child', 'agent_path': '/root/worker',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}}
+            context = {'type': 'turn_context', 'payload': {'turn_id': 'own-turn', 'model': 'first-model', 'effort': 'high'}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message',
+                'message': 'SYMPHONY_FAST_ROUTE: lead\nFirst turn task'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for same_metadata in (False, True):
+                    with self.subTest(hook=hook, same_metadata=same_metadata):
+                        duplicate = context if same_metadata else {'type': 'turn_context', 'payload': {
+                            'turn_id': 'own-turn', 'model': 'second-model', 'effort': 'low'}}
+                        for second_turn in ('own-turn', 'foreign-turn'):
+                            duplicate = {**duplicate, 'payload': {**duplicate['payload'], 'turn_id': second_turn}}
+                            transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task, duplicate)))
+                            event = event_from_payload('codex', {'hook_event_name': hook, 'agent_id': 'child',
+                                'turn_id': 'own-turn', 'agent_transcript_path': str(transcript), 'model': 'callback-model'})
+                            self.assertEqual(event.payload['task_name'], 'worker')
+                            self.assertEqual(event.payload['parent_thread_id'], 'lead')
+                            if second_turn == 'own-turn':
+                                self.assertEqual(event.payload['model'], 'callback-model')
+                                self.assertNotIn('model_reasoning_effort', event.payload)
+                                self.assertNotIn('task', event.payload)
+                            else:
+                                self.assertEqual(event.payload['model'], 'first-model')
+                                self.assertEqual(event.payload['model_reasoning_effort'], 'high')
+                                self.assertIn('task', event.payload)
+
     def test_malformed_copied_codex_header_rejects_all_native_metadata(self):
         with TemporaryDirectory() as temp:
             transcript = Path(temp) / 'child.jsonl'

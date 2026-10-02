@@ -77,6 +77,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     forked = False
     own_turn = True
     native_contexts = 0
+    matching_contexts = 0
     legacy_ambiguous = False
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
@@ -139,6 +140,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                         own_turn = record_payload.get("turn_id") == callback_turn
                     if not own_turn:
                         continue
+                    matching_contexts += 1
                     if record_payload.get("model"):
                         found["model"] = str(record_payload["model"])
                     if record_payload.get("effort"):
@@ -160,8 +162,9 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                             found["task"] = message
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         legacy_ambiguous = not callback_turn
+    ambiguous = legacy_ambiguous or bool(callback_turn and matching_contexts != 1)
     return {key: value for key, value in found.items()
-            if not legacy_ambiguous or key in {'task_name', 'parent_thread_id'}}
+            if not ambiguous or key in {'task_name', 'parent_thread_id'}}
 
 
 def _claude_handback_report(payload: dict[str, Any]) -> str:

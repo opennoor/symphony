@@ -1,12 +1,14 @@
 {
-  "source": "Sanitized native Codex 0.158 archived-lead followup captured 2026-10-01; identities, cwd and messages replaced.",
+  "source": "Sanitized native Codex archived-lead followup captured 2026-10-01: the child header records CLI 0.159.3, while the long-lived VS Code root header records its original 0.156.1 build. Identities, cwd and messages replaced.",
   "root": [
     {
       "type": "session_meta",
       "timestamp": "2026-09-24T12:43:17.178Z",
       "payload": {
         "id": "01a0ec79-988a-7903-ba2e-b003394a341b",
-        "cwd": "FIXTURE_PROJECT"
+        "cwd": "FIXTURE_PROJECT",
+        "cli_version": "0.156.1",
+        "source": "vscode"
       }
     },
     {
@@ -92,7 +94,8 @@
               "parent_thread_id": "01a0ec79-988a-7903-ba2e-b003394a341b"
             }
           }
-        }
+        },
+        "cli_version": "0.159.3"
       }
     },
     {
