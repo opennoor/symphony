@@ -277,24 +277,39 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                 or (accepted := _instant(contract.get('accepted_at'))) is None):
             return 'unknown'
         leads = [item for item in run.delegations if item.identity == run.lead_identity and item.role == 'lead']
+        proofs = run.assessment.get('_substantive_children', {})
+        if not isinstance(proofs, Mapping):
+            return 'unknown'
         children = []
+        uncredited = []
+        seen = set()
+        terminal = {'completed', 'done', 'success', 'succeeded', 'failed', 'interrupted',
+                    'cancelled', 'canceled', 'error', 'terminated'}
+        replaceable = terminal - {'interrupted'}
         for item in run.delegations:
             if item.role not in {'worker', 'consultant'}:
                 continue
             updated = _instant(item.updated_at)
             if updated is None:
                 return 'unknown'
-            # Reassessment keeps historical delegations. Only a durable
-            # terminal strictly before this epoch can be excluded.
-            if updated < accepted and item.state.lower() in {'completed', 'done', 'success', 'succeeded',
-                    'failed', 'interrupted', 'cancelled', 'canceled', 'error', 'terminated'}:
+            # Reassessment keeps historical delegations. A terminal before
+            # this epoch belongs to the old scope.
+            if updated < accepted and item.state.lower() in terminal:
+                continue
+            if item.identity in seen:
+                return 'unknown'
+            seen.add(item.identity)
+            proof = proofs.get(item.identity)
+            if (item.state.lower() in replaceable and isinstance(proof, Mapping)
+                    and proof.get('successful') is False and proof.get('superseded_epoch') == contract['epoch']
+                    and isinstance(proof.get('superseded_by'), str) and proof['superseded_by']):
+                uncredited.append((updated, proof['superseded_by']))
                 continue
             children.append(item)
         if (len(leads) != 1 or leads[0].state.lower() not in {'completed', 'done', 'success', 'succeeded'}
-                or not children or len({item.identity for item in children}) != len(children)):
+                or not children):
             return 'unknown'
         lead = leads[0]
-        proofs = run.assessment.get('_substantive_children', {})
         for child in children:
             proof = proofs.get(child.identity)
             if (child.state.lower() not in {'completed', 'done', 'success', 'succeeded'}
@@ -306,7 +321,13 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                     or proof.get('start_event_id') not in run.assessment.get('_start_event_ids', ())
                     or child.identity in run.assessment.get('_invalid_consultants', ())):
                 return 'unknown'
-        boundaries = []
+        # A durable supersession names the later credited child. Keep the old
+        # terminal's callback before the lead's report as a boundary.
+        admissions = {child.identity: _instant(proofs[child.identity].get('admitted_at')) for child in children}
+        if any(admissions.get(replacement) is None or updated >= admissions[replacement]
+               for updated, replacement in uncredited):
+            return 'unknown'
+        boundaries = [updated for updated, _ in uncredited]
         if run.provider == 'codex':
             home = Path(environ.get('CODEX_HOME') or Path.home() / '.codex')
             root = _chronology_codex_file(home, session, '', project)
@@ -391,7 +412,7 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                     committed_run=run, committed_anchor=sequence)
                 if replay is None or replay[1][-1].event_id != native.event_id:
                     continue
-                boundaries = [_instant(sequence.get('archived_at')),
+                boundaries = [*(updated for updated, _ in uncredited), _instant(sequence.get('archived_at')),
                     *(_instant(item.observed_at) for item in replay[4]['natives'])]
                 if any(when is None for when in boundaries):
                     return 'unknown'

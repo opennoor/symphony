@@ -37,7 +37,7 @@ $q.RedirectStandardOutput=$true
 $q.RedirectStandardError=$true
 $p=[Diagnostics.Process]::Start($q)
 $p.StandardInput.Close()
-if(-not $p.WaitForExit([Math]::Min(1500,$ms))) {$w=$c.Source+': probe timed out';try {$p.Kill()} catch {};continue}
+if(-not $p.WaitForExit([Math]::Min(2500,$ms))) {$w=$c.Source+': probe timed out';try {$p.Kill()} catch {};continue}
 $path=$p.StandardOutput.ReadToEnd().Trim()
 if($p.ExitCode -eq 0 -and [IO.Path]::IsPathRooted($path) -and (Test-Path -LiteralPath $path -PathType Leaf)) {$py=$path;break}
 $w=$c.Source+': probe exit '+$p.ExitCode

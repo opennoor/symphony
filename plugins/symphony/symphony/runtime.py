@@ -2480,6 +2480,22 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
             binding = None
     proofs[identity] = {**proof, **(binding or {}),
                         'successful': successful and binding is not None}
+    if proofs[identity]['successful'] is True:
+        admitted = _instant(proofs[identity].get('admitted_at'))
+        accepted = _instant(contract['accepted_at'])
+        if admitted is not None and accepted is not None:
+            for old in run.delegations:
+                if old.identity == identity or old.role not in {'worker', 'consultant'} or old.state.lower() not in {
+                        'completed', 'done', 'success', 'succeeded', 'failed', 'cancelled', 'canceled', 'error',
+                        'terminated'}:
+                    continue
+                ended = _instant(old.updated_at)
+                prior = proofs.get(old.identity)
+                if (ended is not None and accepted <= ended < admitted
+                        and (not isinstance(prior, Mapping) or prior.get('successful') is not True)):
+                    proofs[old.identity] = {**(dict(prior) if isinstance(prior, Mapping) else {}),
+                                            'successful': False, 'superseded_by': identity,
+                                            'superseded_epoch': contract['epoch']}
     assessment = {**run.assessment, '_substantive_children': proofs}
     updated = replace(run, assessment=assessment)
     if _substantive_child_completed(updated):

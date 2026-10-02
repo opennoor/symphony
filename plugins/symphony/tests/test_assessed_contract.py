@@ -299,6 +299,8 @@ class AssessedContractTests(unittest.TestCase):
                     self.assertEqual(self.state.active_run.status, 'recovering')
                     self.child('lead', 'lead', False, 'lead-2')
                     self.worker(identity='fresh-worker', turn='fresh-worker-1')
+                    self.assertEqual(self.state.active_run.assessment['_substantive_children']['worker']
+                                     ['superseded_by'], 'fresh-worker')
                     self.child('lead', 'lead', True, 'lead-2')
                     self.state, _ = reduce(self.state, self.event('stop_requested'))
                     self.assertIsNone(self.state.active_run)

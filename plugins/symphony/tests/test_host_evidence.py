@@ -1031,6 +1031,31 @@ class CompletionChronologyTests(unittest.TestCase):
                         delegations=(*self.run.delegations, historical)))
                     self.assertEqual(self.check(), expected)
 
+    def test_later_credited_child_supersedes_only_earlier_uncredited_terminal(self):
+        cases = ((5, 'completed', 'marked', 'valid'), (5, 'failed', 'marked', 'valid'),
+                 (5, 'completed', 'unmarked', 'unknown'), (7, 'completed', 'marked', 'unknown'),
+                 (5, 'working', 'marked', 'unknown'), (5, 'interrupted', 'marked', 'unknown'),
+                 (13, 'completed', 'marked', 'unknown'), (5, 'completed', 'wrong-replacement', 'unknown'),
+                 (5, 'completed', 'old-epoch', 'unknown'), (5, 'completed', 'credited', 'unknown'),
+                 ('malformed', 'completed', 'marked', 'unknown'))
+        for provider in ('codex', 'claude'):
+            for timestamp, status, proof_kind, expected in cases:
+                with self.subTest(provider=provider, timestamp=timestamp, status=status, proof=proof_kind):
+                    self.fixture(provider)
+                    old = Delegation('old-child', 'worker', 'old attempt', status, self.model, 'low',
+                        self.stamp(timestamp) if isinstance(timestamp, int) else timestamp)
+                    proofs = dict(self.run.assessment['_substantive_children'])
+                    if proof_kind == 'credited':
+                        proofs[old.identity] = dict(proofs[self.child])
+                    elif proof_kind != 'unmarked':
+                        proofs[old.identity] = {'successful': False,
+                            'superseded_by': 'foreign' if proof_kind == 'wrong-replacement' else self.child,
+                            'superseded_epoch': 'foreign' if proof_kind == 'old-epoch' else 'epoch'}
+                    self.state = replace(self.state, active_run=replace(self.run,
+                        delegations=(*self.run.delegations, old),
+                        assessment={**self.run.assessment, '_substantive_children': proofs}))
+                    self.assertEqual(self.check(), expected)
+
     def test_all_current_children_must_return_before_the_lead_report(self):
         import hashlib
         for provider in ('codex', 'claude'):

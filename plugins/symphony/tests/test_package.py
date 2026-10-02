@@ -179,7 +179,7 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn('foreach($n in 0,1)', source)
         self.assertIn("foreach($name in 'python.exe','python3.exe','py.exe')", source)
         self.assertIn('Select-Object -Skip $n -First 1', source)
-        self.assertIn('$p.WaitForExit([Math]::Min(1500,$ms))', source)
+        self.assertIn('$p.WaitForExit([Math]::Min(2500,$ms))', source)
         self.assertIn('$end=[DateTime]::UtcNow.AddSeconds(4)', source)
         self.assertEqual(source.count('-I -X utf8 -c'), 2)
         self.assertGreaterEqual(load_json('hooks/codex.json')['hooks']['Interrupt'][0]['hooks'][0]['timeout'], 10)
@@ -258,7 +258,7 @@ class PackageContractTests(unittest.TestCase):
         ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
         with tempfile.TemporaryDirectory(prefix='slow interpreter probe ') as temporary:
             directory = Path(temporary)
-            probe = self._probe_executable(directory, delay=1000)
+            probe = self._probe_executable(directory, delay=1800)
             relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)')
             if os.name != 'nt':
                 code = 'import sys;sys.stdout.buffer.write(' + repr('"' + str(probe) + '"\n') + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
