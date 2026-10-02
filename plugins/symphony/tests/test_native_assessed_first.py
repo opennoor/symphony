@@ -93,6 +93,128 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 values = self.fixture(provider)
                 self.assertTrue(smoke.assessed_first_verified(provider, *values[:6]))
 
+    def test_rejected_assessor_messages_expose_only_exact_native_control_facts(self):
+        for case in ('uuid', 'path', 'foreign', 'encrypted', 'changed', 'interrupt',
+                     'failed', 'duplicate-result', 'missing-native-delivery', 'after-final'):
+            with self.subTest(case=case):
+                document, run, children, home, project, profile, roots, write = self.fixture('codex')
+                native_path = children['assessor-id'][0]['payload']['agent_path']
+                args = json.loads(roots[1]['payload']['arguments'])
+                args['message'] = 'PRIVATE_PACKET'
+                roots[1]['payload']['arguments'] = json.dumps(args)
+                target = native_path if case == 'path' else 'foreign-private-id' if case == 'foreign' else 'assessor-id'
+                message = 'gAAAAopaque_private_ciphertext' if case == 'encrypted' else 'PRIVATE_CHANGED' if case == 'changed' else 'PRIVATE_PACKET'
+                second = 7 if case == 'after-final' else 4
+                roots.extend([
+                    {'type': 'response_item', 'timestamp': at(second), 'payload': {'type': 'function_call',
+                     'call_id': 'private-control', 'name': 'followup_task' if case == 'path' else 'send_message',
+                     'arguments': json.dumps({'target': target, 'message': message, 'interrupt': case == 'interrupt'})}},
+                    {'type': 'event_msg', 'timestamp': at(second), 'payload': {'type': 'item_completed',
+                     'thread_id': run['session_id'], 'item': {'type': 'SubAgentActivity', 'id': 'private-control',
+                     'kind': 'interacted', 'agent_thread_id': 'assessor-id', 'agent_path': native_path}}},
+                    {'type': 'response_item', 'timestamp': at(second), 'payload': {'type': 'function_call_output',
+                     'call_id': 'private-control', 'output': json.dumps({'task_name': native_path}), 'is_error': case == 'failed'}}])
+                if case == 'duplicate-result': roots.append(deepcopy(roots[-1]))
+                if case == 'missing-native-delivery': roots.pop(-2)
+                write()
+                with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: children[identity]):
+                    facts = smoke.assessed_first_probe('codex', document, run, home, project)
+                self.assertFalse(facts['accepted'])  # Diagnostics never whitelist the control.
+                control, = facts['rejected_assessor_controls']
+                self.assertTrue(control['native_assessor_binding'])
+                self.assertEqual(control['recipient_uuid_matches'], case not in {'path', 'foreign'})
+                self.assertEqual(control['recipient_path_matches'], case == 'path')
+                self.assertEqual(control['unique_successful_delivery'], case not in {'failed', 'duplicate-result', 'missing-native-delivery'})
+                self.assertEqual(control['same_as_initial_packet'], None if case == 'encrypted' else case != 'changed')
+                self.assertEqual(control['interrupt'], case == 'interrupt')
+                self.assertEqual(control['before_assessor_final'], case != 'after-final')
+                for private in ('PRIVATE_', 'private-', str(project), native_path, 'assessor-id'):
+                    self.assertNotIn(private, json.dumps(facts))
+
+    def test_lead_delivery_diagnostics_distinguish_missing_false_and_exact_evidence(self):
+        from symphony.runtime import _LEAD_VERIFICATION_CONTRACT
+        for case in ('exact', 'changed-prompt', 'encrypted', 'omitted-clause', 'foreign-parent',
+                     'missing-root', 'no-context', 'old-context', 'encrypted-resume'):
+            with self.subTest(case=case):
+                document, run, children, home, project, profile, roots, write = self.fixture('claude')
+                text = smoke.FIXTURE_INSTRUCTIONS + '\nPRIVATE_PACKET'
+                if case == 'encrypted': text = 'gAAAAprivate_ciphertext'
+                if case == 'omitted-clause': text = 'PRIVATE_OTHER_TASK'
+                lead = children[run['lead_identity']]
+                lead[0]['message']['content'] = text if case != 'changed-prompt' else 'PRIVATE_CHANGED_TASK'
+                if case == 'foreign-parent': lead[0]['sessionId'] = 'PRIVATE_FOREIGN_SESSION'
+                label = f'symphony:symphony-lead-{run["delegations"][1]["requested_tier"]}-high'
+                roots.extend([
+                    {'type': 'assistant', 'sessionId': run['session_id'], 'cwd': str(project), 'timestamp': at(9),
+                     'message': {'content': [{'type': 'tool_use', 'name': 'Agent', 'id': 'lead',
+                     'input': {'subagent_type': label, 'prompt': text}}]}},
+                    {'type': 'user', 'sessionId': run['session_id'], 'timestamp': at(12), 'message': {'content': [
+                     {'type': 'tool_result', 'tool_use_id': 'lead', 'content': 'PRIVATE_NATIVE_ACK'}]}},
+                    {'type': 'assistant', 'sessionId': run['session_id'], 'cwd': str(project), 'timestamp': at(14),
+                     'message': {'content': [{'type': 'tool_use', 'name': 'SendMessage', 'id': 'resume',
+                     'input': {'to': run['lead_identity'], 'message': smoke.FIXTURE_INSTRUCTIONS
+                               if case != 'encrypted-resume' else 'gAAAAprivate_resume_ciphertext'}}]}},
+                    {'type': 'user', 'sessionId': run['session_id'], 'timestamp': at(15), 'message': {'content': [
+                     {'type': 'tool_result', 'tool_use_id': 'resume', 'content': 'PRIVATE_NATIVE_ACK'}]}}])
+                if case != 'no-context':
+                    lead.append({'type': 'system', 'timestamp': at(10), 'message': {'role': 'developer', 'content': [
+                        {'type': 'text', 'text': "Symphony worker routes by the packet's own size/complexity: "
+                         + (_LEAD_VERIFICATION_CONTRACT if case != 'old-context' else 'PRIVATE_OLD_CONTEXT')}]}})
+                write()
+                if case == 'missing-root': next((home / 'projects').glob('*/*.jsonl')).unlink()
+                with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: children[identity]):
+                    facts = smoke.lead_integration_probe('claude', run, home, project)
+                self.assertFalse(facts['accepted'])
+                delivery = facts['delivery']
+                self.assertEqual(delivery['root_native_available'], case != 'missing-root')
+                self.assertEqual(delivery['shared_verification_in_start'],
+                                 None if case == 'no-context' else case != 'old-context')
+                if case == 'missing-root':
+                    self.assertIsNone(delivery['launch_binding'])
+                    self.assertIsNone(delivery['resume_deliveries'])
+                else:
+                    self.assertEqual(delivery['launch_binding'], case != 'foreign-parent')
+                    self.assertEqual(delivery['launch_matches_child_prompt'],
+                                     None if case == 'encrypted' else case != 'changed-prompt')
+                    self.assertEqual(delivery['fixture_acceptance_in_launch'],
+                                     None if case == 'encrypted' else case != 'omitted-clause')
+                    self.assertEqual(delivery['resume_deliveries'][0]['fixture_acceptance_present'],
+                                     None if case == 'encrypted-resume' else True)
+                for private in ('PRIVATE_', 'private_', str(project), run['session_id'], run['lead_identity']):
+                    self.assertNotIn(private, json.dumps(facts))
+
+    def test_codex_lead_packet_diagnostics_require_native_binding_and_visible_text(self):
+        for case in ('exact', 'encrypted', 'missing-delivery'):
+            with self.subTest(case=case):
+                document, run, children, home, project, profile, roots, write = self.fixture('codex')
+                lead = children[run['lead_identity']]
+                path = '/root/symphony_lead_private'
+                lead[0]['payload']['agent_path'] = path
+                text = smoke.FIXTURE_INSTRUCTIONS if case != 'encrypted' else 'gAAAAprivate_ciphertext'
+                lead.append({'type': 'event_msg', 'timestamp': at(10), 'payload': {
+                    'type': 'user_message', 'message': text}})
+                roots.extend([
+                    {'type': 'response_item', 'timestamp': at(9), 'payload': {'type': 'function_call',
+                     'name': 'spawn_agent', 'call_id': 'lead-call', 'arguments': json.dumps({
+                         'task_name': path.removeprefix('/root/'), 'message': text, 'fork_turns': 'none'})}},
+                    {'type': 'event_msg', 'timestamp': at(10), 'payload': {'type': 'item_completed',
+                     'thread_id': run['session_id'], 'item': {'type': 'SubAgentActivity', 'id': 'lead-call',
+                     'kind': 'started', 'agent_thread_id': run['lead_identity'], 'agent_path': path}}},
+                    {'type': 'response_item', 'timestamp': at(11), 'payload': {'type': 'function_call_output',
+                     'call_id': 'lead-call', 'output': json.dumps({'task_name': path})}}])
+                if case == 'missing-delivery': roots.pop(-2)
+                write()
+                with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: children[identity]):
+                    facts = smoke.lead_integration_probe('codex', run, home, project)
+                self.assertFalse(facts['accepted'])
+                delivery = facts['delivery']
+                self.assertEqual(delivery['launch_binding'], case != 'missing-delivery')
+                self.assertEqual(delivery['launch_matches_child_prompt'], True if case == 'exact' else None)
+                self.assertEqual(delivery['fixture_acceptance_in_launch'], True if case == 'exact' else None)
+                self.assertIsNone(delivery['shared_verification_in_start'])
+                for secret in (path, 'private_', str(project)):
+                    self.assertNotIn(secret, json.dumps(facts))
+
     def test_failed_hidden_prior_launch_execution_and_scope_conflicts_stay_rejected(self):
         for provider in ('codex', 'claude'):
             for case in ('prior-failed-launch', 'prior-unreturned-launch', 'root-execution', 'duplicate-call',

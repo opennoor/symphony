@@ -346,13 +346,15 @@ def _local_lock(path: Path) -> threading.Lock:
 def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     local = _local_lock(path)
+    deadline = None if timeout is None else time.monotonic() + timeout
     if timeout is None:
         local.acquire()
     elif not local.acquire(timeout=timeout):
         raise TimeoutError(f"state lock timed out: {path}")
     try:
         with path.with_name(path.name + ".lock").open("a+b") as lock_file:
-            deadline = time.monotonic() + (5 if timeout is None else timeout)
+            if deadline is None:
+                deadline = time.monotonic() + 5
             if fcntl is not None:
                 if timeout is None:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -390,12 +392,11 @@ def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
         local.release()
 
 
-def _read_owner_snapshot(path: Path) -> str:
+def _read_owner_snapshot(path: Path, timeout: float = 5) -> str:
     """Read while coordinating with Windows' replace-existing limitation."""
     if os.name == "nt":
-        # Match the writer's bounded lock budget: parallel hook transactions
-        # routinely exceed 100 ms, especially on Windows antivirus-scanned files.
-        with _locked(path, timeout=5):
+        # Share the scan's remaining budget across all project snapshots.
+        with _locked(path, timeout=timeout):
             return path.read_text(encoding="utf-8")
     return path.read_text(encoding="utf-8")
 
@@ -578,11 +579,15 @@ class StateStore:
     ) -> tuple[Path, ...] | None:
         """Find active root or child ancestors; None means a snapshot could not be read."""
         matches: list[Path] = []
+        deadline = time.monotonic() + 5
         for path in self.root.glob("*.v2.json"):
             if path.is_symlink():
                 continue
             try:
-                state = _state_from_dict(json.loads(_read_owner_snapshot(path)))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                state = _state_from_dict(json.loads(_read_owner_snapshot(path, remaining)))
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 # A missing or invalid snapshot cannot prove this root has no
                 # other owner. Defer instead of trusting the event's CWD.

@@ -22,6 +22,7 @@ def sequence_rejection_probe(state, events, session, project, env, evidence, *, 
     facts = {'pending_callbacks': len(events), 'native_readers': []}
     sequence_code = evidence.claude_archived_sendmessage_sequence.__code__
     reader_code = evidence._claude_native_lead_event.__code__
+    callback_code = evidence._claude_sendmessage_callback.__code__
     extra_readers = {getattr(evidence, name).__code__: label for name, label in (
         ('_claude_historical_worker_origin', 'worker_origin'),
         ('_claude_historical_worker_terminal', 'worker_terminal'),
@@ -29,6 +30,37 @@ def sequence_rejection_probe(state, events, session, project, env, evidence, *, 
         ('claude_archived_mixed_sendmessage_sequence', 'mixed_sequence')) if hasattr(evidence, name)}
 
     def trace(frame, kind, result):
+        if frame.f_code is callback_code:
+            if kind == 'return':
+                checks = facts.setdefault('callback_checks', [])
+                values = frame.f_locals
+                source, native = values.get('source'), values.get('native')
+                when, called, upper = values.get('when'), values.get('called_at'), values.get('next_call')
+                if len(checks) < 32 and source is not None and native is not None:
+                    payload, expected = source.payload, native.payload
+                    report = payload.get('last_assistant_message')
+                    checks.append({'source_line': frame.f_lineno, 'accepted': result is True,
+                        'source_ordinal': next((index for index, event in enumerate(events)
+                                                if event.event_id == source.event_id), None),
+                        'kind': source.kind if source.kind in {'subagent_started', 'subagent_stopped'} else 'other',
+                        'native_boundaries': values.get('native_boundaries') is True,
+                        'session_owned': values.get('owned') is True,
+                        'provider_matches': payload.get('provider') == 'claude',
+                        'identity_matches': (payload.get('agent_id') or payload.get('subagent_id')) == expected['agent_id'],
+                        'parent_matches': payload.get('parent_thread_id') in {None, '', values.get('parent')},
+                        'route_matches': all(payload.get(key) in {None, '', expected[key]}
+                                             for key in ('agent_type', 'model', 'model_reasoning_effort')),
+                        'explicit_turn_matches': 'turn_id' not in payload or payload['turn_id'] == expected['prompt_id'],
+                        'at_or_after_call': when is not None and called is not None and when >= called,
+                        'upper_bound_present': upper is not None,
+                        'before_upper_bound': when is not None and (upper is None or when < upper),
+                        'at_or_after_terminal': when is not None and when >= evidence._instant(native.observed_at),
+                        'report_matches': isinstance(report, str) and report in {
+                            expected['last_assistant_message'], expected.get('_symphony_native_callback_report')},
+                        'status_completed': str(payload.get('status') or 'completed').lower() == 'completed',
+                        'report_classification_valid': isinstance(report, str) and (
+                            'SYMPHONY_OUTCOME:' not in report or evidence._reported_status(report) == 'completed')})
+            return trace
         if frame.f_code in extra_readers:
             if kind == 'return':
                 stages = facts.setdefault('historical_readers', [])
@@ -58,6 +90,17 @@ def sequence_rejection_probe(state, events, session, project, env, evidence, *, 
                 assistants = values.get('assistants')
                 lead = values.get('lead')
                 if assistants is not None and lead is not None:
+                    terminal = values.get('message')
+                    reason = terminal.get('stop_reason') if isinstance(terminal, dict) else None
+                    item.update(prompt_ordinal=values.get('prompt_index'), assistant_count=len(assistants),
+                        prior_end_turn_count=sum(row.get('message', {}).get('stop_reason') == 'end_turn'
+                                                 for row in assistants[:-1]),
+                        terminal_reason=(reason if isinstance(reason, str)
+                                         and reason in {'end_turn', 'tool_use', 'max_tokens', 'stop_sequence'}
+                                         else 'null' if reason is None else 'other'),
+                        terminal_reason_present=isinstance(terminal, dict) and 'stop_reason' in terminal,
+                        superseded_proof=values.get('superseded') is True,
+                        native_parent_completion_proof=values.get('delivered') is True)
                     item['assistant_model_matches'] = all(row.get('message', {}).get('model') == lead.requested_tier
                                                          for row in assistants)
                     item['assistant_effort_matches'] = all((row.get('perTurnEffort') or row.get('effort')) ==

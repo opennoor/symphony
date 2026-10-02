@@ -2327,7 +2327,8 @@ def _claude_historical_worker_deliveries(
 def _claude_sendmessage_late_callback(source: Event, native: Event, session: str,
                                      called: datetime, environ: Mapping[str, str],
                                      *, role: str, parent: str, committed_at: datetime,
-                                     native_boundaries: bool = False, callback_until: datetime | None = None) -> bool:
+                                     native_boundaries: bool = False, callback_until: datetime | None = None,
+                                     verified_worker_calls: tuple[Mapping, ...] = ()) -> bool:
     """Bound a new source positively; prompt context never identifies a turn."""
     observed = _instant(source.observed_at)
     completed = _instant(native.observed_at)
@@ -2372,6 +2373,18 @@ def _claude_sendmessage_late_callback(source: Event, native: Event, session: str
                 when = _instant(row.get('timestamp'))
                 if when is None:
                     return False
+                # The mixed sequence already proved these exact historical-worker
+                # deliveries. They cannot change which lead turn produced a Stop.
+                details = item.get('input')
+                if (role == 'lead' and source.kind == 'subagent_stopped'
+                        and item.get('name') == 'SendMessage' and isinstance(item.get('id'), str)
+                        and isinstance(details, Mapping) and isinstance(details.get('message'), str)
+                        and any(record.get('call_hash') == hashlib.sha256(item['id'].encode()).hexdigest()
+                                and record.get('agent') == details.get('to')
+                                and _instant(record.get('called_at')) == when
+                                and record.get('message_hash') == hashlib.sha256(details['message'].encode()).hexdigest()
+                                for record in verified_worker_calls)):
+                    continue
                 if when > called:
                     upper.append(when)
     return found and _claude_sendmessage_callback(source, native, session, called,
@@ -2661,7 +2674,9 @@ def claude_archived_sendmessage_sequence(
         matches = [index for index, native in enumerate(native_events)
                      if _claude_sendmessage_callback(event, native, session, calls[index][0],
                          _instant(records[index]['callback_until']) if queued else
-                         next((when for when in global_calls if when > calls[index][0]), None),
+                         next((when for when in (
+                             (called for called, _, _ in calls) if event.kind == 'subagent_stopped'
+                             else global_calls) if when > calls[index][0]), None),
                          native_boundaries=queued)]
         if len(matches) != 1 or event.event_id in mapping:
             return None

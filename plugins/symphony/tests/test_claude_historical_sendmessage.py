@@ -299,6 +299,86 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
                 self.assertEqual(run.outcome, {'status': 'completed'})
                 self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
 
+    def test_delayed_lead_stop_across_proved_worker_send_preserves_replay_and_credit(self):
+        for mode in ('original', 'partial-ack', 'superseded', 'late-witness'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.prepare_send(persist_start=True)
+                if mode == 'superseded':
+                    fixture.ClaudeSendMessageTests.supersede_intermediate(self)
+                # The native lead ended at 02:04:00. A worker send at 02:04:10
+                # races with its delayed Stop; the next lead send is 02:05:00.
+                delayed = replace(self.events[1], observed_at='2026-09-29T02:04:10.05+00:00')
+                if mode == 'late-witness':
+                    delayed = replace(delayed, payload={**delayed.payload, 'turn_id': 'prompt-send-0'})
+                self.events[1] = delayed
+                sources = tuple(sorted((*self.events, *self.worker_events), key=lambda event: event.observed_at))
+                self.assertIsNotNone(claude_archived_mixed_sendmessage_sequence(
+                    self.state, sources, SESSION, self.project, self.environ))
+                self.store.save(self.project, self.state)
+                self.store.finish_session_events(self.store.session_record('claude', SESSION),
+                                                {source.event_id for source in self.events})
+                self.queue(tuple(source for source in sources
+                                 if mode != 'late-witness' or source.event_id != delayed.event_id))
+                original_receipts = tuple(item for item in self.store.load(self.project).terminal_receipts
+                                          if item.get('agent') == WORKER)
+                payload = {'hook_event_name': 'Stop', 'cwd': str(self.project), 'session_id': SESSION}
+                if mode == 'partial-ack':
+                    with patch.object(StateStore, 'finish_session_events', side_effect=OSError('ACK crash')):
+                        with self.assertRaises(OSError):
+                            handle(payload, self.environ)
+                    self.store.finish_session_events(self.store.session_record('claude', SESSION),
+                                                    {self.events[0].event_id, self.worker_events[0].event_id})
+                else:
+                    self.assertNotIn('"decision": "block"', handle(payload, self.environ).stdout)
+                if mode == 'late-witness':
+                    self.queue((delayed,))
+                self.assertNotIn('"decision": "block"', handle(payload, self.environ).stdout)
+                before_retry = self.store.load(self.project)
+                self.queue((delayed,))
+                self.assertNotIn('"decision": "block"', handle(payload, self.environ).stdout)
+                after = self.store.load(self.project)
+                self.assertEqual(after.recent_runs, before_retry.recent_runs)
+                self.assertEqual(after.terminal_receipts, before_retry.terminal_receipts)
+                self.assertIsNone(after.active_run)
+                self.assertEqual(after.recent_runs[0].outcome, {'status': 'completed'})
+                self.assertEqual(after.recent_runs[0].assessment['_substantive_children'],
+                                 self.original.assessment['_substantive_children'])
+                self.assertEqual(tuple(item for item in after.terminal_receipts if item.get('agent') == WORKER),
+                                 original_receipts)
+                self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
+    def test_delayed_lead_stop_keeps_owner_same_lead_and_global_delivery_bounds(self):
+        for case in ('parent', 'session', 'identity', 'turn', 'report', 'same-lead-boundary',
+                     'start-across-worker', 'ack-across-worker', 'worker-stop-across-lead', 'new-owner'):
+            with self.subTest(case=case):
+                self.setUp()
+                parent = self.prepare_send()
+                self.events[1] = replace(self.events[1], observed_at='2026-09-29T02:04:10.05+00:00')
+                key = {'parent': 'parent_thread_id', 'session': 'session_id', 'identity': 'agent_id',
+                       'turn': 'turn_id', 'report': 'last_assistant_message'}.get(case)
+                if key:
+                    self.events[1] = replace(self.events[1], payload={**self.events[1].payload, key: 'foreign'})
+                if case == 'same-lead-boundary':
+                    self.events[1] = replace(self.events[1], observed_at='2026-09-29T02:05:00+00:00')
+                if case == 'start-across-worker':
+                    self.events[0] = replace(self.events[0], observed_at='2026-09-29T02:04:10.01+00:00')
+                if case == 'ack-across-worker':
+                    next(row for row in parent if row.get('type') == 'user'
+                         and isinstance(row.get('message', {}).get('content'), list)
+                         and row.get('message', {}).get('content', [{}])[0].get('tool_use_id') == 'send-0')[
+                             'timestamp'] = '2026-09-29T02:04:10.01Z'
+                    self.parent.write_text(''.join(json.dumps(row) + '\n' for row in parent))
+                if case == 'worker-stop-across-lead':
+                    self.worker_events = (*self.worker_events[:1], replace(self.worker_events[-1],
+                        observed_at='2026-09-29T02:05:00+00:00'))
+                if case == 'new-owner':
+                    newer = replace(self.run, run_id='new-owner', lead_identity='new-lead', owner_generation=8)
+                    self.state = replace(self.state, active_run=newer, active_runs={f'claude:{SESSION}': newer})
+                self.assertIsNone(claude_archived_mixed_sendmessage_sequence(self.state,
+                    tuple(sorted((*self.events, *self.worker_events), key=lambda event: event.observed_at)),
+                    SESSION, self.project, self.environ))
+
     def commit_without_source(self, target, kind):
         self.prepare_send()
         all_sources = (*self.events, *self.worker_events)

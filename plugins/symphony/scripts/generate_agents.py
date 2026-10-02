@@ -31,7 +31,7 @@ from symphony.routing import (  # noqa: E402
     route_for,
     snapshot_for,
 )
-from symphony.runtime import _CONSULTANT_CONTRACT  # noqa: E402
+from symphony.runtime import _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 REFERENCE = Path(__file__).resolve().parents[1] / "skills/symphony/references/capability-routing.md"
@@ -98,7 +98,8 @@ BODIES = {
         "`SYMPHONY_ROLE: <role>` on the first line, then objective, ownership, evidence, constraints, "
         "acceptance_check, return_contract, size, and complexity. A consultant packet also needs one "
         "`SYMPHONY_DECISION: {\"size\":\"...\",\"complexity\":\"...\"}` line. Name the "
-        "applicable capability and evidence check in each child packet. " + WAITING + "\n\n"
+        "applicable capability and evidence check in each child packet. " + WAITING + " "
+        + _LEAD_VERIFICATION_CONTRACT + "\n\n"
         "For planning use compatible `ce-plan` or bounded steps. For implementation use compatible "
         "`ce-work`, behavior checks (Superpowers TDD when usable), and Ponytail's reuse/native "
         "check. For independent review use compatible `ce-code-review` or a requirement-and-diff "

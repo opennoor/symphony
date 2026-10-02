@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from plugins.symphony.scripts.generate_agents import BODIES
 from plugins.symphony.symphony.model import Event
-from plugins.symphony.symphony.runtime import handle, _assessment_from_marker, _CONSULTANT_CONTRACT, _decision_markers
+from plugins.symphony.symphony.runtime import handle, _assessment_from_marker, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT, _decision_markers
 from plugins.symphony.symphony.routing import Assessment, fast_lead_selection, profiles_for, resolve_tier, route_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
 
@@ -271,6 +271,7 @@ class FastRouteTests(unittest.TestCase):
                 self.assertLess(len(text), limit)
                 self.assertIn(task, text)
                 self.assertIn("never reuse the fast lead selection", text)
+                self.assertIn("await its terminal assessment without sending additional work", text)
                 for size in ("small", "medium", "large"):
                     for complexity in ("simple", "mixed", "complex"):
                         route = resolve_tier(route_for(Assessment(size, complexity)), snapshot_for("codex", profile["id"]))
@@ -323,7 +324,8 @@ class FastRouteTests(unittest.TestCase):
                 self.assertEqual(self.run_state().owner_generation, 2)
                 guidance = json.loads(started_lead.stdout)['hookSpecificOutput']['additionalContext']
                 self.assertIn('SYMPHONY_ROLE: worker', guidance)
-                self.assertIn('After workers return, integrate and run your own native checks.', guidance)
+                self.assertIn(_LEAD_VERIFICATION_CONTRACT, guidance)
+                self.assertIn(_LEAD_VERIFICATION_CONTRACT, BODIES['lead'])
                 self.assertNotIn('SYMPHONY_LEAD_SPAWN_PACKET:', guidance)
                 if provider == 'codex':
                     self.assertIn('fork_turns="none"', guidance)

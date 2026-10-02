@@ -2215,6 +2215,50 @@ def assessed_first_probe(provider, document, run, home, project):
                     first_result_count=len(paired), first_result_failed=bool(paired) and paired[0][3],
                     first_meta_call_matches=meta.get('toolUseId') == call[0] if provider == 'claude' else True,
                     first_meta_type_matches=meta.get('agentType') == frame.f_locals.get('label') if provider == 'claude' else True)
+                if provider == 'codex':
+                    values = frame.f_locals
+                    identity, path = values.get('identity'), values.get('path')
+                    header, output, activity = values.get('header', {}), values.get('output'), values.get('activity', ())
+                    bound = (header.get('id') == identity and isinstance(path, str)
+                        and header.get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id') == run['session_id']
+                        and isinstance(output, dict) and output.get('task_name') == path and len(activity) == 1
+                        and activity[0][1].get('payload', {}).get('thread_id') == run['session_id']
+                        and activity[0][1].get('payload', {}).get('item', {}).get('type') == 'SubAgentActivity'
+                        and activity[0][1]['payload']['item'].get('kind') == 'started'
+                        and activity[0][1].get('payload', {}).get('item', {}).get('agent_thread_id') == identity
+                        and activity[0][1]['payload']['item'].get('agent_path') == path)
+                    facts['rejected_assessor_controls'] = []
+                    for item in unsupported[:16]:
+                        if item[1] not in {'send_message', 'followup_task'}:
+                            continue
+                        details = item[2] if isinstance(item[2], dict) else {}
+                        replies = values.get('results', {}).get(item[0], ())
+                        native_delivery = [row for row in values.get('root', ())
+                            if row.get('type') == 'event_msg' and row.get('payload', {}).get('type') == 'item_completed'
+                            and row['payload'].get('thread_id') == run['session_id']
+                            and row['payload'].get('item', {}).get('id') == item[0]
+                            and row['payload']['item'].get('type') == 'SubAgentActivity']
+                        delivered = (len(native_delivery) == 1
+                            and native_delivery[0]['payload']['item'].get('agent_thread_id') == identity
+                            and native_delivery[0]['payload']['item'].get('agent_path') == path
+                            and native_delivery[0]['payload']['item'].get('kind') in {'interacted', 'started'})
+                        message, initial = _observable_probe_text(details.get('message')), _observable_probe_text(args.get('message'))
+                        final_times = [when for _, when in values.get('reports', ()) if when is not None]
+                        facts['rejected_assessor_controls'].append({
+                            'tool': item[1], 'native_assessor_binding': bound,
+                            'recipient_uuid_matches': bound and details.get('target') == identity,
+                            'recipient_path_matches': bound and details.get('target') == path,
+                            'after_spawn_call': item[3] >= call[3] and item[4] > call[4],
+                            'after_spawn_result': len(paired) == 1 and paired[0][1] is not None
+                                and item[3] >= paired[0][1] and item[4] > paired[0][2],
+                            'before_assessor_final': item[3] < min(final_times) if final_times else None,
+                            'before_admission': item[3] < values['accepted'] if values.get('accepted') else None,
+                            'result_count': len(replies), 'native_delivery_matches': delivered,
+                            'unique_successful_delivery': len(replies) == 1 and not replies[0][3] and delivered
+                                and replies[0][1] is not None and replies[0][1] >= item[3] and replies[0][2] > item[4],
+                            'message_observable': message is not None,
+                            'same_as_initial_packet': message == initial if message is not None and initial is not None else None,
+                            'interrupt': details.get('interrupt') if type(details.get('interrupt')) is bool else None})
         return trace
     previous = sys.gettrace()
     try:
@@ -2327,6 +2371,114 @@ def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows,
     return False
 
 
+def _observable_probe_text(value):
+    """Native encrypted message envelopes are unavailable, never plaintext proof."""
+    return value if isinstance(value, str) and not re.fullmatch(r'gAAAA[A-Za-z0-9_=-]*', value) else None
+
+
+def _lead_delivery_probe(provider, run, home, project, lead):
+    """Observe exact packet/context presence; none of these facts grant authority."""
+    from symphony.runtime import _LEAD_VERIFICATION_CONTRACT
+    clauses = (
+        "After ALL workers return successfully, the canonical lead itself must run exactly python -m unittest -q; "
+        "a worker's test run or git diff does not fulfill this lead integration check.",
+        "after every worker returns successfully, the canonical assessed lead itself must run exactly python -m unittest -q "
+        "in a standalone native tool call and return the full successful result. A worker test or git diff is insufficient.")
+    present = lambda text: any(clause in text for clause in clauses) if text is not None else None
+    facts = {'root_native_available': False, 'launch_binding': None, 'launch_prompt_observable': None,
+             'launch_matches_child_prompt': None, 'fixture_acceptance_in_launch': None,
+             'start_context_observable': False, 'shared_verification_in_start': None, 'resume_deliveries': None}
+    contexts = []
+    for row in lead:
+        payload = row.get('payload', {}) if provider == 'codex' else row.get('message', {})
+        if not isinstance(payload, dict) or not (payload.get('role') in {'developer', 'system'} or row.get('type') == 'system'):
+            continue
+        content = payload.get('content', ())
+        text = '\n'.join(block['text'] for block in content if isinstance(block, dict) and isinstance(block.get('text'), str)) if isinstance(content, list) else content
+        if isinstance(text, str) and 'Symphony worker routes by the packet\'s own size/complexity:' in text:
+            contexts.append(text)
+    if contexts:
+        facts.update(start_context_observable=True,
+                     shared_verification_in_start=any(_LEAD_VERIFICATION_CONTRACT.strip() in text for text in contexts))
+    try:
+        session, identity = run['session_id'], run['lead_identity']
+        paths = (list((home / 'sessions').rglob('*' + session + '.jsonl')) if provider == 'codex'
+                 else list((home / 'projects').glob(f'*/{session}.jsonl')))
+        if len(paths) != 1:
+            return facts
+        root = (_complete_native_jsonl if provider == 'codex' else _native_jsonl)(paths[0])
+        if root is None:
+            return facts
+        facts['root_native_available'] = True
+        calls, results = native_call_inventory(provider, root)
+        canonical_path = None
+        if provider == 'claude':
+            meta = json.loads((paths[0].with_suffix('') / 'subagents' / f'agent-{identity}.meta.json').read_text())
+            launches = [item for item in calls if item[1] == 'Agent' and item[0] == meta.get('toolUseId')]
+            prompts = [row for row in lead if row.get('type') == 'user'
+                       and isinstance(row.get('message', {}).get('content'), str)]
+            child_prompt = prompts[0]['message']['content'] if prompts else None
+            child_bound = bool(prompts and prompts[0].get('sessionId') == session
+                               and prompts[0].get('agentId') == identity and prompts[0].get('isSidechain') is True
+                               and meta.get('spawnDepth') == 1)
+        else:
+            header = lead[0].get('payload', {}) if lead and lead[0].get('type') == 'session_meta' else {}
+            root_header = root[0].get('payload', {}) if root and root[0].get('type') == 'session_meta' else {}
+            canonical_path = header.get('agent_path')
+            launch_ids = [row['payload']['item']['id'] for row in root if row.get('type') == 'event_msg'
+                and row.get('payload', {}).get('type') == 'item_completed'
+                and row['payload'].get('thread_id') == session
+                and row['payload'].get('item', {}).get('type') == 'SubAgentActivity'
+                and row['payload']['item'].get('kind') == 'started'
+                and row['payload']['item'].get('agent_thread_id') == identity
+                and row['payload']['item'].get('agent_path') == canonical_path]
+            launches = [item for item in calls if item[1] == 'spawn_agent' and item[0] in launch_ids]
+            child_bound = (len(launch_ids) == 1 and header.get('id') == identity
+                and root_header.get('id') == session and root_header.get('source') == 'exec'
+                and worker_transcript_is_unforked(provider, root, session)
+                and header.get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id') == session
+                and worker_transcript_is_unforked(provider, lead, identity))
+            # Codex can omit the encrypted spawn prompt from visible child rows.
+            prompts = [row['payload'].get('message') for row in lead if row.get('type') == 'event_msg'
+                       and row.get('payload', {}).get('type') == 'user_message']
+            child_prompt = _observable_probe_text(prompts[0]) if prompts else None
+        facts['launch_binding'] = False
+        if len(launches) == 1 and isinstance(launches[0][2], dict):
+            call = launches[0]
+            args = call[2]
+            paired = results.get(call[0], ())
+            if provider == 'claude':
+                scope = (call[5].get('sessionId') == session and not call[5].get('agentId')
+                    and call[5].get('isSidechain') is not True and args.get('subagent_type') == meta.get('agentType')
+                    and isinstance(call[5].get('cwd'), str) and Path(call[5]['cwd']).is_absolute())
+            else:
+                output = json.loads(paired[0][0]) if len(paired) == 1 and isinstance(paired[0][0], str) else None
+                scope = isinstance(output, dict) and output.get('task_name') == canonical_path
+            facts['launch_binding'] = bool(child_bound and scope and len(paired) == 1 and not paired[0][3]
+                and paired[0][1] is not None and paired[0][1] >= call[3] and paired[0][2] > call[4]
+                and Path(call[5].get('cwd', '') if provider == 'claude' else header.get('cwd', '')).is_absolute()
+                and Path(call[5].get('cwd', '') if provider == 'claude' else header.get('cwd', '')).resolve() == project.resolve())
+            prompt = _observable_probe_text(args.get('prompt' if provider == 'claude' else 'message'))
+            facts.update(launch_prompt_observable=prompt is not None, fixture_acceptance_in_launch=present(prompt),
+                         launch_matches_child_prompt=prompt == child_prompt if prompt is not None and child_prompt is not None else None)
+        facts['resume_deliveries'] = []
+        for call in calls:
+            if call[1] not in ({'SendMessage'} if provider == 'claude' else {'send_message', 'followup_task'}) or not isinstance(call[2], dict):
+                continue
+            target = call[2].get('to' if provider == 'claude' else 'target')
+            if target != identity and not (canonical_path and target == canonical_path):
+                continue
+            prompt = _observable_probe_text(call[2].get('message'))
+            paired = results.get(call[0], ())
+            facts['resume_deliveries'].append({'message_observable': prompt is not None,
+                'fixture_acceptance_present': present(prompt), 'unique_nonerror_result': len(paired) == 1 and not paired[0][3]})
+            if len(facts['resume_deliveries']) == 16:
+                break
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError):
+        facts['source_incomplete'] = True
+    return facts
+
+
 def lead_integration_probe(provider, run, home, project):
     """Inspect the same verifier; export only counts, categories and its exit line."""
     facts = {'accepted': False}
@@ -2348,6 +2500,7 @@ def lead_integration_probe(provider, run, home, project):
         children = {item['identity']: native_rows(provider, home, item['identity']) for item in run['delegations']}
         lead = children[run['lead_identity']]
         workers = [item for item in run['delegations'] if item['role'] == 'worker']
+        facts['delivery'] = _lead_delivery_probe(provider, run, home, project, lead)
         facts['commands'] = command_witness_probe(provider, lead, project)
         sys.settrace(trace)
         lead_verifies_after_worker_returns(provider, lead, workers, children, project, run)

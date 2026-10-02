@@ -219,6 +219,60 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual({self.state_path(), self.store._path(other)},
                          set(self.store.active_owner_paths("codex", "root")))
 
+    def test_owner_scan_shares_one_deadline_and_defers_incomplete_ownership(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        state = ProjectState(active_run=run, active_runs={"codex:root": run})
+        self.store.save(self.project, state)
+        paths = [self.state_path()]
+        for name in ("unrelated", "duplicate"):
+            project = self.root / name
+            project.mkdir()
+            self.store.save(project, state if name == "duplicate" else ProjectState())
+            paths.append(self.store._path(project))
+        clock = [0.0]
+        budgets = []
+
+        def slow_snapshot(path, timeout=5):
+            budgets.append(timeout)
+            clock[0] += min(3, timeout)
+            if timeout < 3:
+                raise TimeoutError("snapshot budget exhausted")
+            return path.read_text(encoding="utf-8")
+
+        with patch.object(Path, "glob", return_value=iter(paths)), \
+                patch("plugins.symphony.symphony.store.time.monotonic", lambda: clock[0]), \
+                patch("plugins.symphony.symphony.store._read_owner_snapshot", slow_snapshot):
+            self.assertIsNone(self.store.active_owner_paths("codex", "root"))
+        self.assertEqual([5, 2], budgets)
+        self.assertEqual(5, clock[0])
+
+    def test_bounded_lock_shares_deadline_between_local_and_native_waits(self):
+        clock = [0.0]
+        released = []
+
+        def acquire(timeout):
+            clock[0] += 4
+            return True
+
+        def busy(*args):
+            raise OSError("native lock held")
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        local = SimpleNamespace(acquire=acquire, release=lambda: released.append(True))
+        native = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=0, locking=busy)
+        with patch("plugins.symphony.symphony.store._local_lock", return_value=local), \
+                patch("plugins.symphony.symphony.store.fcntl", None), \
+                patch("plugins.symphony.symphony.store.msvcrt", native), \
+                patch("plugins.symphony.symphony.store.time.monotonic", lambda: clock[0]), \
+                patch("plugins.symphony.symphony.store.time.sleep", sleep):
+            with self.assertRaises(TimeoutError):
+                with _locked(self.state_path(), timeout=5):
+                    self.fail("busy native lock acquired")
+        self.assertLess(clock[0], 5.01)
+        self.assertEqual([True], released)
+
     def test_snapshot_scan_and_atomic_replace_remain_compatible(self):
         run = RunState("run", "task", session_id="root", provider="codex")
         self.store.save(self.project, ProjectState(active_run=run,

@@ -96,6 +96,8 @@ class NativeClaudeFollowupTests(unittest.TestCase):
         self.assertTrue(all(not item['message_matches_child_prompt']
                             for item in positive['sequence']['deliveries']))
         self.assertTrue(all(item['original_launch_prompt_matches'] for item in positive['native_readers']))
+        self.assertTrue(any(item['accepted'] and item['report_matches']
+                            for item in positive['callback_checks'] if item['kind'] == 'subagent_stopped'))
         original = f.parent.read_bytes()
         rows = [json.loads(line) for line in original.splitlines()]
         result = rows[-1]['message']['content'][0]
@@ -112,6 +114,37 @@ class NativeClaudeFollowupTests(unittest.TestCase):
         with patch.object(probe.sys, 'gettrace', return_value=previous), patch.object(probe.sys, 'settrace') as traced:
             probe.sequence_rejection_probe(before, events, SESSION, f.project, f.environ, host_evidence)
         self.assertIs(traced.call_args.args[0], previous)
+
+    def test_rejection_trace_distinguishes_callback_window_and_duplicate_terminal(self):
+        from dataclasses import replace
+        f = fixture.ClaudeSendMessageTests()
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        f.prepare()
+        before = f.store.load(f.project)
+        events = tuple(f.events)
+        delayed = (events[0], replace(events[1], observed_at='2026-09-29T02:05:00+00:00'), *events[2:])
+        facts = probe.sequence_rejection_probe(before, delayed, SESSION, f.project, f.environ, host_evidence)
+        self.assertFalse(facts['accepted'])
+        checks = [item for item in facts['callback_checks'] if item['source_ordinal'] == 1]
+        self.assertTrue(any(item['report_matches'] and item['session_owned'] and item['identity_matches']
+                            and item['upper_bound_present'] and not item['before_upper_bound'] for item in checks))
+        rows = [json.loads(line) for line in f.child.read_text().splitlines()]
+        index = next(index for index, row in enumerate(rows) if row.get('uuid') == 'terminal-send-0')
+        duplicate = {**rows[index], 'uuid': 'private-native-terminal', 'timestamp': '2026-09-29T02:03:59Z',
+                     'message': {**rows[index]['message'], 'content': [{'type': 'text', 'text': 'private-terminal-prose'}]}}
+        rows.insert(index, duplicate)
+        f.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        facts = probe.sequence_rejection_probe(before, events, SESSION, f.project, f.environ, host_evidence)
+        self.assertFalse(facts['accepted'])
+        rejected = [item for item in facts['native_readers'] if not item['accepted']]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]['prompt_ordinal'], 1)
+        self.assertEqual(rejected[0]['assistant_count'], 2)
+        self.assertEqual(rejected[0]['prior_end_turn_count'], 1)
+        self.assertEqual(rejected[0]['terminal_reason'], 'end_turn')
+        for secret in ('private-terminal-prose', 'private-native-terminal', str(f.project), SESSION):
+            self.assertNotIn(secret, json.dumps(facts))
 
     def prepare(self):
         f = fixture.ClaudeSendMessageTests()
