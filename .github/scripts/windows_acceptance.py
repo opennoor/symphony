@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 TESTS = (
     "plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_relay_accepts_a_slow_working_interpreter_probe",
+    "plugins.symphony.tests.test_package.PackageContractTests.test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_launcher_propagates_runtime_failure_without_reexecuting_hook",
     "plugins.symphony.tests.test_package.PackageContractTests.test_claude_hooks_select_available_python_with_a_quoted_plugin_path",
     "plugins.symphony.tests.test_store.StateStoreTests.test_updates_from_separate_processes_preserve_both_runs",

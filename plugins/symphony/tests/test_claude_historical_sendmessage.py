@@ -140,6 +140,64 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
                     'claude-sonnet-5', 'low', parent_rows=rows, parent=LEAD)
                 self.assertEqual(result is not None, case == 'valid')
 
+    def test_null_foreground_worker_requires_the_exact_native_agent_result(self):
+        from copy import deepcopy
+        from plugins.symphony.symphony.host_evidence import _instant
+        for case in ('valid', 'root', 'no-hash', 'wrong-hash', 'missing-result', 'duplicate-call',
+                     'duplicate-result', 'session', 'parent', 'sidechain', 'no-uuid', 'api-error',
+                     'error-result', 'early-result', 'late-result', 'wrong-report', 'wrong-footer',
+                     'async-ack', 'async-launch', 'wrong-prompt', 'foreign-prompt', 'wrong-tool'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prepare()
+                terminal = deepcopy(self.rows[1])
+                terminal['message']['stop_reason'] = None
+                text = 'Original worker success.'
+                parent = LEAD if case != 'root' else ''
+                call = {'type': 'assistant', 'sessionId': SESSION, 'agentId': parent,
+                    'isSidechain': bool(parent), 'uuid': 'native-parent-call',
+                    'timestamp': '2026-09-29T02:01:20Z', 'message': {'content': [{
+                        'type': 'tool_use', 'name': 'Agent', 'id': 'original-worker-launch',
+                        'input': {'prompt': self.rows[0]['message']['content']}}]}}
+                footer = (f"agentId: {WORKER} (use SendMessage with to: '{WORKER}', "
+                          "summary: '<5-10 word recap>' to continue this agent)\n"
+                          "<usage>subagent_tokens: 10\ntool_uses: 0\nduration_ms: 120</usage>")
+                delivery = {'type': 'user', 'sessionId': SESSION, 'agentId': parent,
+                    'isSidechain': bool(parent), 'uuid': 'native-parent-result',
+                    'timestamp': '2026-09-29T02:01:40.5Z', 'message': {'content': [{
+                        'type': 'tool_result', 'tool_use_id': 'original-worker-launch',
+                        'content': [{'type': 'text', 'text': text}, {'type': 'text', 'text': footer}]}]}}
+                prompt = deepcopy(self.rows[0])
+                rows = [call, delivery]
+                launch_hash = hashlib.sha256(b'original-worker-launch').hexdigest()
+                if case == 'no-hash': launch_hash = ''
+                if case == 'wrong-hash': launch_hash = 'b' * 64
+                if case == 'missing-result': rows.pop()
+                if case == 'duplicate-call': rows.append(deepcopy(call))
+                if case == 'duplicate-result': rows.append(deepcopy(delivery))
+                if case == 'session': delivery['sessionId'] = 'foreign'
+                if case == 'parent': delivery['agentId'] = 'foreign'
+                if case == 'sidechain': delivery['isSidechain'] = False
+                if case == 'no-uuid': delivery.pop('uuid')
+                if case == 'api-error': delivery['isApiErrorMessage'] = True
+                if case == 'error-result': delivery['message']['content'][0]['is_error'] = True
+                if case == 'early-result': delivery['timestamp'] = '2026-09-29T02:01:39Z'
+                if case == 'late-result': delivery['timestamp'] = self.rows[2]['timestamp']
+                if case == 'wrong-report': delivery['message']['content'][0]['content'][0]['text'] = 'Different result.'
+                if case == 'wrong-footer': delivery['message']['content'][0]['content'][1]['text'] = footer.replace(WORKER, 'foreign')
+                if case == 'async-ack': delivery['message']['content'][0]['content'] = [{'type': 'text', 'text': 'Async agent launched successfully.\n' + footer}]
+                if case == 'async-launch': call['message']['content'][0]['input']['run_in_background'] = True
+                if case == 'wrong-prompt': call['message']['content'][0]['input']['prompt'] = 'Different task.'
+                if case == 'foreign-prompt': prompt['agentId'] = 'foreign'
+                if case == 'wrong-tool': call['message']['content'][0]['name'] = 'SendMessage'
+                expected = case in {'valid', 'root'}
+                self.assertEqual(claude_native_parent_completion(rows, terminal, text, SESSION, parent, WORKER,
+                    before=_instant(self.rows[2]['timestamp']), prompt=prompt, launch_hash=launch_hash), expected)
+                worker_rows = [prompt, terminal, *self.rows[2:]]
+                self.assertEqual(_claude_historical_worker_terminal(worker_rows, 0, WORKER, SESSION,
+                    'claude-sonnet-5', 'low', parent_rows=rows, parent=parent,
+                    launch_hash=launch_hash) is not None, expected)
+
     def prepare_send(self, *, persist_start=False):
         self.prepare(persist_start=persist_start)
         parent = [json.loads(line) for line in self.parent.read_text().splitlines()]

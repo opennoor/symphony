@@ -1475,6 +1475,7 @@ def tool_evidence(provider, rows):
 
 
 JSON_STRING = r'"(?:[^"\\]|\\.)*"'
+JS_STRING = r'''(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')'''
 
 
 def composed_call(source, method, *, output_only=False, serialized=False):
@@ -1482,7 +1483,7 @@ def composed_call(source, method, *, output_only=False, serialized=False):
     if not isinstance(source, str):
         return None
     source = re.sub(r'^\s*// @exec:[^\n]*\n', '', source).strip()
-    argument = JSON_STRING if method == "apply_patch" else rf'\{{(?:{JSON_STRING}|[^{{}}"])*\}}'
+    argument = JS_STRING if method == "apply_patch" else rf'''\{{(?:{JS_STRING}|[^{{}}"'])*\}}'''
     call = rf'tools\.{method}\((?P<argument>{argument})\)'
     wrappers = [rf'text\(await {call}\);?',
                 rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\);?']
@@ -1495,9 +1496,17 @@ def composed_call(source, method, *, output_only=False, serialized=False):
         if match:
             value = match['argument']
             if method == "exec_command":
-                value = re.sub(JSON_STRING + r'|([{,]\s*)([A-Za-z_]\w*)(\s*:)',
+                value = re.sub(JS_STRING + r'|([{,]\s*)([A-Za-z_]\w*)(\s*:)',
                     lambda match: match[0] if match[1] is None else f'{match[1]}"{match[2]}"{match[3]}', value)
             try:
+                def json_string(match):
+                    literal = match[0]
+                    if literal.startswith("'"):
+                        body = re.sub(r'''\\.|"''', lambda part: "'" if part[0] == r"\'"
+                                      else r'\"' if part[0] == '"' else part[0], literal[1:-1])
+                        return json.dumps(json.loads('"' + body + '"'))
+                    return literal
+                value = re.sub(JS_STRING, json_string, value)
                 return json.loads(value)
             except ValueError:
                 return None
@@ -1884,7 +1893,7 @@ def structured_root_discovery(name, args, *, provider='', document=None, session
         return args.get('skill') in {'symphony', 'symphony:symphony'}
     if provider != 'codex' or not isinstance(document, dict) or project is None:
         return False
-    details = (args if name == 'exec_command' else composed_call(args, 'exec_command', serialized=True)
+    details = (args if name == 'exec_command' else composed_call(args, 'exec_command', serialized=True, output_only=True)
                if name in {'exec', 'functions.exec'} else None)
     if (not isinstance(details, dict) or not isinstance(details.get('cmd'), str)
             or set(details) - {'cmd', 'workdir', 'yield_time_ms', 'max_output_tokens'}
@@ -1910,8 +1919,11 @@ def structured_root_discovery(name, args, *, provider='', document=None, session
         lexer = shlex.shlex(details['cmd'], posix=True, punctuation_chars=';&|<>')
         lexer.whitespace_split = True
         argv = list(lexer)
-        allowed = {(project / 'AGENTS.md').resolve(),
-                   (Path(original) / 'skills/symphony/SKILL.md').resolve()}
+        allowed = {(project / 'AGENTS.md').resolve()}
+        allowed.update((Path(root) / 'skills/symphony' / relative).resolve()
+                       for root in (original, retained) for relative in (
+                           'SKILL.md', 'references/role-contracts.md',
+                           'references/provider-activation.md', 'references/capability-routing.md'))
         return (len(argv) >= 2 and argv[0] == 'cat'
                 and all((project / value).resolve() in allowed for value in argv[1:]))
     except (ValueError, OSError):
@@ -1941,7 +1953,8 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
         terminals = [item for item in history if item.get('kind') == 'delegation_updated'
                      and item.get('payload', {}).get('identity') == identity
                      and item.get('payload', {}).get('state') == 'completed']
-        if (accepted is None or len(admissions) != 1 or len(terminals) != 1
+        if (accepted is None or len(admissions) != 1 or not terminals
+                or any(item.get('payload', {}).get('role') not in {None, 'assessor'} for item in terminals)
                 or any(admissions[0].get('payload', {}).get(key) != run['assessment'].get(key)
                        for key in ('size', 'complexity', 'risk'))):
             return False
@@ -1949,6 +1962,7 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
         lead_rows = child_rows[run['lead_identity']]
         if identity == run['lead_identity']:
             return False
+        retried = set()
         if provider == 'codex':
             paths = list((home / 'sessions').rglob('*' + session + '.jsonl'))
             if len(paths) != 1:
@@ -2032,9 +2046,12 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
             launches = [item for item in calls if item[1] == 'Agent']
             if not launches:
                 return False
-            call = launches[0]
-            args, launch_row = call[2], call[5]
             meta = json.loads((paths[0].with_suffix('') / 'subagents' / f'agent-{identity}.meta.json').read_text())
+            bound = [item for item in launches if item[0] == meta.get('toolUseId')]
+            if len(bound) != 1:
+                return False
+            call = bound[0]
+            args, launch_row = call[2], call[5]
             label = f'symphony:symphony-assessor-{expected}-high'
             paired = results.get(call[0], ())
             if (not isinstance(args, dict) or args.get('subagent_type') != label
@@ -2046,6 +2063,33 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
                     or launch_row.get('isSidechain') is True or not Path(launch_row.get('cwd', '')).is_absolute()
                     or Path(launch_row['cwd']).resolve() != project.resolve()):
                 return False
+            # A rejected launch of this same assessor may be retried. It must
+            # have failed before spawning any child; unknown prior work remains
+            # a failure of the assessor-first proof.
+            for earlier in launches:
+                if earlier[4] >= call[4]:
+                    continue
+                values, earlier_row = earlier[2], earlier[5]
+                response = results.get(earlier[0], ())
+                if (not isinstance(values, dict) or values.get('subagent_type') != label
+                        or values.get('model', expected) != expected
+                        or values.get('prompt') != args['prompt']
+                        or len(response) != 1 or response[0][3] is not True
+                        or not earlier[3] <= response[0][1] < call[3]
+                        or not earlier[4] < response[0][2] < call[4]
+                        or earlier_row.get('sessionId') != session or earlier_row.get('agentId')
+                        or earlier_row.get('isSidechain') is True):
+                    return False
+                retried.add(earlier[0])
+            if retried:
+                metadata_paths = list((paths[0].with_suffix('') / 'subagents').glob('*.meta.json'))
+                if len(metadata_paths) > 128:
+                    return False
+                for metadata_path in metadata_paths:
+                    if metadata_path.is_symlink() or metadata_path.stat().st_size > 64 * 1024:
+                        return False
+                    if json.loads(metadata_path.read_text()).get('toolUseId') in retried:
+                        return False
             result, returned, result_index, _ = paired[0]
             # The child metadata binds this exact native launch, including
             # background ACKs whose text does not contain the child UUID.
@@ -2082,7 +2126,7 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
             return False
         # No prior launch can vanish just because it failed or had no result.
         # Unknown execution/write wrappers before admission stay unverified.
-        if any(item != call and item[3] <= accepted and not (
+        if any(item != call and item[0] not in retried and item[3] <= accepted and not (
                     structured_root_discovery(item[1], item[2], provider=provider,
                                               document=document, session=session, project=project)
                     or provider == 'codex' and item[1] == 'wait_agent' and isinstance(item[2], dict))
@@ -2116,6 +2160,7 @@ def assessed_first_probe(provider, document, run, home, project):
             facts.update(accepted=value is True, source_line=frame.f_lineno)
             facts['admission_count'] = len(frame.f_locals.get('admissions', ()))
             facts['assessor_terminal_count'] = len(frame.f_locals.get('terminals', ()))
+            facts['failed_same_assessor_retries'] = len(frame.f_locals.get('retried', ()))
             calls = frame.f_locals.get('calls', ())
             if isinstance(calls, (tuple, list)):
                 facts['root_call_count'] = len(calls)

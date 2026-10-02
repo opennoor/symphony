@@ -288,11 +288,15 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         rows = [json.loads(line) for line in parent.read_text(encoding='utf-8').splitlines()]
         block = rows[0]['message']['content'][0]
         block['input']['prompt'] = 'SYMPHONY_ROLE: worker\nReturn GATE_RELEASED.'
+        block['input']['run_in_background'] = True
         rows.append({'type': 'user', 'sessionId': 'root', 'agentId': 'lead', 'isSidechain': True,
                      'timestamp': '2026-10-01T14:00:04+00:00', 'message': {'content': [
                      {'type': 'tool_result', 'tool_use_id': block['id'], 'content': 'worker', 'is_error': False}]}})
         parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
         child = directory / 'agent-worker.jsonl'
+        child_rows = [json.loads(line) for line in child.read_text(encoding='utf-8').splitlines()]
+        child_rows[0]['message']['content'] = block['input']['prompt']
+        child.write_text(''.join(json.dumps(row) + '\n' for row in child_rows), encoding='utf-8')
         with child.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps({'type': 'assistant', 'sessionId': 'root', 'agentId': 'worker', 'isSidechain': True,
                 'uuid': 'native-terminal', 'timestamp': '2026-10-01T14:00:04+00:00',

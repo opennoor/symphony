@@ -661,7 +661,18 @@ def _claude_native_lead_event(
                     and not any(marker in str(item.get('text', '')) for marker in
                                 ('SYMPHONY_OUTCOME:', 'SYMPHONY_FAST_DECISION:'))
                     for item in row['message']['content']) for row in assistants))
-    if (not isinstance(message, dict) or message.get("stop_reason") != "end_turn" and not superseded
+    delivered = bool(isinstance(message, dict) and message.get('stop_reason') is None
+        and isinstance(message.get('content'), list)
+        and not any(row.get('isApiErrorMessage') is True or row.get('type') == 'error'
+                    or row.get('subtype') == 'api_error' for row in turn)
+        and claude_native_parent_completion(parent_rows, terminal,
+            '\n'.join(item.get('text', '') for item in message['content']
+                      if isinstance(item, dict) and item.get('type') == 'text' and isinstance(item.get('text'), str)),
+            session, '', lead_id,
+            before=_instant(child_rows[end]['timestamp']) if end < len(child_rows) else None,
+            prompt=child_rows[last_prompt] if prompt_index == 0 else None,
+            launch_hash=hashlib.sha256(launch_id.encode()).hexdigest()))
+    if (not isinstance(message, dict) or message.get("stop_reason") != "end_turn" and not superseded and not delivered
             or any((row.get("message") or {}).get("stop_reason") == "end_turn"
                    for row in assistants[:-1])):
         return None
@@ -1941,7 +1952,7 @@ def _claude_historical_worker_origin(
     native = (_claude_historical_worker_terminal(rows, first, identity, run.session_id,
         children[0].requested_tier, children[0].requested_effort,
         parent_rows=_native_jsonl(paths[0].parent / f'agent-{run.lead_identity}.jsonl') or [],
-        parent=run.lead_identity) if first is not None else None)
+        parent=run.lead_identity, launch_hash=binding['launch_hash']) if first is not None else None)
     if (native is None or _instant(native.observed_at) > archived
             or _instant(native.observed_at) > _instant(stops[0].observed_at)
             or hashlib.sha256(native.payload['prompt_id'].encode()).hexdigest() != proof['native_prompt_hash']):
@@ -1955,7 +1966,8 @@ def _claude_historical_worker_origin(
 
 def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report: str,
                                     session: str, parent: str, identity: str,
-                                    *, before: datetime | None = None) -> bool:
+                                    *, before: datetime | None = None,
+                                    prompt: Mapping | None = None, launch_hash: str = '') -> bool:
     """Prove a NULL stop reason from the native task producer's exact delivery."""
     message = terminal.get('message', {})
     completed = _instant(terminal.get('timestamp'))
@@ -1965,11 +1977,67 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
             or terminal.get('isSidechain') is not True or terminal.get('isApiErrorMessage') is True
             or not isinstance(report, str) or not report.strip()
             or not isinstance(message.get('content'), list)
-            or any(not isinstance(item, dict) or item.get('type') not in {'text', 'thinking', 'redacted_thinking'}
-                   for item in message['content'])
+              or any(not isinstance(item, dict) or item.get('type') not in {'text', 'thinking', 'redacted_thinking'}
+                     or item.get('type') == 'text' and not isinstance(item.get('text'), str)
+                     for item in message['content'])
             or report != '\n'.join(item.get('text', '') for item in message['content'] if item['type'] == 'text')):
         return False
     matching = []
+    # Foreground Agent calls deliver a completed report as a native tool_result,
+    # not as a task notification. Bind the exact launch independently through
+    # the child's metadata; an asynchronous launch ACK is never a completion.
+    if prompt is not None and isinstance(launch_hash, str) and re.fullmatch(r'[0-9a-f]{64}', launch_hash):
+        launches = [(row, item) for row in rows if isinstance(row.get('message'), Mapping)
+            for item in (row['message'].get('content') or ())
+            if isinstance(item, dict) and isinstance(item.get('id'), str)
+            and hashlib.sha256(item['id'].encode()).hexdigest() == launch_hash]
+        if len(launches) != 1:
+            return False
+        call_row, call = launches[0]
+        inputs = call.get('input')
+        launched, began = _instant(call_row.get('timestamp')), _instant(prompt.get('timestamp'))
+        if (call_row.get('type') != 'assistant' or call_row.get('sessionId') != session
+                or (call_row.get('agentId') or '') != parent
+                or call_row.get('isSidechain') is not bool(parent)
+                or call_row.get('isApiErrorMessage') is True
+                or call.get('type') != 'tool_use' or call.get('name') != 'Agent'
+                or not isinstance(inputs, dict) or inputs.get('prompt') != (prompt.get('message') or {}).get('content')
+                or not isinstance(inputs.get('prompt'), str) or not inputs['prompt'].strip()
+                or prompt.get('sessionId') != session or prompt.get('agentId') != identity
+                or prompt.get('isSidechain') is not True
+                or not isinstance(prompt.get('uuid'), str) or not prompt['uuid']
+                or launched is None or began is None or not launched <= began < completed):
+            return False
+        if inputs.get('run_in_background') is not None and inputs['run_in_background'] is not False:
+            deliveries = []
+        else:
+            deliveries = [(row, item) for row in rows if isinstance(row.get('message'), Mapping)
+                for item in (row['message'].get('content') or ())
+                if isinstance(item, dict) and item.get('type') == 'tool_result'
+                and item.get('tool_use_id') == call['id']]
+        if deliveries:
+            if len(deliveries) != 1:
+                return False
+            row, result = deliveries[0]
+            when, content = _instant(row.get('timestamp')), result.get('content')
+            escaped = re.escape(identity)
+            footer = (rf"agentId: {escaped} \(use SendMessage with to: '{escaped}', "
+                      r"summary: '<5-10 word recap>' to continue this agent\)\n"
+                      r"<usage>subagent_tokens: [0-9]+\ntool_uses: [0-9]+\nduration_ms: [0-9]+</usage>")
+            if (row.get('type') != 'user' or row.get('sessionId') != session
+                    or (row.get('agentId') or '') != parent
+                    or row.get('isSidechain') is not bool(parent)
+                    or row.get('isApiErrorMessage') is True
+                    or not isinstance(row.get('uuid'), str) or not row['uuid']
+                    or when is None or when < completed or before is not None and when >= before
+                    or result.get('is_error') is not None and result['is_error'] is not False
+                    or not isinstance(content, list) or len(content) != 2
+                    or content[0] != {'type': 'text', 'text': report}
+                    or not isinstance(content[1], dict) or content[1].get('type') != 'text'
+                    or not isinstance(content[1].get('text'), str)
+                    or re.fullmatch(footer, content[1]['text']) is None):
+                return False
+            matching.append(row)
     for row in rows:
         origin = row.get('origin')
         if not isinstance(origin, Mapping) or origin.get('kind') != 'task-notification' or origin.get('producer') != 'session-task':
@@ -1994,7 +2062,7 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
         tags = [item.tag for item in notification]
         result = notification.find('result')
         if (row.get('type') != 'user' or row.get('sessionId') != session
-                or row.get('agentId') != parent or row.get('isSidechain') is not True
+                or (row.get('agentId') or '') != parent or row.get('isSidechain') is not bool(parent)
                 or not isinstance(row.get('uuid'), str) or not row['uuid']
                 or 'isMeta' in row and row['isMeta'] is not True
                 or when is None or when < completed or before is not None and when >= before
@@ -2014,7 +2082,8 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
 def _claude_historical_worker_terminal(rows: list[dict], prompt_index: int,
                                         identity: str, session: str, model: str, effort: str,
                                         *, ack_only: bool = False,
-                                        parent_rows: list[dict] = (), parent: str = '') -> Event | None:
+                                        parent_rows: list[dict] = (), parent: str = '',
+                                        launch_hash: str = '') -> Event | None:
     """Validate one descendant turn without giving it a lead or worker credit."""
     if any(row.get('sessionId') != session or row.get('agentId') != identity
            or row.get('isSidechain') is not True
@@ -2067,7 +2136,8 @@ def _claude_historical_worker_terminal(rows: list[dict], prompt_index: int,
         and item.get('type') in {'text', 'thinking', 'redacted_thinking'}
         for row in assistants for item in row['message']['content'])
         and claude_native_parent_completion(parent_rows, terminal, final, session, parent, identity,
-            before=_instant(rows[end]['timestamp']) if end < len(rows) else None))
+            before=_instant(rows[end]['timestamp']) if end < len(rows) else None,
+            prompt=rows[prompt_index] if launch_hash else None, launch_hash=launch_hash))
     if (terminal['message'].get('stop_reason') != 'end_turn' and not delivered
             or any(row['message'].get('stop_reason') == 'end_turn' for row in assistants[:-1])
             or not isinstance(terminal.get('uuid'), str) or not terminal['uuid']

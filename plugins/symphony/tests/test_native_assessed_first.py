@@ -141,6 +141,45 @@ class NativeAssessedFirstTests(unittest.TestCase):
                     write()
                     self.assertFalse(smoke.assessed_first_verified(provider, document, run, children, home, project, profile))
 
+    def test_claude_retries_only_a_rejected_unspawned_same_assessor(self):
+        for case in ('valid', 'wrong-type', 'wrong-model', 'wrong-prompt', 'success', 'missing-result',
+                     'overlap', 'before-call', 'partial-child'):
+            with self.subTest(case=case):
+                document, run, children, home, project, profile, roots, write = self.fixture('claude')
+                earlier = deepcopy(roots[0])
+                earlier['timestamp'] = at(0)
+                call = earlier['message']['content'][0]
+                call['id'] = 'rejected-assessor'
+                result = {'type': 'user', 'sessionId': run['session_id'], 'timestamp': '2026-10-01T00:00:00.5+00:00',
+                          'message': {'content': [{'type': 'tool_result', 'tool_use_id': call['id'],
+                                      'is_error': True, 'content': 'Launch rejected before any child.'}]}}
+                if case == 'wrong-type': call['input']['subagent_type'] = 'foreign'
+                if case == 'wrong-model': call['input']['model'] = 'foreign'
+                if case == 'wrong-prompt': call['input']['prompt'] = 'Another objective.'
+                if case == 'success': result['message']['content'][0]['is_error'] = False
+                if case == 'overlap': result['timestamp'] = at(2)
+                if case == 'before-call': result['timestamp'] = '2026-09-30T23:59:59+00:00'
+                roots[:0] = [earlier] + ([] if case == 'missing-result' else [result])
+                if case == 'partial-child':
+                    meta = next((home / 'projects').glob('*/root-id/subagents')) / 'agent-partial.meta.json'
+                    meta.write_text(json.dumps({'toolUseId': call['id']}))
+                write()
+                self.assertEqual(smoke.assessed_first_verified('claude', document, run, children,
+                                                              home, project, profile), case == 'valid')
+
+    def test_late_assessor_confirmation_does_not_erase_first_assessment_proof(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                document, run, children, home, project, profile, _, _ = self.fixture(provider)
+                confirmation = deepcopy(document['event_history'][1])
+                confirmation.update(event_id='late-confirmation', observed_at=at(13))
+                document['event_history'].append(confirmation)
+                self.assertTrue(smoke.assessed_first_verified(provider, document, run, children,
+                                                              home, project, profile))
+                confirmation['payload']['role'] = 'lead'
+                self.assertFalse(smoke.assessed_first_verified(provider, document, run, children,
+                                                               home, project, profile))
+
     def test_codex_report_before_stop_hook_is_available_before_task_complete(self):
         document, run, children, home, project, profile, _, _ = self.fixture('codex')
         run['assessment']['substantive_contract']['accepted_at'] = at(6)
@@ -181,7 +220,7 @@ class NativeAssessedFirstTests(unittest.TestCase):
         self.assertNotIn('private-', json.dumps(facts))
 
     def test_codex_readonly_bootstrap_preserves_assessor_first_authority(self):
-        for wrapped in (False, True):
+        for wrapped in (False, 'serialized', 'output'):
             with self.subTest(wrapped=wrapped):
                 document, run, children, home, project, profile, roots, write = self.fixture('codex')
                 retained, original = str(home / ('a' * 64)), str(home / 'plugin')
@@ -189,12 +228,14 @@ class NativeAssessedFirstTests(unittest.TestCase):
                     'runtime_root': retained, 'plugin_root': original}}
                 commands = [smoke._retained_activation_command(retained, original),
                             smoke.shlex.join(['cat', str(Path(original) / 'skills/symphony/SKILL.md')]),
+                            smoke.shlex.join(['cat', str(Path(retained) / 'skills/symphony/references/role-contracts.md')]),
                             'cat AGENTS.md']
                 for ordinal, command in enumerate(commands):
                     arguments = {'cmd': command, 'workdir': str(project)}
                     name = 'exec_command'
                     if wrapped:
-                        arguments = 'const r = await tools.exec_command(' + json.dumps(arguments) + '); text(JSON.stringify(r));'
+                        output = 'r.output' if wrapped == 'output' else 'JSON.stringify(r)'
+                        arguments = 'const r = await tools.exec_command(' + json.dumps(arguments) + '); text(' + output + ');'
                         name = 'exec'
                     roots.insert(1 + ordinal, {'type': 'response_item', 'timestamp': at(0), 'payload': {
                         'type': 'custom_tool_call' if wrapped else 'function_call', 'name': name,

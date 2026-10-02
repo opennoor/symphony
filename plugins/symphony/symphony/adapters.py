@@ -78,26 +78,26 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     own_turn = True
     native_contexts = 0
     matching_contexts = 0
-    legacy_ambiguous = False
+    contexts_ambiguous = False
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
-            # A prefix cannot prove that a tokenless callback has only one turn.
+            # A partial stream cannot prove uniqueness, even with a turn token.
             for line in handle:
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    if header_seen and not callback_turn:
-                        legacy_ambiguous = True
+                    if header_seen:
+                        contexts_ambiguous = True
                     continue
                 if not isinstance(record, dict):
-                    if header_seen and not callback_turn:
-                        legacy_ambiguous = True
+                    if header_seen:
+                        contexts_ambiguous = True
                     continue
                 if not isinstance(record.get("payload", {}), dict):
                     if record.get("type") == "session_meta":
                         return {}
-                    if header_seen and not callback_turn:
-                        legacy_ambiguous = True
+                    if header_seen:
+                        contexts_ambiguous = True
                     continue
                 record_payload = record.get("payload", {})
                 if record.get("type") != "session_meta" and not header_seen:
@@ -111,7 +111,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     if header_seen:
                         forked = True
                         own_turn = False
-                        legacy_ambiguous = not callback_turn
+                        contexts_ambiguous |= not callback_turn
                         continue
                     header_seen = True
                     if identity != callback_identity:
@@ -132,7 +132,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                 elif record.get("type") == "turn_context":
                     native_contexts += 1
                     if not callback_turn and native_contexts > 1:
-                        legacy_ambiguous = True
+                        contexts_ambiguous = True
                         own_turn = False
                     if forked:
                         own_turn = bool(callback_turn and record_payload.get("turn_id") == callback_turn)
@@ -161,8 +161,8 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                         if "SYMPHONY_FAST_ROUTE: lead" in message:
                             found["task"] = message
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        legacy_ambiguous = not callback_turn
-    ambiguous = legacy_ambiguous or bool(callback_turn and matching_contexts != 1)
+        contexts_ambiguous = True
+    ambiguous = contexts_ambiguous or bool(callback_turn and matching_contexts != 1)
     return {key: value for key, value in found.items()
             if not ambiguous or key in {'task_name', 'parent_thread_id'}}
 
@@ -173,17 +173,31 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
     if not transcript:
         return ""
     report = ""
+    final = ""
+    prompt_id = ""
+    turns = []
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
             for line in handle:
-                if "SubagentHandback" not in line:
-                    continue
                 try:
                     record = json.loads(line)
                 except ValueError:
                     continue
                 message = record.get("message") if isinstance(record, dict) else None
                 content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(record, dict) and record.get("type") == "user":
+                    if isinstance(content, str) or isinstance(content, list) and content and all(
+                            isinstance(item, dict) and item.get("type") == "text" for item in content):
+                        # requestJournal context can be reused across native child
+                        # turns. A report belongs only to its own prompt.
+                        if report or final:
+                            turns.append((prompt_id, report, final))
+                        prompt_id = record.get("uuid")
+                        report, final = "", ""
+                    continue
+                if isinstance(record, dict) and record.get("type") == "assistant" and isinstance(content, list):
+                    final = "\n".join(item.get("text", "") for item in content
+                                      if isinstance(item, dict) and item.get("type") == "text")
                 for item in content if isinstance(content, list) else ():
                     if (
                         isinstance(item, dict)
@@ -194,7 +208,20 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                         if isinstance(values, dict):
                             report = str(values.get("message") or report)
     except (OSError, TypeError, ValueError, AttributeError):
-        return report
+        return ""
+    turns.append((prompt_id, report, final))
+    callback = payload.get("last_assistant_message")
+    if 'turn_id' in payload:
+        matching = [turn for turn in turns if isinstance(payload['turn_id'], str)
+                    and payload['turn_id'] and turn[0] == payload['turn_id'] and callback == turn[2]]
+        return matching[0][1] if len(matching) == 1 else ""
+    if callback:
+        matching = [turn for turn in turns if turn[2] == callback]
+        # Identical goodbyes in separate turns cannot identify a delayed Stop.
+        if len(matching) != 1 or matching[0] != turns[-1]:
+            return ""
+    elif len(turns) != 1:
+        return ""
     return report
 
 

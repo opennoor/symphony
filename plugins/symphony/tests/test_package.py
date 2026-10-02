@@ -139,11 +139,32 @@ class PackageContractTests(unittest.TestCase):
 
     def test_windows_probe_deadline_starts_after_candidate_collection(self):
         source = (PLUGIN / 'scripts/codex_hook.ps1').read_text()
-        self.assertLess(source.index('$cs = @(Get-Command'), source.index('$until ='))
+        self.assertLess(source.index('$cs = @('), source.index('$until ='))
         self.assertLess(source.index('$until ='), source.index('foreach ($c in $cs)'))
-        self.assertIn('Select-Object -First 6', source)
+        self.assertIn("foreach ($n in 0,1)", source)
+        self.assertIn("foreach ($name in 'python.exe','python3.exe','py.exe')", source)
+        self.assertIn('Select-Object -Skip $n -First 1', source)
         self.assertIn('$p.WaitForExit(1500)', source)
         self.assertIn('$until = [DateTime]::UtcNow.AddSeconds(4)', source)
+
+    @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
+    def test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries(self):
+        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = sys.executable.replace("'", "''")
+            missing = str(Path(temporary) / 'missing.exe').replace("'", "''")
+            command = ("function Get-Command { param($Name, $CommandType, $ErrorAction, [switch]$All) "
+                       "if ($Name -eq 'python.exe') { 1..6 | ForEach-Object { "
+                       "[pscustomobject]@{Name='python.exe';Source='" + missing + "'} } } "
+                       "elseif ($Name -eq 'python3.exe') { [pscustomobject]@{Name=$Name;Source='"
+                       + executable + "'} } }\n")
+            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                    command + relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                    text=True, timeout=15, env={**os.environ, variable: temporary})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), '123')
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_accepts_a_slow_working_interpreter_probe(self):

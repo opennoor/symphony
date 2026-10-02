@@ -3048,7 +3048,8 @@ def require_literal_worker(provider, run, home, project=None, captures=()):
         scoped = replace(_run_from_dict(run), assessment={'substantive_contract': {'accepted_at': run['started_at']}})
         source = Event('fixture-native-worker', 'subagent_stopped', latest, {'provider': 'claude',
             'session_id': run['session_id'], 'agent_id': worker['identity'], 'cwd': str(project)})
-        if not claude_substantive_launch(scoped, source, 'worker', admitted, {'CLAUDE_CONFIG_DIR': str(home)}):
+        binding = claude_substantive_launch(scoped, source, 'worker', admitted, {'CLAUDE_CONFIG_DIR': str(home)})
+        if not binding:
             raise RuntimeError('literal Claude worker lacks exact native lead parent proof')
         assistants = [row for row in rows if row.get('type') == 'assistant']
         activity = [row for row in rows if row.get('type') in {'assistant', 'user'}]
@@ -3058,7 +3059,8 @@ def require_literal_worker(provider, run, home, project=None, captures=()):
                    and isinstance(row.get('message', {}).get('content'), str)]
         closed = (len(prompts) == 1 and _claude_historical_worker_terminal(
             rows, prompts[0], worker['identity'], run['session_id'], worker['requested_tier'],
-            worker['requested_effort'], parent_rows=lead_rows, parent=run['lead_identity']) is not None)
+            worker['requested_effort'], parent_rows=lead_rows, parent=run['lead_identity'],
+            launch_hash=binding['launch_hash']) is not None)
         literal = closed and final == 'GATE_RELEASED'
         if closed and not literal and not any(line.strip().startswith('SYMPHONY_OUTCOME:') for line in final.splitlines()):
             handbacks = [(block, row) for row in assistants[:-1] for block in row.get('message', {}).get('content', [])
@@ -3097,6 +3099,17 @@ def claude_literal_worker_probe(run, home):
             calls, results = native_call_inventory('claude', rows)
             lead_rows = native_rows('claude', home, run['lead_identity']) if run.get('lead_identity') else []
             handbacks = [call for call in calls if call[1] == 'SubagentHandback']
+            proof = run.get('assessment', {}).get('_substantive_children', {}).get(worker['identity'], {})
+            launch_hash = proof.get('launch_hash', '')
+            launches = [block for row in lead_rows if row.get('type') == 'assistant'
+                for block in row.get('message', {}).get('content', [])
+                if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('name') == 'Agent'
+                and isinstance(block.get('id'), str)
+                and hashlib.sha256(block['id'].encode()).hexdigest() == launch_hash]
+            bound_results = [block for row in lead_rows if row.get('type') == 'user'
+                for block in row.get('message', {}).get('content', [])
+                if isinstance(block, dict) and block.get('type') == 'tool_result'
+                and any(block.get('tool_use_id') == launch.get('id') for launch in launches)]
             parent_deliveries = [item for row in lead_rows if row.get('type') == 'user'
                 for item in row.get('message', {}).get('content', [])
                 if isinstance(item, dict) and item.get('type') == 'tool_result'
@@ -3105,6 +3118,16 @@ def claude_literal_worker_probe(run, home):
                     and block['text'].startswith('agentId: ' + worker['identity'] + ' ')
                     for block in item['content'])]
             item.update(native_reader_available=True, assistant_count=len(assistants),
+                native_bound_launch_count=len(launches),
+                native_bound_background_launch_count=sum(launch.get('input', {}).get('run_in_background') is True
+                                                          for launch in launches),
+                native_bound_result_shapes=[{'content_type': type(delivery.get('content')).__name__,
+                    'block_count': len(delivery['content']) if isinstance(delivery.get('content'), list) else None,
+                    'is_error': delivery.get('is_error') is True,
+                    'child_footer_present': 'agentId: ' + worker['identity'] in json.dumps(delivery.get('content')),
+                    'literal_report_present': 'GATE_RELEASED' in json.dumps(delivery.get('content')),
+                    'async_ack_present': 'Async agent launched successfully' in json.dumps(delivery.get('content'))}
+                    for delivery in bound_results[:4]],
                 native_parent_result_with_child_footer_count=len(parent_deliveries),
                 native_parent_result_success_count=sum(delivery.get('is_error') is not True
                                                        for delivery in parent_deliveries),
@@ -3112,7 +3135,9 @@ def claude_literal_worker_probe(run, home):
                     and delivery['content'][0] == {'type': 'text', 'text': report}
                     for delivery in parent_deliveries),
                 native_parent_completion_verified=claude_native_parent_completion(
-                    lead_rows, terminal, report, run.get('session_id', ''), run.get('lead_identity', ''), worker['identity']),
+                    lead_rows, terminal, report, run.get('session_id', ''), run.get('lead_identity', ''), worker['identity'],
+                    prompt=next((row for row in rows if row.get('type') == 'user'
+                        and isinstance(row.get('message', {}).get('content'), str)), None), launch_hash=launch_hash),
                 native_parent_notification_count=sum(isinstance(row.get('origin'), dict)
                     and row['origin'].get('kind') == 'task-notification'
                     and row['origin'].get('producer') == 'session-task' for row in lead_rows),

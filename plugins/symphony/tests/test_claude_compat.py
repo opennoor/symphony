@@ -83,7 +83,9 @@ class ClaudeCompatTests(unittest.TestCase):
                 ]
             },
         }
-        transcript.write_text(json.dumps(handback) + "\n", encoding="utf-8")
+        final = {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Assessment delivered."}]}}
+        transcript.write_text(json.dumps(handback) + "\n" + json.dumps(final) + "\n", encoding="utf-8")
         self.hook(
             "SubagentStop",
             agent_id="assessor-1",

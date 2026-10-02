@@ -154,9 +154,10 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
                 self.assertEqual(private[0].stat().st_mode & 0o777, 0o600)
                 self.assertEqual(private[0].parent.stat().st_mode & 0o777, 0o700)
             transcript = root / 'child.jsonl'
-            handback = {'message': {'content': [{'type': 'tool_use', 'name': 'SubagentHandback',
+            handback = {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'SubagentHandback',
                          'input': {'message': 'PRIVATE_HOOK_TIME_REPORT'}}]}}
-            transcript.write_text(json.dumps(handback) + '\n', encoding='utf-8')
+            terminal = {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Goodbye'}]}}
+            transcript.write_text(json.dumps(handback) + '\n' + json.dumps(terminal) + '\n', encoding='utf-8')
             stop = {**payload, 'hook_event_name': 'SubagentStop', 'agent_transcript_path': str(transcript),
                     'last_assistant_message': 'Goodbye'}
             completed = subprocess.run([sys.executable, str(script), 'SubagentStop', str(public), 'claude'],
@@ -166,8 +167,8 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
             snapshots = [json.loads(path.read_text(encoding='utf-8')) for path in (root / 'private-child-hooks').glob('*.json')]
             captured_stop = next(item for item in snapshots if item['raw']['hook_event_name'] == 'SubagentStop')
             self.assertEqual(captured_stop['canonical']['payload']['last_assistant_message'], 'PRIVATE_HOOK_TIME_REPORT\nGoodbye')
-            transcript.write_text(json.dumps({'message': {'content': [{'type': 'tool_use', 'name': 'SubagentHandback',
-                                  'input': {'message': 'LATER_REPORT'}}]}}) + '\n', encoding='utf-8')
+            transcript.write_text(json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'SubagentHandback',
+                                  'input': {'message': 'LATER_REPORT'}}]}}) + '\n' + json.dumps(terminal) + '\n', encoding='utf-8')
             self.assertNotEqual(captured_stop['canonical']['event_id'], smoke.event_from_payload('claude', stop).event_id)
             self.assertNotIn('PRIVATE_HOOK_TIME_REPORT', ''.join(path.read_text(encoding='utf-8') for path in public.glob('*.json')))
 
@@ -971,6 +972,19 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         value = {'cmd': "cat file,{private:unchanged}", 'workdir': '/fixture'}
         source = 'text(await tools.exec_command(' + json.dumps(value) + '));'
         self.assertEqual(smoke.composed_call(source, 'exec_command'), value)
+
+    def test_native_composed_call_accepts_literal_js_quote_styles_only(self):
+        expected = {'cmd': "cat file,{private:unchanged}", 'workdir': '/fixture'}
+        for source in ("text(await tools.exec_command({cmd: 'cat file,{private:unchanged}', workdir: '/fixture'}));",
+                       "const r = await tools.exec_command({cmd: 'cat file,{private:unchanged}', workdir: '/fixture'}); text(r.output);"):
+            self.assertEqual(smoke.composed_call(source, 'exec_command', output_only=True), expected)
+        for source in ("text(await tools.exec_command({cmd: getCommand()}));",
+                       "text(await tools.exec_command({cmd: 'read'})); text(await tools.exec_command({cmd: 'write'}));",
+                       "text(await tools.exec_command({cmd: `dynamic ${command}`}));",
+                       r"text(await tools.exec_command({cmd: '\U00000067reet.py'}));",
+                       r"text(await tools.exec_command({cmd: '\N{LATIN SMALL LETTER G}reet.py'}));",
+                       "text(await tools.exec_command({cmd: 'read'})); mutate();"):
+            self.assertIsNone(smoke.composed_call(source, 'exec_command', output_only=True))
 
     def test_verification_requires_an_executed_unittest_command(self):
         output = '"exit_code": 0, "output": "Ran 2 tests. OK"'
