@@ -992,11 +992,15 @@ class CompletionChronologyTests(unittest.TestCase):
         self.assertEqual(self.check(), 'unknown')
 
     def test_codex_handback_delivery_can_follow_the_send_ack(self):
-        for case in ('valid', 'encrypted', 'foreign-message', 'missing', 'duplicate', 'early', 'before-send'):
+        for case in ('valid', 'split-text', 'encrypted', 'foreign-message', 'missing', 'duplicate', 'early', 'before-send'):
             with self.subTest(case=case):
                 self.fixture('codex', handback=True)
                 receipt = self.rows[self.lead][-3]
                 receipt['timestamp'] = '2026-10-02T10:00:08.500+00:00'
+                if case == 'split-text':
+                    receipt['payload']['content'] = [
+                        {'type': 'input_text', 'text': 'Message Type: MESSAGE\nTask name: /root/lead\nSender: /root/lead/child\nPayload:\n'},
+                        {'type': 'input_text', 'text': self.child_report}]
                 if case == 'encrypted':
                     packet = {'target': '/root/lead', 'message': 'gAAAAopaque_report'}
                     self.rows[self.child][3]['payload']['arguments'] = json.dumps(packet)
@@ -1011,8 +1015,31 @@ class CompletionChronologyTests(unittest.TestCase):
                     self.rows[self.lead][-3:-1] = list(reversed(self.rows[self.lead][-3:-1]))
                 if case == 'before-send': receipt['timestamp'] = self.stamp(6)
                 self.write()
-                expected = 'valid' if case in {'valid', 'encrypted'} else 'early' if case == 'early' else 'unknown'
+                expected = 'valid' if case in {'valid', 'split-text', 'encrypted'} else 'early' if case == 'early' else 'unknown'
                 self.assertEqual(self.check(), expected)
+
+    def test_claude_isolated_lead_binds_child_launches_to_its_native_worktree(self):
+        for case in ('valid', 'resumed-root', 'not-isolated', 'missing-cwd', 'relative-cwd', 'different-child-cwd'):
+            with self.subTest(case=case):
+                self.fixture('claude')
+                isolated = self.project / '.claude/worktrees' / ('agent-' + self.lead)
+                self.rows[self.session][0]['message']['content'][0]['input']['isolation'] = 'worktree'
+                for identity in (self.lead, self.child):
+                    for row in self.rows[identity]:
+                        row['cwd'] = str(isolated)
+                if case == 'resumed-root':
+                    for row in self.rows[self.lead][1:] + self.rows[self.child]:
+                        row['cwd'] = str(self.project)
+                    self.rows[self.lead].insert(1, {**self.rows[self.lead][0], 'uuid': 'resumed-prompt',
+                        'timestamp': '2026-10-02T10:00:03.500+00:00', 'cwd': str(self.project),
+                        'message': {'content': 'Continue the owned task.'}})
+                if case == 'not-isolated':
+                    self.rows[self.session][0]['message']['content'][0]['input'].pop('isolation')
+                if case == 'missing-cwd': self.rows[self.lead][0].pop('cwd')
+                if case == 'relative-cwd': self.rows[self.lead][0]['cwd'] = 'relative'
+                if case == 'different-child-cwd': self.rows[self.lead][1]['cwd'] = str(self.project / 'foreign')
+                self.write()
+                self.assertEqual(self.check(), 'valid' if case in {'valid', 'resumed-root'} else 'unknown')
 
     def test_missing_foreign_ambiguous_failed_and_unsettled_evidence_is_unknown(self):
         for provider in ('codex', 'claude'):

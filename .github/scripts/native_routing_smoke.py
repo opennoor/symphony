@@ -206,7 +206,7 @@ def failure_diagnostics(provider, root, document):
             **({'fast_identity_components': fast_identity_components} if provider == 'codex' else {}),
             'fast_terminal_turns': fast_terminal_turns,
             'fast_command_witnesses': fast_command_witnesses,
-            'assessed_completion': [assessed_completion_probe(provider, home, run, document) for run in runs
+            'assessed_completion': [assessed_completion_probe(provider, home, run, document, root / 'primary') for run in runs
                                     if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'root_native_launches': root_launches,
             'root_native_tool_categories': root_calls,
@@ -1324,7 +1324,7 @@ def claude_child_binding_probe(home, run_dict, document):
     return results
 
 
-def assessed_completion_probe(provider, home, run, document=None):
+def assessed_completion_probe(provider, home, run, document=None, project=None):
     """Separate admitted child proof from supplied lead-result categories."""
     assessment = run.get('assessment', {})
     contract = assessment.get('substantive_contract')
@@ -1382,7 +1382,36 @@ def assessed_completion_probe(provider, home, run, document=None):
             latest_effort_matches = bool(contexts and contexts[-1].get('effort') == child.get('requested_effort'))
     except (OSError, ValueError, RuntimeError, TypeError):
         pass
-    return {'claude_child_binding': claude_child_binding_probe(home, run, document) if provider == 'claude' else [],
+    chronology = {}
+    if isinstance(document, dict) and project is not None:
+        # Read-only replay asks where this candidate would reject completion;
+        # it neither dispatches events nor supplies durable outcome credit.
+        readers = {getattr(host_evidence, name).__code__: name for name in (
+            'assessed_completion_chronology', '_chronology_codex_file', '_chronology_codex_turn',
+            '_chronology_codex_launch', '_chronology_report', '_chronology_claude_launch',
+            '_claude_substantive_launch', '_claude_native_lead_event',
+            '_claude_historical_worker_terminal', 'claude_native_parent_completion')}
+        def trace(frame, event, value):
+            name = readers.get(frame.f_code)
+            if name is None:
+                return None
+            if event == 'return' and (name == 'assessed_completion_chronology' or value is None or value is False):
+                chronology.setdefault('boundaries', []).append({'reader': name, 'source_line': frame.f_lineno})
+                chronology['boundaries'] = chronology['boundaries'][-8:]
+            return trace
+        previous = sys.gettrace()
+        try:
+            replay = replace(_state_from_dict(document), active_run=replace(_run_from_dict(run),
+                status='completing', outcome={'status': 'completed'}))
+            sys.settrace(trace)
+            chronology['result'] = host_evidence.assessed_completion_chronology(replay,
+                run['session_id'], project, {'CODEX_HOME' if provider == 'codex' else 'CLAUDE_CONFIG_DIR': str(home)})
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+            chronology['result'] = 'unavailable'
+        finally:
+            sys.settrace(previous)
+    return {'completion_replay': chronology,
+            'claude_child_binding': claude_child_binding_probe(home, run, document) if provider == 'claude' else [],
             'contract_present': 'substantive_contract' in assessment,
             'contract_version_one': isinstance(contract, dict) and type(contract.get('version')) is int and contract['version'] == 1,
             'child_proof_counts': counts, 'retryable_lead_present': bool(assessment.get('_retryable_lead')),

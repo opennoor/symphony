@@ -10,6 +10,7 @@
 - Bind new Claude fast runs to the exact accepted native launch so a parent call recorded before its hook can reconcile safely. Repeated native Stop releases the host turn while retaining unresolved work and displaying recovery guidance.
 - Reconcile ordinary Claude completion across prompt-context changes and markerless resumed turns, including a first Stop held by unfinished work.
 - Recognize Claude's native framed hand-back reports and Codex messages delivered after their send acknowledgement. Require exact child reports and actual parent delivery before the lead completes, so successful native work does not get trapped in repeated Stop recovery.
+- Verify Claude child completion against the lead's native isolated worktree, including later lead turns resumed in the original project. Preserve exact launch ownership when checking either directory.
 - Accept Claude's native background Agent completion notifications, including automatic backgrounding and batched notices, only when the child, launch, exact report, and delivery time agree. An early launch acknowledgement cannot complete a worker.
 - Acknowledge an unadmitted preliminary Codex child only when exact native evidence and complete retained history prove its escalation finished before managed work began. Record an explicit unmanaged disposition without task or lead credit. Clarify the distinct fast and assessed lead names.
 - Preserve accepted legacy risk text during route recovery while keeping new assessment validation strict.

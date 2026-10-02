@@ -409,6 +409,16 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         self.assertFalse(facts['exact_literal_report'])
         self.assertTrue(facts['literal_line_present'])
         self.assertEqual(facts['outcome_marker_count'], 1)
+        self.assertEqual(facts['successful_parent_handback_count'], 0)
+        handback = [*extra_report[:-1],
+            {'type': 'response_item', 'payload': {'type': 'function_call', 'call_id': 'handback',
+             'name': 'collaboration.send_message', 'arguments': json.dumps({'target': lead_path, 'message': 'GATE_RELEASED'})}},
+            {'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'handback', 'output': '{}'}},
+            extra_report[-1]]
+        with patch.object(smoke, 'native_rows', side_effect=[handback, lead_rows]):
+            reported = native.codex_literal_worker_probe(run, Path('/native'))['workers'][0]
+        self.assertEqual(reported['successful_parent_handback_count'], 1)
+        self.assertEqual(reported['literal_parent_handback_count'], 1)
         self.assertNotIn('PRIVATE_SENTINEL', json.dumps(diagnostic))
         self.assertNotIn(worker_path, json.dumps(diagnostic))
         for values, child_rows in (({**run, 'delegations': [worker, worker]}, rows),

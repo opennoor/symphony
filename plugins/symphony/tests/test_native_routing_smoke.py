@@ -1002,6 +1002,26 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
                        "text(await tools.exec_command({cmd: 'read'})); mutate();"):
             self.assertIsNone(smoke.composed_call(source, 'exec_command', output_only=True))
 
+    def test_completion_replay_exports_only_native_reader_boundaries(self):
+        from plugins.symphony.tests.test_host_evidence import CompletionChronologyTests
+        from plugins.symphony.symphony.store import _state_to_dict
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                fixture = CompletionChronologyTests()
+                self.addCleanup(fixture.doCleanups)
+                fixture.fixture('codex')
+                if missing:
+                    fixture.paths[fixture.child].unlink()
+                document = _state_to_dict(fixture.state)
+                before = json.dumps(document)
+                facts = smoke.assessed_completion_probe('codex', fixture.home,
+                    document['active_run'], document, fixture.project)['completion_replay']
+                self.assertEqual(facts['result'], 'unknown' if missing else 'valid')
+                self.assertTrue(all(type(item['source_line']) is int for item in facts['boundaries']))
+                self.assertEqual(before, json.dumps(document))
+                for private in (str(fixture.project), fixture.lead, fixture.child, fixture.session):
+                    self.assertNotIn(private, json.dumps(facts))
+
     def test_verification_requires_an_executed_unittest_command(self):
         output = '"exit_code": 0, "output": "Ran 2 tests. OK"'
         self.assertTrue(smoke.unittest_verified([("exec_command", {"cmd": "python -m unittest -q"}, "", output)]))

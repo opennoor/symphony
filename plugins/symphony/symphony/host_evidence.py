@@ -370,6 +370,7 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                     prefix = (f"Message Type: MESSAGE\nTask name: {rows[0]['payload']['agent_path']}\n"
                         f"Sender: {child_rows[0]['payload']['agent_path']}\nPayload:\n")
                     visible = [{'type': 'input_text', 'text': prefix + sent}]
+                    split_visible = [{'type': 'input_text', 'text': prefix}, {'type': 'input_text', 'text': sent}]
                     encrypted = [{'type': 'input_text', 'text': prefix},
                                  {'type': 'encrypted_content', 'encrypted_content': sent}]
                 # send_message acknowledges queueing. Delivery can occur after
@@ -378,7 +379,7 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                     and row['payload'].get('type') == 'agent_message'
                     and row['payload'].get('author') == child_rows[0]['payload']['agent_path']
                     and row['payload'].get('recipient') == rows[0]['payload']['agent_path']
-                    and row['payload'].get('content') in (visible, encrypted)
+                    and row['payload'].get('content') in (visible, split_visible, encrypted)
                     and (when := _instant(row.get('timestamp'))) is not None
                     and times[0] <= when] if handback else
                     [row for row in rows if row.get('type') == 'event_msg'
@@ -441,15 +442,26 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                           and isinstance(row.get('message', {}).get('content'), str)), None)
             if launch is None or first is None or launch[2].get('prompt') != first['message']['content']:
                 return 'unknown'
+            execution_projects = {project.resolve()}
+            if launch[2].get('isolation') == 'worktree':
+                # The exact root launch and first native lead prompt bind its
+                # isolated cwd. Child launches must match that cwd, not root's.
+                cwd = first.get('cwd')
+                if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                    return 'unknown'
+                execution_projects.add(Path(cwd).resolve())
             for child in children:
                 proof = proofs[child.identity]
+                launches = [(candidate, _chronology_claude_launch(rows, proof.get('launch_hash'),
+                    session, lead.identity, candidate)) for candidate in execution_projects]
+                launches = [(candidate, match) for candidate, match in launches if match is not None]
+                if len(launches) != 1:
+                    return 'unknown'
+                execution_project, launched = launches[0]
                 source = Event('', 'subagent_stopped', run.updated_at, {'provider': 'claude', 'session_id': session,
-                    'agent_id': child.identity, 'parent_thread_id': lead.identity, 'cwd': str(project)})
+                    'agent_id': child.identity, 'parent_thread_id': lead.identity, 'cwd': str(execution_project)})
                 binding = claude_substantive_launch(run, source, child.role, proof.get('admitted_at'), environ)
                 if binding is None or any(proof.get(key) != value for key, value in binding.items()):
-                    return 'unknown'
-                launched = _chronology_claude_launch(rows, binding['launch_hash'], session, lead.identity, project)
-                if launched is None:
                     return 'unknown'
                 child_rows = _native_jsonl(paths[0].parent / f'agent-{child.identity}.jsonl')
                 if not child_rows:

@@ -2973,7 +2973,12 @@ def codex_literal_worker_probe(run, home):
             header = rows[0].get('payload', {}) if rows and rows[0].get('type') == 'session_meta' else {}
             parent = header.get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id')
             parent_path = lead_rows[0].get('payload', {}).get('agent_path', '') if lead_rows else ''
+            handbacks = [arguments for name, arguments, _, _ in tool_evidence('codex', rows)
+                         if name.rsplit('.', 1)[-1] == 'send_message' and isinstance(arguments, dict)
+                         and arguments.get('target') == parent_path]
             facts.update(native_reader_available=True,
+                successful_parent_handback_count=len(handbacks),
+                literal_parent_handback_count=sum(item.get('message') == 'GATE_RELEASED' for item in handbacks),
                 worker_unforked=worker_transcript_is_unforked('codex', rows, worker['identity']),
                 lead_unforked=worker_transcript_is_unforked('codex', lead_rows, run['lead_identity']),
                 native_parent_matches_lead=parent == run['lead_identity'],
