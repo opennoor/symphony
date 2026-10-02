@@ -254,6 +254,7 @@ class FastRouteTests(unittest.TestCase):
                     self.assertIn("Topology: " + expected, output)
                     self.assertIn("Accepted topology: " + expected, output)
                     self.assertIn("small tasks need one worker", output)
+                    self.assertIn("Delegate implementation before editing", output)
                     self.assertIn('SYMPHONY_OUTCOME:', output)
 
     def test_codex_exact_profile_cells_and_handoff_fit_the_host_context_limit(self):

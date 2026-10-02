@@ -281,6 +281,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         self.addCleanup(fixture.doCleanups)
         fixture.worker()
         run = asdict(fixture.state.active_run)
+        worker = next(item for item in run['delegations'] if item['role'] == 'worker')
         home = Path(fixture.environ['CLAUDE_CONFIG_DIR'])
         directory = home / 'projects' / '-fixture' / 'root' / 'subagents'
         parent = directory / 'agent-lead.jsonl'
@@ -295,7 +296,8 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         with child.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps({'type': 'assistant', 'sessionId': 'root', 'agentId': 'worker', 'isSidechain': True,
                 'uuid': 'native-terminal', 'timestamp': '2026-10-01T14:00:04+00:00',
-                'message': {'role': 'assistant', 'stop_reason': 'end_turn', 'content': [
+                'effort': worker['requested_effort'],
+                'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'end_turn', 'content': [
                 {'type': 'text', 'text': 'GATE_RELEASED'}]}}) + '\n')
         native.require_literal_worker('claude', run, home, fixture.project)
         legacy = {**run, 'assessment': {}}
@@ -306,21 +308,36 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         native.require_literal_worker('claude', legacy, home, fixture.project, [clock])
         original = child.read_text(encoding='utf-8')
         history = [json.loads(line) for line in original.splitlines()]
+        notification = {'type': 'user', 'sessionId': 'root', 'agentId': 'lead', 'isSidechain': True,
+            'uuid': 'native-notification', 'isMeta': True, 'timestamp': '2026-10-01T14:00:04.1+00:00',
+            'origin': {'kind': 'task-notification', 'producer': 'session-task'}, 'message': {'content':
+                '<task-notification><task-id>worker</task-id><status>completed</status><result>GATE_RELEASED</result></task-notification>'}}
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in [*rows, notification]), encoding='utf-8')
         history[-1]['message']['stop_reason'] = None
+        child.write_text(''.join(json.dumps(row) + '\n' for row in history), encoding='utf-8')
+        native.require_literal_worker('claude', run, home, fixture.project)
+        for reason in (None, 'end_turn'):
+            history[-1]['message']['stop_reason'] = reason
+            error = {**history[-1], 'type': 'error', 'subtype': 'api_error', 'uuid': 'later-error',
+                     'timestamp': '2026-10-01T14:00:04.2+00:00'}
+            child.write_text(''.join(json.dumps(row) + '\n' for row in [*history, error]), encoding='utf-8')
+            with self.assertRaises(RuntimeError): native.require_literal_worker('claude', run, home, fixture.project)
+        history[-1]['message']['stop_reason'] = None
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
         later = {**history[-1], 'uuid': 'later', 'timestamp': '2026-10-01T14:00:05+00:00',
-                 'message': {'role': 'assistant', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'different result'}]}}
+                 'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'different result'}]}}
         child.write_text(''.join(json.dumps(row) + '\n' for row in [*history, later]), encoding='utf-8')
         with self.assertRaises(RuntimeError):
             native.require_literal_worker('claude', run, home, fixture.project)
         child.write_text(original, encoding='utf-8')
         prompt = json.loads(original.splitlines()[0])
         handback = {**history[-1], 'uuid': 'handback', 'timestamp': '2026-10-01T14:00:04+00:00',
-                    'message': {'role': 'assistant', 'stop_reason': 'tool_use', 'content': [
+                    'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'tool_use', 'content': [
                     {'type': 'tool_use', 'id': 'handback-id', 'name': 'SubagentHandback', 'input': {'message': 'GATE_RELEASED'}}]}}
         delivered = {**prompt, 'timestamp': '2026-10-01T14:00:05+00:00', 'message': {'content': [
             {'type': 'tool_result', 'tool_use_id': 'handback-id', 'content': 'accepted', 'is_error': False}]}}
         goodbye = {**later, 'timestamp': '2026-10-01T14:00:06+00:00',
-                   'message': {'role': 'assistant', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Done.'}]}}
+                   'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Done.'}]}}
         child.write_text(''.join(json.dumps(row) + '\n' for row in (prompt, handback, delivered, goodbye)), encoding='utf-8')
         native.require_literal_worker('claude', run, home, fixture.project)
         delivered['message']['content'][0]['is_error'] = True

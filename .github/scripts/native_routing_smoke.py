@@ -31,7 +31,7 @@ from symphony.routing import Assessment, fast_lead_selection, route_for, snapsho
 from symphony.store import StateStore, _state_from_dict, _run_from_dict  # noqa: E402
 from symphony.model import Event, ProjectState  # noqa: E402
 from symphony.adapters import event_from_payload  # noqa: E402
-from symphony.runtime import _terminal_result_id, _child_turn_token, _child_turn_kind, _substantive_turn_matches, _observed_role  # noqa: E402
+from symphony.runtime import _terminal_result_id, _child_turn_token, _child_turn_kind, _substantive_turn_matches, _observed_role, _retained_activation_command  # noqa: E402
 
 CASES = {
     "command": "Run python -m unittest -q and report the result.",
@@ -53,14 +53,15 @@ FIXTURE_COMMAND_INSTRUCTIONS = (
     "text(await tools.exec_command({\"cmd\":\"python -m unittest -q\"})); do not print only result.output.\n")
 FIXTURE_INSTRUCTIONS = (
     "This is a disposable greeting fixture. Use native apply_patch, Write, or Edit for file changes. "
-    "Relay this fixture acceptance contract unchanged to the canonical assessed lead. After ALL workers "
+    "Relay this fixture acceptance contract unchanged to the canonical assessed lead. Workers own and make "
+    "the implementation edits; delegate them before editing project files. After ALL workers "
     "return successfully, the canonical lead itself must run exactly python -m unittest -q; a worker's "
     "test run or git diff does not fulfill this lead integration check. Use one standalone native "
     "exec_command (Codex) or Bash (Claude) invocation. Return the full structured tool result, "
     "including exit code and output. On Codex use text(await tools.exec_command({\"cmd\":\"python -m unittest -q\"})); "
     "Do not batch verification with other commands or print only result.output. "
-    "If supplying SYMPHONY_OUTCOME, return exactly one line with status completed, failed, or blocked; "
-    "never substitute successful or duplicate a marker.\n")
+    'If supplying an outcome, use one valid JSON line: SYMPHONY_OUTCOME: {"status":"completed"}. '
+    'Use failed or blocked when appropriate. Never emit SYMPHONY_OUTCOME: completed or duplicate a marker.\n')
 
 
 def setup_prompt(provider):
@@ -172,9 +173,28 @@ def failure_diagnostics(provider, root, document):
     if phase_path.is_file():
         for phase in json.loads(phase_path.read_text(encoding="utf-8")):
             if phase.get('phase') in {'enable', 'objective', 'reconcile', 'stop'}:
-                phases.append({'phase': phase['phase'], 'resume': phase.get('resume') is True,
+                  phases.append({'phase': phase['phase'], 'resume': phase.get('resume') is True,
                                'returned': phase.get('returned') is True,
-                               'cli_success': phase.get('cli_success') is True})
+                                 'cli_success': phase.get('cli_success') is True})
+    archived_probes = []
+    if provider == 'claude':
+        from native_claude_followup import sequence_rejection_probe
+        for run in runs:
+            session = run.get('session_id')
+            if run.get('provider') != provider or not isinstance(session, str) or not session:
+                continue
+            pending = []
+            for path in (root / 'state').glob('.session-*.json'):
+                try:
+                    record = read_state_snapshot(path)
+                    if record.get('owner_session') == session:
+                        pending.extend(Event(item['event_id'], item['kind'], item['observed_at'], item['payload'])
+                                       for item in record.get('pending', ()))
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+            if pending:
+                archived_probes.append(sequence_rejection_probe(_state_from_dict(document), pending, session,
+                    root / 'primary', {'CLAUDE_CONFIG_DIR': str(home)}, host_evidence, mixed=True))
     return {"enabled": document.get("enabled") is True,
             "activation_guarded": activation.get("state") == "guarded",
             "profile": activation.get("profile") if activation.get("profile") in {"latest", "full", "opus-5-5"} else "unknown",
@@ -194,7 +214,8 @@ def failure_diagnostics(provider, root, document):
                 for run in runs if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'assessed_first_authority': [assessed_first_probe(provider, document, run, home, root / 'primary')
                 for run in runs if run.get('provider') == provider and run.get('assessment', {}).get('size')],
-            **({'claude_phases': claude_phase_diagnostics(root, home)} if provider == 'claude' else {}),
+              **({'claude_phases': claude_phase_diagnostics(root, home)} if provider == 'claude' else {}),
+              **({'claude_archived_sequence': archived_probes} if provider == 'claude' else {}),
             'claude_completion': [claude_completion_probe(document, run.get('session_id'), root / 'primary', home)
                 for run in document.get('active_runs', {}).values()
                 if provider == 'claude' and run.get('provider') == provider and run.get('status') == 'completing'],
@@ -1456,7 +1477,7 @@ def tool_evidence(provider, rows):
 JSON_STRING = r'"(?:[^"\\]|\\.)*"'
 
 
-def composed_call(source, method, *, output_only=False):
+def composed_call(source, method, *, output_only=False, serialized=False):
     """Recognize only a single literal native tool invocation, never evaluate JS."""
     if not isinstance(source, str):
         return None
@@ -1465,6 +1486,8 @@ def composed_call(source, method, *, output_only=False):
     call = rf'tools\.{method}\((?P<argument>{argument})\)'
     wrappers = [rf'text\(await {call}\);?',
                 rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\);?']
+    if serialized:
+        wrappers.append(rf'const (?P<result>\w+) = await {call};\s*text\(JSON\.stringify\((?P=result)\)\);?')
     if output_only:
         wrappers.append(rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\.output\);?')
     for wrapper in wrappers:
@@ -1854,11 +1877,45 @@ def native_call_inventory(provider, rows):
     return calls, results
 
 
-def structured_root_discovery(name, args):
+def structured_root_discovery(name, args, *, provider='', document=None, session='', project=None):
     if name in {'Read', 'Glob', 'Grep', 'read_file', 'AskUserQuestion', 'request_user_input'}:
         return isinstance(args, dict)
-    return (name == 'Skill' and isinstance(args, dict)
-            and args.get('skill') in {'symphony', 'symphony:symphony'})
+    if name == 'Skill' and isinstance(args, dict):
+        return args.get('skill') in {'symphony', 'symphony:symphony'}
+    if provider != 'codex' or not isinstance(document, dict) or project is None:
+        return False
+    details = (args if name == 'exec_command' else composed_call(args, 'exec_command', serialized=True)
+               if name in {'exec', 'functions.exec'} else None)
+    if (not isinstance(details, dict) or not isinstance(details.get('cmd'), str)
+            or set(details) - {'cmd', 'workdir', 'yield_time_ms', 'max_output_tokens'}
+            or 'workdir' in details and (not isinstance(details['workdir'], str)
+                or Path(details['workdir']).resolve() != project.resolve())):
+        return False
+    activation = document.get('activation', {}).get('codex', {})
+    profiles = [activation, *activation.get('session_profiles', ())]
+    roots = {(item.get('runtime_root'), item.get('plugin_root')) for item in profiles
+             if isinstance(item, dict) and item.get('session_id') == session}
+    if len(roots) != 1:
+        return False
+    retained, original = next(iter(roots))
+    if not isinstance(retained, str) or not isinstance(original, str):
+        return False
+    # The exact generated checker verifies the retained tree before importing it.
+    checker = _retained_activation_command(retained, original)
+    if checker and details['cmd'] == checker:
+        return True
+    try:
+        if any(value in details['cmd'] for value in ('$','`','\n','\r')):
+            return False
+        lexer = shlex.shlex(details['cmd'], posix=True, punctuation_chars=';&|<>')
+        lexer.whitespace_split = True
+        argv = list(lexer)
+        allowed = {(project / 'AGENTS.md').resolve(),
+                   (Path(original) / 'skills/symphony/SKILL.md').resolve()}
+        return (len(argv) >= 2 and argv[0] == 'cat'
+                and all((project / value).resolve() in allowed for value in argv[1:]))
+    except (ValueError, OSError):
+        return False
 
 
 def assessed_first_verified(provider, document, run, child_rows, home, project, profile):
@@ -2026,7 +2083,8 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
         # No prior launch can vanish just because it failed or had no result.
         # Unknown execution/write wrappers before admission stay unverified.
         if any(item != call and item[3] <= accepted and not (
-                    structured_root_discovery(item[1], item[2])
+                    structured_root_discovery(item[1], item[2], provider=provider,
+                                              document=document, session=session, project=project)
                     or provider == 'codex' and item[1] == 'wait_agent' and isinstance(item[2], dict))
                for item in calls):
             return False
@@ -2064,7 +2122,8 @@ def assessed_first_probe(provider, document, run, home, project):
                 facts['root_launch_count'] = sum(item[1] in {'Agent', 'spawn_agent'} for item in calls)
                 facts['pre_admission_unsupported_calls'] = sum(item != frame.f_locals.get('call')
                     and frame.f_locals.get('accepted') is not None and item[3] <= frame.f_locals['accepted']
-                    and not (structured_root_discovery(item[1], item[2])
+                    and not (structured_root_discovery(item[1], item[2], provider=provider,
+                                                      document=document, session=run['session_id'], project=project)
                              or provider == 'codex' and item[1] == 'wait_agent' and isinstance(item[2], dict))
                     for item in calls)
             args = frame.f_locals.get('args', {})

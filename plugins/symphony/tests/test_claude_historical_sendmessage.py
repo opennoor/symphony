@@ -9,6 +9,7 @@ from plugins.symphony.symphony.host_evidence import (
     _claude_historical_worker_origin, _claude_historical_worker_terminal,
     _claude_historical_worker_deliveries,
     claude_archived_mixed_sendmessage_sequence,
+    claude_native_parent_completion,
 )
 from plugins.symphony.symphony.model import Event, ProjectState
 from plugins.symphony.symphony.runtime import _observe_delegation, _sendmessage_sequence_digest, event_from_payload, handle
@@ -90,6 +91,54 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
 
     def write_worker(self):
         self.worker.write_text(''.join(json.dumps(row) + '\n' for row in self.rows))
+
+    def test_null_worker_terminal_requires_exact_native_parent_delivery(self):
+        from copy import deepcopy
+        for case in ('valid', 'missing', 'origin', 'producer', 'parent', 'session', 'sidechain', 'not-meta',
+                     'time', 'late', 'wrong-status', 'wrong-id', 'wrong-result', 'duplicate', 'interim-note',
+                     'duplicate-tag', 'nested-result', 'nested-status', 'scalar-attribute', 'unexpected-text',
+                     'missing-stop-reason', 'api-error', 'unfinished-tool'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prepare()
+                terminal = deepcopy(self.rows[1])
+                terminal['message']['stop_reason'] = None
+                text = 'Original worker success.'
+                content = f'<task-notification><task-id>{WORKER}</task-id><status>completed</status><result>{text}</result></task-notification>'
+                notification = {'type': 'user', 'sessionId': SESSION, 'agentId': LEAD, 'isSidechain': True,
+                    'isMeta': True, 'uuid': 'native-parent-result', 'timestamp': '2026-09-29T02:01:40.5Z',
+                    'origin': {'kind': 'task-notification', 'producer': 'session-task'}, 'message': {'content': content}}
+                rows = [notification]
+                if case == 'missing': rows = []
+                if case == 'origin': notification.pop('origin')
+                if case == 'producer': notification['origin']['producer'] = 'user'
+                if case == 'parent': notification['agentId'] = 'foreign'
+                if case == 'session': notification['sessionId'] = 'foreign'
+                if case == 'sidechain': notification['isSidechain'] = False
+                if case == 'not-meta': notification['isMeta'] = False
+                if case == 'time': notification['timestamp'] = '2026-09-29T02:01:39Z'
+                if case == 'late': notification['timestamp'] = self.rows[2]['timestamp']
+                if case == 'wrong-status': notification['message']['content'] = content.replace('completed', 'failed')
+                if case == 'wrong-id': notification['message']['content'] = content.replace(WORKER, 'foreign')
+                if case == 'wrong-result': notification['message']['content'] = content.replace(text, 'Different report.')
+                if case == 'duplicate': rows.append(deepcopy(notification))
+                if case == 'interim-note': notification['message']['content'] = content.replace('</task-notification>', '<note>Background work remains.</note></task-notification>')
+                if case == 'duplicate-tag': notification['message']['content'] = content.replace('</task-notification>', '<status>completed</status></task-notification>')
+                if case == 'nested-result': notification['message']['content'] = content.replace(text, '<text>' + text + '</text>')
+                if case == 'nested-status': notification['message']['content'] = content.replace('completed</status>', 'completed<note>Background work remains.</note></status>')
+                if case == 'scalar-attribute': notification['message']['content'] = content.replace('<status>', '<status interim="true">')
+                if case == 'unexpected-text': notification['message']['content'] = content.replace('</status>', '</status>Background work remains.')
+                if case == 'missing-stop-reason': terminal['message'].pop('stop_reason')
+                if case == 'api-error': terminal['isApiErrorMessage'] = True
+                if case == 'unfinished-tool': terminal['message']['content'].append({'type': 'tool_use', 'name': 'Agent', 'id': 'unfinished'})
+                before = self.rows[2]['timestamp']
+                from plugins.symphony.symphony.host_evidence import _instant
+                self.assertEqual(claude_native_parent_completion(rows, terminal, text, SESSION, LEAD, WORKER,
+                                 before=_instant(before)), case == 'valid')
+                worker_rows = [*self.rows[:1], terminal, *self.rows[2:]]
+                result = _claude_historical_worker_terminal(worker_rows, 0, WORKER, SESSION,
+                    'claude-sonnet-5', 'low', parent_rows=rows, parent=LEAD)
+                self.assertEqual(result is not None, case == 'valid')
 
     def prepare_send(self, *, persist_start=False):
         self.prepare(persist_start=persist_start)

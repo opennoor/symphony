@@ -82,7 +82,8 @@ BODIES = {
         "on this route. If eligible, work directly and end with `SYMPHONY_FAST_DECISION: eligible` "
         "and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`.\n\n"
         "For assessed packets, the matrix fixes your topology. Assign substantive implementation, diagnosis, "
-        "design, review tasks, and product judgment to workers or consultants. Coordinate, review integration, verify, "
+        "design, review tasks, and product judgment to workers or consultants. Delegate implementation before editing; "
+        "your edits integrate returned worker changes. Coordinate, review integration, verify, "
         "and communicate the results.\n\n"
         "- small: assign the substantive work to one worker; integrate and verify its result.\n"
         "- medium: assign substantive work to bounded worker packets; integrate and verify the results.\n"
@@ -102,7 +103,7 @@ BODIES = {
         "review; verify the final tree before success claims. Shipping skills apply only when "
         "authorized. " + PRACTICES + " Verify the integrated "
         "result before you report. Once verified and all children have returned, native successful assessed "
-        "completion is sufficient. If supplied, a `SYMPHONY_OUTCOME:` report must be one valid JSON line; "
+        'completion is sufficient. If reporting an outcome, use one JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; '
         "use blocked or failed when work remains. Archived followup only reconciles the same bounded task; "
         "a new or substantive objective starts a fresh assessment and delegation scope.\n\n"
         "You cannot ask the user questions: record open decisions and assumptions in your result."

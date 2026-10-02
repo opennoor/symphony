@@ -167,6 +167,48 @@ class NativeAssessedFirstTests(unittest.TestCase):
         write()
         self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
 
+    def test_codex_readonly_bootstrap_preserves_assessor_first_authority(self):
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                document, run, children, home, project, profile, roots, write = self.fixture('codex')
+                retained, original = str(home / ('a' * 64)), str(home / 'plugin')
+                document['activation'] = {'codex': {'session_id': run['session_id'],
+                    'runtime_root': retained, 'plugin_root': original}}
+                commands = [smoke._retained_activation_command(retained, original),
+                            smoke.shlex.join(['cat', str(Path(original) / 'skills/symphony/SKILL.md')]),
+                            'cat AGENTS.md']
+                for ordinal, command in enumerate(commands):
+                    arguments = {'cmd': command, 'workdir': str(project)}
+                    name = 'exec_command'
+                    if wrapped:
+                        arguments = 'const r = await tools.exec_command(' + json.dumps(arguments) + '); text(JSON.stringify(r));'
+                        name = 'exec'
+                    roots.insert(1 + ordinal, {'type': 'response_item', 'timestamp': at(0), 'payload': {
+                        'type': 'custom_tool_call' if wrapped else 'function_call', 'name': name,
+                        'call_id': 'bootstrap-' + str(ordinal),
+                        'input' if wrapped else 'arguments': arguments if wrapped else json.dumps(arguments)}})
+                write()
+                self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
+                for command in ('python -m unittest -q', 'cat greet.py', 'cat AGENTS.md; touch greet.py',
+                                'cat AGENTS.md && true', 'cat $(touch greet.py)/AGENTS.md', commands[0] + '; true'):
+                    with self.subTest(rejected=command):
+                        self.assertFalse(smoke.structured_root_discovery('exec_command', {'cmd': command},
+                            provider='codex', document=document, session=run['session_id'], project=project))
+                for conflict in ('session', 'profile', 'shell', 'workdir', 'wrapper'):
+                    with self.subTest(conflict=conflict):
+                        changed = deepcopy(document)
+                        arguments = {'cmd': commands[0], 'workdir': str(project)}
+                        name = 'exec_command'
+                        if conflict == 'session': changed['activation']['codex']['session_id'] = 'foreign'
+                        if conflict == 'profile': changed['activation']['codex']['session_profiles'] = [{
+                            **changed['activation']['codex'], 'runtime_root': str(home / ('b' * 64))}]
+                        if conflict == 'shell': arguments['shell'] = 'untrusted'
+                        if conflict == 'workdir': arguments['workdir'] = str(project / 'foreign')
+                        if conflict == 'wrapper':
+                            name = 'exec'; arguments = 'text(await tools.exec_command(' + json.dumps(arguments) + ')); text(await tools.exec_command({cmd:"work"}));'
+                        self.assertFalse(smoke.structured_root_discovery(name, arguments, provider='codex',
+                            document=changed, session=run['session_id'], project=project))
+
     def test_claude_background_assessment_can_be_accepted_before_final_courtesy_turn(self):
         document, run, children, home, project, profile, roots, write = self.fixture('claude')
         # The root receives the handback while the native child is still writing

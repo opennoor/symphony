@@ -7,9 +7,9 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from plugins.symphony.symphony.adapters import event_from_payload
-from plugins.symphony.symphony.host_evidence import claude_archived_sendmessage_sequence
+from plugins.symphony.symphony.host_evidence import claude_archived_sendmessage_sequence, _claude_native_lead_event
 from plugins.symphony.symphony.model import ProjectState
-from plugins.symphony.symphony.runtime import handle, _root_admission_key
+from plugins.symphony.symphony.runtime import handle, _root_admission_key, _terminal_result_id
 from plugins.symphony.symphony.store import StateStore
 from plugins.symphony.tests import test_claude_host_evidence as fixture
 from plugins.symphony.tests.test_claude_host_evidence import SESSION, LEAD, TYPE, REPORT
@@ -86,6 +86,124 @@ class ClaudeSendMessageTests(unittest.TestCase):
         next(row for row in rows if row.get('uuid') == 'terminal-send-0')['message']['stop_reason'] = None
         self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
         return rows
+
+    def prepare_queued(self, straddling=True):
+        self.prepare(count=3)
+        self.store.finish_session_events(self.store.session_record('claude', SESSION),
+                                        {event.event_id for event in self.events})
+        parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
+        child = [json.loads(line) for line in self.child.read_text().splitlines()]
+        for index in (1, 2):
+            minute = 3 + 2 * (index - 1)
+            next(row for row in parent if row.get('type') == 'assistant'
+                 and row.get('message', {}).get('content', [{}])[0].get('id') == f'send-{index}')['timestamp'] = f'2026-09-29T02:{minute:02}:59Z'
+            next(row for row in parent if row.get('type') == 'user'
+                 and isinstance(row.get('message', {}).get('content'), list)
+                 and row.get('message', {}).get('content', [{}])[0].get('tool_use_id') == f'send-{index}')['timestamp'] = f'2026-09-29T02:{minute:02}:59.5Z'
+            next(row for row in child if row.get('uuid') == f'prompt-send-{index}')['timestamp'] = f'2026-09-29T02:{minute+1:02}:01Z'
+            self.events[2 * index] = replace(self.events[2 * index], observed_at=f'2026-09-29T02:{minute+1:02}:01.1+00:00')
+        self.parent.write_text(''.join(json.dumps(row) + '\n' for row in parent))
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in child))
+        if straddling:
+            self.archived = replace(self.archived, updated_at='2026-09-29T02:03:30+00:00')
+        baseline = _claude_native_lead_event(ProjectState(active_run=self.archived), SESSION,
+            self.project, self.environ, require_missing=False, target_prompt=child[0]['uuid'],
+            allow_archived_assessed_markerless=True)
+        self.assertIsNotNone(baseline)
+        result = _terminal_result_id(baseline)
+        token = 'prompt_id:' + baseline.payload['prompt_id']
+        self.archived = replace(self.archived, assessment={**self.archived.assessment,
+            '_terminal_turns': {LEAD: (token,)}, '_terminal_event_ids': (result,)})
+        receipt = {'provider': 'claude', 'session': SESSION, 'agent': LEAD,
+            'run_id': self.archived.run_id, 'turn': token, 'result': result, 'parent': SESSION,
+            'lead': LEAD, 'status': 'completed', 'native_terminal_id': baseline.event_id,
+            'native_report_hash': hashlib.sha256(baseline.payload['last_assistant_message'].encode()).hexdigest(),
+            'native_owner_generation': self.archived.owner_generation,
+            'native_agent_type': TYPE, 'native_model': baseline.payload['model'],
+            'native_effort': baseline.payload['model_reasoning_effort']}
+        self.store.save(self.project, ProjectState(recent_runs=(self.archived,), terminal_receipts=(receipt,)))
+        self.queue()
+
+    def test_queued_turns_straddling_archive_commit_and_partial_ack_replay(self):
+        for straddling in (False, True):
+            with self.subTest(straddling=straddling):
+                self.setUp()
+                self.prepare_queued(straddling)
+                proof = self.proof()
+                self.assertIsNotNone(proof)
+                self.assertEqual(len(proof[1]), 3)
+                self.assertEqual('baseline' in proof[3], straddling)
+                self.assertIn('callback_until', proof[3]['turns'][0])
+                with patch.object(StateStore, 'finish_session_events', side_effect=OSError('crash')):
+                    with self.assertRaises(OSError): self.call()
+                before = self.store.load(self.project)
+                self.store.finish_session_events(self.store.session_record('claude', SESSION),
+                                                {self.events[1].event_id, self.events[-1].event_id})
+                self.assertNotIn('"decision": "block"', self.call('SessionStart').stdout)
+                after = self.store.load(self.project)
+                self.assertEqual(after.recent_runs, before.recent_runs)
+                self.assertEqual(after.terminal_receipts, before.terminal_receipts)
+                self.assertEqual(len(after.terminal_receipts), 4)
+                self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
+    def test_straddling_queue_requires_exact_credit_order_and_delivery(self):
+        for case in ('receipt', 'terminal-id', 'generation', 'model', 'parent', 'turn', 'result', 'changed-baseline-report',
+                     'terminal-conflict', 'followup-conflict', 'callback-preprompt', 'callback-before-baseline-end',
+                     'missing-delivery', 'failed-delivery', 'duplicate-delivery', 'overlap', 'projection', 'foreign-target'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prepare_queued()
+                state = self.store.load(self.project)
+                if case in ('receipt', 'terminal-id', 'generation', 'model', 'parent', 'turn', 'result'):
+                    fields = {'terminal-id': ('native_terminal_id', 'foreign'), 'generation': ('native_owner_generation', 8),
+                        'model': ('native_model', 'foreign'), 'parent': ('parent', 'foreign'),
+                        'turn': ('turn', 'foreign'), 'result': ('result', 'foreign')}
+                    receipt = dict(state.terminal_receipts[0])
+                    if case != 'receipt': receipt[fields[case][0]] = fields[case][1]
+                    self.store.save(self.project, replace(state, terminal_receipts=() if case == 'receipt' else (receipt,)))
+                if case in ('terminal-conflict', 'followup-conflict'):
+                    receipt = dict(state.terminal_receipts[0])
+                    receipt['native_followup_start_id'] = receipt['native_terminal_id'] + ':followup-start'
+                    receipt['native_terminal_id' if case == 'terminal-conflict' else 'native_followup_start_id'] = 'foreign'
+                    self.store.save(self.project, replace(state, terminal_receipts=(receipt,)))
+                parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
+                delivery = next(row for row in parent if row.get('type') == 'user'
+                    and isinstance(row.get('message', {}).get('content'), list)
+                    and row.get('message', {}).get('content', [{}])[0].get('tool_use_id') == 'send-1')
+                if case == 'missing-delivery': parent.remove(delivery)
+                if case == 'failed-delivery': delivery['message']['content'][0]['is_error'] = True
+                if case == 'duplicate-delivery': parent.append(delivery)
+                if case == 'foreign-target': next(row for row in parent if row.get('type') == 'assistant'
+                    and row.get('message', {}).get('content', [{}])[0].get('id') == 'send-1')['message']['content'][0]['input']['to'] = 'foreign'
+                if case == 'callback-before-baseline-end':
+                    parent[2]['timestamp'] = '2026-09-29T02:01:59Z'
+                    parent[3]['timestamp'] = '2026-09-29T02:01:59.5Z'
+                    self.events[0] = replace(self.events[0], observed_at='2026-09-29T02:01:59.8+00:00')
+                if case == 'callback-preprompt':
+                    self.events[0] = replace(self.events[0], observed_at='2026-09-29T02:03:00.5+00:00')
+                self.parent.write_text(''.join(json.dumps(row) + '\n' for row in parent))
+                child = [json.loads(line) for line in self.child.read_text().splitlines()]
+                if case == 'changed-baseline-report': child[1]['message']['content'][0]['text'] += '\nChanged report.'
+                prompt = next(row for row in child if row.get('uuid') == 'prompt-send-1')
+                if case == 'overlap': prompt['timestamp'] = '2026-09-29T02:03:59.9Z'
+                if case == 'projection': prompt['message']['content'] = 'Foreign prompt.'
+                self.child.write_text(''.join(json.dumps(row) + '\n' for row in child))
+                self.assertIsNone(self.proof())
+
+    def test_queued_committed_receipt_identity_generation_and_report_stay_bound(self):
+        from plugins.symphony.symphony.runtime import _committed_sendmessage_source
+        for field, value in (('native_terminal_id', 'foreign'), ('native_owner_generation', 999),
+                             ('native_report_hash', '0' * 64)):
+            with self.subTest(field=field):
+                self.setUp()
+                self.prepare_queued()
+                self.call()
+                state = self.store.load(self.project)
+                receipts = [dict(receipt) for receipt in state.terminal_receipts]
+                receipts[-1][field] = value
+                changed = replace(state, terminal_receipts=tuple(receipts))
+                self.assertFalse(_committed_sendmessage_source(changed, self.events[-1], SESSION, 1,
+                                                              self.project, self.environ))
 
     def test_exact_obsolete_ack_is_superseded_without_a_completion_receipt(self):
         for hook in ('Stop', 'SessionStart', 'UserPromptSubmit'):
@@ -343,7 +461,9 @@ class ClaudeSendMessageTests(unittest.TestCase):
                         'malformed-final': 'SYMPHONY_OUTCOME: bad',
                         'duplicate-outcome': REPORT + '\n' + REPORT,
                         'markerless-final': 'Done.'}[case]
-                if case == 'overlapping-send': parent[-2]['timestamp'] = '2026-09-29T02:03:30Z'
+                if case == 'overlapping-send':
+                    parent[-2]['timestamp'] = '2026-09-29T02:03:30Z'
+                    child[-2]['timestamp'] = '2026-09-29T02:03:59Z'
                 if case == 'late-result': parent[-3]['timestamp'] = '2026-09-29T02:05:30Z'
                 if case == 'competing-Agent': call['name'] = 'Agent'
                 if case == 'missing-terminal': child.pop(-1)

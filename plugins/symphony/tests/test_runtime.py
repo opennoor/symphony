@@ -3813,7 +3813,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_explicit_invalid_or_blocked_outcome_does_not_complete_native_lead(self):
         for provider in ("codex", "claude"):
-            for marker in ('SYMPHONY_OUTCOME: {broken', 'SYMPHONY_OUTCOME: {}',
+            for marker in ('SYMPHONY_OUTCOME: completed', 'SYMPHONY_OUTCOME: {broken', 'SYMPHONY_OUTCOME: {}',
                            'SYMPHONY_OUTCOME: {"status":"blocked"}'):
                 with self.subTest(provider=provider, marker=marker):
                     choice = route_choice(provider=provider)
@@ -3826,6 +3826,10 @@ class RuntimeTests(unittest.TestCase):
                     self.assertIsNotNone(state.active_run)
                     self.assertEqual(state.active_run.status, "recovering")
                     self.assertIsNone(state.active_run.outcome)
+                    guidance = runtime_module._recovery_guidance(state, provider)
+                    self.assertIn('SYMPHONY_OUTCOME: {"status":"completed"}', guidance)
+                    self.assertIn('blocked or failed', guidance)
+                    self.assertIn('followup_task' if provider == 'codex' else 'SendMessage', guidance)
 
     def test_single_word_codex_task_starts_a_one_shot_run(self):
         result = handle(self.payload("$symphony:symphony summarize"), self.environ)

@@ -3031,7 +3031,7 @@ def require_literal_worker(provider, run, home, project=None, captures=()):
         plugin = Path(__file__).resolve().parents[2] / 'plugins' / 'symphony'
         if str(plugin) not in sys.path:
             sys.path.insert(0, str(plugin))
-        from symphony.host_evidence import claude_substantive_launch
+        from symphony.host_evidence import claude_substantive_launch, _claude_historical_worker_terminal
         from symphony.store import _run_from_dict
         from symphony.model import Event
         latest = rows[-1].get('timestamp') if rows else ''
@@ -3053,12 +3053,12 @@ def require_literal_worker(provider, run, home, project=None, captures=()):
         assistants = [row for row in rows if row.get('type') == 'assistant']
         activity = [row for row in rows if row.get('type') in {'assistant', 'user'}]
         terminal = assistants[-1] if assistants else {}
-        native_message = terminal.get('message', {})
-        closed = (bool(activity) and activity[-1] is terminal and native_message.get('stop_reason') == 'end_turn'
-                  and isinstance(terminal.get('uuid'), str) and bool(terminal['uuid'])
-                  and not any(row.get('message', {}).get('stop_reason') == 'end_turn' for row in assistants[:-1])
-                  and not any(row.get('isApiErrorMessage') is True for row in assistants))
         final = assistant_text(provider, terminal)
+        prompts = [index for index, row in enumerate(rows) if row.get('type') == 'user'
+                   and isinstance(row.get('message', {}).get('content'), str)]
+        closed = (len(prompts) == 1 and _claude_historical_worker_terminal(
+            rows, prompts[0], worker['identity'], run['session_id'], worker['requested_tier'],
+            worker['requested_effort'], parent_rows=lead_rows, parent=run['lead_identity']) is not None)
         literal = closed and final == 'GATE_RELEASED'
         if closed and not literal and not any(line.strip().startswith('SYMPHONY_OUTCOME:') for line in final.splitlines()):
             handbacks = [(block, row) for row in assistants[:-1] for block in row.get('message', {}).get('content', [])
@@ -3083,6 +3083,7 @@ def require_literal_worker(provider, run, home, project=None, captures=()):
 def claude_literal_worker_probe(run, home):
     """Fixed report-shape facts; native report prose stays private."""
     from native_routing_smoke import native_rows, assistant_text, native_call_inventory
+    from symphony.host_evidence import claude_native_parent_completion
     facts = []
     workers = [child for child in run.get('delegations', ()) if child.get('role') == 'worker']
     for ordinal, worker in enumerate(workers[:12]):
@@ -3094,8 +3095,14 @@ def claude_literal_worker_probe(run, home):
             terminal = assistants[-1] if assistants else {}
             report = assistant_text('claude', terminal)
             calls, results = native_call_inventory('claude', rows)
+            lead_rows = native_rows('claude', home, run['lead_identity']) if run.get('lead_identity') else []
             handbacks = [call for call in calls if call[1] == 'SubagentHandback']
             item.update(native_reader_available=True, assistant_count=len(assistants),
+                native_parent_completion_verified=claude_native_parent_completion(
+                    lead_rows, terminal, report, run.get('session_id', ''), run.get('lead_identity', ''), worker['identity']),
+                native_parent_notification_count=sum(isinstance(row.get('origin'), dict)
+                    and row['origin'].get('kind') == 'task-notification'
+                    and row['origin'].get('producer') == 'session-task' for row in lead_rows),
                 final_activity_is_terminal=bool(activity) and activity[-1] is terminal,
                   terminal_is_end_turn=terminal.get('message', {}).get('stop_reason') == 'end_turn',
                   terminal_stop_reason_present='stop_reason' in terminal.get('message', {}),
@@ -3834,6 +3841,13 @@ def failure_state(root, provider):
                         run.get('provider') == provider and run.get('session_id') == gate_session
                         for run in (*document.get('active_runs', {}).values(), *document.get('recent_runs', [])))):
                     cli_sessions[label] = gate_session
+        if case == 'case' and not cli_sessions:
+            owners = {run.get('session_id') for run in (
+                *document.get('active_runs', {}).values(), *document.get('recent_runs', ()))
+                if run.get('provider') == provider and isinstance(run.get('session_id'), str)
+                and run['session_id']}
+            if len(owners) == 1:
+                cli_sessions['a'] = owners.pop()
         activation = document.get("activation", {}).get(provider, {})
         profiles = ([activation, *activation.get("session_profiles", [])]
                     if isinstance(activation, dict) else [])

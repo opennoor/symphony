@@ -65,6 +65,13 @@ CONTROLS = {
 ROLES = {"assessor", "consultant", "lead", "worker"}
 HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
 _ROOT_EXECUTION_TOOLS = {"Bash", "PowerShell", "Write", "Edit", "NotebookEdit"}
+_ASSESSED_LEAD_CONTRACT = (
+    "delegate implementation, diagnosis, design, review, and product judgment to workers or consultants; "
+    "small tasks need one worker; medium: bounded worker packets; large: delegate project work. "
+    "Delegate implementation before editing. Integrate returned worker changes and verify. "
+    "Use each child's matrix cell. Complete after all children return and verification passes. "
+    'If reporting an outcome, use one JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; use blocked or failed if work remains. '
+)
 
 
 def _root_admission_key(provider: str, payload: Mapping) -> str:
@@ -1990,13 +1997,17 @@ def _sendmessage_late_sources_valid(run: RunState, sequence: Mapping,
         observed = _instant(item.get('observed_at'))
         next_call = min((_instant(turn['called_at']) for turn in turns
                          if called is not None and _instant(turn['called_at']) > called), default=None)
+        if 'callback_until' in turn:
+            next_call = _instant(turn['callback_until'])
         if (item.get('agent') != native.payload['agent_id'] or item.get('turn') != _child_turn_token(native.payload)
                 or item.get('result') != _terminal_result_id(native) or called is None or observed is None
                 or observed < called or next_call is not None and observed >= next_call
                 or item['kind'] == 'subagent_stopped' and observed < _instant(native.observed_at)
                 or _sendmessage_commit_boundary(sequence) is None
-                or observed > _sendmessage_commit_boundary(sequence)
-                or item['kind'] == 'subagent_started' and observed > _instant(native.observed_at)
+                  or observed > _sendmessage_commit_boundary(sequence)
+                  or item['kind'] == 'subagent_started' and 'callback_from' in turn
+                     and observed < _instant(turn['callback_from'])
+                  or item['kind'] == 'subagent_started' and observed > _instant(native.observed_at)
                 or item['kind'] == 'subagent_stopped' and item.get('source_turn_id') != native.payload['prompt_id']):
             return False
     return True
@@ -2066,6 +2077,8 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                     turns = (*sequence['turns'], *sequence.get('historical_workers', {}).get('turns', ()))
                     next_call = min((_instant(item['called_at']) for item in turns
                                      if called is not None and _instant(item['called_at']) > called), default=None)
+                    if 'callback_until' in turn:
+                        next_call = _instant(turn['callback_until'])
                     committed = _sendmessage_commit_boundary(sequence)
                     if (turn.get('disposition') != 'superseded'
                             or turn.get('superseded_by') != proof[1][-1].event_id
@@ -2086,8 +2099,10 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                                    or next_call is not None and _instant(item['observed_at']) >= next_call
                                    or item['kind'] == 'subagent_stopped'
                                       and _instant(item['observed_at']) < _instant(native.observed_at)
-                                   or item['kind'] == 'subagent_started'
-                                      and _instant(item['observed_at']) > _instant(native.observed_at)
+                                     or item['kind'] == 'subagent_started'
+                                        and _instant(item['observed_at']) > _instant(native.observed_at)
+                                     or item['kind'] == 'subagent_started' and 'callback_from' in turn
+                                        and _instant(item['observed_at']) < _instant(turn['callback_from'])
                                    for item in witnesses)
                             or receipts or token in terminal_turns.get(lead_identity, ())
                             or native.event_id + ':followup-start' in run.assessment.get('_start_event_ids', ())
@@ -2105,6 +2120,12 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                     # and any supplied Start must still agree exactly.
                     if (any(key in receipt and receipt[key] != expected
                             for key, expected in metadata.items())
+                            or receipt.get('native_terminal_id') not in {None, '', native.event_id}
+                            or receipt.get('native_report_hash') not in {None, '', hashlib.sha256(
+                                native.payload['last_assistant_message'].encode()).hexdigest()}
+                            or 'native_owner_generation' in receipt and (
+                                type(receipt['native_owner_generation']) is not int
+                                or receipt['native_owner_generation'] != sequence['owner_generation'])
                             or ('native_fast_escalation' in receipt
                                 and receipt['native_fast_escalation'] is not False)
                             or (receipt.get('native_launch_prompt_hash') not in {None, ''}
@@ -2147,7 +2168,9 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                     historical = native.payload['agent_id'] != lead_identity
                     if _claude_sendmessage_late_callback(source, native, session, called, environ,
                             role='worker' if historical else 'lead',
-                            parent=lead_identity if historical else session, committed_at=committed):
+                            parent=lead_identity if historical else session, committed_at=committed,
+                            native_boundaries='callback_until' in turn,
+                            callback_until=_instant(turn.get('callback_until'))):
                         candidates.append((run, sequence, native))
                 continue
             for witness in run.assessment.get('_claude_sendmessage_late_sources', ()):
@@ -2531,6 +2554,10 @@ def _observe_delegation(
             "status": str(source.payload.get("status") or "completed").lower(),
         }
         if source.payload.get("_symphony_native_recovery"):
+            receipt["native_terminal_id"] = source.event_id
+            receipt["native_owner_generation"] = state.active_run.owner_generation
+            receipt["native_report_hash"] = hashlib.sha256(
+                str(source.payload.get("last_assistant_message") or "").encode()).hexdigest()
             receipt["native_agent_type"] = str(source.payload.get("agent_type") or "")
             receipt["native_model"] = str(source.payload.get("model") or "")
             receipt["native_effort"] = str(source.payload.get("model_reasoning_effort") or "")
@@ -4029,12 +4056,7 @@ def _render_actions(
                 f" ({profile} profile): {model}/{effort}. Spawn only this model and effort{agent} "
                 "with the accepted SYMPHONY_ROUTE marker; keep the root thin. "
                 f"Accepted topology: {route.get('execution', '')}. Relay this lead contract: "
-                "assign substantive implementation, diagnosis, design, review tasks, and product judgment to workers "
-                "or consultants; small tasks need one worker, medium tasks need bounded worker packets, "
-                "and large tasks delegate project work. The lead coordinates, reviews integration, and verifies results. "
-                "Use the matrix for each child packet's own size/complexity. After verification and all children "
-                "have returned, native successful assessed completion is sufficient. If supplied, a `SYMPHONY_OUTCOME:` "
-                "report must be one valid JSON line; use blocked or failed when work remains."}))
+                + _ASSESSED_LEAD_CONTRACT}))
         elif action.kind == "reject_lead_replacement":
             lead = state.active_run.lead_identity if state.active_run else "the registered lead"
             rendered.append(Action("inject_context", {"text":
@@ -4210,8 +4232,9 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
     """The same assessor/lead packet contract for escalation and direct assessment."""
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
-        "On Codex, use `fork_turns=\"none\"` for assessor and assessed lead. Task names replace model punctuation "
-        "with underscores: gpt-6.1-sol becomes gpt_6_1_sol. Append a unique suffix if occupied. Require one exact "
+        "On Codex, use `fork_turns=\"none\"` for assessor and assessed lead. Name them "
+        "`symphony_<role>_<model>_<effort>`; use underscores in model names (gpt_6_1_sol). "
+        "Add a suffix if occupied. Require one exact "
         "`SYMPHONY_ASSESSMENT: {\"size\":\"small|medium|large\",\"complexity\":\"simple|mixed|complex\",\"risk\":\"normal|high\","
         "\"rationale\":\"...\",\"topology\":\"...\"}` line. "
         if provider == "codex"
@@ -4247,12 +4270,8 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         'explicit model/reasoning_effort from its own cell, underscore `symphony_worker_<model>_<effort>` '
           'task name with a unique suffix if occupied, and a packet starting `SYMPHONY_ROLE: worker`. '
         "Relay this matrix lead contract (assessor topology is advisory): "
-        "assign substantive work to workers or consultants; small tasks need one worker, medium tasks need "
-        "bounded worker packets, and large tasks delegate project work. The lead coordinates, integrates, "
-        "and verifies results. Use the matrix for each child packet's own size/complexity. "
-        "After verification and all children have returned, native successful assessed completion is sufficient. "
-        "If supplied, a `SYMPHONY_OUTCOME:` report must be one valid JSON line; use blocked or failed when work remains. "
-        "Archived followup only reconciles the same bounded task. New objectives need a fresh managed scope; "
+        + _ASSESSED_LEAD_CONTRACT
+        + "Archived followup only reconciles the same bounded task. New objectives need a fresh managed scope; "
         "substantive work needs fresh assessment. Never credit previous-task workers to it. "
         "Relay the task in full: the lead cannot see this conversation, so if the request has several parts, "
         "every part goes in the packet and the acceptance check covers all of them. "
@@ -4414,7 +4433,9 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     retry = ("For this retryable Codex lead, call followup_task on the original spawn_agent "
              "task_name (lowercase letters, digits, and underscores), not its /root/ path or UUID. "
              "A completed host roster entry alone does not prove the agent unavailable; do not spawn "
-             "another lead for that name. After its result, finish this root turn so native Stop can "
+             "another lead for that name. Ask it for one observed-result JSON line: "
+             '`SYMPHONY_OUTCOME: {"status":"completed"}`; use blocked or failed if work remains. '
+             "After its result, finish this root turn so native Stop can "
              "reconcile the actual outcome; a missing text marker alone never authorizes replacement. "
              "Only an explicit unavailable error from followup_task can "
              "authorize one replacement; Symphony verifies the original spawn, exact error, and native "
@@ -4428,11 +4449,12 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
         f"For this Claude lead, await an active background result. If its native turn has ended "
         f"without a reconciled outcome, use SendMessage with `to: {run.lead_identity}` to resume "
         "that same agent and ask it to report its observed result with one exact "
-        "SYMPHONY_OUTCOME JSON line. Await its returned result before normal Stop. "
+        '`SYMPHONY_OUTCOME: {"status":"completed"}` JSON line; use blocked or failed if work remains. '
+        "Await its returned result before normal Stop. "
         "Do not start another task or invent a missing outcome. "
         if run.provider == "claude" and run.lead_identity and run.status in {"active", "recovering"}
         and not route_mismatch
-        and any(item.identity == run.lead_identity and item.state in {"working", "pending", "failed"}
+        and any(item.identity == run.lead_identity and item.state in {"working", "pending", "failed", "completed"}
                 for item in run.delegations) else ""
     )
     return (

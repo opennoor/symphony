@@ -114,9 +114,12 @@ def _receipt_from_dict(value: Any) -> dict[str, object]:
     required = ("provider", "session", "agent", "run_id",
                 "turn", "result", "parent", "lead")
     optional = ("status", "native_agent_type", "native_model", "native_effort",
-                "native_launch_prompt_hash")
+                "native_launch_prompt_hash", "native_terminal_id", "native_report_hash")
     if 'native_fast_escalation' in receipt and type(receipt['native_fast_escalation']) is not bool:
         raise ValueError('terminal receipt.native_fast_escalation must be a boolean')
+    if 'native_owner_generation' in receipt and (
+            type(receipt['native_owner_generation']) is not int or receipt['native_owner_generation'] < 0):
+        raise ValueError('terminal receipt.native_owner_generation must be a nonnegative integer')
     return {**{key: _text(receipt.get(key), f"terminal receipt.{key}")
                for key in required},
             **{key: _text(receipt.get(key, ""), f"terminal receipt.{key}")
@@ -124,6 +127,8 @@ def _receipt_from_dict(value: Any) -> dict[str, object]:
             **({'native_followup_start_id': _text(receipt['native_followup_start_id'],
                     'terminal receipt.native_followup_start_id')}
                if 'native_followup_start_id' in receipt else {}),
+            **({'native_owner_generation': receipt['native_owner_generation']}
+               if 'native_owner_generation' in receipt else {}),
             **({'native_fast_escalation': receipt['native_fast_escalation']}
                if 'native_fast_escalation' in receipt else {})}
 
