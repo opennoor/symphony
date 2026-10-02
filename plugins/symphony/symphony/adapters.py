@@ -204,9 +204,14 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                         prompt_id = record.get("uuid")
                         report, final = "", ""
                     continue
-                if isinstance(record, dict) and record.get("type") == "assistant" and isinstance(content, list):
+                if record.get("type") == "assistant":
+                    if not isinstance(content, list) or any(
+                            not isinstance(item, dict) or not isinstance(item.get("type"), str)
+                            or (item["type"] == "text" and not isinstance(item.get("text"), str))
+                            for item in content):
+                        return ""
                     final = "\n".join(item.get("text", "") for item in content
-                                      if isinstance(item, dict) and item.get("type") == "text")
+                                      if item["type"] == "text")
                 for item in content if isinstance(content, list) else ():
                     if (
                         isinstance(item, dict)
@@ -214,8 +219,9 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                         and item.get("name") == "SubagentHandback"
                     ):
                         values = item.get("input")
-                        if isinstance(values, dict):
-                            report = str(values.get("message") or report)
+                        if not isinstance(values, dict) or not isinstance(values.get("message"), str):
+                            return ""
+                        report = values["message"]
     except (OSError, TypeError, ValueError, AttributeError):
         return ""
     turns.append((prompt_id, report, final))

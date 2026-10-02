@@ -117,6 +117,29 @@ class AdapterContractTests(unittest.TestCase):
                     self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
                                      "New final.")
 
+    def test_malformed_later_claude_assistant_never_reuses_a_prior_handback(self):
+        rows = [
+            {"type": "user", "uuid": "turn", "message": {"content": "Task."}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use",
+                "name": "SubagentHandback", "input": {"message": "Delivered report."}}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Final."}]}}]
+        malformed = [None, {}, [{"type": "text", "text": None}], [None], [{"text": "Bad."}],
+            [{"type": "tool_use", "name": "SubagentHandback", "input": {}}],
+            [{"type": "tool_use", "name": "SubagentHandback", "input": {"message": None}}]]
+        for content in malformed:
+            for turn_id in (None, "turn"):
+                for callback in ("Final.", ""):
+                    with self.subTest(content=content, turn_id=turn_id, callback=callback), TemporaryDirectory() as temporary:
+                        transcript = Path(temporary) / "child.jsonl"
+                        transcript.write_text(''.join(json.dumps(row) + '\n' for row in
+                            [*rows, {"type": "assistant", "message": {"content": content}}]), encoding="utf-8")
+                        payload = {"hook_event_name": "SubagentStop", "agent_id": "child",
+                            "agent_transcript_path": str(transcript), "last_assistant_message": callback}
+                        if turn_id is not None:
+                            payload["turn_id"] = turn_id
+                        self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
+                                         callback)
+
     def test_claude_handback_stays_in_its_native_child_turn(self):
         blocked = 'SYMPHONY_OUTCOME: {"status":"blocked"}'
         completed = 'SYMPHONY_OUTCOME: {"status":"completed"}'
