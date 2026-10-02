@@ -196,7 +196,7 @@ class PackageContractTests(unittest.TestCase):
             records = [str(directory / 'python.exe') for directory in directories[:-1]] + [str(probe)]
             code = 'import sys;sys.stdout.buffer.write(' + repr(''.join('"' + path + '"\n' for path in records)) + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
             relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
-                        .replace('__SYMPHONY_BOOTSTRAP__', 'print(123)'), code)
+                        .replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)'), code)
             for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
                 result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
                     relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
@@ -217,7 +217,7 @@ class PackageContractTests(unittest.TestCase):
             records = [str(broken / 'python.exe'), str(broken / 'python.exe'), str(probe)]
             code = 'import sys;sys.stdout.buffer.write(' + repr(''.join('"' + path + '"\n' for path in records)) + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
             relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
-                        .replace('__SYMPHONY_BOOTSTRAP__', 'print(123)'), code)
+                        .replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)'), code)
             for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
                 result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
                     relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
@@ -239,7 +239,7 @@ class PackageContractTests(unittest.TestCase):
                             output += '"unfinished'
                         code = 'import sys,time;sys.stdout.buffer.write(' + repr(output) + ".encode('utf-16-le'));sys.stdout.buffer.flush();time.sleep(20)"
                         relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
-                                    .replace('__SYMPHONY_BOOTSTRAP__', 'print(123)'), code)
+                                    .replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)'), code)
                         began = time.monotonic()
                         result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
                             relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
@@ -259,7 +259,7 @@ class PackageContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='slow interpreter probe ') as temporary:
             directory = Path(temporary)
             probe = self._probe_executable(directory, delay=1000)
-            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)')
             if os.name != 'nt':
                 code = 'import sys;sys.stdout.buffer.write(' + repr('"' + str(probe) + '"\n') + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
                 relay = self._mock_windows_discovery(relay, code)
@@ -289,7 +289,7 @@ class PackageContractTests(unittest.TestCase):
             entries = [r'\\symphony.invalid\unavailable', '', '.', 'C:relative', r'\relative', '"' + str(good) + '"']
             entries.extend(map(str, directories))
             self.assertGreater(len(';'.join(entries)), 8191)
-            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)')
             for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
                 began = time.monotonic()
                 result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
