@@ -3,12 +3,23 @@
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import datetime
 
 from .model import Action, Delegation, Event, ProjectState, RunState, persistable
 
 
 _ACTIVE_STATES = {"active", "created", "pending", "running", "waiting", "working"}
 _EVENT_HISTORY_LIMIT = 200
+
+
+def _proof_instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return instant if instant.tzinfo is not None else None
+    except ValueError:
+        return None
 
 
 def _active_identities(run: RunState) -> list[str]:
@@ -379,8 +390,17 @@ def _substantive_child_completed(run: RunState) -> bool:
     # Pre-1.7 accepted contracts lack this flag; changing their rule mid-run
     # would strand leads after a plugin update.
     if contract.get('review_required') is True:
-        return (any(proof.get('reviewed') is True for proof in completed)
-                and any(proof.get('reviewed') is not True for proof in completed))
+        work = [_proof_instant(proof.get('completed_at')) for proof in completed
+                if proof.get('reviewed') is not True]
+        if not work or any(instant is None for instant in work):
+            return False
+        for proof in completed:
+            if proof.get('reviewed') is True:
+                start = _proof_instant(proof.get('admitted_at'))
+                end = _proof_instant(proof.get('completed_at'))
+                if start and end and end > start > max(work):
+                    return True
+        return False
     return bool(completed)
 
 

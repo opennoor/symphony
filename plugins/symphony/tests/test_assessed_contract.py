@@ -115,6 +115,16 @@ class AssessedContractTests(unittest.TestCase):
                     self.child('reviewer', 'worker', True, 'review-1', report='SYMPHONY_REVIEW: passed')
                     self.assertFalse(_substantive_child_completed(self.state.active_run))
 
+                with self.subTest(provider=provider, sizing=sizing, case='stale-review'):
+                    self.begin(provider, sizing=sizing)
+                    self.child('early-reviewer', 'worker', False, 'review-1')
+                    self.child('early-reviewer', 'worker', True, 'review-1', report='SYMPHONY_REVIEW: passed')
+                    self.worker()
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+                    self.child('fresh-reviewer', 'worker', False, 'review-2')
+                    self.child('fresh-reviewer', 'worker', True, 'review-2', report='SYMPHONY_REVIEW: passed')
+                    self.assertTrue(_substantive_child_completed(self.state.active_run))
+
                 with self.subTest(provider=provider, sizing=sizing, case='old-contract'):
                     self.begin(provider, sizing=sizing)
                     run = self.state.active_run

@@ -2484,6 +2484,7 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
                     if isinstance(report, str) else [])
     proofs[identity] = {**proof, **(binding or {}),
                         'successful': successful and binding is not None,
+                        'completed_at': source.observed_at if successful and binding is not None else '',
                         'reviewed': successful and binding is not None
                         and review_lines == ['SYMPHONY_REVIEW: passed']}
     if proofs[identity]['successful'] is True:
