@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 
-from native_managed_concurrency import prepare_baseline_capture, projects, run_git, state_file
+from native_managed_concurrency import prepare_baseline_capture, projects, run_git, state_file, read_state_snapshot
 
 PLUGIN = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
 sys.path.insert(0, str(PLUGIN))
@@ -44,6 +44,10 @@ class GreetingTests(unittest.TestCase):
     def test_default(self):
         self.assertEqual(greet('Ada'), 'Hello, Ada!')
 """
+FIXTURE_COMMAND_INSTRUCTIONS = (
+    "Run the requested test command in one standalone native exec_command (Codex) or Bash (Claude) call. "
+    "Return the full structured result including exit code and output. On Codex use "
+    "text(await tools.exec_command({\"cmd\":\"python -m unittest -q\"})); do not print only result.output.\n")
 FIXTURE_INSTRUCTIONS = (
     "This is a disposable greeting fixture. Use native apply_patch, Write, or Edit for file changes. "
     "Relay this fixture acceptance contract unchanged to the canonical assessed lead. After ALL workers "
@@ -334,7 +338,7 @@ def lifecycle_diagnostics(provider, root, document):
     """Bounded state categories; identities, messages and arbitrary reasons stay private."""
     store = StateStore(root / 'state')
     result = []
-    for run in document.get('active_runs', {}).values():
+    for run in (*document.get('active_runs', {}).values(), *document.get('recent_runs', [])):
         if run.get('provider') != provider:
             continue
         assessment = run.get('assessment', {})
@@ -377,7 +381,8 @@ def lifecycle_diagnostics(provider, root, document):
         conditions['interrupted_children'] = any(child.get('state') == 'interrupted'
                                                  for child in run.get('delegations', []))
         conditions['successful_outcome'] = (run.get('outcome') or {}).get('status') in {'completed', 'done', 'success', 'succeeded'}
-        result.append({'pending_kinds': kinds, 'invocation_matches': matches, 'records': records,
+        result.append({'archived_owner': run not in document.get('active_runs', {}).values(),
+                       'pending_kinds': kinds, 'invocation_matches': matches, 'records': records,
                        'stop_conditions': conditions,
                        **({'pending_terminals': pending_terminals,
                            'pending_terminal_details_truncated': kinds['subagent_stopped'] > len(pending_terminals)}
@@ -726,7 +731,8 @@ def fast_native_identity(provider, rows, identity, run, home=None, project=None)
         spawn = header.get('source', {}).get('subagent', {}).get('thread_spawn', {})
         expected = 'symphony_lead_fast_' + re.sub(r'\W', '_', fast['model']) + '_' + fast['effort']
         return (header.get('id') == identity and isinstance(header.get('agent_path'), str)
-                and header['agent_path'].rsplit('/', 1)[-1] == expected
+                and re.fullmatch(re.escape('/root/' + expected) + r'(?:_[a-z0-9_]+)?', header['agent_path']) is not None
+                and spawn.get('agent_path', header['agent_path']) == header['agent_path']
                 and spawn.get('parent_thread_id') == run.get('session_id'))
     return (claude_fast_launch_identity(home, project, identity, run, fast)
             and all(row.get('agentId') == identity and row.get('sessionId') == run.get('session_id')
@@ -1610,7 +1616,7 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     greeting = project / "greet.py"
     greeting.write_text("def greet(name):\n    return f'" + ("hello" if case == "run-and-fix" else "Hello") + ", {name}!'\n")
     (project / "test_greet.py").write_text(TEST)
-    (project / "AGENTS.md").write_text(FIXTURE_INSTRUCTIONS)
+    (project / "AGENTS.md").write_text(FIXTURE_COMMAND_INSTRUCTIONS if case == 'command' else FIXTURE_INSTRUCTIONS)
     run_git("add", ".", cwd=project)
     run_git("commit", "-m", "greeting fixture", cwd=project)
     initial_hash = fingerprint(greeting)
@@ -1676,23 +1682,23 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     state_path = state_file(state_dir, project)
     require(state_path.is_file(), "installed enable hook did not create durable state")
     version = json.loads((candidate / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"]
-    assert_enabled_fixture(json.loads(state_path.read_text(encoding="utf-8")), provider, profile, version)
+    assert_enabled_fixture(read_state_snapshot(state_path), provider, profile, version)
     run(prompt, provider == "claude")
     if provider == "codex":
         matches = re.findall(r"^session id: ([0-9a-f-]+)$", (logs / "stderr").read_text(encoding="utf-8"), re.MULTILINE)
         require(len(matches) == 2 and matches[0] != matches[1], "native enable/objective sessions are missing or reused")
         session = matches[-1]
     require(state_path.is_file(), "installed native hooks did not create durable state")
-    document = json.loads(state_path.read_text(encoding="utf-8"))
+    document = read_state_snapshot(state_path)
     owner = f"{provider}:{session}"
     active = lambda doc: doc.get("active_runs", {}).get(owner)
     if provider == "claude" and active(document):
         # Background native results may need a same-session root turn to reconcile.
         run("Continue this Symphony session after its background results; reconcile the existing work and finish.", True, 'reconcile')
-        document = json.loads(state_path.read_text(encoding="utf-8"))
+        document = read_state_snapshot(state_path)
         if (active(document) or {}).get("status") == "completing":
             run("/symphony:stop", True, 'stop')
-            document = json.loads(state_path.read_text(encoding="utf-8"))
+            document = read_state_snapshot(state_path)
     require(active(document) is None, "native Stop did not archive the run")
     runs = [item for item in document.get("recent_runs", []) if item.get("session_id") == session]
     require(len(runs) == 1 and runs[0]["status"] == "completed", "native run did not complete exactly once")
@@ -1716,13 +1722,13 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
         run('New wholly mechanical Symphony objective: run python -m unittest -q again and report the result. '
             'The preceding objective is archived. Use a fresh fast lead for this new objective, '
             'without resuming the preceding child.', True, 'objective')
-        document = json.loads(state_path.read_text(encoding='utf-8'))
+        document = read_state_snapshot(state_path)
         if provider == 'claude' and active(document):
             run('Reconcile only the new mechanical objective and finish after its background result.', True, 'reconcile')
-            document = json.loads(state_path.read_text(encoding='utf-8'))
+            document = read_state_snapshot(state_path)
             if (active(document) or {}).get('status') == 'completing':
                 run('/symphony:stop', True, 'stop')
-                document = json.loads(state_path.read_text(encoding='utf-8'))
+                document = read_state_snapshot(state_path)
         require(active(document) is None, 'second mechanical objective did not archive')
         fresh = fresh_command_run_verified(document, original, provider, session, original_receipts,
                                            store, greeting, initial_hash)
@@ -1779,7 +1785,11 @@ def native_call_inventory(provider, rows):
                     args = json.loads(args)
                 calls.append((payload.get('call_id'), payload.get('name'), args, when, ordinal, row))
             elif payload.get('type') in {'function_call_output', 'custom_tool_call_output'}:
-                results.setdefault(payload.get('call_id'), []).append((payload.get('output'), when, ordinal, False))
+                output = payload.get('output')
+                failed = (payload.get('is_error') is True or payload.get('isError') is True
+                          or isinstance(output, str) and re.search(
+                              r'Error:|Unknown model `|"isError"\s*:\s*true|exit code [1-9]|"exit_code"\s*:\s*[1-9]', output) is not None)
+                results.setdefault(payload.get('call_id'), []).append((output, when, ordinal, failed))
         else:
             message = row.get('message', {})
             content = message.get('content') if isinstance(message, dict) else None
@@ -1825,8 +1835,8 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
         history = document.get('event_history', ())
         admissions = [item for item in history if item.get('event_id') == contract['epoch'] + ':assessment:assessment_accepted'
                       and item.get('kind') == 'assessment_accepted' and item.get('observed_at') == contract['accepted_at']]
-        terminals = [item for item in history if item.get('event_id') == contract['epoch'] + ':delegation:delegation_updated'
-                     and item.get('kind') == 'delegation_updated' and item.get('payload', {}).get('identity') == identity
+        terminals = [item for item in history if item.get('kind') == 'delegation_updated'
+                     and item.get('payload', {}).get('identity') == identity
                      and item.get('payload', {}).get('state') == 'completed']
         if (accepted is None or len(admissions) != 1 or len(terminals) != 1
                 or any(admissions[0].get('payload', {}).get(key) != run['assessment'].get(key)
@@ -1934,12 +1944,8 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
                     or Path(launch_row['cwd']).resolve() != project.resolve()):
                 return False
             result, returned, result_index, _ = paired[0]
-            # Meta binds the exact child UUID; result must independently carry
-            # that same ID, never a substring from arbitrary report prose.
-            text = result if isinstance(result, str) else '\n'.join(
-                item['text'] for item in result if isinstance(item, dict) and item.get('type') == 'text')
-            if len(re.findall(r'(?m)^agentId: ' + re.escape(identity) + r'(?:[ \t]|$)', text)) != 1:
-                return False
+            # The child metadata binds this exact native launch, including
+            # background ACKs whose text does not contain the child UUID.
             activity = [row for row in rows if row.get('type') in {'user', 'assistant'}]
             if any(row.get('sessionId') != session or row.get('agentId') != identity
                    or row.get('isSidechain') is not True or row.get('isApiErrorMessage') is True for row in activity):
@@ -1969,7 +1975,6 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
         if (began is None or completed is None or returned is None or not lead_starts
                 or call[3] > began or call[3] > returned or call[4] >= result_index
                 or began > completed or accepted < began
-                or completed >= host_evidence._instant(lead_starts[0].get('timestamp'))
                 or accepted >= host_evidence._instant(lead_starts[0].get('timestamp'))):
             return False
         # No prior launch can vanish just because it failed or had no result.
@@ -2023,7 +2028,7 @@ def assessed_first_probe(provider, document, run, home, project):
     return facts
 
 
-def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows, project):
+def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows, project, run=None):
     """A worker's test output cannot stand in for the lead's later integration call."""
     try:
         calls, results = native_call_inventory(provider, lead_rows)
@@ -2041,9 +2046,14 @@ def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows,
                     header = child_rows[worker['identity']][0]['payload']
                     exact = isinstance(output, str) and json.loads(output).get('task_name') == header.get('agent_path')
                 else:
-                    text = output if isinstance(output, str) else '\n'.join(
-                        block['text'] for block in output if isinstance(block, dict) and block.get('type') == 'text')
-                    exact = len(re.findall(r'(?m)^agentId: ' + re.escape(worker['identity']) + r'(?:[ \t]|$)', text)) == 1
+                    proof = (run or {}).get('assessment', {}).get('_substantive_children', {}).get(worker['identity'], {})
+                    scope = {'run_id': (run or {}).get('run_id'), 'lead': (run or {}).get('lead_identity'),
+                             'owner_generation': (run or {}).get('owner_generation'),
+                             'epoch': (run or {}).get('assessment', {}).get('substantive_contract', {}).get('epoch')}
+                    exact = (proof.get('successful') is True and proof.get('role') == 'worker'
+                             and proof.get('parent') == scope['lead'] and all(scope.values())
+                             and all(proof.get(key) == value for key, value in scope.items())
+                             and proof.get('launch_hash') == hashlib.sha256(call_id.encode()).hexdigest())
                 if exact:
                     rows = child_rows[worker['identity']]
                     if provider == 'codex':
@@ -2061,6 +2071,36 @@ def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows,
                                 or any(row.get('isApiErrorMessage') is True for row in activity)):
                             return False
                         completed = host_evidence._instant(activity[-1].get('timestamp'))
+                    child_calls, child_results = native_call_inventory(provider, rows)
+                    handbacks = [item for item in child_calls if item[1] == 'SubagentHandback'] if provider == 'claude' else []
+                    if provider == 'codex' and child_calls and child_calls[-1][1] == 'send_message' and run:
+                        candidate = child_calls[-1]
+                        args = candidate[2]
+                        parent = rows[0]['payload'].get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id')
+                        if (parent and parent == run.get('lead_identity') and isinstance(args, dict) and args.get('target')
+                                and args.get('target') in {parent, lead_rows[0].get('payload', {}).get('agent_path')}):
+                            handbacks = [candidate]
+                    if handbacks:
+                        if len(handbacks) != 1 or child_calls[-1] != handbacks[0]:
+                            return False
+                        handback = handbacks[0]
+                        response = child_results.get(handback[0], ())
+                        if (len(response) != 1 or response[0][3] or response[0][1] is None
+                                or not isinstance(handback[2], dict) or not isinstance(handback[2].get('message'), str)
+                                or not handback[2]['message'] or response[0][2] <= handback[4]
+                                or response[0][1] < handback[3] or completed is None or response[0][1] > completed):
+                            return False
+                        for prior in child_calls[:-1]:
+                            prior_result = child_results.get(prior[0], ())
+                            if (len(prior_result) != 1 or prior_result[0][1] is None
+                                    or not prior[3] <= prior_result[0][1] <= handback[3]
+                                    or not prior[4] < prior_result[0][2] < handback[4]):
+                                return False
+                        # Earlier diagnostic failures may be repaired; all
+                        # their results must be settled before successful handoff.
+                        # Native handoff can deliver the finished report before
+                        # the child's final courtesy terminal is written.
+                        completed = response[0][1]
                     if completed is None:
                         return False
                     matches.append(max(when, completed))
@@ -2167,7 +2207,7 @@ def verify_case_run(provider, case, document, run_state, home, project, greeting
         require(any(fixture_edit(provider, tool_evidence(provider, child_rows[item["identity"]]), project) for item in workers),
                 "fixture edit has no successful worker-origin native tool evidence")
         require(lead_verifies_after_worker_returns(provider, child_rows[run_state['lead_identity']],
-                                                  workers, child_rows, project),
+                                                  workers, child_rows, project, run_state),
                 "lead integration has no successful native verification call after worker returns")
     oracle = "from greet import greet; assert greet('Ada') == 'Hello, Ada!'"
     if case == "feature":

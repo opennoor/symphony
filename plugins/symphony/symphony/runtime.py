@@ -4023,7 +4023,7 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
     snapshot = _snapshot(state, provider)
     protocol = (
         'Every worker spawn must pass explicit `model` and `reasoning_effort`, `fork_turns="none"`, '
-        'and task name `symphony_worker_<model>_<effort>` using underscores for model punctuation. '
+          'and task name `symphony_worker_<model>_<effort>` with a unique suffix if occupied. '
         'Put `SYMPHONY_ROLE: worker` on the first line of its bounded objective/ownership/evidence/'
         'constraints/acceptance_check/return_contract/size/complexity packet. '
         if provider == "codex" else
@@ -4085,9 +4085,9 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                      "does not identify a fast launch. "
                      if provider == "claude" else
                      f"Pass `model=\"{fast['model']}\"`, `reasoning_effort=\"{fast['effort']}\"`, "
-                     f"`fork_turns=\"none\"`, and `task_name=\"{fast_name}\"` exactly. "
-                     "The initial fast lead must keep this reserved fast name. Generic assessed-lead "
-                     "names below apply only after independent assessment; never use them for a fast spawn. ")
+                       f"`fork_turns=\"none\"`, and `task_name=\"{fast_name}\"`. "
+                       "If occupied, append a unique underscore suffix for a fresh child. Keep this fast prefix; "
+                       "generic assessed-lead names apply after assessment; never use them for a fast spawn. ")
             return (
                 "Symphony fast route: the root is a courier. For a wholly predetermined mechanical objective, "
                 "spawn one capable lead at "
@@ -4125,7 +4125,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
         "On Codex, use `fork_turns=\"none\"` for assessor and assessed lead, name them "
-        "`symphony_<role>_<model>_<effort>`, and require the assessor's final response to contain one exact "
+          "`symphony_<role>_<model>_<effort>` with a unique underscore suffix if occupied, and require one exact "
         "`SYMPHONY_ASSESSMENT: {\"size\":\"small|medium|large\",\"complexity\":\"simple|mixed|complex\",\"risk\":\"normal|high\","
         "\"rationale\":\"...\",\"topology\":\"...\"}` line. "
         if provider == "codex"
@@ -4156,7 +4156,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         "consultants also need SYMPHONY_DECISION JSON with decision-local size and complexity. "
         'Relay the child spawn protocol in the lead packet: on Codex every worker uses `fork_turns="none"`, '
         'explicit model/reasoning_effort from its own cell, underscore `symphony_worker_<model>_<effort>` '
-        'task name, and a packet whose first line is `SYMPHONY_ROLE: worker`. '
+          'task name with a unique suffix if occupied, and a packet starting `SYMPHONY_ROLE: worker`. '
         "The matrix fixes execution topology; the assessor's topology is advisory. Relay this lead contract: "
         "assign substantive work to workers or consultants; small tasks need one worker, medium tasks need "
         "bounded worker packets, and large tasks delegate project work. The lead coordinates, integrates, "

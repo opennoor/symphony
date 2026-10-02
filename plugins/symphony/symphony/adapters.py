@@ -69,11 +69,13 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     callback_identity = payload.get("agent_id")
     if not transcript or not isinstance(callback_identity, str) or not callback_identity:
         return {}
+    callback_turn = payload.get("turn_id", "")
+    if "turn_id" in payload and (not isinstance(callback_turn, str) or not callback_turn):
+        return {}
     found: dict[str, str] = {}
     header_seen = False
     forked = False
     own_turn = True
-    callback_turn = str(payload.get("turn_id") or "")
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
             for index, line in enumerate(handle):

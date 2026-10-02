@@ -85,6 +85,11 @@ class ClaudeIsolatedWorktreeTests(unittest.TestCase):
             self.assertIn("SYMPHONY_ROLE: lead", packet["prompt"])
             self.assertIn("SYMPHONY_ROUTE:", packet["prompt"])
             self.assertIn("gate.py", packet["prompt"])
+            self.assertIn('"topology":"delegated"', packet['prompt'])
+            worker = json.loads(packet['prompt'].partition('WORKER_SPAWN_PACKET: ')[2])
+            self.assertEqual(worker['subagent_type'], 'symphony:symphony-worker-claude-sonnet-5-5-low')
+            self.assertTrue(worker['prompt'].startswith('SYMPHONY_ROLE: worker\n'))
+            self.assertIn(str(Path(sys.executable)).replace('\\', '/'), worker['prompt'])
             self.assertIn("without retrying without isolation", root_prompt)
             for selected, label, blocked in ((profile, agent, False),
                                              ("sonnet", "symphony:symphony-lead-claude-sonnet-5-low", True)):

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -248,15 +249,26 @@ def verify_lead_model(env, root):
 
 def prompt(project):
     route = ('{"size":"small","complexity":"simple","risk":"normal",'
-             '"rationale":"disposable native worktree hook check","topology":"direct"}')
+             '"rationale":"disposable native worktree hook check","topology":"delegated"}')
     gate = str(project / "gate.py").replace("\\", "/")
+    gate_command = shlex.join([str(Path(sys.executable)).replace("\\", "/"), gate, "isolated"])
+    worker_packet = {'subagent_type': f'symphony:symphony-worker-{MODEL}-low',
+                     'prompt': 'SYMPHONY_ROLE: worker\n' + json.dumps({
+                         'objective': 'Run the isolated fixture gate once and return GATE_RELEASED.',
+                         'ownership': 'Only the supplied gate command in the owning isolated worktree.',
+                         'constraints': 'Run exactly ' + gate_command + '. Do not edit files or delegate.',
+                         'acceptance_check': 'The command exits zero after printing GATE_RELEASED.',
+                         'return_contract': 'Return exactly GATE_RELEASED on successful completion.',
+                         'size': 'small', 'complexity': 'simple'})}
     lead_packet = {"subagent_type": LEAD_AGENT,
                    "description": "Check isolated Symphony lead gate",
                    "run_in_background": True,
                    "isolation": "worktree",
                    "prompt": (f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n"
-                              f"Run `python '{gate}' isolated` once, wait for GATE_RELEASED, "
-                              'then return exactly SYMPHONY_OUTCOME: {"status":"completed"}.')}
+                              'Spawn exactly one worker using WORKER_SPAWN_PACKET unchanged. '
+                              'Await its successful GATE_RELEASED result, verify it, '
+                              'then return exactly SYMPHONY_OUTCOME: {"status":"completed"}. '
+                              'WORKER_SPAWN_PACKET: ' + json.dumps(worker_packet))}
     return (
         "/symphony:start Disposable native Claude isolated Agent hook check. "
         "Spawn one Symphony assessor and await its assessment: SYMPHONY_ASSESSMENT: "
@@ -333,7 +345,7 @@ def run_case(root, package, timeout, budget):
             raise RuntimeError("SubagentStart hook did not contain lead agent_id")
         if not state_path.is_file():
             raise RuntimeError("isolated lead did not register in its root project")
-        before_release = json.loads(state_path.read_text())
+        before_release = native.read_state_snapshot(state_path)
         original_run = before_release.get("active_runs", {}).get(f"claude:{session}")
         if (not original_run or original_run.get("lead_identity") != lead_id
                 or original_run.get("status") != "active"):
@@ -351,7 +363,7 @@ def run_case(root, package, timeout, budget):
                                      logs, "isolated")
                 resumed = True
             if resumed and state_path.exists():
-                document = json.loads(state_path.read_text())
+                document = native.read_state_snapshot(state_path)
                 matching = [run for run in document.get("recent_runs", [])
                             if run.get("session_id") == session]
                 if (len(matching) == 1 and matching[0].get("status") == "completed"
@@ -365,7 +377,7 @@ def run_case(root, package, timeout, budget):
                                and item.get("plugin_version") == version for item in profiles):
                         raise RuntimeError("isolated root used another Symphony plugin version")
                     for record_path in state.glob(".session-*.json"):
-                        record = json.loads(record_path.read_text())
+                        record = native.read_state_snapshot(record_path)
                         if record.get("pending") or record.get("overflow"):
                             raise RuntimeError("isolated root retained unresolved callbacks")
                     return {"provider": "claude", "case": "isolated-worktree",

@@ -30,6 +30,25 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_failure_trace_uses_exact_gate_owner_when_cli_stdout_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = root / 'same-worktree'
+            project = case / 'primary'
+            project.mkdir(parents=True)
+            (case / 'native-gate').mkdir()
+            (case / 'native-gate/a.root.json').write_text('{"session_id":"own-root"}')
+            (case / 'native-gate/b.root.json').write_text('{"session_id":"foreign-root"}')
+            state = native.state_file(case / 'state', project)
+            state.parent.mkdir()
+            state.write_text(json.dumps({'recent_runs': [{'provider': 'claude', 'session_id': 'own-root',
+                'lead_identity': 'lead', 'run_id': 'run', 'status': 'completed'}]}))
+            with patch.object(native, 'claude_host_trace', return_value={'exact_owner': True}) as trace:
+                report = native.failure_state(root, 'claude')
+            self.assertEqual(report['cases'][0]['cli_session_ids'], {'a': 'own-root'})
+            self.assertEqual(report['native_host_trace']['same-worktree:a'], {'exact_owner': True})
+            trace.assert_called_once_with(root / 'claude-baseline-home', 'own-root', 'lead')
+
     def test_nonupdate_wake_skips_only_exact_completed_original_owner(self):
         run = {'provider': 'claude', 'session_id': 'root', 'run_id': 'original',
                'lead_identity': 'lead', 'status': 'completed', 'outcome': {'status': 'completed'},
@@ -650,6 +669,23 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                                         timeout=0)
         with self.assertRaises(ValueError):
             native.observer_locked_read(Mock(side_effect=ValueError("invalid state")))
+
+    def test_windows_observer_uses_the_writers_project_and_session_locks(self):
+        from contextlib import nullcontext
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'owner.v2.json'
+            session = root / '.session-owner.json'
+            session.write_text('{"pending": []}', encoding='utf-8')
+            # Preserve the native Path class when simulating Windows on Linux.
+            with patch.object(native.os, 'name', 'nt'), patch.object(native, 'Path', type(root)), \
+                 patch('plugins.symphony.symphony.store._read_owner_snapshot',
+                       return_value='{"active_runs": {}}') as read, \
+                 patch('plugins.symphony.symphony.store._locked', return_value=nullcontext()) as locked:
+                self.assertEqual(native.read_state_snapshot(project), {'active_runs': {}})
+                read.assert_called_once_with(project)
+                self.assertEqual(native.read_state_snapshot(session), {'pending': []})
+                locked.assert_called_once_with(session.with_suffix(''), timeout=.1)
 
     def test_codex_native_hook_gate_holds_declared_assessed_task_not_fast_or_workers(self):
         with tempfile.TemporaryDirectory() as temporary:

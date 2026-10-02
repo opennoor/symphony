@@ -159,10 +159,27 @@ class NativeAssessedFirstTests(unittest.TestCase):
         write()
         self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
 
+    def test_claude_background_assessment_can_be_accepted_before_final_courtesy_turn(self):
+        document, run, children, home, project, profile, roots, write = self.fixture('claude')
+        # The root receives the handback while the native child is still writing
+        # its final end_turn; lead admission gets its own source event ID.
+        document['event_history'][1].update(event_id='native-stop:delegation:delegation_updated', observed_at=at(13))
+        children['assessor-id'].append({**deepcopy(children['assessor-id'][-1]), 'timestamp': at(12),
+            'message': {'role': 'assistant', 'model': run['delegations'][0]['requested_tier'],
+                        'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Report delivered.'}]}})
+        roots[-1]['message']['content'][0]['content'] = 'Background agent launched.'
+        write()
+        self.assertTrue(smoke.assessed_first_verified('claude', document, run, children, home, project, profile))
+        metadata = next((home / 'projects').glob('*/root-id/subagents/agent-assessor-id.meta.json'))
+        value = json.loads(metadata.read_text()); value['toolUseId'] = 'foreign-call'
+        metadata.write_text(json.dumps(value))
+        self.assertFalse(smoke.assessed_first_verified('claude', document, run, children, home, project, profile))
+
     def test_lead_verification_requires_successful_result_after_worker_completion(self):
         worker = {'identity': 'worker-id'}
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):
+                run = None
                 if provider == 'codex':
                     def call(name, args, identity, second):
                         return {'type': 'response_item', 'timestamp': at(second), 'payload': {
@@ -190,9 +207,14 @@ class NativeAssessedFirstTests(unittest.TestCase):
                         'message': {'stop_reason': 'end_turn'}}]}
                     verify = call('Bash', {'command': 'python -m unittest -q'}, 'test', 8)
                     checked = result('test', 'Ran 1 test in 0.01s\nOK', 9)
+                    run = {'run_id': 'run', 'lead_identity': 'lead-id', 'owner_generation': 1,
+                        'assessment': {'substantive_contract': {'epoch': 'assessment'}, '_substantive_children': {
+                            'worker-id': {'run_id': 'run', 'lead': 'lead-id', 'parent': 'lead-id',
+                                'owner_generation': 1, 'epoch': 'assessment', 'role': 'worker', 'successful': True,
+                                'launch_hash': smoke.hashlib.sha256(b'launch').hexdigest()}}}}
                 rows = [launch, launched, verify, checked]
                 check = lambda values: smoke.lead_verifies_after_worker_returns(
-                    provider, values, [worker], children, Path('/fixture'))
+                    provider, values, [worker], children, Path('/fixture'), run)
                 self.assertTrue(check(rows))
                 early = deepcopy(verify); early['timestamp'] = at(3)
                 early_result = deepcopy(checked); early_result['timestamp'] = at(4)
@@ -202,6 +224,77 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 else: failed = result('test', 'Ran 1 test in 0.01s\nOK', 9, True)
                 self.assertFalse(check([launch, launched, verify, failed]))
                 self.assertFalse(check(rows + [checked]))
+                if provider == 'claude':
+                    children['worker-id'] = [
+                        call('SubagentHandback', {'message': 'Work and tests completed.'}, 'handback', 5),
+                        result('handback', 'OK', 6),
+                        {'type': 'assistant', 'timestamp': at(12), 'message': {'stop_reason': 'end_turn'}}]
+                    self.assertTrue(check(rows))
+                    children['worker-id'][:0] = [call('Bash', {'command': 'work'}, 'work', 2),
+                                                   result('work', 'OK', 4)]
+                    self.assertTrue(check(rows))
+                    good = deepcopy(children['worker-id'])
+                    for case in ('missing-result', 'failed-result', 'reversed-time', 'later-work', 'duplicate-result'):
+                        with self.subTest(handback=case):
+                            children['worker-id'] = deepcopy(good)
+                            if case == 'missing-result': children['worker-id'].pop(3)
+                            if case == 'failed-result': children['worker-id'][3]['message']['content'][0]['is_error'] = True
+                            if case == 'reversed-time': children['worker-id'][3]['timestamp'] = at(4)
+                            if case == 'later-work': children['worker-id'].insert(-1, call('Bash', {'command': 'do work'}, 'later', 7))
+                            if case == 'duplicate-result': children['worker-id'].insert(-1, deepcopy(children['worker-id'][3]))
+                            self.assertFalse(check(rows))
+                    for case in ('pending', 'late', 'failed', 'duplicated'):
+                        with self.subTest(prior_work=case):
+                            children['worker-id'] = deepcopy(good)
+                            result_row = children['worker-id'][1]
+                            if case == 'pending': children['worker-id'].pop(1)
+                            if case == 'late':
+                                children['worker-id'].pop(1); result_row['timestamp'] = at(10)
+                                children['worker-id'].insert(-1, result_row)
+                            if case == 'failed': result_row['message']['content'][0]['is_error'] = True
+                            if case == 'duplicated': children['worker-id'].insert(2, deepcopy(result_row))
+                            if case == 'failed': self.assertTrue(check(rows))
+                            else: self.assertFalse(check(rows))
+                    children['worker-id'] = good
+                    for change in ({'epoch': 'foreign'}, {'parent': 'foreign'}, {'successful': False}, {'launch_hash': 'foreign'}):
+                        original = run['assessment']['_substantive_children']['worker-id']
+                        run['assessment']['_substantive_children']['worker-id'] = {**original, **change}
+                        self.assertFalse(check(rows))
+                        run['assessment']['_substantive_children']['worker-id'] = original
+
+    def test_codex_native_report_to_parent_can_precede_the_final_courtesy_terminal(self):
+        def row(kind, payload, second):
+            return {'type': kind, 'timestamp': at(second), 'payload': payload}
+        def call(name, args, identity, second):
+            return row('response_item', {'type': 'function_call', 'name': name,
+                'arguments': json.dumps(args), 'call_id': identity}, second)
+        def result(identity, output, second):
+            return row('response_item', {'type': 'function_call_output', 'call_id': identity,
+                'output': json.dumps(output) if isinstance(output, dict) else output}, second)
+        lead = [row('session_meta', {'id': 'lead', 'agent_path': '/root/lead'}, 0),
+            call('spawn_agent', {}, 'spawn', 1), result('spawn', {'task_name': '/root/lead/worker'}, 2),
+            call('exec_command', {'cmd': 'python -m unittest -q'}, 'test', 8),
+            result('test', {'exit_code': 0, 'output': 'Ran 1 test\nOK'}, 9)]
+        worker = [row('session_meta', {'id': 'worker', 'agent_path': '/root/lead/worker',
+            'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}, 2),
+            call('exec_command', {'cmd': 'diagnose'}, 'work', 3),
+            result('work', {'exit_code': 1, 'output': 'A diagnostic failure that is repaired.'}, 4),
+            call('send_message', {'target': '/root/lead', 'message': 'Repaired; ready to integrate.'}, 'handoff', 5),
+            result('handoff', '', 6), row('event_msg', {'type': 'task_complete'}, 12)]
+        check = lambda rows: smoke.lead_verifies_after_worker_returns('codex', lead,
+            [{'identity': 'worker'}], {'worker': rows}, Path('/fixture'), {'lead_identity': 'lead'})
+        self.assertTrue(check(worker))
+        for case in ('foreign-parent', 'foreign-target', 'pending-work', 'late-work', 'failed-handoff', 'later-work'):
+            with self.subTest(case=case):
+                rows = deepcopy(worker)
+                if case == 'foreign-parent': rows[0]['payload']['source']['subagent']['thread_spawn']['parent_thread_id'] = 'foreign'
+                if case == 'foreign-target': rows[3]['payload']['arguments'] = '{"target":"foreign","message":"done"}'
+                if case == 'pending-work': rows.pop(2)
+                if case == 'late-work':
+                    pending = rows.pop(2); pending['timestamp'] = at(10); rows.insert(-1, pending)
+                if case == 'failed-handoff': rows[4]['payload']['output'] = 'Error: unavailable parent'
+                if case == 'later-work': rows.insert(-1, call('exec_command', {'cmd': 'more work'}, 'later', 7))
+                self.assertFalse(check(rows))
 
     def test_resume_command_keeps_the_native_root_for_both_providers(self):
         for provider in ('codex', 'claude'):

@@ -218,6 +218,32 @@ class AdapterContractTests(unittest.TestCase):
                             for field in ('parent_thread_id', 'task_name', 'task', 'model_reasoning_effort'):
                                 self.assertNotIn(field, event.payload)
 
+    def test_malformed_explicit_codex_callback_turn_imports_no_native_metadata(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child',
+                'agent_path': '/root/symphony_lead_fast_model_medium', 'source': {
+                    'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}
+            task = {'type': 'event_msg', 'payload': {
+                'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for token in (None, '', 0, 1, False, True, [], {}, '1'):
+                    with self.subTest(hook=hook, callback_turn=token):
+                        context = {'type': 'turn_context', 'payload': {
+                            'turn_id': str(token), 'model': 'native-model', 'effort': 'medium'}}
+                        transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task)))
+                        event = event_from_payload('codex', {
+                            'hook_event_name': hook, 'agent_id': 'child', 'turn_id': token,
+                            'agent_transcript_path': str(transcript), 'model': 'callback-model'})
+                        if token == '1':
+                            self.assertEqual(event.payload['model'], 'native-model')
+                            self.assertIn('task', event.payload)
+                        else:
+                            self.assertEqual(event.payload['_symphony_child_metadata'], ())
+                            self.assertEqual(event.payload['model'], 'callback-model')
+                            for field in ('parent_thread_id', 'task_name', 'task', 'model_reasoning_effort'):
+                                self.assertNotIn(field, event.payload)
+
     def test_codex_fork_keeps_child_header_and_binds_only_its_callback_turn(self):
         # Sanitized native fork: child header, copied parent header/turn, own turn.
         rows = [

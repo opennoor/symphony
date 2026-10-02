@@ -526,10 +526,17 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
             'agent_path': '/root/symphony_lead_fast_gpt_6_1_sol_medium',
             'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}
         self.assertTrue(smoke.fast_native_identity('codex', [header], 'fast', run))
+        unique = {**header['payload'], 'agent_path': header['payload']['agent_path'] + '_second_objective'}
+        self.assertTrue(smoke.fast_native_identity('codex', [{'type': 'session_meta', 'payload': unique}], 'fast', run))
         for changed in ({**header['payload'], 'id': 'assessed',
                          'agent_path': '/root/symphony_lead_gpt_6_1_sol_medium'},
                         {**header['payload'], 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'foreign'}}}},
-                        {**header['payload'], 'id': 'foreign'}):
+                        {**header['payload'], 'id': 'foreign'},
+                        {**unique, 'agent_path': unique['agent_path'] + '/nested'},
+                        {**unique, 'source': {'subagent': {'thread_spawn': {
+                            'parent_thread_id': 'root', 'agent_path': '/root/foreign'}}}},
+                        {**unique, 'agent_path': header['payload']['agent_path'] + 'foreign'},
+                        {**unique, 'agent_path': header['payload']['agent_path'] + '_'}):
             self.assertFalse(smoke.fast_native_identity('codex', [{'type': 'session_meta', 'payload': changed}],
                                                        changed['id'], run))
         call = {'type': 'response_item', 'payload': {'type': 'custom_tool_call', 'name': 'functions.exec',

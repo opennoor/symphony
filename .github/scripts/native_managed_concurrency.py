@@ -1853,7 +1853,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                     if gate_record.get("session_id") != sessions[label]:
                         raise RuntimeError(f"{label}: native lead gate belongs to another root session")
                 if all(path.exists() for path in paths.values()):
-                    docs = {label: json.loads(path.read_text()) for label, path in paths.items()}
+                    docs = {label: read_state_snapshot(path) for label, path in paths.items()}
                     expected_gate_version = update["old_version"] if update else candidate_version
                     for label, session in sessions.items():
                         activation = docs[label].get("activation", {}).get(provider, {})
@@ -1873,7 +1873,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             for label, project in (("a", first), ("b", second)):
                 path = paths[label]
                 try:
-                    document = json.loads(path.read_text()) if path.is_file() else {}
+                    document = read_state_snapshot(path) if path.is_file() else {}
                 except (OSError, ValueError):
                     document = {}
                 owned = document.get("active_runs", {}).get(f"{provider}:{sessions[label]}")
@@ -1973,7 +1973,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             old_records = update_while_gated(update, env, docs, sessions,
                                              {"a": first, "b": second}, deadline)
             snapshot["old_source_removed_ns"] = update["old_source_removed_ns"]
-            snapshot["post_update"] = {label: event_counts(json.loads(paths[label].read_text()))
+            snapshot["post_update"] = {label: event_counts(read_state_snapshot(paths[label]))
                                        for label in sessions}
             snapshot_file.write_text(json.dumps(snapshot))
         if not gate_release_before_update:
@@ -1994,7 +1994,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 if exit_code and not (label == "a" and old_root_interruption):
                     raise RuntimeError(f"{label}: native CLI exited {exit_code}")
             if update:
-                before_resume = json.loads(paths["a"].read_text())
+                before_resume = read_state_snapshot(paths["a"])
                 pre_resume_state = codex_pre_resume_state(
                     before_resume, sessions["a"], observed_run_ids["a"], observed_leads["a"])
                 pre_resume_run_ids = {run.get("run_id") for run in [
@@ -2065,7 +2065,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                                          timeout=max(1, min(30, deadline - time.monotonic())))
                 if checked.returncode or "guarded: matching current-session heartbeat" not in checked.stdout:
                     raise RuntimeError("candidate checker rejected the resumed native root session")
-                snapshot["post_candidate_resume"] = event_counts(json.loads(paths["a"].read_text()))
+                snapshot["post_candidate_resume"] = event_counts(read_state_snapshot(paths["a"]))
                 snapshot_file.write_text(json.dumps(snapshot))
         else:
             resumed = set()
@@ -2073,7 +2073,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
             while time.monotonic() < deadline:
                 if any(process.poll() not in (None, 0) for process in processes.values()):
                     raise RuntimeError("native Claude CLI exited unsuccessfully")
-                current = {label: json.loads(path.read_text()) for label, path in paths.items()}
+                current = {label: read_state_snapshot(path) for label, path in paths.items()}
                 for label, process in processes.items():
                     if not update and claude_original_owner_archived(
                             current[label], sessions[label], observed_run_ids[label], observed_leads[label]):
@@ -2134,7 +2134,7 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                 raise RuntimeError("background Claude leads did not resume and archive completed outcomes")
         final_docs = (wait_for_completed_docs(paths, provider, sessions, observed_run_ids, deadline)
                       if provider == "codex" else
-                      {label: json.loads(path.read_text()) for label, path in paths.items()})
+                      {label: read_state_snapshot(path) for label, path in paths.items()})
         if provider == "codex" and update:
             final_a = final_docs["a"]
             final_run_ids = {run.get("run_id") for run in [
@@ -3762,7 +3762,7 @@ def failure_state(root, provider):
     cases = []
     for path in root.rglob("*.v2.json"):
         try:
-            document = json.loads(path.read_text())
+            document = read_state_snapshot(path)
         except (OSError, ValueError):
             continue
         case = path.relative_to(root).parts[0]
@@ -3781,6 +3781,16 @@ def failure_state(root, provider):
                 match = re.search(pattern, log.read_text(errors="replace"), re.MULTILINE)
                 if match:
                     cli_sessions[label] = match.group(1)
+            if label not in cli_sessions:
+                gate_root = case_root / 'native-gate' / f'{label}.root.json'
+                try:
+                    gate_session = json.loads(gate_root.read_text()).get('session_id')
+                except (OSError, ValueError, AttributeError):
+                    gate_session = None
+                if (isinstance(gate_session, str) and gate_session and any(
+                        run.get('provider') == provider and run.get('session_id') == gate_session
+                        for run in (*document.get('active_runs', {}).values(), *document.get('recent_runs', [])))):
+                    cli_sessions[label] = gate_session
         activation = document.get("activation", {}).get(provider, {})
         profiles = ([activation, *activation.get("session_profiles", [])]
                     if isinstance(activation, dict) else [])
@@ -3798,7 +3808,7 @@ def failure_state(root, provider):
         raw_session_records = []
         for record_path in (case_root / "state").glob(".session-*.json"):
             try:
-                record = json.loads(record_path.read_text())
+                record = read_state_snapshot(record_path)
             except (OSError, ValueError):
                 continue
             if record.get("state_name") in {None, path.name}:
@@ -3892,6 +3902,10 @@ def failure_state(root, provider):
                              if run.get("session_id") == session), None)
                 if lead:
                     host[f"{case['case']}:{label}"] = claude_host_trace(home, session, lead)
+            for run in runs:
+                if run.get('session_id') not in case['cli_session_ids'].values() and run.get('lead_id'):
+                    host[f"{case['case']}:durable-owner-{len(host)}"] = claude_host_trace(
+                        home, run['session_id'], run['lead_id'])
     resume_status_file = root / "live-update" / "logs" / "a.resume.status.json"
     resume_status = json.loads(resume_status_file.read_text()) if resume_status_file.is_file() else None
     phase_file = root / "live-update" / "logs" / "a.resume.phase90.json"
