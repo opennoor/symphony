@@ -205,6 +205,28 @@ class PackageContractTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), '123')
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
+    def test_windows_relay_deduplicates_repeated_path_candidates(self):
+        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            broken, working = root / 'broken', root / 'working'
+            broken.mkdir()
+            working.mkdir()
+            (broken / 'python.exe').write_bytes(b'not an interpreter')
+            probe = self._probe_executable(working)
+            records = [str(broken / 'python.exe'), str(broken / 'python.exe'), str(probe)]
+            code = 'import sys;sys.stdout.buffer.write(' + repr(''.join('"' + path + '"\n' for path in records)) + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
+            relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
+                        .replace('__SYMPHONY_BOOTSTRAP__', 'print(123)'), code)
+            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                    relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                    text=True, timeout=15, env={**os.environ,
+                        'PATH': os.pathsep.join((str(broken), str(broken), str(working))), variable: temporary})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), '123')
+
+    @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_discovery_timeout_preserves_candidates_without_running_the_hook_twice(self):
         ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
         with tempfile.TemporaryDirectory() as temporary:

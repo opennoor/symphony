@@ -7,7 +7,7 @@ $why='No candidates'
 $dirs=@($env:PATH -split [IO.Path]::PathSeparator | ForEach-Object {$d=$_.Trim();if($d.StartsWith('"') -and $d.EndsWith('"')) {$d=$d.Trim('"')};if([IO.Path]::IsPathRooted($d) -and ($d -match '^(?:[a-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::DirectorySeparatorChar -eq '/') -and $d -notmatch '["\x00-\x1f]') {$d.TrimEnd('\','/')}})
 $dirs=@($dirs | Where-Object {$_ -notlike '\\*'})+@($dirs | Where-Object {$_ -like '\\*'})
 $parts=@('');foreach($d in $dirs) {if($parts[-1].Length+$d.Length -gt 3000) {$parts+='';};$parts[-1]+=$d+';'}
-$all=@();$cs=@();$end=[DateTime]::UtcNow.AddSeconds(3)
+$all=@();$cs=@();$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);$end=[DateTime]::UtcNow.AddSeconds(3)
 foreach($part in $parts) {
 $p=$null
 try {
@@ -17,7 +17,7 @@ $q.UseShellExecute=$false;$q.RedirectStandardOutput=$true;$q.StandardOutputEncod
 $ms=[int]($end-[DateTime]::UtcNow).TotalMilliseconds;if($ms -le 0) {break}
 $p=[Diagnostics.Process]::Start($q);$out=$p.StandardOutput.ReadToEndAsync()
 if(-not $p.WaitForExit($ms)) {$why='Python discovery timed out';$p.Kill();[void]$p.WaitForExit(250)}
-if($out.Wait(250)) {foreach($line in $out.Result -split '\r?\n') {if($line -match '^"([^"\r\n]+)"$') {$src=$Matches[1];if($dirs -contains [IO.Path]::GetDirectoryName($src).TrimEnd('\','/')) {$all += [pscustomobject]@{Name=[IO.Path]::GetFileName($src);Source=$src}}}}}
+if($out.Wait(250)) {foreach($line in $out.Result -split '\r?\n') {if($line -match '^"([^"\r\n]+)"$') {$src=$Matches[1];if($dirs -contains [IO.Path]::GetDirectoryName($src).TrimEnd('\','/') -and $seen.Add($src)) {$all += [pscustomobject]@{Name=[IO.Path]::GetFileName($src);Source=$src}}}}}
 } catch {$why='Python discovery failed: '+$_.Exception.Message} finally {if($p) {$p.Dispose()}}
 }
 foreach($n in 0,1) {foreach($name in 'python.exe','python3.exe','py.exe') {$cs+=@($all | Where-Object Name -eq $name | Select-Object -Skip $n -First 1)}}
