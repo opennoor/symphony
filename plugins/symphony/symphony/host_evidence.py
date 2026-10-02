@@ -808,6 +808,13 @@ def _claude_observed_fast_launch(run: RunState, launch_id: str, root_prompt: str
                 and hashlib.sha256(launch_id.encode()).hexdigest() == pinned)
 
 
+def _claude_tool_result_content(content) -> bool:
+    return (isinstance(content, list) and bool(content)
+        and any(isinstance(item, dict) and item.get('type') == 'tool_result' for item in content)
+        and all(isinstance(item, dict) and (item.get('type') == 'tool_result'
+            or item.get('type') == 'text' and isinstance(item.get('text'), str)) for item in content))
+
+
 def claude_substantive_launch(
     run: RunState, source: Event, role: str, started_at: str, environ: Mapping[str, str],
 ) -> dict[str, str] | None:
@@ -927,10 +934,7 @@ def _claude_substantive_launch(
                 isinstance(item, dict) and item.get('type') == 'text' and isinstance(item.get('text'), str)
                 for item in content)):
             prompts.append(row)
-        elif not (isinstance(content, list) and content and any(
-                isinstance(item, dict) and item.get('type') == 'tool_result' for item in content)
-                and all(isinstance(item, dict) and (item.get('type') == 'tool_result'
-                    or item.get('type') == 'text' and isinstance(item.get('text'), str)) for item in content)):
+        elif not _claude_tool_result_content(content):
             return None
     # A fresh child has one invocation. Reused/multiple native prompt history
     # cannot be assigned to an earlier callback just because its ID is reused.
@@ -1231,7 +1235,19 @@ def _claude_native_lead_event(
                 and item.state.lower() in {"failed", "interrupted", "cancelled",
                                            "canceled", "error", "terminated"}):
             return None
-    for record in state.event_history if target_prompt is None else ():
+    # Successful terminal recovery reopens the same owner inside its completion
+    # transaction. That paired synthetic Start is not a later native restart.
+    recovered_starts = {
+        (record.event_id.removesuffix(':lead-completion:lead_completed') + ':lead-followup:lead_started',
+         record.observed_at): index
+        for index, record in enumerate(state.event_history)
+        if record.kind == 'lead_completed' and record.event_id.endswith(':lead-completion:lead_completed')
+        and record.payload.get('identity') == lead_id
+        and type(record.payload.get('owner_generation')) is int
+        and record.payload['owner_generation'] == run.owner_generation
+        and isinstance(record.payload.get('outcome'), Mapping)
+        and record.payload['outcome'].get('status') == 'completed'}
+    for index, record in enumerate(state.event_history if target_prompt is None else ()):
         when = _instant(record.observed_at)
         if when is None or when <= completed_at:
             continue
@@ -1242,6 +1258,10 @@ def _claude_native_lead_event(
                     "failed", "interrupted", "cancelled", "canceled", "error", "terminated"}):
             return None
         if record.kind in {"lead_failed", "lead_started"} and payload.get("identity") == lead_id:
+            if (record.kind == 'lead_started' and type(payload.get('owner_generation')) is int
+                    and payload['owner_generation'] == run.owner_generation
+                    and recovered_starts.get((record.event_id, record.observed_at), -1) > index):
+                continue
             return None
     report = reports[0]
     if len(report) > 100_000:
@@ -2627,8 +2647,7 @@ def _claude_historical_worker_terminal(rows: list[dict], prompt_index: int,
             continue
         message = row.get('message')
         content = message.get('content') if isinstance(message, dict) else None
-        if isinstance(content, list) and content and all(isinstance(item, dict)
-                and item.get('type') == 'tool_result' for item in content):
+        if _claude_tool_result_content(content):
             continue
         if (not isinstance(content, str) or not content.strip()
                 or not isinstance(row.get('uuid'), str) or not row['uuid']
@@ -2663,12 +2682,10 @@ def _claude_historical_worker_terminal(rows: list[dict], prompt_index: int,
     began = _instant(rows[prompt_index]['timestamp'])
     final = '\n'.join(item.get('text', '') for item in terminal['message']['content']
                      if isinstance(item, dict) and item.get('type') == 'text')
-    delivered = (turn == assistants and all(isinstance(item, dict)
-        and item.get('type') in {'text', 'thinking', 'redacted_thinking'}
-        for row in assistants for item in row['message']['content'])
-        and claude_native_parent_completion(parent_rows, terminal, final, session, parent, identity,
-            before=_instant(rows[end]['timestamp']) if end < len(rows) else None,
-            prompt=rows[prompt_index] if launch_hash else None, launch_hash=launch_hash))
+    # Native delivery can close a NULL stop reason after tool work, too.
+    delivered = claude_native_parent_completion(parent_rows, terminal, final, session, parent, identity,
+        before=_instant(rows[end]['timestamp']) if end < len(rows) else None,
+        prompt=rows[prompt_index] if launch_hash else None, launch_hash=launch_hash)
     if (terminal['message'].get('stop_reason') != 'end_turn' and not delivered
             or any(row['message'].get('stop_reason') == 'end_turn' for row in assistants[:-1])
             or not isinstance(terminal.get('uuid'), str) or not terminal['uuid']
@@ -2793,8 +2810,7 @@ def _claude_historical_worker_deliveries(
                 continue
             message = row.get('message')
             content = message.get('content') if isinstance(message, dict) else None
-            if isinstance(content, list) and content and all(isinstance(item, dict)
-                    and item.get('type') == 'tool_result' for item in content):
+            if _claude_tool_result_content(content):
                 continue
             when = _instant(row.get('timestamp'))
             if not isinstance(content, str) or when is None:
@@ -2885,8 +2901,7 @@ def _claude_sendmessage_late_callback(source: Event, native: Event, session: str
             continue
         message = row.get('message')
         content = message.get('content') if isinstance(message, Mapping) else None
-        if isinstance(content, list) and content and all(isinstance(item, Mapping)
-                and item.get('type') == 'tool_result' for item in content):
+        if _claude_tool_result_content(content):
             continue
         when = _instant(row.get('timestamp'))
         if not isinstance(content, str) or when is None:
@@ -3032,8 +3047,7 @@ def claude_archived_sendmessage_sequence(
         content = message.get('content') if isinstance(message, dict) else None
         # Tool results are part of a turn. Every other user row must be a
         # supported textual prompt; malformed/opaque rows cannot hide reuse.
-        if isinstance(content, list) and content and all(
-                isinstance(item, dict) and item.get('type') == 'tool_result' for item in content):
+        if _claude_tool_result_content(content):
             continue
         if not isinstance(content, str):
             return None

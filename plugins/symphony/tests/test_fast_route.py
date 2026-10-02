@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from plugins.symphony.scripts.generate_agents import BODIES
 from plugins.symphony.symphony.model import Event
-from plugins.symphony.symphony.runtime import handle, _assessment_from_marker, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT, _decision_markers
+from plugins.symphony.symphony.runtime import handle, _assessment_from_marker, _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT, _decision_markers
 from plugins.symphony.symphony.routing import Assessment, fast_lead_selection, profiles_for, resolve_tier, route_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
 
@@ -222,7 +222,7 @@ class FastRouteTests(unittest.TestCase):
         self.assertIn("assign the substantive work to one worker", lead)
         self.assertIn("assign substantive work to bounded worker packets", lead)
         self.assertNotIn("do quick glue work", lead)
-        self.assertIn('"risk":"normal|high"', BODIES["assessor"])
+        self.assertIn('risk normal/high', BODIES["assessor"])
         self.assertIn("substantive small work", BODIES["assessor"])
 
     def test_assessor_topology_cannot_override_worker_execution(self):
@@ -301,7 +301,11 @@ class FastRouteTests(unittest.TestCase):
                 self.hook(provider, "PreToolUse", tool_name="Agent" if provider == "claude" else "spawn_agent",
                           tool_input=tool_input, tool_use_id="assessor-spawn")
                 assessor = {"agent_id": "assessor-2", "agent_type": assessor_type, "task": packet}
-                self.hook(provider, "SubagentStart", **assessor)
+                started_assessor = self.hook(provider, "SubagentStart", **assessor)
+                context = json.loads(started_assessor.stdout)['hookSpecificOutput']['additionalContext']
+                self.assertIn(_ASSESSOR_CONTRACT, context)
+                self.assertIn(_ASSESSOR_CONTRACT, BODIES['assessor'])
+                self.assertIsNotNone(_assessment_from_marker({'last_assistant_message': _ASSESSOR_CONTRACT}, 'SYMPHONY_ASSESSMENT:'))
                 self.assertEqual(self.run_state().lead_identity, "fast-1")
                 self.hook(provider, "SubagentStop", **assessor, status="completed",
                           last_assistant_message='SYMPHONY_ASSESSMENT: {"size":"medium","complexity":"mixed","risk":"normal","rationale":"not bounded","topology":"mixed"}')
@@ -330,6 +334,7 @@ class FastRouteTests(unittest.TestCase):
                 if provider == 'codex':
                     self.assertIn('fork_turns="none"', guidance)
                     self.assertIn('symphony_worker_<model>_<effort>', guidance)
+                    self.assertIn('symphony_consultant_<model>_<effort>', guidance)
                     self.assertLess(len(guidance), 2048)
                 else:
                     self.assertIn('symphony:symphony-worker-', guidance)

@@ -2226,6 +2226,9 @@ def assessed_first_probe(provider, document, run, home, project):
                 if len(rejected) < 16:
                     rejected.append({'source_line': frame.f_lineno,
                         'literal_call_parsed': isinstance(details, dict),
+                        'execution_options': sorted(key for key in details if key in {
+                            'login', 'shell', 'tty', 'sandbox_permissions', 'justification', 'prefix_rule'})
+                            if isinstance(details, dict) else [],
                         'exec_command_mentions': min(16, source.count('tools.exec_command('))
                             if isinstance(source, str) else 0,
                         'command_family': argv[0] if argv and argv[0] in {
@@ -2240,6 +2243,16 @@ def assessed_first_probe(provider, document, run, home, project):
             facts['admission_count'] = len(frame.f_locals.get('admissions', ()))
             facts['assessor_terminal_count'] = len(frame.f_locals.get('terminals', ()))
             facts['failed_same_assessor_retries'] = len(frame.f_locals.get('retried', ()))
+            if provider == 'codex':
+                parents = dict.fromkeys(('root', 'lead', 'other', 'unavailable'), 0)
+                for assessor in frame.f_locals.get('assessors', ()):
+                    rows = frame.f_locals.get('child_rows', {}).get(assessor.get('identity'), ())
+                    parent = (rows[0].get('payload', {}).get('source', {}).get('subagent', {})
+                              .get('thread_spawn', {}).get('parent_thread_id')) if rows else None
+                    kind = ('root' if parent == run['session_id'] else 'lead' if parent == run.get('lead_identity')
+                            else 'other' if parent else 'unavailable')
+                    parents[kind] += 1
+                facts['assessor_native_parents'] = parents
             calls = frame.f_locals.get('calls', ())
             if isinstance(calls, (tuple, list)):
                 facts['root_call_count'] = len(calls)

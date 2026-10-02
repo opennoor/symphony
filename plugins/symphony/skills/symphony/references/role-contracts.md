@@ -30,6 +30,8 @@ For a new task, the hook may offer one fast lead at the account profile's capabl
 
 Run substantive or uncertain work as a bounded assessment on the strongest model in the accepted account profile, normally at `high` effort. A session assessor boost uses native levels above high: Codex xhigh/max/ultra, Claude xhigh/max. Unsupported account/model levels are rejected, never mapped to another effort. Boosts apply only to subsequent assessor spawns. The assessor chooses needs, not provider model names, and does not become the lead implicitly.
 
+The assessor classifies the task itself, without spawning agents or executing the task. Its native Start supplies the JSON contract directly. A lead without an accepted assessment stops before project work or child launches and asks the root to resume the existing assessor. Leads spawn workers and consultants; routing assessors belong to the root.
+
 Required fields:
 
 ```yaml

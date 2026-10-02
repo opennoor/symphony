@@ -2177,6 +2177,12 @@ class RuntimeTests(unittest.TestCase):
         claude_guidance = runtime_module._lead_guidance(state, 'claude')
         self.assertIn('`run_in_background: false`', claude_guidance)
         self.assertIn('a native async launch acknowledgment is not the child result', claude_guidance)
+        for provider in ('codex', 'claude'):
+            self.assertIn('routing assessors belong to the root', runtime_module._lead_guidance(state, provider))
+            unassessed = replace(state, active_run=replace(state.active_run, assessment={}))
+            held = runtime_module._lead_guidance(unassessed, provider)
+            self.assertIn('Do not execute project work or spawn children', held)
+            self.assertNotIn('Symphony worker routes', held)
 
     def test_completing_run_denies_new_lead_spawn_but_preserves_other_work(self):
         marker = ('SYMPHONY_ROUTE: {"size":"small","complexity":"simple",'

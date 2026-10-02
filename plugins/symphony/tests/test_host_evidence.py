@@ -1205,6 +1205,51 @@ class CompletionChronologyTests(unittest.TestCase):
                     self.write()
                     self.assertEqual(self.check(), 'unknown')
 
+    def test_claude_completion_recovery_is_not_a_later_native_restart(self):
+        for case in ('valid', 'missing-pair', 'wrong-source', 'wrong-time', 'wrong-owner',
+                     'wrong-generation', 'wrong-start-generation', 'wrong-order',
+                     'failed-outcome', 'real-start', 'later-failure'):
+            with self.subTest(case=case):
+                self.fixture('claude')
+                start = Event('terminal:lead-followup:lead_started', 'lead_started', self.stamp(24),
+                              {'identity': self.lead, 'owner_generation': 1})
+                completed = Event('terminal:lead-completion:lead_completed', 'lead_completed', self.stamp(24),
+                                  {'identity': self.lead, 'owner_generation': 1, 'outcome': {'status': 'completed'}})
+                if case == 'wrong-source': completed = replace(completed, event_id='other:lead-completion:lead_completed')
+                if case == 'wrong-time': completed = replace(completed, observed_at=self.stamp(25))
+                if case == 'wrong-owner': completed = replace(completed, payload={**completed.payload, 'identity': 'foreign'})
+                if case == 'wrong-generation': completed = replace(completed, payload={**completed.payload, 'owner_generation': 2})
+                if case == 'wrong-start-generation': start = replace(start, payload={**start.payload, 'owner_generation': 2})
+                if case == 'failed-outcome': completed = replace(completed, payload={**completed.payload, 'outcome': {'status': 'failed'}})
+                if case == 'real-start': start = replace(start, event_id='restart:lead:lead_started')
+                history = (start,) if case == 'missing-pair' else (start, completed)
+                if case == 'wrong-order': history = tuple(reversed(history))
+                if case == 'later-failure':
+                    history += (Event('failed', 'lead_failed', self.stamp(25), {'identity': self.lead}),)
+                self.state = replace(self.state, event_history=history)
+                self.assertEqual(self.check(), 'valid' if case == 'valid' else 'unknown')
+
+    def test_claude_worker_completion_keeps_settled_tools_inside_its_native_turn(self):
+        for stop_reason in (None, 'end_turn'):
+            for case in ('valid', 'mixed', 'missing-result', 'duplicate-result', 'foreign-result', 'text-only'):
+                with self.subTest(stop_reason=stop_reason, case=case):
+                    self.fixture('claude')
+                    terminal = self.rows[self.child][-1]
+                    terminal['message']['stop_reason'] = stop_reason
+                    call = {**terminal, 'uuid': 'worker-call', 'timestamp': self.stamp(8),
+                        'message': {'model': self.model, 'stop_reason': 'tool_use', 'content': [
+                            {'type': 'tool_use', 'name': 'Bash', 'id': 'worker-test',
+                             'input': {'command': 'python -m unittest -q'}}]}}
+                    result = {**self.rows[self.child][0], 'uuid': 'worker-result', 'timestamp': self.stamp(9),
+                        'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'worker-test', 'content': 'OK'}]}}
+                    if case == 'mixed': result['message']['content'].append({'type': 'text', 'text': 'Native tool context.'})
+                    if case == 'foreign-result': result['message']['content'][0]['tool_use_id'] = 'foreign'
+                    if case == 'text-only': result['message']['content'] = [{'type': 'text', 'text': 'New task.'}]
+                    self.rows[self.child][1:1] = [call, *([] if case == 'missing-result' else [result]),
+                                                *([result] if case == 'duplicate-result' else [])]
+                    self.write()
+                    self.assertEqual(self.check(), 'valid' if case in {'valid', 'mixed'} else 'unknown')
+
     def test_claude_null_terminal_needs_the_existing_exact_parent_completion_proof(self):
         from itertools import product
         from plugins.symphony.tests.test_claude_historical_sendmessage import HANDBACK_FRAME

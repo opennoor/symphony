@@ -31,7 +31,7 @@ from symphony.routing import (  # noqa: E402
     route_for,
     snapshot_for,
 )
-from symphony.runtime import _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT  # noqa: E402
+from symphony.runtime import _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 REFERENCE = Path(__file__).resolve().parents[1] / "skills/symphony/references/capability-routing.md"
@@ -127,13 +127,7 @@ BODIES = {
         + PRACTICES
     ),
     "assessor": (
-        "Assess only. Return size, complexity, risk, rationale, topology, and abstract role "
-        "routes. End with exactly one `SYMPHONY_ASSESSMENT: "
-        '{"size":"small|medium|large","complexity":"simple|mixed|complex","risk":"normal|high",'
-        '"rationale":"...","topology":"..."}` line. Do not become the lead. '
-        "Use only those literal axis values. The matrix fixes execution topology: substantive small work "
-        "uses one worker; medium work uses bounded worker packets. The lead coordinates, reviews integration, "
-        "and verifies results. Your topology recommendation is advisory. "
+        _ASSESSOR_CONTRACT +
         "Identify applicable phase practices, their current availability, native fallbacks, and "
         "evidence needed in the lead packet; do not execute them. " + PRACTICES
     ),

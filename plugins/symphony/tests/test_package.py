@@ -24,6 +24,56 @@ def handlers(relative: str):
 
 
 class PackageContractTests(unittest.TestCase):
+    def test_ci_spends_provider_credits_only_for_release_workflows(self):
+        workflow = (PLUGIN.parents[1] / '.github/workflows/ci.yml').read_text()
+        triggers = workflow.split('\njobs:', 1)[0]
+        self.assertIn('push:\n    branches: [main]', triggers)
+        self.assertNotIn('pull_request:', triggers)
+        self.assertNotIn('workflow_dispatch:', triggers)
+        self.assertNotIn('schedule:', triggers)
+        for name in ('verify', 'windows-hooks', 'dockur-windows'):
+            self.assertIn(f'  {name}:\n    needs: release-candidate\n'
+                          "    if: needs.release-candidate.outputs.pending == 'true'", workflow)
+        self.assertIn('needs: [verify, windows-hooks, dockur-windows]', workflow)
+        refresh = (PLUGIN.parents[1] / '.github/workflows/capability-refresh.yml').read_text()
+        self.assertIn('  workflow_dispatch:', refresh)
+        self.assertNotIn('  schedule:', refresh)
+        self.assertIn("  refresh:\n    if: github.ref == format('refs/heads/{0}', "
+                      'github.event.repository.default_branch)', refresh)
+        if os.name == 'nt':
+            return  # The release gate runs on Ubuntu; Windows checks its wiring above.
+        command = workflow.split('        id: version\n        run: |\n', 1)[1].split('\n\n', 1)[0]
+        command = '\n'.join(line[10:] for line in command.splitlines())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(['git', 'init', '-q', temporary], check=True)
+            subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+                            'commit', '-q', '--allow-empty', '-m', 'fixture'], cwd=root, check=True)
+            manifests = [root / 'plugins/symphony' / provider / 'plugin.json'
+                         for provider in ('.claude-plugin', '.codex-plugin')]
+            for path in manifests:
+                path.parent.mkdir(parents=True)
+            output = root / 'outputs'
+            for version, codex, tagged, expected in (
+                    ('1.7.0', '1.7.0', False, 'pending=true'),
+                    ('1.7.0', '1.7.0', True, 'pending=false'),
+                    ('1.7.1', '1.7.0', False, None),
+                    ('invalid', 'invalid', False, None)):
+                with self.subTest(version=version, codex=codex, tagged=tagged):
+                    for path, value in zip(manifests, (version, codex)):
+                        path.write_text(json.dumps({'version': value}))
+                    if tagged:
+                        subprocess.run(['git', 'tag', 'v' + version], cwd=root, check=True)
+                    output.write_text('')
+                    result = subprocess.run(['bash', '-e', '-c', command], cwd=root, capture_output=True,
+                                            text=True, env={**os.environ, 'GITHUB_OUTPUT': str(output)})
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(output.read_text(), '')
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(output.read_text().strip(), expected)
+
     def test_both_provider_manifests_declare_the_same_released_version(self):
         from plugins.symphony.symphony import PLUGIN_VERSION
 

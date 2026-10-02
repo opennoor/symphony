@@ -324,6 +324,44 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
         self.assertEqual(self.state.recent_runs, (self.original,))
         self.assertEqual(len(self.state.terminal_receipts), 1)
 
+    def test_mixed_tool_result_context_survives_archived_worker_recovery(self):
+        self.prepare_send(persist_start=True)
+        self.rows[1:1] = [
+            {**self.rows[1], 'uuid': 'original-tool-call', 'timestamp': '2026-09-29T02:01:25Z',
+             'message': {'model': 'claude-sonnet-5', 'stop_reason': 'tool_use', 'content': [
+                 {'type': 'tool_use', 'id': 'original-tool', 'name': 'Bash', 'input': {'command': 'true'}}]}},
+            {**self.rows[0], 'uuid': 'original-tool-result', 'timestamp': '2026-09-29T02:01:26Z',
+             'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'original-tool', 'content': 'OK'},
+                                     {'type': 'text', 'text': 'Native tool context.'}]}}]
+        self.write_worker()
+        lead_rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        lead_rows.insert(2, {**self.rows[2], 'agentId': LEAD, 'uuid': 'original-worker-result',
+            'timestamp': '2026-09-29T02:01:41Z', 'message': {'content': [
+                {'type': 'tool_result', 'tool_use_id': 'original-worker-launch', 'content': 'Original worker success.'},
+                {'type': 'text', 'text': 'Native tool context.'}]}})
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in lead_rows))
+        self.assertIsNotNone(_claude_historical_worker_origin(
+            self.state, self.original, WORKER, self.project, self.environ))
+        delayed = replace(self.events[1], observed_at='2026-09-29T02:04:10.05+00:00',
+                          payload={**self.events[1].payload, 'turn_id': 'prompt-send-0'})
+        self.events[1] = delayed
+        sources = tuple(sorted((*self.events, *self.worker_events), key=lambda event: event.observed_at))
+        self.assertIsNotNone(claude_archived_mixed_sendmessage_sequence(
+            self.state, sources, SESSION, self.project, self.environ))
+        self.store.save(self.project, self.state)
+        self.store.finish_session_events(self.store.session_record('claude', SESSION),
+                                        {source.event_id for source in self.events})
+        self.queue(tuple(source for source in sources if source.event_id != delayed.event_id))
+        stop = {'hook_event_name': 'Stop', 'cwd': str(self.project), 'session_id': SESSION}
+        self.assertNotIn('"decision": "block"', handle(stop, self.environ).stdout)
+        self.queue((delayed,))
+        self.assertNotIn('"decision": "block"', handle(stop, self.environ).stdout)
+        after = self.store.load(self.project)
+        self.assertIsNone(after.active_run)
+        self.assertEqual(after.recent_runs[0].assessment['_substantive_children'],
+                         self.original.assessment['_substantive_children'])
+        self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
     def test_superseded_lead_ack_preserves_historical_worker_credit(self):
         self.prepare_send(persist_start=True)
         rows = [json.loads(line) for line in self.child.read_text().splitlines()]

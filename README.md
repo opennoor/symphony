@@ -187,7 +187,7 @@ The package smoke supports `activation`, `managed-run`, `unmarked-spawn`, `inter
 
 ### Receiving capability updates
 
-Symphony ships its tier-to-model map inside the release, and a scheduled workflow republishes that map whenever a provider retires a model. Installing does not subscribe you to those releases: both hosts leave a third-party plugin at the version you installed until you ask for a newer one.
+Symphony ships its tier-to-model map inside the release. Maintainers can manually run the Capability refresh release workflow on the default branch to publish an updated map. Development tests run locally without provider API calls; CI tests run only for a new manifest version on `main`. Installing does not subscribe you to those releases: both hosts leave a third-party plugin at the version you installed until you ask for a newer one.
 
 ```bash
 claude plugin update symphony

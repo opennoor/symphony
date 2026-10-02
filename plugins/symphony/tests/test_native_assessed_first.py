@@ -370,14 +370,15 @@ class NativeAssessedFirstTests(unittest.TestCase):
             'runtime_root': str(home / ('a' * 64)), 'plugin_root': str(home / 'plugin')}}
         roots.append({'type': 'response_item', 'timestamp': at(4), 'payload': {
             'type': 'custom_tool_call', 'name': 'exec', 'call_id': 'unsupported',
-            'input': 'text(await tools.exec_command({cmd: "cat private-token.txt"}));'}})
+            'input': 'text(await tools.exec_command({cmd: "cat private-token.txt", login: false}));'}})
         write()
         with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: children[identity]):
             facts = smoke.assessed_first_probe('codex', document, run, home, project)
         rejected = facts['root_discovery_rejections'][0]
         self.assertTrue(rejected['literal_call_parsed'])
-        self.assertEqual(rejected['command_family'], 'cat')
+        self.assertEqual(rejected['execution_options'], ['login'])
         self.assertEqual(rejected['exec_command_mentions'], 1)
+        self.assertEqual(facts['assessor_native_parents'], {'root': 1, 'lead': 0, 'other': 0, 'unavailable': 0})
         self.assertFalse(facts['accepted'])
         self.assertNotIn('private-', json.dumps(facts))
 

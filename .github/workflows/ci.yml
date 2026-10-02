@@ -2,12 +2,35 @@ name: Symphony CI
 
 on:
   push:
-  pull_request:
+    branches: [main]
 
 jobs:
+  release-candidate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      pending: ${{ steps.version.outputs.pending }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a new manifest version before running release tests
+        id: version
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('plugins/symphony/.claude-plugin/plugin.json'))['version'])")
+          codex_version=$(python3 -c "import json; print(json.load(open('plugins/symphony/.codex-plugin/plugin.json'))['version'])")
+          test "$version" = "$codex_version" || { echo "::error::Provider manifest versions differ"; exit 1; }
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid release version"; exit 1; }
+          if git show-ref --verify --quiet "refs/tags/v$version"; then
+            echo "pending=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "pending=true" >> "$GITHUB_OUTPUT"
+          fi
+
   dockur-windows:
-    # Skip this job for fork PRs by default; this is not a package-access boundary.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: release-candidate
+    if: needs.release-candidate.outputs.pending == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -25,6 +48,8 @@ jobs:
           bash .github/scripts/dockur_windows_smoke.sh
 
   windows-hooks:
+    needs: release-candidate
+    if: needs.release-candidate.outputs.pending == 'true'
     runs-on: windows-latest
     timeout-minutes: 150
     permissions:
@@ -283,6 +308,8 @@ jobs:
           if-no-files-found: ignore
 
   verify:
+    needs: release-candidate
+    if: needs.release-candidate.outputs.pending == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read

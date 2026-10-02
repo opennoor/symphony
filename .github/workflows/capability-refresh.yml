@@ -1,11 +1,8 @@
 name: Capability refresh
 
-# Model lineups change over months, not days, so weekly is ample and keeps the
-# token cost of verification trivial. A scheduled workflow only runs from the
-# default branch, so this stays inert until it is merged.
+# Provider calls are reserved for an intentional capability-map release.
+# Development and scheduled checks must not spend API credits.
 on:
-  schedule:
-    - cron: "17 6 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -14,6 +11,7 @@ permissions:
 
 jobs:
   refresh:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

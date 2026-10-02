@@ -2,6 +2,7 @@
 
 ## 1.7.0 — prepared 2026-10-02
 
+- Reserve CI tests and provider API credits for new-version release workflows. Development and PR tests run locally; capability-map releases require an explicit dispatch on the default branch.
 - Limit fast direct execution to wholly predetermined mechanical work. Tiny features, diagnosis, substantive review, and mixed run-and-fix requests require assessment before changes. Assessed small work uses a worker; the routing matrix controls execution topology.
 - Require successful child work from the current assessment and lead generation before new delegated or mixed runs complete. Preserve the admitted child role and exact lead ownership. Claude scoped credit requires a fresh native child; retained multiple-prompt history has actionable same-lead recovery through fresh bounded delegation. A finished uncredited attempt can be explicitly superseded by a later credited child without blocking Stop. Legacy completion remains compatible.
 - Preserve the original assessment boundary when its already-running assessor confirms the same accepted route after the lead starts. This prevents completed workers from losing credit because of delayed native callbacks; changed routes, new assessor turns, and explicit reassessment still require fresh worker evidence.
@@ -11,6 +12,9 @@
 - Reconcile ordinary Claude completion across prompt-context changes and markerless resumed turns, including a first Stop held by unfinished work.
 - Recognize Claude's native framed hand-back reports and Codex messages delivered after their send acknowledgement. Require exact child reports and actual parent delivery before the lead completes, so successful native work does not get trapped in repeated Stop recovery.
 - Verify Claude child completion against the lead's native isolated worktree, including later lead turns resumed in the original project. Preserve exact launch ownership when checking either directory.
+- Recognize Claude's exact native worker delivery after tool work when its final stop reason is null. Use the same tool-result/context boundary at admission and completion, while still requiring settled tool calls and rejecting a new user prompt.
+- Distinguish a successful lead recovery's paired synthetic Start/completion transaction from a later native restart. Match its source, time, owner generation, outcome, and history order; genuine later starts and failures still invalidate an older result.
+- Deliver the assessor's exact JSON contract directly at native Start on both providers. Unassessed leads stop before project work or child launches. Name Codex consultants explicitly and keep routing assessors at the root.
 - Accept Claude's native background Agent completion notifications, including automatic backgrounding and batched notices, only when the child, launch, exact report, and delivery time agree. An early launch acknowledgement cannot complete a worker.
 - Acknowledge an unadmitted preliminary Codex child only when exact native evidence and complete retained history prove its escalation finished before managed work began. Record an explicit unmanaged disposition without task or lead credit. Clarify the distinct fast and assessed lead names.
 - Preserve accepted legacy risk text during route recovery while keeping new assessment validation strict.
