@@ -2184,6 +2184,72 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn('Do not execute project work or spawn children', held)
             self.assertNotIn('Symphony worker routes', held)
 
+    def test_codex_root_and_lead_wait_only_for_active_work(self):
+        self.seed_run(RunState('run', 'Implement and verify the feature', lead_identity='lead',
+            assessment={'size': 'small', 'complexity': 'simple'}))
+        state = StateStore(self.state_root).load(self.project)
+        for provider in ('codex', 'claude'):
+            root = runtime_module._assessment_guidance('Implement and verify the feature', provider, state)
+            lead = runtime_module._lead_guidance(state, provider)
+            for role, guidance in (('root', root), ('lead', lead)):
+                with self.subTest(provider=provider, role=role):
+                    for instruction in ('Reuse returned evidence', 'Wake idle children for work/evidence with followup_task',
+                                        'send_message only queues',
+                                        'wait_agent only for active work', 'timeout_ms<=60000'):
+                        if provider == 'codex':
+                            self.assertIn(instruction, guidance)
+                        else:
+                            self.assertNotIn(instruction, guidance)
+
+    def test_codex_required_context_survives_long_task_reminder_clipping(self):
+        task = 'Implement the feature and verify every acceptance check. ' + 'Acceptance detail. ' * 600
+        self.assertGreater(len(task), 10000)
+        manifest = json.loads((Path(__file__).resolve().parents[1] / 'hooks/codex.json').read_text())
+        limits = {event: manifest['hooks'][event][0]['hooks'][0]['additionalContextLimit']
+                  for event in ('UserPromptSubmit', 'SubagentStart')}
+        state = ProjectState(active_run=RunState('run', task, lead_identity='lead',
+            assessment={'size': 'small', 'complexity': 'simple'}))
+        for profile in profiles_for('codex'):
+            snapshot = snapshot_for('codex', profile['id'])
+            with patch.object(runtime_module, '_snapshot', return_value=snapshot):
+                contexts = (
+                    ('root', runtime_module._assessment_guidance(task, 'codex', state), 'UserPromptSubmit', 'original request'),
+                    ('root-assessed', runtime_module._assessed_guidance(task, 'codex', state, ''), 'UserPromptSubmit', 'original request'),
+                    ('lead', runtime_module._lead_guidance(state, 'codex'), 'SubagentStart', 'assigned packet'),
+                )
+            for role, guidance, event, source in contexts:
+                with self.subTest(profile=profile['id'], role=role):
+                    emitted = guidance[:limits[event]]
+                    reminder = f'\n\nTask reminder (full {source} governs if clipped):\n'
+                    contracts, separator, repeated_task = guidance.partition(reminder)
+                    self.assertEqual(reminder, separator)
+                    self.assertEqual(task, repeated_task)
+                    self.assertEqual(task, state.active_run.task)
+                    self.assertIn(contracts + reminder, emitted)
+                    self.assertNotIn(task, emitted)
+                    self.assertIn(runtime_module._ASSESSED_LEAD_CONTRACT, emitted)
+                    self.assertIn(runtime_module._LEAD_VERIFICATION_CONTRACT, emitted)
+                    self.assertIn(runtime_module._CODEX_LIFECYCLE_GUIDANCE, emitted)
+                    self.assertIn('SYMPHONY_ROLE: worker', emitted)
+                    if role == 'lead':
+                        self.assertIn("Symphony worker routes by the packet's own size/complexity:", emitted)
+                        self.assertIn('SYMPHONY_ROLE: consultant', emitted)
+                        self.assertIn('SYMPHONY_DECISION JSON in packet and own final report', emitted)
+                    else:
+                        self.assertIn('SYMPHONY_ROLE: assessor', emitted)
+                        self.assertIn('SYMPHONY_ROLE: lead', emitted)
+                        self.assertIn('SYMPHONY_ROUTE:', emitted)
+                        self.assertIn('SYMPHONY_ASSESSMENT:', emitted)
+                        self.assertIn('substantive tasks also need fresh assessment and fresh worker evidence', emitted)
+                    for size in ('small', 'medium', 'large'):
+                        for complexity in ('simple', 'mixed', 'complex'):
+                            normal, high = (resolve_tier(route_for(Assessment(size, complexity, risk)), snapshot)
+                                            for risk in ('normal', 'high'))
+                            expected = f"{size}/{complexity} `{normal['lead_model']}/{normal['lead_effort']}`"
+                            if (normal['lead_model'], normal['lead_effort']) != (high['lead_model'], high['lead_effort']):
+                                expected += f" (high risk: `{high['lead_model']}/{high['lead_effort']}`)"
+                            self.assertIn(expected, emitted)
+
     def test_completing_run_denies_new_lead_spawn_but_preserves_other_work(self):
         marker = ('SYMPHONY_ROUTE: {"size":"small","complexity":"simple",'
                   '"risk":"normal","rationale":"test","topology":"direct"}')

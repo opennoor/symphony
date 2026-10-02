@@ -66,6 +66,10 @@ CONTROLS = {
 ROLES = {"assessor", "consultant", "lead", "worker"}
 HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
 _ROOT_EXECUTION_TOOLS = {"Bash", "PowerShell", "Write", "Edit", "NotebookEdit"}
+_CODEX_LIFECYCLE_GUIDANCE = (
+    "Reuse returned evidence. Wake idle children for work/evidence with followup_task; send_message only queues. "
+    "wait_agent only for active work; timeout_ms<=60000. "
+)
 _LEAD_VERIFICATION_CONTRACT = (
     "After all children return, integrate and execute your packet's acceptance_check yourself with native tools; "
     "worker checks cannot substitute. If you ended a WAITING turn, do this on waking before completion."
@@ -74,8 +78,8 @@ _ASSESSED_LEAD_CONTRACT = (
     "delegate implementation, diagnosis, design, review, and product judgment to workers or consultants; "
     "small tasks need one worker; medium: bounded worker packets; large: delegate project work. "
     "Delegate implementation before editing. " + _LEAD_VERIFICATION_CONTRACT
-    + " Use each child's matrix cell. Complete after all children return and verification passes. "
-    'If reporting an outcome, use one JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; use blocked or failed if work remains. '
+    + " Use each child's matrix cell. Complete only after verification passes. "
+    'Outcome JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; use blocked or failed if work remains. '
 )
 _ASSESSOR_CONTRACT = (
     "Assess the bounded task yourself; do not spawn agents or execute the task. "
@@ -4236,10 +4240,11 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
                 'SYMPHONY_ASSESSMENT JSON report before selecting or resuming the matrix lead.')
     snapshot = _snapshot(state, provider)
     protocol = (
-        'Every worker spawn must pass explicit `model` and `reasoning_effort`, `fork_turns="none"`, '
-          'and task name `symphony_worker_<model>_<effort>` with a unique suffix if occupied. '
-        'Put `SYMPHONY_ROLE: worker` on the first line of its bounded objective/ownership/evidence/'
-        'constraints/acceptance_check/return_contract/size/complexity packet. '
+        'Worker spawns: explicit model, reasoning_effort, fork_turns="none", '
+        'task_name=symphony_worker_<model>_<effort> (unique suffix if occupied). '
+        'Bounded packet: first line SYMPHONY_ROLE: worker, then objective/ownership/evidence/'
+        'constraints/acceptance_check/return_contract/size/complexity. '
+        + _CODEX_LIFECYCLE_GUIDANCE
         if provider == "codex" else
         'Every worker or consultant Agent spawn uses its exact packaged agent type and '
         '`run_in_background: false` to request direct delivery to this lead. '
@@ -4248,16 +4253,16 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
         'Worker packets begin `SYMPHONY_ROLE: worker`. '
     )
     return (
-        "Assessed task and acceptance checks from admission:\n" + state.active_run.task + "\n\n"
-        "For assessed work, " + _ASSESSED_LEAD_CONTRACT
-        + 'Spawn only workers or consultants; routing assessors belong to the root. '
+        _ASSESSED_LEAD_CONTRACT
+        + 'Only spawn workers/consultants; routing assessors belong to the root. '
         + protocol + "Symphony worker routes by the packet's own size/complexity: "
         + "; ".join(_provider_cells(snapshot, "worker"))
         + (f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
            if provider == "claude" else
-           f". Consultants use explicit model={snapshot.tiers['strongest']}, reasoning_effort=high, "
-           'fork_turns="none", task name `symphony_consultant_<model>_<effort>` with a unique suffix if occupied, '
-           'SYMPHONY_ROLE: consultant, and SYMPHONY_DECISION JSON in its packet and own final report.')
+           f". Consultants: model={snapshot.tiers['strongest']}, reasoning_effort=high, "
+           'fork_turns="none", name `symphony_consultant_<model>_<effort>` (unique suffix if occupied), '
+           'SYMPHONY_ROLE: consultant; SYMPHONY_DECISION JSON in packet and own final report.')
+        + "\n\nTask reminder (full assigned packet governs if clipped):\n" + state.active_run.task
     )
 
 
@@ -4309,7 +4314,6 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                        "If occupied, append a unique underscore suffix for a fresh child. Keep this fast prefix; "
                        "generic assessed-lead names apply after assessment; never use them for a fast spawn. ")
             return (
-                f"Task to relay in full, including every acceptance check:\n{task}\n\n"
                 "For implementation, diagnosis, run-and-fix, design, review, or uncertainty, "
                 "spawn the assessor directly. Do not probe with another agent or run project commands at the root. "
                 "Symphony fast route: the root is a courier. For a wholly predetermined mechanical objective, "
@@ -4335,6 +4339,7 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                 + "For assessed-first work, or after an attempted fast lead returns native escalation, "
                 "use this assessment contract: "
                 + _assessed_guidance("", provider, state, session_id)
+                + f"\n\nTask reminder (full original request governs if clipped):\n{task}"
             )
     return _assessed_guidance(task, provider, state, session_id)
 
@@ -4343,6 +4348,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
     """The same assessor/lead packet contract for escalation and direct assessment."""
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
+        _CODEX_LIFECYCLE_GUIDANCE +
         "On Codex, use `fork_turns=\"none\"` for assessor and assessed lead. Name them "
         "`symphony_<role>_<model>_<effort>`; use underscores in model names (gpt_6_1_sol). "
         "Add a suffix if occupied. Require one exact "
@@ -4353,8 +4359,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
     )
     if provider == "codex":
         snapshot = _snapshot(state, provider) if state else snapshot_for(provider)
-        codex += ("Profile cell choices override abstract tiers. Select the assessed lead and each worker "
-                  "from these exact cells; never reuse the fast lead selection: "
+        codex += ("Exact profile cells override tiers for lead and worker; never reuse the fast lead selection: "
                   + "; ".join(_provider_cells(snapshot, "lead")) + ". ")
     boost = ""
     if state is not None and provider:
@@ -4368,12 +4373,10 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
                  f"`reasoning_effort=\"{effort}\"`, and `fork_turns=\"none\"`. ")
         boost = _boost_status(state, provider, session_id) + " " + spawn
     return (
-        (f"Task to relay in full, including every acceptance check:\n{task}\n\n" if task else "")
-        +
         "Keep the root thin. Spawn the selected assessor with explicit model "
         "and effort and put `SYMPHONY_ROLE: assessor` on its own line. Give it the full objective, constraints "
         "and acceptance checks; await its terminal assessment without sending additional work. "
-        "On Codex use wait_agent. Select the lead mechanically from the "
+        "Select the lead mechanically from the "
         "nine-cell matrix; the assessor must not become the lead. Spawn the lead with explicit model and effort, "
         "put `SYMPHONY_ROLE: lead` on its own line, and include one exact line in its task: "
         "SYMPHONY_ROUTE: {\"size\":\"small|medium|large\",\"complexity\":\"simple|mixed|complex\","
@@ -4385,12 +4388,12 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
           'task name with a unique suffix if occupied, and a packet starting `SYMPHONY_ROLE: worker`. '
         "Relay this matrix lead contract (assessor topology is advisory): "
         + _ASSESSED_LEAD_CONTRACT
-        + "Archived followup only reconciles the same bounded task. New objectives need a fresh managed scope; "
-        "substantive work needs fresh assessment. Never credit previous-task workers to it. "
-        "Relay the task in full; every part and acceptance check goes in the packet. The lead cannot see this conversation. "
-        "The assessor packet must require the exact size/complexity/risk vocabulary above and explain that "
-        "substantive small work uses one worker; medium work uses bounded worker packets. "
+        + "Archived followup reconciles only the same task. New objectives need fresh scope; "
+        "substantive tasks also need fresh assessment and fresh worker evidence. "
+        "Relay all task parts and acceptance checks; the lead cannot see this conversation. "
+        "Assessor packets require that exact size/complexity/risk vocabulary; substantive small work uses one worker. "
         f"{boost}{codex}{claude}"
+        + (f"\n\nTask reminder (full original request governs if clipped):\n{task}" if task else "")
     )
 
 
