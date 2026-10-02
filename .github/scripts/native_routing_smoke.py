@@ -45,7 +45,10 @@ class GreetingTests(unittest.TestCase):
         self.assertEqual(greet('Ada'), 'Hello, Ada!')
 """
 FIXTURE_COMMAND_INSTRUCTIONS = (
-    "Run the requested test command in one standalone native exec_command (Codex) or Bash (Claude) call. "
+    "The root delegates and waits; relay these execution instructions to the selected fast lead. "
+    "The fast lead runs the requested test command in one standalone native exec_command (Codex) or Bash (Claude) call. "
+    "Use exactly python -m unittest -q, with no test-file arguments, discovery arguments, shell "
+    "operators, pipelines, or output filters. Relay this exact command unchanged to the fast lead. "
     "Return the full structured result including exit code and output. On Codex use "
     "text(await tools.exec_command({\"cmd\":\"python -m unittest -q\"})); do not print only result.output.\n")
 FIXTURE_INSTRUCTIONS = (
@@ -96,6 +99,7 @@ def failure_diagnostics(provider, root, document):
                          bound_child_eligible_markers=0, bound_child_escalate_markers=0)
     root_launches = dict.fromkeys(('calls', 'successful_results', 'error_results', 'missing_results'), 0)
     fast_calls = dict.fromkeys(('dedicated_read', 'exec_wrapper', 'shell_exec', 'edit', 'handback', 'other'), 0)
+    root_calls = dict(fast_calls)
     runs = [*document.get('active_runs', {}).values(), *document.get('recent_runs', [])]
     known_children = {child.get('identity') for run in runs for child in run.get('delegations', [])}
     fast_provenance = dict.fromkeys(('matching_native_candidates', 'unforked_candidates',
@@ -119,6 +123,9 @@ def failure_diagnostics(provider, root, document):
                 counts_for_root = raw_launch_counts(provider, rows)
                 for key in root_launches:
                     root_launches[key] += counts_for_root[key]
+                categories = raw_tool_categories(provider, rows)
+                for key in root_calls:
+                    root_calls[key] += categories[key]
             fast_candidate = any(fast_native_identity(provider, rows, identity, run, home, root / 'primary')
                                  for run in runs)
             if (provider == 'codex' and identity in known_children
@@ -182,6 +189,9 @@ def failure_diagnostics(provider, root, document):
             'assessed_completion': [assessed_completion_probe(provider, home, run, document) for run in runs
                                     if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'root_native_launches': root_launches,
+            'root_native_tool_categories': root_calls,
+            'lead_integration': [lead_integration_probe(provider, run, home, root / 'primary')
+                for run in runs if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'assessed_first_authority': [assessed_first_probe(provider, document, run, home, root / 'primary')
                 for run in runs if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             **({'claude_phases': claude_phase_diagnostics(root, home)} if provider == 'claude' else {}),
@@ -1616,7 +1626,9 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     greeting = project / "greet.py"
     greeting.write_text("def greet(name):\n    return f'" + ("hello" if case == "run-and-fix" else "Hello") + ", {name}!'\n")
     (project / "test_greet.py").write_text(TEST)
-    (project / "AGENTS.md").write_text(FIXTURE_COMMAND_INSTRUCTIONS if case == 'command' else FIXTURE_INSTRUCTIONS)
+    instructions = FIXTURE_COMMAND_INSTRUCTIONS if case == 'command' else FIXTURE_INSTRUCTIONS
+    (project / "AGENTS.md").write_text(instructions)
+    (project / "CLAUDE.md").write_text(instructions)
     run_git("add", ".", cwd=project)
     run_git("commit", "-m", "greeting fixture", cwd=project)
     initial_hash = fingerprint(greeting)
@@ -1632,7 +1644,9 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     prompt = CASES[case] + (' This is the required fast-eligibility escalation probe: first relay the complete '
         'request to the offered fast lead. That lead must use NO tools and make NO changes before returning '
         'SYMPHONY_FAST_DECISION: escalate. Only then request independent assessment and bounded delegation.'
-        if case == 'feature' else '')
+        if case == 'feature' else ' This is the required assessor-first probe: request independent assessment '
+        'before launching any lead or worker. Then launch the selected canonical assessed lead and let that '
+        'lead delegate the fix to a bounded worker.' if case == 'run-and-fix' else '')
     if case != 'command':
         prompt += (' Relay the fixture integration check unchanged: after every worker returns successfully, '
             'the canonical assessed lead itself must run exactly python -m unittest -q in a standalone native '
@@ -1840,7 +1854,7 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
                      and item.get('payload', {}).get('state') == 'completed']
         if (accepted is None or len(admissions) != 1 or len(terminals) != 1
                 or any(admissions[0].get('payload', {}).get(key) != run['assessment'].get(key)
-                       for key in ('size', 'complexity', 'risk', 'substantive_contract'))):
+                       for key in ('size', 'complexity', 'risk'))):
             return False
         rows = child_rows[identity]
         lead_rows = child_rows[run['lead_identity']]
@@ -2010,6 +2024,8 @@ def assessed_first_probe(provider, document, run, home, project):
             return None
         if event == 'return':
             facts.update(accepted=value is True, source_line=frame.f_lineno)
+            facts['admission_count'] = len(frame.f_locals.get('admissions', ()))
+            facts['assessor_terminal_count'] = len(frame.f_locals.get('terminals', ()))
             calls = frame.f_locals.get('calls', ())
             if isinstance(calls, (tuple, list)):
                 facts['root_call_count'] = len(calls)
@@ -2120,6 +2136,35 @@ def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows,
     except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError):
         pass
     return False
+
+
+def lead_integration_probe(provider, run, home, project):
+    """Inspect the same verifier; export only counts, categories and its exit line."""
+    facts = {'accepted': False}
+    code = lead_verifies_after_worker_returns.__code__
+    def trace(frame, kind, result):
+        if frame.f_code != code:
+            return None
+        if kind == 'return':
+            values = frame.f_locals
+            facts.update(accepted=result is True, source_line=frame.f_lineno,
+                         returned_workers=len(values.get('returned', ())),
+                         worker_matches=len(values.get('matches', ())),
+                         integration_boundary_present=values.get('boundary') is not None)
+        return trace
+    previous = sys.gettrace()
+    try:
+        children = {item['identity']: native_rows(provider, home, item['identity']) for item in run['delegations']}
+        lead = children[run['lead_identity']]
+        workers = [item for item in run['delegations'] if item['role'] == 'worker']
+        facts['commands'] = command_witness_probe(provider, lead, project)
+        sys.settrace(trace)
+        lead_verifies_after_worker_returns(provider, lead, workers, children, project, run)
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError) as error:
+        facts['error_type'] = type(error).__name__
+    finally:
+        sys.settrace(previous)
+    return facts
 
 
 def verify_case_run(provider, case, document, run_state, home, project, greeting,

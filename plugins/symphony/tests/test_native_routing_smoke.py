@@ -20,6 +20,32 @@ spec.loader.exec_module(smoke)
 
 
 class NativeRoutingEvidenceTests(unittest.TestCase):
+    def test_integration_diagnostics_keep_native_text_private(self):
+        run = {'lead_identity': 'lead', 'delegations': [{'identity': 'lead', 'role': 'lead'}]}
+        rows = [{'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+            {'type': 'text', 'text': 'PRIVATE_SENTINEL'}]}}]
+        with patch.object(smoke, 'native_rows', return_value=rows):
+            facts = smoke.lead_integration_probe('claude', run, Path('/private-home'), Path('/private-project'))
+        self.assertFalse(facts['accepted'])
+        self.assertIn('source_line', facts)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(facts))
+
+    def test_native_fixtures_supply_the_same_instructions_to_both_hosts(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                project = root / 'primary'
+                project.mkdir()
+                with patch.object(smoke, 'prepare_baseline_capture', return_value={}), \
+                     patch.object(smoke, 'install_private_child_capture'), \
+                     patch.object(smoke, 'projects', return_value=(project, project)), \
+                     patch.object(smoke, 'run_git'), \
+                     patch.object(smoke.shutil, 'which', side_effect=RuntimeError('fixture prepared')):
+                    with self.assertRaisesRegex(RuntimeError, 'fixture prepared'):
+                        smoke.check_case(provider, root, root, 'command', 60, 1)
+                self.assertEqual((project / 'CLAUDE.md').read_text(), smoke.FIXTURE_COMMAND_INSTRUCTIONS)
+                self.assertEqual((project / 'AGENTS.md').read_text(), smoke.FIXTURE_COMMAND_INSTRUCTIONS)
+
     def test_command_diagnostics_separate_native_results_from_supported_argv(self):
         rows = [{'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': 'call', 'name': 'Bash',
                  'input': {'command': 'cd PRIVATE_SENTINEL && python -m unittest -q'}}]}},

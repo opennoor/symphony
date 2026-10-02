@@ -142,7 +142,39 @@ class PackageContractTests(unittest.TestCase):
         self.assertLess(source.index('$cs = @(Get-Command'), source.index('$until ='))
         self.assertLess(source.index('$until ='), source.index('foreach ($c in $cs)'))
         self.assertIn('Select-Object -First 6', source)
-        self.assertIn('$p.WaitForExit(700)', source)
+        self.assertIn('$p.WaitForExit(1500)', source)
+        self.assertIn('$until = [DateTime]::UtcNow.AddSeconds(4)', source)
+
+    @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
+    def test_windows_relay_accepts_a_slow_working_interpreter_probe(self):
+        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        with tempfile.TemporaryDirectory(prefix='slow interpreter probe ') as temporary:
+            directory = Path(temporary)
+            probe = directory / 'python.exe'
+            if os.name == 'nt':
+                source = directory / 'probe.cs'
+                executable = sys.executable.replace('"', '""')
+                source.write_text('using System; class Probe { static void Main() { '
+                                  'System.Threading.Thread.Sleep(1000); Console.WriteLine(@"'
+                                  + executable + '"); } }')
+                quoted = lambda path: "'" + str(path).replace("'", "''") + "'"
+                compiler = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+                compiled = subprocess.run([compiler, '-NoProfile', '-NonInteractive', '-Command',
+                    'Add-Type -Path ' + quoted(source) + ' -OutputAssembly ' + quoted(probe)
+                    + ' -OutputType ConsoleApplication -ErrorAction Stop'],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            else:
+                probe.write_text('#!' + sys.executable + '\nimport time\ntime.sleep(1)\nprint('
+                                 + repr(sys.executable) + ')\n')
+                probe.chmod(0o755)
+            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                    relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                    text=True, timeout=15, env={**os.environ, 'PATH': str(directory), variable: str(directory)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), '123')
 
     @unittest.skipUnless(Path('/usr/bin/python3').is_file(), 'needs a second system Python')
     def test_generated_launchers_match_system_python_compression_backend(self):

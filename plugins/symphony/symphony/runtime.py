@@ -2058,6 +2058,43 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                             if receipt.get('provider') == 'claude' and receipt.get('session') == session
                             and receipt.get('run_id') == run.run_id and receipt.get('agent') == lead_identity
                             and receipt.get('turn') == token]
+                if native.payload.get('status') == 'superseded':
+                    turn = next(item for item in sequence['turns'] if item['native_event_id'] == native.event_id)
+                    witnesses = [item for item in sequence['sources'] if isinstance(item, Mapping)
+                                 and item.get('native_event_id') == native.event_id]
+                    called = _instant(turn.get('called_at'))
+                    turns = (*sequence['turns'], *sequence.get('historical_workers', {}).get('turns', ()))
+                    next_call = min((_instant(item['called_at']) for item in turns
+                                     if called is not None and _instant(item['called_at']) > called), default=None)
+                    committed = _sendmessage_commit_boundary(sequence)
+                    if (turn.get('disposition') != 'superseded'
+                            or turn.get('superseded_by') != proof[1][-1].event_id
+                            or called is None or committed is None
+                            or any(not isinstance(item.get('event_id'), str) or not item['event_id'] for item in witnesses)
+                            or len({item.get('event_id') for item in witnesses}) != len(witnesses)
+                            or not any(item.get('kind') == 'subagent_stopped' for item in witnesses)
+                            or any(item.get('disposition') != 'superseded' or item.get('result') != result
+                                   or item.get('turn') != token or type(item.get('generation')) is not int
+                                   or item['generation'] != generation
+                                   or not isinstance(item.get('kind'), str)
+                                   or item['kind'] not in {'subagent_started', 'subagent_stopped'}
+                                   or not isinstance(item.get('hash'), str)
+                                   or re.fullmatch('[0-9a-f]{64}', item['hash']) is None
+                                   or _instant(item.get('observed_at')) is None
+                                   or _instant(item['observed_at']) < called
+                                   or _instant(item['observed_at']) > committed
+                                   or next_call is not None and _instant(item['observed_at']) >= next_call
+                                   or item['kind'] == 'subagent_stopped'
+                                      and _instant(item['observed_at']) < _instant(native.observed_at)
+                                   or item['kind'] == 'subagent_started'
+                                      and _instant(item['observed_at']) > _instant(native.observed_at)
+                                   for item in witnesses)
+                            or receipts or token in terminal_turns.get(lead_identity, ())
+                            or native.event_id + ':followup-start' in run.assessment.get('_start_event_ids', ())
+                            or result in run.assessment.get('_terminal_event_ids', ())):
+                        valid = False
+                        break
+                    continue
                 metadata = {'native_agent_type': native.payload.get('agent_type'),
                             'native_model': native.payload.get('model'),
                             'native_effort': native.payload.get('model_reasoning_effort'),
@@ -2145,6 +2182,8 @@ def _committed_sendmessage_source(state: ProjectState, source: Event,
                 if (native is None or witness.get('turn') != _child_turn_token(native.payload)
                         or witness.get('result') != _terminal_result_id(native)):
                     continue
+                if native.payload.get('status') == 'superseded' and witness.get('disposition') == 'superseded':
+                    return True
                 start = witness.get('native_event_id', '') + ':followup-start'
                 if (start not in run.assessment.get('_start_event_ids', ())
                         or witness.get('result') not in run.assessment.get('_terminal_event_ids', ())
@@ -2219,6 +2258,8 @@ def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: 
     witnesses, dispositions = [], []
     ordered_sources = tuple(sorted(sources, key=lambda source: (_instant(source.observed_at), source.event_id)))
     for native in natives:
+        if native.payload.get('status') == 'superseded':
+            continue
         started = Event(native.event_id + ':followup-start', 'subagent_started',
                         native.payload['_symphony_native_started_at'],
                         {**native.payload, 'status': 'working', 'task': archived.task})
@@ -2236,6 +2277,8 @@ def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: 
                           'hash': claude_sendmessage_source_hash(source, session),
                           'native_event_id': native.event_id, 'turn': _child_turn_token(native.payload),
                           'result': _terminal_result_id(native)})
+        if native.payload.get('status') == 'superseded':
+            target[-1]['disposition'] = 'superseded'
     run = state.active_runs[f'claude:{session}']
     sequences = run.assessment.get('_claude_sendmessage_sequences', ())
     if not isinstance(sequences, (list, tuple)):
@@ -4152,7 +4195,8 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         "put `SYMPHONY_ROLE: lead` on its own line, and include one exact line in its task: "
         "SYMPHONY_ROUTE: {\"size\":\"small|medium|large\",\"complexity\":\"simple|mixed|complex\","
         "\"risk\":\"normal|high\",\"rationale\":\"...\",\"topology\":\"...\"}. "
-        "Every later worker or consultant spawn needs its matching SYMPHONY_ROLE line and explicit model/effort; "
+        "Spawn the assessed lead first; it delegates workers. The root awaits results. Every worker or consultant "
+        "spawn needs its matching SYMPHONY_ROLE line and explicit model/effort; "
         "consultants also need SYMPHONY_DECISION JSON with decision-local size and complexity. "
         'Relay the child spawn protocol in the lead packet: on Codex every worker uses `fork_turns="none"`, '
         'explicit model/reasoning_effort from its own cell, underscore `symphony_worker_<model>_<effort>` '

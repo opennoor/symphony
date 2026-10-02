@@ -122,6 +122,25 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
         self.assertEqual(self.state.recent_runs, (self.original,))
         self.assertEqual(len(self.state.terminal_receipts), 1)
 
+    def test_superseded_lead_ack_preserves_historical_worker_credit(self):
+        self.prepare_send(persist_start=True)
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        next(row for row in rows if row.get('uuid') == 'terminal-send-0')['message']['stop_reason'] = None
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.store.save(self.project, self.state)
+        self.queue(self.worker_events)
+        before = self.store.load(self.project)
+        result = handle({'hook_event_name': 'Stop', 'cwd': str(self.project), 'session_id': SESSION}, self.environ)
+        self.assertNotIn('"decision": "block"', result.stdout)
+        after = self.store.load(self.project)
+        self.assertEqual(after.recent_runs[0].assessment['_substantive_children'],
+                         before.recent_runs[0].assessment['_substantive_children'])
+        self.assertEqual(tuple(receipt for receipt in after.terminal_receipts if receipt.get('agent') == WORKER),
+                         tuple(receipt for receipt in before.terminal_receipts if receipt.get('agent') == WORKER))
+        self.assertEqual(sum(receipt.get('agent') == LEAD for receipt in after.terminal_receipts),
+                         1 + sum(receipt.get('agent') == LEAD for receipt in before.terminal_receipts))
+        self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
     def test_historical_ack_rejects_native_errors_new_tools_and_orphan_results(self):
         for case in ('original-error', 'terminal-error', 'earlier-error', 'Agent', 'SendMessage',
                      'Write', 'Edit', 'Bash', 'Read', 'orphan-result'):

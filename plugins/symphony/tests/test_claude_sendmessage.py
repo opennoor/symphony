@@ -81,6 +81,106 @@ class ClaudeSendMessageTests(unittest.TestCase):
         return claude_archived_sendmessage_sequence(self.store.load(self.project), tuple(self.events),
                                                     SESSION, self.project, self.environ)
 
+    def supersede_intermediate(self):
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        next(row for row in rows if row.get('uuid') == 'terminal-send-0')['message']['stop_reason'] = None
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        return rows
+
+    def test_exact_obsolete_ack_is_superseded_without_a_completion_receipt(self):
+        for hook in ('Stop', 'SessionStart', 'UserPromptSubmit'):
+            with self.subTest(hook=hook):
+                self.setUp()
+                self.prepare()
+                self.supersede_intermediate()
+                proof = self.proof()
+                self.assertIsNotNone(proof)
+                self.assertEqual(proof[1][0].payload['status'], 'superseded')
+                self.assertEqual(proof[3]['turns'][0]['superseded_by'], proof[1][-1].event_id)
+                self.assertNotIn('"decision": "block"', self.call(hook).stdout)
+                self.call()
+                state = self.store.load(self.project)
+                self.assertIsNone(state.active_run)
+                self.assertEqual(state.recent_runs[0].outcome, {'status': 'completed'})
+                self.assertEqual(len(state.terminal_receipts), 1)
+                self.assertEqual(state.terminal_receipts[0]['turn'], 'prompt_id:prompt-send-1')
+                self.assertNotIn('prompt_id:prompt-send-0', state.recent_runs[0].assessment['_terminal_turns'][LEAD])
+                self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
+    def test_superseded_ack_commit_survives_failed_or_partial_ack(self):
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                self.setUp()
+                self.prepare()
+                self.supersede_intermediate()
+                with patch.object(StateStore, 'finish_session_events', side_effect=OSError('crash')):
+                    with self.assertRaises(OSError): self.call()
+                before = self.store.load(self.project)
+                if partial:
+                    self.store.finish_session_events(self.store.session_record('claude', SESSION),
+                                                    {self.events[1].event_id, self.events[-1].event_id})
+                self.call('SessionStart')
+                after = self.store.load(self.project)
+                self.assertEqual(after.recent_runs, before.recent_runs)
+                self.assertEqual(after.terminal_receipts, before.terminal_receipts)
+                self.assertEqual(len(after.terminal_receipts), 1)
+                self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
+    def test_superseded_ack_requires_exact_stop_and_successful_successor(self):
+        for case in ('missing-stop', 'wrong-report', 'failed-stop', 'missing-stop-reason', 'tool',
+                     'api-error', 'native-error', 'native-interrupted', 'outcome', 'failed-successor', 'unfinished-successor'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prepare()
+                rows = self.supersede_intermediate()
+                terminal = rows[-3]
+                if case == 'missing-stop': self.events.pop(1)
+                if case in ('wrong-report', 'failed-stop'):
+                    self.events[1] = replace(self.events[1], payload={**self.events[1].payload,
+                        **({'last_assistant_message': 'Foreign.'} if case == 'wrong-report' else {'status': 'failed'})})
+                if case == 'missing-stop-reason': terminal['message'].pop('stop_reason')
+                if case == 'tool': terminal['message']['content'].append({'type': 'tool_use', 'id': 'tool', 'name': 'Bash'})
+                if case == 'api-error': terminal['isApiErrorMessage'] = True
+                if case in ('native-error', 'native-interrupted'):
+                    rows.insert(-3, {**terminal, 'type': 'error' if case == 'native-error' else 'system',
+                                     'subtype': 'interrupted', 'uuid': 'error-row'})
+                if case == 'outcome': terminal['message']['content'][0]['text'] = REPORT
+                if case == 'failed-successor': rows[-1]['message']['content'][0]['text'] = 'SYMPHONY_OUTCOME: {"status":"failed"}'
+                if case == 'unfinished-successor': rows[-1]['message']['stop_reason'] = None
+                self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                self.assertIsNone(self.proof())
+
+    def test_partial_ack_replay_validates_the_superseded_stop_witness(self):
+        from plugins.symphony.symphony.runtime import _committed_sendmessage_source
+        for case in ('before-report', 'after-next-call', 'hash', 'boolean-generation', 'missing-stop',
+                     'duplicate-id', 'wrong-disposition', 'forged-receipt'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prepare()
+                self.supersede_intermediate()
+                with patch.object(StateStore, 'finish_session_events', side_effect=OSError('crash')):
+                    with self.assertRaises(OSError): self.call()
+                state = self.store.load(self.project)
+                run = state.recent_runs[0]
+                anchor = dict(run.assessment['_claude_sendmessage_sequences'][0])
+                sources = [dict(item) for item in anchor['sources']]
+                stop = next(item for item in sources if item.get('disposition') == 'superseded'
+                            and item['kind'] == 'subagent_stopped')
+                if case == 'before-report': stop['observed_at'] = '2026-09-29T02:03:02+00:00'
+                if case == 'after-next-call': stop['observed_at'] = '2026-09-29T02:05:02+00:00'
+                if case == 'hash': stop['hash'] = 'bad'
+                if case == 'boolean-generation': stop['generation'] = True
+                if case == 'missing-stop': sources.remove(stop)
+                if case == 'duplicate-id': sources.append(stop)
+                if case == 'wrong-disposition': stop['disposition'] = 'completed'
+                if case == 'forged-receipt': state = replace(state, terminal_receipts=(*state.terminal_receipts,
+                    {**state.terminal_receipts[0], 'turn': 'prompt_id:prompt-send-0'}))
+                anchor['sources'] = sources
+                state = replace(state, recent_runs=(replace(run, assessment={**run.assessment,
+                    '_claude_sendmessage_sequences': (anchor,)}),))
+                self.assertFalse(_committed_sendmessage_source(state, self.events[0], SESSION, 1,
+                                                              self.project, self.environ))
+
     def test_exact_native_coordinator_projection_rejects_raw_and_conflicting_metadata(self):
         for case in ('raw', 'prefix', 'suffix', 'extra', 'peer', 'malformed-origin', 'not-meta'):
             with self.subTest(case=case):

@@ -254,10 +254,10 @@ def prompt(project):
     gate_command = shlex.join([str(Path(sys.executable)).replace("\\", "/"), gate, "isolated"])
     worker_packet = {'subagent_type': f'symphony:symphony-worker-{MODEL}-low',
                      'prompt': 'SYMPHONY_ROLE: worker\n' + json.dumps({
-                         'objective': 'Run the isolated fixture gate once and return GATE_RELEASED.',
-                         'ownership': 'Only the supplied gate command in the owning isolated worktree.',
-                         'constraints': 'Run exactly ' + gate_command + '. Do not edit files or delegate.',
-                         'acceptance_check': 'The command exits zero after printing GATE_RELEASED.',
+                         'objective': 'Return the literal callback report GATE_RELEASED.',
+                         'ownership': 'Only this bounded literal report under the owning isolated lead.',
+                         'constraints': 'No applicable capability phase. Do not inspect files, run commands, edit files or delegate.',
+                         'acceptance_check': 'The worker finishes successfully with exactly GATE_RELEASED.',
                          'return_contract': 'Return exactly GATE_RELEASED on successful completion.',
                          'size': 'small', 'complexity': 'simple'})}
     lead_packet = {"subagent_type": LEAD_AGENT,
@@ -265,7 +265,11 @@ def prompt(project):
                    "run_in_background": True,
                    "isolation": "worktree",
                    "prompt": (f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n"
-                              'Spawn exactly one worker using WORKER_SPAWN_PACKET unchanged. '
+                              'Run exactly ' + gate_command + ' first as one native Bash command. '
+                              'Only after it exits zero with GATE_RELEASED, spawn exactly one worker '
+                              'using WORKER_SPAWN_PACKET unchanged. '
+                              'An Agent launch acknowledgment is not a worker result: yield without '
+                              'an outcome until the host delivers the worker result. '
                               'Await its successful GATE_RELEASED result, verify it, '
                               'then return exactly SYMPHONY_OUTCOME: {"status":"completed"}. '
                               'WORKER_SPAWN_PACKET: ' + json.dumps(worker_packet))}

@@ -7,11 +7,12 @@ $why = 'No Python executable found'
 $began = [DateTime]::UtcNow
 $cs = @(Get-Command python.exe,python3.exe,py.exe -All -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 6)
 $enumerationMs = [int]([DateTime]::UtcNow - $began).TotalMilliseconds
-$until = [DateTime]::UtcNow.AddSeconds(2)
+$until = [DateTime]::UtcNow.AddSeconds(4)
 $attempts = 0
 foreach ($c in $cs) {
 if ([DateTime]::UtcNow -ge $until) { break }
 $attempts++
+$p = $null
 try {
 $a = '-I -c "import sys;assert sys.version_info>=(3,10);print(sys.executable)"'
 if ($c.Name -eq 'py.exe') { $a = '-3 ' + $a }
@@ -22,12 +23,12 @@ $q.RedirectStandardOutput = $true
 $q.RedirectStandardError = $true
 $p = [Diagnostics.Process]::Start($q)
 $p.StandardInput.Close()
-if (-not $p.WaitForExit(700)) { $p.Kill(); $why = $c.Source + ': probe timed out'; continue }
+if (-not $p.WaitForExit(1500)) { $why = $c.Source + ': probe timed out'; try { $p.Kill() } catch {}; continue }
 $path = $p.StandardOutput.ReadToEnd().Trim()
 $errorText = $p.StandardError.ReadToEnd().Trim()
 if ($p.ExitCode -eq 0 -and [IO.Path]::IsPathRooted($path) -and (Test-Path -LiteralPath $path -PathType Leaf)) { $py = $path; break }
 $why = $c.Source + ': probe exit ' + $p.ExitCode + ' ' + $errorText.Substring(0,[Math]::Min(160,$errorText.Length))
-} catch { $why = $c.Source + ': ' + $_.Exception.Message; continue }
+} catch { $why = $c.Source + ': ' + $_.Exception.Message; continue } finally { if ($p) { $p.Dispose() } }
 }
 if (-not $py) { [Console]::Error.WriteLine('Symphony pending activation: no working Python 3.10+ on PATH; candidates=' + $cs.Count + ' attempted=' + $attempts + ' enumeration_ms=' + $enumerationMs + ' elapsed_ms=' + [int]([DateTime]::UtcNow - $began).TotalMilliseconds + '; ' + $why); exit 1 }
 $i = [Diagnostics.ProcessStartInfo]::new($py, '-I -c "' + $b + '" "' + $root + '" ' + $v)

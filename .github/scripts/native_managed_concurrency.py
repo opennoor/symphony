@@ -393,7 +393,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
         'objective': 'Return the literal callback report GATE_RELEASED.',
         'ownership': 'Only this bounded literal report under the owning lead.',
         'evidence': 'The owning lead has already returned from its native start hook.',
-        'constraints': 'Do not inspect files, execute shell commands, edit files, create worktrees or delegate.',
+        'constraints': 'No applicable capability phase. Do not inspect files, execute shell commands, edit files, create worktrees or delegate.',
         'acceptance_check': 'The native worker finishes successfully with exactly GATE_RELEASED.',
         'return_contract': 'Return exactly GATE_RELEASED without Markdown.',
         'size': 'small', 'complexity': 'simple'})
@@ -2122,7 +2122,12 @@ def check_case(provider, root, separate, timeout, budget, update=None,
                                           sessions[label], budget, deadline, logs,
                                           f"{label}.finalize", finalize=True)
                             finalized.add(label)
+                records_clear = all(not (record.get('pending') or record.get('overflow'))
+                                    for record in (read_state_snapshot(path)
+                                                   for path in state_dir.glob('.session-*.json')))
                 if ((len(resumed) == len(processes) if update else True)
+                        and all(process.poll() == 0 for process in processes.values())
+                        and records_clear
                         and all(any(run.get("session_id") == sessions[label]
                                 and run.get("status") == "completed"
                                 and (run.get("outcome") or {}).get("status") == "completed"
@@ -3075,6 +3080,41 @@ def require_literal_worker(provider, run, home, project=None, captures=()):
         raise RuntimeError('literal worker has no exact successful native report')
 
 
+def claude_literal_worker_probe(run, home):
+    """Fixed report-shape facts; native report prose stays private."""
+    from native_routing_smoke import native_rows, assistant_text, native_call_inventory
+    facts = []
+    workers = [child for child in run.get('delegations', ()) if child.get('role') == 'worker']
+    for ordinal, worker in enumerate(workers[:12]):
+        item = {'ordinal': ordinal, 'native_reader_available': False}
+        try:
+            rows = native_rows('claude', home, worker['identity'])
+            assistants = [row for row in rows if row.get('type') == 'assistant']
+            activity = [row for row in rows if row.get('type') in {'assistant', 'user'}]
+            terminal = assistants[-1] if assistants else {}
+            report = assistant_text('claude', terminal)
+            calls, results = native_call_inventory('claude', rows)
+            handbacks = [call for call in calls if call[1] == 'SubagentHandback']
+            item.update(native_reader_available=True, assistant_count=len(assistants),
+                final_activity_is_terminal=bool(activity) and activity[-1] is terminal,
+                terminal_is_end_turn=terminal.get('message', {}).get('stop_reason') == 'end_turn',
+                terminal_has_uuid=bool(terminal.get('uuid')),
+                prior_end_turn_count=sum(row.get('message', {}).get('stop_reason') == 'end_turn' for row in assistants[:-1]),
+                api_error_count=sum(row.get('isApiErrorMessage') is True for row in assistants),
+                exact_literal_final=report == 'GATE_RELEASED',
+                literal_line_present='GATE_RELEASED' in report.splitlines(),
+                outcome_marker_count=sum(line.strip().startswith('SYMPHONY_OUTCOME:') for line in report.splitlines()),
+                handback_count=len(handbacks),
+                exact_literal_handbacks=sum(call[2].get('message') == 'GATE_RELEASED' for call in handbacks
+                                            if isinstance(call[2], dict)),
+                handback_result_counts=[len(results.get(call[0], ())) for call in handbacks],
+                handback_error_counts=[sum(result[3] for result in results.get(call[0], ())) for call in handbacks])
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError) as error:
+            item['error_type'] = type(error).__name__
+        facts.append(item)
+    return {'worker_count': len(workers), 'workers': facts}
+
+
 def require_codex_gate_lead(records, label, session_id, lead_id):
     """The second-child scheduling heuristic cannot prove native ownership."""
     starts = [item for item in records if item.get('event') == 'SubagentStart'
@@ -3676,7 +3716,8 @@ def failure_state(root, provider):
                                              for item in assessment.get("_terminal_event_ids", ())],
                 "terminal_turn_hashes": {identity: [short_hash(token) for token in tokens]
                                          for identity, tokens in terminal_turns.items()},
-                'native_literal_workers': codex_literal_worker_probe(run, home) if provider == 'codex' else None,
+                'native_literal_workers': (codex_literal_worker_probe(run, home) if provider == 'codex'
+                                         else claude_literal_worker_probe(run, home)),
                 'native_child_binding': claude_child_binding_probe(home, run, document)
                     if provider == 'claude' else None,
                 'native_callback_disposition': claude_callback_disposition_probe(root, run, document, raw_session_records)

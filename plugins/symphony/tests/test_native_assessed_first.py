@@ -151,6 +151,14 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 'type': 'output_text', 'text': assessor[-1]['payload']['last_agent_message']}]}})
         self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
 
+    def test_persisted_admission_allowlist_does_not_contain_private_contract(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                document, run, children, home, project, profile, _, _ = self.fixture(provider)
+                document['event_history'][0]['payload'] = {
+                    key: value for key, value in run['assessment'].items() if key != 'substantive_contract'}
+                self.assertTrue(smoke.assessed_first_verified(provider, document, run, children, home, project, profile))
+
     def test_codex_native_wait_during_assessment_is_supported(self):
         document, run, children, home, project, profile, roots, write = self.fixture('codex')
         roots.append({'type': 'response_item', 'timestamp': at(4), 'payload': {

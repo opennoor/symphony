@@ -30,6 +30,20 @@ SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_claude_literal_worker_probe_exports_only_fixed_report_facts(self):
+        import native_routing_smoke as routing
+        rows = [{'type': 'assistant', 'uuid': 'terminal', 'timestamp': '2026-10-01T00:00:01Z',
+                 'message': {'role': 'assistant', 'stop_reason': None, 'content': [{'type': 'text', 'text': 'PRIVATE_SENTINEL\nGATE_RELEASED'}]}}]
+        run = {'delegations': [{'identity': 'worker', 'role': 'worker', 'state': 'completed'}]}
+        with patch.object(routing, 'native_rows', return_value=rows):
+            result = native.claude_literal_worker_probe(run, Path('private-home'))
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+        facts = result['workers'][0]
+        self.assertTrue(facts['native_reader_available'])
+        self.assertTrue(facts['literal_line_present'])
+        self.assertFalse(facts['exact_literal_final'])
+        self.assertFalse(facts['terminal_is_end_turn'])
+
     def test_failure_trace_uses_exact_gate_owner_when_cli_stdout_is_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

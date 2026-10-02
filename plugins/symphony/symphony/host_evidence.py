@@ -474,6 +474,7 @@ def _claude_native_lead_event(
     allow_fast_escalation: bool = False,
     allow_assessed_markerless: bool = False,
     allow_archived_assessed_markerless: bool = False,
+    allow_archived_superseded: bool = False,
 ) -> Event | None:
     """Validate one lead terminal against Claude's native parent and child turns.
 
@@ -646,7 +647,20 @@ def _claude_native_lead_event(
         return None
     terminal = assistants[-1]
     message = terminal.get("message")
-    if (not isinstance(message, dict) or message.get("stop_reason") != "end_turn"
+    # A later verified turn may supersede a tool-free archived acknowledgment.
+    # This is not native completion: the sequence records a disposition and
+    # never dispatches this turn or grants a successful terminal receipt.
+    superseded = bool(archived_markerless and allow_archived_superseded
+        and prompt_index < len(prompt_indices) - 1 and isinstance(message, dict)
+        and 'stop_reason' in message and message['stop_reason'] is None
+        and turn == assistants and not any(row.get('isApiErrorMessage') is True for row in turn)
+        and all((row.get('message') or {}).get('stop_reason') is None for row in assistants)
+        and all(isinstance((row.get('message') or {}).get('content'), list)
+            and all(isinstance(item, dict) and item.get('type') in {'text', 'thinking', 'redacted_thinking'}
+                    and not any(marker in str(item.get('text', '')) for marker in
+                                ('SYMPHONY_OUTCOME:', 'SYMPHONY_FAST_DECISION:'))
+                    for item in row['message']['content']) for row in assistants))
+    if (not isinstance(message, dict) or message.get("stop_reason") != "end_turn" and not superseded
             or any((row.get("message") or {}).get("stop_reason") == "end_turn"
                    for row in assistants[:-1])):
         return None
@@ -745,7 +759,7 @@ def _claude_native_lead_event(
     payload = {
         "provider": "claude", "session_id": session, "agent_id": lead_id,
         "parent_thread_id": session, "agent_type": agent_type,
-        "prompt_id": prompt_id, "status": "completed",
+        "prompt_id": prompt_id, "status": "superseded" if superseded else "completed",
         "model": lead.requested_tier, "model_reasoning_effort": lead.requested_effort,
         "last_assistant_message": report,
         "_symphony_native_started_at": prompt_at.isoformat(),
@@ -2406,6 +2420,10 @@ def claude_archived_sendmessage_sequence(
         return None
     native_events, records = [], []
     scoped = replace(state, active_run=run)
+    final_native = _claude_native_lead_event(scoped, session, project, environ,
+        require_missing=False, target_prompt=prompts[-1]['uuid'], allow_archived_assessed_markerless=True)
+    if final_native is None or _reported_status(final_native.payload['last_assistant_message']) != 'completed':
+        return None
     for index, ((called, row, call), prompt) in enumerate(zip(calls, prompts)):
         next_call = next((when for when in global_calls if when > called), None)
         began = _instant(prompt['timestamp'])
@@ -2429,8 +2447,9 @@ def claude_archived_sendmessage_sequence(
                 or response.get('resumedAgentId') not in {None, run.lead_identity}
                 or not _claude_coordinator_prompt_matches(prompt, call['input']['message'])):
             return None
-        native = _claude_native_lead_event(scoped, session, project, environ,
-            require_missing=False, target_prompt=prompt['uuid'], allow_archived_assessed_markerless=True)
+        native = (final_native if index == len(calls) - 1 else _claude_native_lead_event(
+            scoped, session, project, environ, require_missing=False, target_prompt=prompt['uuid'],
+            allow_archived_assessed_markerless=True, allow_archived_superseded=True))
         if native is None:
             return None
         completed = _instant(native.observed_at)
@@ -2447,6 +2466,8 @@ def claude_archived_sendmessage_sequence(
                         'called_at': called.isoformat(), 'native_event_id': native.event_id,
                         'prompt_id': prompt['uuid'], 'completed_at': native.observed_at,
                         'returned_at': returned.isoformat()})
+        if native.payload['status'] == 'superseded':
+            records[-1].update(disposition='superseded', superseded_by=final_native.event_id)
     mapping = {}
     for event in events:
         matches = [index for index, native in enumerate(native_events)
@@ -2455,6 +2476,21 @@ def claude_archived_sendmessage_sequence(
         if len(matches) != 1 or event.event_id in mapping:
             return None
         mapping[event.event_id] = matches[0]
+    for index, native in enumerate(native_events):
+        if native.payload['status'] != 'superseded':
+            continue
+        # A missing native stop reason alone cannot dispose of any callback.
+        # The exact recorded Stop/report must precede the completing successor.
+        if replay:
+            witnesses = committed_anchor.get('sources', ())
+            stopped = any(isinstance(item, Mapping) and item.get('kind') == 'subagent_stopped'
+                          and item.get('native_event_id') == native.event_id
+                          and item.get('disposition') == 'superseded' for item in witnesses)
+        else:
+            stopped = any(event.kind == 'subagent_stopped' and mapping[event.event_id] == index
+                          for event in events)
+        if not stopped:
+            return None
     lead = next(item for item in run.delegations if item.identity == run.lead_identity and item.role == 'lead')
     anchor = {'version': 1, 'archived_at': run.updated_at, 'owner_generation': run.owner_generation,
               'lead': run.lead_identity, 'turns': records,
