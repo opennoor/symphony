@@ -40,7 +40,8 @@ class ClaudeStartProbeTests(unittest.TestCase):
 
     def test_success_retains_original_command_and_budget(self):
         self.assertEqual(probe.command('claude.cmd'), ['claude.cmd', '--print', '--model', 'haiku',
-            '--max-budget-usd', '0.50', '--output-format', 'text', '/symphony:start CI routing probe'])
+            '--max-budget-usd', '0.50', '--output-format', 'text',
+            '/symphony:start Run git rev-parse --show-toplevel and report its output.'])
         result, process = self.run_fake()
         self.assertEqual(result['exit_code'], 0)
         self.assertFalse(result['timed_out'])
@@ -56,6 +57,10 @@ class ClaudeStartProbeTests(unittest.TestCase):
         self.assertTrue(result['stderr_nonempty'])
         self.assertNotIn('PRIVATE_AUTH_SENTINEL', json.dumps(result))
         self.assertNotIn('ParserError', json.dumps(result))
+
+    def test_stop_hook_block_has_its_own_private_category(self):
+        self.assertTrue(probe.error_categories('Blocked by hook: PRIVATE_CHILD')['stop_blocked'])
+        self.assertNotIn('PRIVATE_CHILD', json.dumps(probe.error_categories('Blocked by hook: PRIVATE_CHILD')))
 
     def test_timeout_cannot_be_reported_as_success(self):
         result, process = self.run_fake(timeout=True)

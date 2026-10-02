@@ -398,6 +398,20 @@ class NativeAssessedFirstTests(unittest.TestCase):
                                   ['cat', str(Path(original) / 'profiles.json')]):
                     self.assertTrue(smoke.structured_root_discovery('exec_command', {'cmd': smoke.shlex.join(arguments)},
                         provider='codex', document=document, session=run['session_id'], project=project))
+                migrated = str(Path(original) / '.codex-plugin/migrated-command-skills/source-command-help/SKILL.md')
+                shell = str(home / 'pwsh.exe')
+                wrapper = f'"{shell}" -Command "Get-Content -LiteralPath \'{migrated}\'"'
+                with patch.object(smoke.shutil, 'which', return_value=shell):
+                    self.assertTrue(smoke.structured_root_discovery('exec_command', {'cmd': wrapper},
+                        provider='codex', document=document, session=run['session_id'], project=project))
+                    composed = 'const r=await tools.exec_command({cmd:' + json.dumps(wrapper) + '}); text(JSON.stringify(r));'
+                    self.assertTrue(smoke.structured_root_discovery('exec', composed,
+                        provider='codex', document=document, session=run['session_id'], project=project))
+                    for unsafe in (wrapper + '; touch greet.py',
+                                   wrapper.replace('SKILL.md', 'other.md'),
+                                   wrapper.replace('Get-Content', 'Remove-Item')):
+                        self.assertFalse(smoke.structured_root_discovery('exec_command', {'cmd': unsafe},
+                            provider='codex', document=document, session=run['session_id'], project=project))
                 for ordinal, command in enumerate(commands):
                     arguments = {'cmd': command, 'workdir': str(project)}
                     name = 'exec_command'

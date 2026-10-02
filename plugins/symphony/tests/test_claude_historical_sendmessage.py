@@ -146,7 +146,10 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
         for case in ('valid', 'root', 'no-hash', 'wrong-hash', 'missing-result', 'duplicate-call',
                      'duplicate-result', 'session', 'parent', 'sidechain', 'no-uuid', 'api-error',
                      'error-result', 'early-result', 'late-result', 'wrong-report', 'wrong-footer',
-                     'async-ack', 'async-launch', 'wrong-prompt', 'foreign-prompt', 'wrong-tool'):
+                     'async-ack', 'async-launch', 'wrong-prompt', 'foreign-prompt', 'wrong-tool',
+                     'one-block-valid', 'one-block-valid-single-newline',
+                     'one-block-wrong-report', 'one-block-wrong-footer',
+                     'one-block-async-ack'):
             with self.subTest(case=case):
                 self.setUp()
                 self.prepare()
@@ -190,7 +193,14 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
                 if case == 'wrong-prompt': call['message']['content'][0]['input']['prompt'] = 'Different task.'
                 if case == 'foreign-prompt': prompt['agentId'] = 'foreign'
                 if case == 'wrong-tool': call['message']['content'][0]['name'] = 'SendMessage'
-                expected = case in {'valid', 'root'}
+                if case.startswith('one-block-'):
+                    combined = text + '\n\n' + footer
+                    if case == 'one-block-valid-single-newline': combined = text + '\n' + footer
+                    if case == 'one-block-wrong-report': combined = 'Different result.\n\n' + footer
+                    if case == 'one-block-wrong-footer': combined = text + '\n\n' + footer.replace(WORKER, 'foreign')
+                    if case == 'one-block-async-ack': combined = 'Async agent launched successfully.\n\n' + footer
+                    delivery['message']['content'][0]['content'] = [{'type': 'text', 'text': combined}]
+                expected = case in {'valid', 'root', 'one-block-valid', 'one-block-valid-single-newline'}
                 self.assertEqual(claude_native_parent_completion(rows, terminal, text, SESSION, parent, WORKER,
                     before=_instant(self.rows[2]['timestamp']), prompt=prompt, launch_hash=launch_hash), expected)
                 worker_rows = [prompt, terminal, *self.rows[2:]]

@@ -13,7 +13,8 @@ import sys
 
 def command(executable):
     return [executable, '--print', '--model', 'haiku', '--max-budget-usd', '0.50',
-            '--output-format', 'text', '/symphony:start CI routing probe']
+            '--output-format', 'text',
+            '/symphony:start Run git rev-parse --show-toplevel and report its output.']
 
 
 def error_categories(text):
@@ -22,6 +23,7 @@ def error_categories(text):
         'authentication': r'authentication|unauthorized|not logged in|invalid api key|login required',
         'model_unavailable': r'model.*(?:unavailable|not found|not supported)|invalid model',
         'hook_failure': r'hook.*(?:failed|error)|ParserError|no working Python',
+        'stop_blocked': r'blocked by hook|Symphony stop is blocked',
         'permission': r'permission denied|access.*denied|UnauthorizedAccess',
         'runtime_exception': r'Traceback|RuntimeError|Exception',
     }

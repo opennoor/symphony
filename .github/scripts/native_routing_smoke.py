@@ -1925,16 +1925,26 @@ def structured_root_discovery(name, args, *, provider='', document=None, session
     try:
         if any(value in details['cmd'] for value in ('$','`','\n','\r')):
             return False
-        lexer = shlex.shlex(details['cmd'], posix=True, punctuation_chars=';&|<>')
-        lexer.whitespace_split = True
-        argv = list(lexer)
+        wrapped = re.fullmatch(
+            r'"(?P<shell>[^"]+)" -Command "Get-Content -LiteralPath \'(?P<path>[^\'"]+)\'"',
+            details['cmd'], re.IGNORECASE)
+        if wrapped:
+            installed = shutil.which('pwsh.exe') or shutil.which('pwsh')
+            if not installed or Path(wrapped['shell']).resolve() != Path(installed).resolve():
+                return False
+            argv = ['Get-Content', '-LiteralPath', wrapped['path']]
+        else:
+            lexer = shlex.shlex(details['cmd'], posix=True, punctuation_chars=';&|<>')
+            lexer.whitespace_split = True
+            argv = list(lexer)
         allowed = {(project / 'AGENTS.md').resolve()}
         allowed.update((Path(root) / 'skills/symphony' / relative).resolve()
                        for root in (original, retained) for relative in (
                            'SKILL.md', 'references/role-contracts.md',
                            'references/provider-activation.md', 'references/capability-routing.md'))
         allowed.update((Path(root) / relative).resolve() for root in (original, retained)
-                       for relative in ('profiles.json', 'model-policy.json'))
+                       for relative in ('profiles.json', 'model-policy.json',
+                           '.codex-plugin/migrated-command-skills/source-command-help/SKILL.md'))
         paths = (argv[2:] if len(argv) >= 3 and argv[:2] == ['cat', '--'] else
                  argv[1:] if len(argv) >= 2 and argv[0] == 'cat' else
                  argv[3:] if len(argv) == 4 and argv[:2] == ['sed', '-n']

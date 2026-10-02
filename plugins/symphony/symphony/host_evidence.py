@@ -2453,6 +2453,16 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
             footer = (rf"agentId: {escaped} \(use SendMessage with to: '{escaped}', "
                       r"summary: '<5-10 word recap>' to continue this agent\)\n"
                       r"<usage>subagent_tokens: [0-9]+\ntool_uses: [0-9]+\nduration_ms: [0-9]+</usage>")
+            separate = (isinstance(content, list) and len(content) == 2
+                and content[0] == {'type': 'text', 'text': report}
+                and isinstance(content[1], dict) and content[1].get('type') == 'text'
+                and isinstance(content[1].get('text'), str)
+                and re.fullmatch(footer, content[1]['text']) is not None)
+            combined = (isinstance(content, list) and len(content) == 1
+                and isinstance(content[0], dict) and content[0].get('type') == 'text'
+                and isinstance(content[0].get('text'), str)
+                and re.fullmatch(re.escape(report) + r'\n{1,2}' + footer,
+                                 content[0]['text']) is not None)
             if (row.get('type') != 'user' or row.get('sessionId') != session
                     or (row.get('agentId') or '') != parent
                     or row.get('isSidechain') is not bool(parent)
@@ -2460,11 +2470,7 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
                     or not isinstance(row.get('uuid'), str) or not row['uuid']
                     or when is None or when < completed or before is not None and when >= before
                     or result.get('is_error') is not None and result['is_error'] is not False
-                    or not isinstance(content, list) or len(content) != 2
-                    or content[0] != {'type': 'text', 'text': report}
-                    or not isinstance(content[1], dict) or content[1].get('type') != 'text'
-                    or not isinstance(content[1].get('text'), str)
-                    or re.fullmatch(footer, content[1]['text']) is None):
+                    or not (separate or combined)):
                 return False
             matching.append(row)
     for row in rows:
