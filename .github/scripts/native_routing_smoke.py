@@ -2160,6 +2160,24 @@ def assessed_first_probe(provider, document, run, home, project):
     """Expose exact proof stage, never native arguments, identities or paths."""
     facts = {'accepted': False, 'source_line': None, 'root_call_count': 0, 'root_launch_count': 0}
     def trace(frame, event, value):
+        if frame.f_code is structured_root_discovery.__code__:
+            if event == 'return' and value is False and frame.f_locals.get('name') in {
+                    'exec', 'functions.exec', 'exec_command'}:
+                details = frame.f_locals.get('details')
+                argv = frame.f_locals.get('argv', ())
+                paths = frame.f_locals.get('paths', ())
+                source = frame.f_locals.get('args')
+                rejected = facts.setdefault('root_discovery_rejections', [])
+                if len(rejected) < 16:
+                    rejected.append({'source_line': frame.f_lineno,
+                        'literal_call_parsed': isinstance(details, dict),
+                        'exec_command_mentions': min(16, source.count('tools.exec_command('))
+                            if isinstance(source, str) else 0,
+                        'command_family': argv[0] if argv and argv[0] in {
+                            'cat', 'sed', 'Get-Content', 'python', 'python3', 'rg', 'pwd'} else 'other',
+                        'bootstrap_target_count': len(paths),
+                        'control_operator_present': any(token in {';', '&&', '||', '|', '>', '<'} for token in argv)})
+            return trace
         if frame.f_code is not assessed_first_verified.__code__:
             return None
         if event == 'return':

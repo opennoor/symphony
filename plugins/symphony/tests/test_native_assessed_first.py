@@ -219,6 +219,23 @@ class NativeAssessedFirstTests(unittest.TestCase):
         self.assertFalse(facts['accepted'])
         self.assertNotIn('private-', json.dumps(facts))
 
+    def test_assessed_first_probe_classifies_rejected_root_read_without_exporting_arguments(self):
+        document, run, children, home, project, profile, roots, write = self.fixture('codex')
+        document['activation'] = {'codex': {'session_id': run['session_id'],
+            'runtime_root': str(home / ('a' * 64)), 'plugin_root': str(home / 'plugin')}}
+        roots.append({'type': 'response_item', 'timestamp': at(4), 'payload': {
+            'type': 'custom_tool_call', 'name': 'exec', 'call_id': 'unsupported',
+            'input': 'text(await tools.exec_command({cmd: "cat private-token.txt"}));'}})
+        write()
+        with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: children[identity]):
+            facts = smoke.assessed_first_probe('codex', document, run, home, project)
+        rejected = facts['root_discovery_rejections'][0]
+        self.assertTrue(rejected['literal_call_parsed'])
+        self.assertEqual(rejected['command_family'], 'cat')
+        self.assertEqual(rejected['exec_command_mentions'], 1)
+        self.assertFalse(facts['accepted'])
+        self.assertNotIn('private-', json.dumps(facts))
+
     def test_codex_readonly_bootstrap_preserves_assessor_first_authority(self):
         for wrapped in (False, 'serialized', 'output'):
             with self.subTest(wrapped=wrapped):

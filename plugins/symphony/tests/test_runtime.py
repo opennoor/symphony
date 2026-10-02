@@ -3136,7 +3136,7 @@ class RuntimeTests(unittest.TestCase):
                 **lead,
                 "hook_event_name": "SubagentStop",
                 "status": "completed",
-                "last_assistant_message": "Done",
+                "last_assistant_message": 'SYMPHONY_DECISION: {"size":"small","complexity":"simple"}\nDone',
             },
             self.environ,
         )

@@ -102,7 +102,9 @@ class AdapterContractTests(unittest.TestCase):
         final = {"type": "assistant", "message": {"content": [{"type": "text", "text": "New final."}]}}
         for boundary in ('{"type":"user",', 'null', '[]',
                          '{"type":"user","message":{}}',
-                         '{"type":"user","message":{"content":[null]}}'):
+                         '{"type":"user","message":{"content":[null]}}',
+                         '{"type":"user","message":{"content":[{"type":"tool_result"},{"type":"text","text":null}]}}',
+                         '{"type":"user","message":{"content":[{"type":"tool_result"},{"type":"image"}]}}'):
             for turn in (None, "old", "new"):
                 with self.subTest(boundary=boundary, turn=turn), TemporaryDirectory() as temporary:
                     transcript = Path(temporary) / "child.jsonl"
@@ -125,17 +127,24 @@ class AdapterContractTests(unittest.TestCase):
                 "name": "SubagentHandback", "input": {"message": text}}]}}
         def final(text):
             return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
-        for case in ('plain-prompt', 'text-block-prompt', 'new-handback', 'same-turn-result', 'delayed-stop'):
+        for case in ('plain-prompt', 'text-block-prompt', 'image-prompt', 'new-handback',
+                     'same-turn-result', 'same-turn-mixed-result', 'same-turn-mixed-result-reversed', 'delayed-stop'):
             with self.subTest(case=case), TemporaryDirectory() as temporary:
                 transcript = Path(temporary) / 'child.jsonl'
                 rows = [prompt('First task.'), report(blocked), final('First turn ended.')]
                 latest = 'Latest turn ended.'
-                if case == 'same-turn-result':
-                    rows.append(prompt([{"type": "tool_result", "tool_use_id": "handback", "content": "OK"}]))
+                if case.startswith('same-turn-'):
+                    content = [{"type": "tool_result", "tool_use_id": "handback", "content": "OK"}]
+                    if case != 'same-turn-result':
+                        content.append({"type": "text", "text": "Native tool-result reminder."})
+                    if case.endswith('-reversed'):
+                        content.reverse()
+                    rows.append(prompt(content))
                     expected = blocked
                 else:
                     rows.append(prompt([{"type": "text", "text": "Continue task."}]
-                                       if case == 'text-block-prompt' else 'Continue task.'))
+                                       if case == 'text-block-prompt' else [{"type": "image"}]
+                                       if case == 'image-prompt' else 'Continue task.'))
                     expected = ''
                 if case in {'new-handback', 'delayed-stop'}:
                     rows.append(report(completed))

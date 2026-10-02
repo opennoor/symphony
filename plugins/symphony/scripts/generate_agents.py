@@ -31,6 +31,7 @@ from symphony.routing import (  # noqa: E402
     route_for,
     snapshot_for,
 )
+from symphony.runtime import _CONSULTANT_CONTRACT  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 REFERENCE = Path(__file__).resolve().parents[1] / "skills/symphony/references/capability-routing.md"
@@ -83,7 +84,8 @@ BODIES = {
         "and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`.\n\n"
         "For assessed packets, the matrix fixes your topology. Assign substantive implementation, diagnosis, "
         "design, review tasks, and product judgment to workers or consultants. Delegate implementation before editing; "
-        "your edits integrate returned worker changes. Coordinate, review integration, verify, "
+        "your edits integrate returned worker changes. After workers return, run your own native "
+        "acceptance check on the integrated result and report its fresh evidence. Coordinate, review integration, "
         "and communicate the results.\n\n"
         "- small: assign the substantive work to one worker; integrate and verify its result.\n"
         "- medium: assign substantive work to bounded worker packets; integrate and verify the results.\n"
@@ -129,10 +131,7 @@ BODIES = {
         "evidence needed in the lead packet; do not execute them. " + PRACTICES
     ),
     "consultant": (
-        "Decide only the supplied question. Return recommendation, evidence, uncertainty, and "
-        "consequences. Include one `SYMPHONY_DECISION: "
-        '{"size":"small|medium|large","complexity":"simple|mixed|complex"}` line per actionable '
-        "decision. For an independent review use compatible `ce-code-review` or Matt Pocock "
+        _CONSULTANT_CONTRACT + "For an independent review use compatible `ce-code-review` or Matt Pocock "
         "`code-review`, or compare the exact diff with requirements and affected callers. "
         "For external facts use Context7 or dated official sources. When asked for a review, "
         "review independently and do not fix the code.\n\n" + PRACTICES

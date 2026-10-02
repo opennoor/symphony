@@ -72,6 +72,14 @@ _ASSESSED_LEAD_CONTRACT = (
     "Use each child's matrix cell. Complete after all children return and verification passes. "
     'If reporting an outcome, use one JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; use blocked or failed if work remains. '
 )
+_CONSULTANT_CONTRACT = (
+    "Decide only the supplied question. Return recommendation, evidence, uncertainty, and consequences. "
+    "In your own final native report, classify each recommendation or review conclusion with a "
+    "SYMPHONY_DECISION JSON line, including a review that recommends no changes. "
+    "Use decision-local size (small, medium, large) and complexity (simple, mixed, complex). "
+    'Example of a valid final line:\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}\n'
+    "Return at least one classification; a line supplied by the lead cannot classify your result. "
+)
 
 
 def _root_admission_key(provider: str, payload: Mapping) -> str:
@@ -1500,6 +1508,10 @@ def _transition(
                     if not str(item.get('payload', {}).get('text', '')).startswith('Symphony accepted the assessed route.')]
                 state = replace(state, active_run=replace(state.active_run, assessment=assessment))
                 actions += (Action("inject_context", {"text": _lead_guidance(state, provider)}),)
+            elif state.active_run and any(item.identity == str(payload.get("agent_id") or "")
+                    and item.role == "consultant" and item.state in {"working", "pending"}
+                    for item in state.active_run.delegations):
+                actions += (Action("inject_context", {"text": _CONSULTANT_CONTRACT}),)
     elif source.kind in {"post_tool_use", "post_tool_failed"}:
         state = _discard_failed_spawn(state, source, provider)
         state, parent_actions = _consume_parent_actions(state)
@@ -4145,15 +4157,13 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
         'Every worker spawn uses its exact packaged agent type and a packet beginning `SYMPHONY_ROLE: worker`. '
     )
     return (
-        "For assessed work, assign substantive work to workers or consultants; small tasks need one worker, "
-        "medium tasks need bounded worker packets, and large tasks delegate project work. "
-        "The lead coordinates, integrates, and verifies results. "
+        "For assessed work, " + _ASSESSED_LEAD_CONTRACT
         + protocol + "Symphony worker routes by the packet's own size/complexity: "
         + "; ".join(_provider_cells(snapshot, "worker"))
         + (f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
            if provider == "claude" else
            f". Consultants use explicit model={snapshot.tiers['strongest']}, reasoning_effort=high, "
-           'fork_turns="none", SYMPHONY_ROLE: consultant, and SYMPHONY_DECISION JSON.')
+           'fork_turns="none", SYMPHONY_ROLE: consultant, and SYMPHONY_DECISION JSON in its packet and own final report.')
     )
 
 

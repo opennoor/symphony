@@ -191,8 +191,12 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                     if not isinstance(content, (str, list)) or isinstance(content, list) and any(
                             not isinstance(item, dict) or not isinstance(item.get("type"), str) for item in content):
                         return ""
-                    if isinstance(content, str) or not content or any(
-                            item["type"] != "tool_result" for item in content):
+                    tool_result = isinstance(content, list) and any(
+                        item["type"] == "tool_result" for item in content)
+                    if tool_result and any(item["type"] != "tool_result" and (
+                            item["type"] != "text" or not isinstance(item.get("text"), str)) for item in content):
+                        return ""
+                    if not tool_result:
                         # requestJournal context can be reused across native child
                         # turns. A report belongs only to its own prompt.
                         if report or final:
