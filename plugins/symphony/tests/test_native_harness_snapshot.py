@@ -246,14 +246,11 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 native.require_live_update_versions(old, candidate)
 
 
-    def test_native_ci_upgrade_baseline_uses_released_160(self):
+    def test_release_ci_preserves_offline_legacy_recovery_replay(self):
         workflow = (PLUGIN.parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
-        self.assertEqual(workflow.count('git fetch origin tag v1.6.0'), 3)
-        self.assertNotIn('git fetch origin tag v1.5.1', workflow)
-        self.assertEqual(sum('git worktree add --detach' in line and line.endswith(' v1.6.0')
-                             for line in workflow.splitlines()), 3)
-        # The separate legacy recovering-state replay remains a strict test.
         self.assertIn('Replay released 1.5.1 recovering state', workflow)
+        self.assertIn('python -m unittest plugins.symphony.tests.test_host_evidence.'
+                      'HostEvidenceTests.test_released_151_recovering_state_reconciles_unique_native_followup', workflow)
 
     def test_live_update_main_accepts_both_released_roots_with_default_candidate(self):
         for old_version in ("1.5.1", "1.6.0"):

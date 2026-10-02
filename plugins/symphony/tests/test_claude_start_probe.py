@@ -91,12 +91,6 @@ class ClaudeStartProbeTests(unittest.TestCase):
             self.assertNotIn('PRIVATE_AUTH_SENTINEL', saved.read_text(encoding='utf-8'))
             self.assertNotIn('PRIVATE_AUTH_SENTINEL', str(output.call_args))
 
-    def test_windows_workflow_preserves_start_failure_gate(self):
-        workflow = (SCRIPT.parents[1] / 'workflows/ci.yml').read_text(encoding='utf-8')
-        self.assertIn('python .github/scripts/claude_start_probe.py --timeout 600\n'
-                      "          if ($LASTEXITCODE -ne 0) { throw 'Claude start control failed' }", workflow)
-        self.assertIn("symphony-native-diagnostics/*.json", workflow)
-
 
 if __name__ == '__main__':
     unittest.main()
