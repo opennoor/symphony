@@ -4208,7 +4208,11 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
         'Put `SYMPHONY_ROLE: worker` on the first line of its bounded objective/ownership/evidence/'
         'constraints/acceptance_check/return_contract/size/complexity packet. '
         if provider == "codex" else
-        'Every worker spawn uses its exact packaged agent type and a packet beginning `SYMPHONY_ROLE: worker`. '
+        'Every worker or consultant Agent spawn uses its exact packaged agent type and '
+        '`run_in_background: false` to request direct delivery to this lead. '
+        'If Claude forces background execution, wait for the native completion notification; '
+        'a native async launch acknowledgment is not the child result. '
+        'Worker packets begin `SYMPHONY_ROLE: worker`. '
     )
     return (
         "Assessed task and acceptance checks from admission:\n" + state.active_run.task + "\n\n"

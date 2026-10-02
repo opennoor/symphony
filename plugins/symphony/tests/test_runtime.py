@@ -2136,6 +2136,9 @@ class RuntimeTests(unittest.TestCase):
         guidance = runtime_module._lead_guidance(state, 'codex')
         self.assertIn(task, guidance)
         self.assertIn(runtime_module._LEAD_VERIFICATION_CONTRACT, guidance)
+        claude_guidance = runtime_module._lead_guidance(state, 'claude')
+        self.assertIn('`run_in_background: false`', claude_guidance)
+        self.assertIn('a native async launch acknowledgment is not the child result', claude_guidance)
 
     def test_completing_run_denies_new_lead_spawn_but_preserves_other_work(self):
         marker = ('SYMPHONY_ROUTE: {"size":"small","complexity":"simple",'
