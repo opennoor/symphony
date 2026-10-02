@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from plugins.symphony.tests.test_native_routing_smoke import smoke
 
@@ -166,6 +166,19 @@ class NativeAssessedFirstTests(unittest.TestCase):
             'arguments': '{"timeout_ms":30000}'}})
         write()
         self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
+
+    def test_assessed_first_probe_reports_only_fixed_unsupported_tool_kinds(self):
+        document, run, children, home, project, profile, roots, write = self.fixture('codex')
+        roots.append({'type': 'response_item', 'timestamp': at(4), 'payload': {
+            'type': 'function_call', 'name': 'private-tool-name', 'call_id': 'unsupported',
+            'arguments': '{"secret":"private-token"}'}})
+        write()
+        with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: children[identity]):
+            facts = smoke.assessed_first_probe('codex', document, run, home, project)
+        self.assertEqual(facts['unsupported_tool_kinds'], {'other': 1})
+        self.assertEqual(facts['pre_admission_unsupported_calls'], 1)
+        self.assertFalse(facts['accepted'])
+        self.assertNotIn('private-', json.dumps(facts))
 
     def test_codex_readonly_bootstrap_preserves_assessor_first_authority(self):
         for wrapped in (False, True):

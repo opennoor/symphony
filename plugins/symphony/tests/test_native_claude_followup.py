@@ -29,6 +29,8 @@ class NativeClaudeFollowupTests(unittest.TestCase):
             self.assertEqual([call.kwargs['label'] for call in check.call_args_list], ['a', 'b'])
             self.assertTrue(check.call_args_list[-1].kwargs['historical_worker'])
             self.assertNotIn('private-token', (root / 'sendmessage-required.json').read_text())
+            diagnostic = json.loads((root / 'sendmessage-required.json').read_text())
+            self.assertIsInstance(diagnostic['a']['proof_source_line'], int)
 
     def test_mixed_copies_queue_both_roles_and_preserve_sibling_pending_inbox(self):
         from dataclasses import replace

@@ -431,6 +431,44 @@ class RuntimeTests(unittest.TestCase):
             "lead",
         )
 
+    def test_observed_role_uses_own_native_identity_before_quoted_roles(self):
+        for role in ('assessor', 'consultant', 'lead', 'worker'):
+            for separator in ('/', '\\'):
+                name = separator.join(('root', 'symphony_lead_gpt_6_sol_high',
+                                       f'symphony_{role}_gpt_6_luna_low'))
+                with self.subTest(role=role, separator=separator):
+                    self.assertEqual(runtime_module._observed_role({
+                        'task_name': name, 'task': 'Instructions for another agent:\nSYMPHONY_ROLE: worker'}), role)
+        self.assertEqual(runtime_module._observed_role({
+            'role': 'lead', 'task': 'Worker packet:\nSYMPHONY_ROLE: worker'}), 'lead')
+        self.assertEqual(runtime_module._observed_role({
+            'agent_type': 'symphony:symphony-lead-claude-sonnet-5-5-low',
+            'task': 'Worker packet:\nSYMPHONY_ROLE: worker'}), 'lead')
+        self.assertEqual(runtime_module._observed_role({
+            'task_name': '/root/symphony_lead_gpt_6_sol_high/unmanaged'}), '')
+        self.assertEqual(runtime_module._observed_role({'task': 'SYMPHONY_ROLE: consultant'}), 'consultant')
+
+    def test_corrected_native_role_keeps_preupgrade_terminal_fingerprints(self):
+        for report in ('Complete.', 'Quoted instructions:\nSYMPHONY_ROLE: lead'):
+            payload = {'provider': 'codex', 'session_id': 'original-root', 'agent_id': 'worker',
+                'task_name': '/root/symphony_lead_gpt_6_sol_high/symphony_worker_gpt_6_luna_low',
+                'prompt_id': 'original-turn', 'status': 'completed', 'last_assistant_message': report}
+            source = Event('retry', 'subagent_stopped', '2026-10-02T10:00:00Z', payload)
+            original_hash = runtime_module.hashlib.sha256(json.dumps(
+                {**payload, 'observed_role': 'lead'}, sort_keys=True).encode()).hexdigest()
+            state = ProjectState(terminal_receipts=({'provider': 'codex', 'session': 'original-root',
+                'agent': 'worker', 'run_id': 'original-run', 'parent': 'original-lead',
+                'lead': 'original-lead', 'turn': 'prompt_id:original-turn',
+                'result': original_hash, 'status': 'completed'},))
+            with self.subTest(report=report):
+                self.assertEqual(runtime_module._observed_role(payload), 'worker')
+                self.assertEqual(runtime_module._terminal_result_id(source), original_hash)
+                self.assertEqual(runtime_module._prior_child_terminal_disposition(
+                    state, source, 'codex', 'original-root', allow_active=False), 'replay')
+                changed = replace(source, payload={**payload, 'last_assistant_message': report + ' changed'})
+                self.assertEqual(runtime_module._prior_child_terminal_disposition(
+                    state, changed, 'codex', 'original-root', allow_active=False), 'conflict')
+
     def test_status_does_not_call_a_historical_heartbeat_current(self):
         handle(self.payload("$symphony:symphony status"), self.environ)
         state = StateStore(self.state_root).load(self.project)
@@ -805,6 +843,9 @@ class RuntimeTests(unittest.TestCase):
                             self.assertEqual((recorded["lead_model"], recorded["lead_effort"]), (model, effort))
                             guidance = self.flush(provider)
                             self.assertIn(f"Selected {provider} lead ({profile_id} profile): {model}/{effort}", guidance)
+                            if provider == 'codex':
+                                self.assertIn('task_name `' + codex_agent_type('lead', model, effort) + '`', guidance)
+                                self.assertIn('fork_turns="none"', guidance)
 
                             proceed = "/symphony:proceed" if provider == "claude" else "$symphony:symphony proceed"
                             handle(self.payload(proceed, provider), environ)

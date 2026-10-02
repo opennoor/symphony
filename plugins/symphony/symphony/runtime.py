@@ -2347,7 +2347,8 @@ def _terminal_result_id(source: Event) -> str:
               "prompt_id", "status", "last_assistant_message", "agent_transcript_path",
               "agent_type", "task_name", "role", "model", "model_reasoning_effort")
     stable = {key: payload[key] for key in fields if key in payload}
-    stable["observed_role"] = _observed_role(payload)
+    # Persisted retry fingerprints must survive changes to operational inference.
+    stable["observed_role"] = _observed_role(payload, legacy=True)
     return hashlib.sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -3217,8 +3218,8 @@ def _escalate_fast_run(state: ProjectState, source: Event, *, fresh_assessment: 
     ))
 
 
-def _observed_role(payload: Mapping[str, object]) -> str:
-    for value in payload.values():
+def _observed_role(payload: Mapping[str, object], *, legacy: bool = False) -> str:
+    for value in payload.values() if legacy else ():
         if not isinstance(value, str):
             continue
         marker = _marker_value(value, "SYMPHONY_ROLE:")
@@ -3232,11 +3233,18 @@ def _observed_role(payload: Mapping[str, object]) -> str:
             continue
         if key not in {"agent_type", "task_name"}:
             continue
-        if value.strip().lower() in ROLES:
-            return value.strip().lower()
-        match = re.search(r"(?:^|[_:/-])symphony[_-](assessor|consultant|lead|worker)(?:[_:/-]|$)", value.lower())
+        leaf = value.lower() if legacy else re.split(r"[/\\]", value.strip())[-1].lower()
+        if leaf.strip() in ROLES:
+            return leaf.strip()
+        match = re.search(r"(?:^|[_:/-])symphony[_-](assessor|consultant|lead|worker)(?:[_:/-]|$)", leaf)
         if match:
             return match.group(1)
+    for value in payload.values():
+        if not isinstance(value, str):
+            continue
+        marker = _marker_value(value, "SYMPHONY_ROLE:")
+        if marker in ROLES:
+            return marker
     return ""
 
 
@@ -4050,7 +4058,9 @@ def _render_actions(
             route = state.active_run.assessment.get("route", {}) if state.active_run else {}
             model, effort = _required_lead_route(state.active_run.assessment) if state.active_run else ("", "")
             profile = route.get("profile", "") if isinstance(route, Mapping) else ""
-            agent = f" as `symphony:symphony-lead-{model}-{effort}`" if provider == "claude" and model else ""
+            task_name = 'symphony_lead_' + re.sub(r'\W', '_', model) + '_' + effort
+            agent = (f" as `symphony:symphony-lead-{model}-{effort}`" if provider == "claude" else
+                     f" with task_name `{task_name}` and fork_turns=\"none\"") if model else ""
             rendered.append(Action("inject_context", {"text":
                 f"Symphony accepted the assessed route. Selected {provider} lead"
                 f" ({profile} profile): {model}/{effort}. Spawn only this model and effort{agent} "

@@ -456,6 +456,11 @@ def check_native_sendmessage_pair(root, candidate, baseline_env, baseline_result
         except Exception as error:
             errors[label] = {'failed': True, 'timed_out': isinstance(error, subprocess.TimeoutExpired),
                              'proof_failed': isinstance(error, RuntimeError)}
+            frame = error.__traceback__
+            while frame is not None:
+                if frame.tb_frame.f_code.co_filename == __file__:
+                    errors[label]['proof_source_line'] = frame.tb_lineno
+                frame = frame.tb_next
     if errors:
         (root / 'sendmessage-required.json').write_text(json.dumps(errors), encoding='utf-8')
         raise RuntimeError('required native lead or historical-worker continuation failed')

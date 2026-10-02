@@ -2120,12 +2120,17 @@ def assessed_first_probe(provider, document, run, home, project):
             if isinstance(calls, (tuple, list)):
                 facts['root_call_count'] = len(calls)
                 facts['root_launch_count'] = sum(item[1] in {'Agent', 'spawn_agent'} for item in calls)
-                facts['pre_admission_unsupported_calls'] = sum(item != frame.f_locals.get('call')
+                unsupported = [item for item in calls if item != frame.f_locals.get('call')
                     and frame.f_locals.get('accepted') is not None and item[3] <= frame.f_locals['accepted']
                     and not (structured_root_discovery(item[1], item[2], provider=provider,
                                                       document=document, session=run['session_id'], project=project)
-                             or provider == 'codex' and item[1] == 'wait_agent' and isinstance(item[2], dict))
-                    for item in calls)
+                             or provider == 'codex' and item[1] == 'wait_agent' and isinstance(item[2], dict))]
+                facts['pre_admission_unsupported_calls'] = len(unsupported)
+                facts['unsupported_tool_kinds'] = {}
+                for item in unsupported:
+                    name = item[1] if item[1] in {'exec', 'functions.exec', 'exec_command', 'wait_agent',
+                        'list_agents', 'send_message', 'followup_task', 'Agent', 'spawn_agent', 'Bash'} else 'other'
+                    facts['unsupported_tool_kinds'][name] = facts['unsupported_tool_kinds'].get(name, 0) + 1
             args = frame.f_locals.get('args', {})
             call = frame.f_locals.get('call')
             paired = frame.f_locals.get('paired', ())
