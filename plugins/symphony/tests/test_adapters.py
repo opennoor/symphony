@@ -71,7 +71,7 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(event.payload["model"], "gpt-6-astra")
         self.assertEqual(event.payload["model_reasoning_effort"], "high")
 
-    def test_malformed_transcript_rows_do_not_hide_child_metadata_or_handback(self):
+    def test_malformed_transcript_rows_preserve_only_verified_native_header(self):
         with TemporaryDirectory() as temp:
             transcript = Path(temp) / "child.jsonl"
             transcript.write_text('not json\n' + json.dumps({"type": "session_meta", "payload": {
@@ -91,7 +91,29 @@ class AdapterContractTests(unittest.TestCase):
             claude = event_from_payload("claude", payload)
             self.assertEqual(codex.payload["parent_thread_id"], "lead-thread")
             self.assertNotIn("model_reasoning_effort", codex.payload)
-            self.assertIn('"blocked"', claude.payload["last_assistant_message"])
+            self.assertNotIn('SYMPHONY_OUTCOME', claude.payload.get("last_assistant_message", ""))
+
+    def test_malformed_claude_turn_boundaries_never_reuse_a_prior_handback(self):
+        rows = [
+            {"type": "user", "uuid": "old", "message": {"content": "Old task."}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use",
+                "name": "SubagentHandback", "input": {"message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Old final."}]}}]
+        final = {"type": "assistant", "message": {"content": [{"type": "text", "text": "New final."}]}}
+        for boundary in ('{"type":"user",', 'null', '[]',
+                         '{"type":"user","message":{}}',
+                         '{"type":"user","message":{"content":[null]}}'):
+            for turn in (None, "old", "new"):
+                with self.subTest(boundary=boundary, turn=turn), TemporaryDirectory() as temporary:
+                    transcript = Path(temporary) / "child.jsonl"
+                    transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows)
+                        + boundary + '\n' + json.dumps(final) + '\n', encoding="utf-8")
+                    payload = {"hook_event_name": "SubagentStop", "agent_id": "child",
+                        "agent_transcript_path": str(transcript), "last_assistant_message": "New final."}
+                    if turn is not None:
+                        payload["turn_id"] = turn
+                    self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
+                                     "New final.")
 
     def test_claude_handback_stays_in_its_native_child_turn(self):
         blocked = 'SYMPHONY_OUTCOME: {"status":"blocked"}'

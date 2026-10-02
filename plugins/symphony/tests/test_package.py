@@ -76,8 +76,7 @@ class PackageContractTests(unittest.TestCase):
                 command = next(token for token in tokens if token.startswith('iex '))
                 provider = 'claude'
             payload = base64.b64decode(re.search(r"FromBase64String\('([^']+)'", command)[1])
-            binding = ("$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
-                       if provider == 'claude' else "$b = '" + bootstrap().replace("'", "''") + "'")
+            binding = "$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
             expected = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", binding).replace('__SYMPHONY_PROVIDER__', provider).encode()
             self.assertEqual(gzip.decompress(payload), expected)
             self.assertEqual(payload[:10], bytes.fromhex('1f8b08000000000000ff'))
@@ -137,93 +136,149 @@ class PackageContractTests(unittest.TestCase):
                         self.assertEqual(activation['state'], 'guarded')
                         self.assertEqual(activation['session_id'], session)
 
-    def test_windows_probe_deadline_starts_after_candidate_collection(self):
+    @staticmethod
+    def _mock_windows_discovery(relay, code):
+        import base64
+        encoded = base64.b64encode(code.encode()).decode()
+        arguments = '-I -c "import base64;exec(base64.b64decode(\'' + encoded + '\'))"'
+        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        target = next(line for line in relay.splitlines() if line.startswith('$q=') and "System32\\cmd.exe" in line)
+        return relay.replace(target, '$q=[Diagnostics.ProcessStartInfo]::new('
+                             + quote(sys.executable) + ',' + quote(arguments) + ')')
+
+    def _probe_executable(self, directory, delay=0, name='python3.exe', marker=None):
+        probe = directory / name
+        if os.name == 'nt':
+            source = directory / 'probe.cs'
+            executable = sys.executable.replace('"', '""')
+            mark = ('System.IO.File.WriteAllText(@"' + str(marker).replace('"', '""') + '","x"); '
+                    if marker else '')
+            source.write_text('using System; class Probe { static void Main() { ' + mark
+                              + 'System.Threading.Thread.Sleep(' + str(delay) + '); Console.WriteLine(@"'
+                              + executable + '"); } }')
+            quote = lambda path: "'" + str(path).replace("'", "''") + "'"
+            ps = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+            compiled = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                'Add-Type -Path ' + quote(source) + ' -OutputAssembly ' + quote(probe)
+                + ' -OutputType ConsoleApplication -ErrorAction Stop'],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        else:
+            probe.write_text('#!' + sys.executable + '\nimport time\ntime.sleep(' + str(delay / 1000)
+                             + ')\nprint(' + repr(sys.executable) + ')\n')
+            probe.chmod(0o755)
+        return probe
+
+    def test_windows_discovery_is_native_bounded_and_fits_event_timeouts(self):
         source = (PLUGIN / 'scripts/codex_hook.ps1').read_text()
-        self.assertLess(source.index('$cs = @('), source.index('$until ='))
-        self.assertLess(source.index('$until ='), source.index('foreach ($c in $cs)'))
-        self.assertIn("foreach ($n in 0,1)", source)
-        self.assertIn("foreach ($name in 'python.exe','python3.exe','py.exe')", source)
+        self.assertIn("System32\\cmd.exe", source)
+        self.assertIn('/d /u /v:off /c', source)
+        self.assertIn('[Text.Encoding]::Unicode', source)
+        self.assertIn('$q.StandardOutputEncoding=[Text.Encoding]::UTF8', source)
+        self.assertNotIn('Get-Command', source)
+        self.assertIn('foreach($n in 0,1)', source)
+        self.assertIn("foreach($name in 'python.exe','python3.exe','py.exe')", source)
         self.assertIn('Select-Object -Skip $n -First 1', source)
-        self.assertIn('$p.WaitForExit(1500)', source)
-        self.assertIn('$until = [DateTime]::UtcNow.AddSeconds(4)', source)
+        self.assertIn('$p.WaitForExit([Math]::Min(1500,$ms))', source)
+        self.assertIn('$end=[DateTime]::UtcNow.AddSeconds(4)', source)
+        self.assertEqual(source.count('-I -X utf8 -c'), 2)
+        self.assertGreaterEqual(load_json('hooks/codex.json')['hooks']['Interrupt'][0]['hooks'][0]['timeout'], 10)
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries(self):
         ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
         with tempfile.TemporaryDirectory() as temporary:
-            executable = sys.executable.replace("'", "''")
-            missing = str(Path(temporary) / 'missing.exe').replace("'", "''")
-            command = ("function Get-Command { param($Name, $CommandType, $ErrorAction, [switch]$All) "
-                       "if ($Name -eq 'python.exe') { 1..6 | ForEach-Object { "
-                       "[pscustomobject]@{Name='python.exe';Source='" + missing + "'} } } "
-                       "elseif ($Name -eq 'python3.exe') { [pscustomobject]@{Name=$Name;Source='"
-                       + executable + "'} } }\n")
-            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
-            relay = relay.replace('$discover = {', '$discover = {' + command)
+            root = Path(temporary)
+            directories = [root / ('broken' + str(n)) for n in range(6)] + [root / 'working']
+            for directory in directories:
+                directory.mkdir()
+            probe = self._probe_executable(directories[-1])
+            records = [str(directory / 'python.exe') for directory in directories[:-1]] + [str(probe)]
+            code = 'import sys;sys.stdout.buffer.write(' + repr(''.join('"' + path + '"\n' for path in records)) + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
+            relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
+                        .replace('__SYMPHONY_BOOTSTRAP__', 'print(123)'), code)
             for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
                 result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
                     relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
-                    text=True, timeout=15, env={**os.environ, variable: temporary})
+                    text=True, timeout=15, env={**os.environ, 'PATH': os.pathsep.join(map(str, directories)), variable: temporary})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), '123')
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_discovery_timeout_preserves_candidates_without_running_the_hook_twice(self):
-        import time
         ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
-        executable = sys.executable.replace("'", "''")
-        for partial in ('none', 'complete', 'truncated-tail'):
-            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
-                with self.subTest(partial=partial, provider=provider), tempfile.TemporaryDirectory() as temporary:
-                    relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
-                    candidate = ("[pscustomobject]@{Name='python3.exe';Source='" + executable
-                                 + "'} | ConvertTo-Json -Compress; ") if partial != 'none' else ''
-                    if partial == 'truncated-tail':
-                        candidate += "[Console]::Write('{bad'); "
-                    relay = relay.replace('$discover = {', '$discover = {' + candidate + 'Start-Sleep -Seconds 20; ')
-                    began = time.monotonic()
-                    result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
-                        relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
-                        text=True, timeout=10, env={**os.environ, variable: temporary})
-                    self.assertLess(time.monotonic() - began, 8)
-                    if partial != 'none':
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(result.stdout.strip(), '123')
-                    else:
-                        self.assertEqual(result.returncode, 1)
-                        self.assertEqual(result.stdout, '')
-                        self.assertIn('Python discovery timed out', result.stderr)
+        with tempfile.TemporaryDirectory() as temporary:
+            probe = self._probe_executable(Path(temporary))
+            for partial in ('none', 'complete', 'truncated-tail'):
+                for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                    with self.subTest(partial=partial, provider=provider):
+                        output = '"' + str(probe) + '"\n' if partial != 'none' else ''
+                        if partial == 'truncated-tail':
+                            output += '"unfinished'
+                        code = 'import sys,time;sys.stdout.buffer.write(' + repr(output) + ".encode('utf-16-le'));sys.stdout.buffer.flush();time.sleep(20)"
+                        relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
+                                    .replace('__SYMPHONY_BOOTSTRAP__', 'print(123)'), code)
+                        began = time.monotonic()
+                        result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                            relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                            text=True, timeout=10, env={**os.environ, 'PATH': temporary, variable: temporary})
+                        self.assertLess(time.monotonic() - began, 8)
+                        if partial != 'none':
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stdout.strip(), '123')
+                        else:
+                            self.assertEqual(result.returncode, 1)
+                            self.assertEqual(result.stdout, '')
+                            self.assertIn('Python discovery timed out', result.stderr)
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_accepts_a_slow_working_interpreter_probe(self):
         ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
         with tempfile.TemporaryDirectory(prefix='slow interpreter probe ') as temporary:
             directory = Path(temporary)
-            probe = directory / 'python.exe'
-            if os.name == 'nt':
-                source = directory / 'probe.cs'
-                executable = sys.executable.replace('"', '""')
-                source.write_text('using System; class Probe { static void Main() { '
-                                  'System.Threading.Thread.Sleep(1000); Console.WriteLine(@"'
-                                  + executable + '"); } }')
-                quoted = lambda path: "'" + str(path).replace("'", "''") + "'"
-                compiler = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
-                compiled = subprocess.run([compiler, '-NoProfile', '-NonInteractive', '-Command',
-                    'Add-Type -Path ' + quoted(source) + ' -OutputAssembly ' + quoted(probe)
-                    + ' -OutputType ConsoleApplication -ErrorAction Stop'],
-                    capture_output=True, text=True, timeout=30)
-                self.assertEqual(compiled.returncode, 0, compiled.stderr)
-            else:
-                probe.write_text('#!' + sys.executable + '\nimport time\ntime.sleep(1)\nprint('
-                                 + repr(sys.executable) + ')\n')
-                probe.chmod(0o755)
+            probe = self._probe_executable(directory, delay=1000)
             relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+            if os.name != 'nt':
+                code = 'import sys;sys.stdout.buffer.write(' + repr('"' + str(probe) + '"\n') + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
+                relay = self._mock_windows_discovery(relay, code)
             for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
                 result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
                     relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
-                    text=True, timeout=15, env={**os.environ, 'PATH': str(directory), variable: str(directory)})
+                    text=True, timeout=15, env={**os.environ, 'PATH': temporary, variable: temporary})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), '123')
+
+    @unittest.skipUnless(os.name == 'nt', 'runs native cmd discovery on Windows')
+    def test_native_windows_discovery_preserves_unicode_and_metacharacters_without_cwd_search(self):
+        ps = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            good = root / 'Unicode 国王 %n %PATH% ! & ^ ( )'
+            good.mkdir()
+            shutil.copy2(sys.executable, good / 'python.exe')
+            for dll in Path(sys.base_prefix).glob('*.dll'):
+                shutil.copy2(dll, good / dll.name)
+            shutil.copytree(Path(sys.base_prefix) / 'Lib', good / 'Lib',
+                ignore=shutil.ignore_patterns('site-packages', '__pycache__', 'test', 'idlelib',
+                                              'tkinter', 'ensurepip', 'venv'))
+            marker = root / 'decoy-ran'
+            self._probe_executable(root, name='python.exe', marker=marker)
+            directories = [root / ('absent' + str(n)) for n in range(160)]
+            entries = [r'\\symphony.invalid\unavailable', '', '.', 'C:relative', r'\relative', '"' + str(good) + '"']
+            entries.extend(map(str, directories))
+            self.assertGreater(len(';'.join(entries)), 8191)
+            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                began = time.monotonic()
+                result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                    "[Console]::OutputEncoding=[Text.Encoding]::GetEncoding(1252);"
+                    + relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                    text=True, timeout=10, cwd=root,
+                    env={**os.environ, 'PATH': ';'.join(entries), variable: temporary})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), '123')
+                self.assertFalse(marker.exists(), 'empty or relative PATH searched the current project')
+                self.assertLess(time.monotonic() - began, 8)
 
     @unittest.skipUnless(Path('/usr/bin/python3').is_file(), 'needs a second system Python')
     def test_generated_launchers_match_system_python_compression_backend(self):
@@ -409,9 +464,12 @@ class PackageContractTests(unittest.TestCase):
             payload = re.search(r"FromBase64String\('([^']+)'\)", wrapper).group(1)
             source = gzip.decompress(base64.b64decode(payload)).decode()
             expected = (PLUGIN / "scripts/codex_hook.ps1").read_text().replace(
-                "$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + bootstrap().replace("'", "''") + "'").replace('__SYMPHONY_PROVIDER__', 'codex')
+                "$b = '__SYMPHONY_BOOTSTRAP__'", "$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')").replace('__SYMPHONY_PROVIDER__', 'codex')
+            capture = "[Environment]::SetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP','" + bootstrap().replace("'", "''") + "');"
+            self.assertTrue(wrapper.startswith(capture))
+            self.assertEqual(wrapper.count(capture), 1)
             self.assertEqual(source, expected)
-            self.assertIn("-I -c", source)
+            self.assertIn("-I -X utf8 -c", source)
             self.assertLess(len(command) + len('cmd.exe /C ""'), 8191)
             self.assertNotIn(".ps1", source)
             self.assertEqual(command.count('"'), 2)

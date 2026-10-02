@@ -3105,7 +3105,7 @@ def claude_literal_worker_probe(run, home):
                 for block in row.get('message', {}).get('content', [])
                 if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('name') == 'Agent'
                 and isinstance(block.get('id'), str)
-                and hashlib.sha256(block['id'].encode()).hexdigest() == launch_hash]
+                and sha256(block['id'].encode()).hexdigest() == launch_hash]
             bound_results = [block for row in lead_rows if row.get('type') == 'user'
                 for block in row.get('message', {}).get('content', [])
                 if isinstance(block, dict) and block.get('type') == 'tool_result'

@@ -34,12 +34,28 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         import native_routing_smoke as routing
         rows = [{'type': 'assistant', 'uuid': 'terminal', 'timestamp': '2026-10-01T00:00:01Z',
                  'message': {'role': 'assistant', 'stop_reason': None, 'content': [{'type': 'text', 'text': 'PRIVATE_SENTINEL\nGATE_RELEASED'}]}}]
-        run = {'delegations': [{'identity': 'worker', 'role': 'worker', 'state': 'completed'}]}
-        with patch.object(routing, 'native_rows', return_value=rows):
+        launch = {'type': 'tool_use', 'id': 'bound-launch', 'name': 'Agent',
+                  'input': {'prompt': 'PRIVATE_PROMPT', 'run_in_background': True}}
+        lead_rows = [{'type': 'assistant', 'message': {'content': [launch]}},
+                     {'type': 'user', 'message': {'content': [{'type': 'tool_result',
+                       'tool_use_id': 'bound-launch', 'content': [{'type': 'text',
+                         'text': 'Async agent launched successfully PRIVATE_ACK'}]}]}}]
+        run = {'lead_identity': 'lead',
+               'assessment': {'_substantive_children': {'worker': {
+                   'launch_hash': native.sha256(b'bound-launch').hexdigest()}}},
+               'delegations': [{'identity': 'worker', 'role': 'worker', 'state': 'completed'}]}
+        with patch.object(routing, 'native_rows', side_effect=lambda provider, home, identity:
+                          lead_rows if identity == 'lead' else rows):
             result = native.claude_literal_worker_probe(run, Path('private-home'))
         self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+        self.assertNotIn('PRIVATE_PROMPT', json.dumps(result))
+        self.assertNotIn('PRIVATE_ACK', json.dumps(result))
         facts = result['workers'][0]
         self.assertTrue(facts['native_reader_available'])
+        self.assertEqual(facts['native_bound_launch_count'], 1)
+        self.assertEqual(facts['native_bound_background_launch_count'], 1)
+        self.assertTrue(facts['native_bound_result_shapes'][0]['async_ack_present'])
+        self.assertFalse(facts['native_parent_completion_verified'])
         self.assertTrue(facts['literal_line_present'])
         self.assertFalse(facts['exact_literal_final'])
         self.assertFalse(facts['terminal_is_end_turn'])

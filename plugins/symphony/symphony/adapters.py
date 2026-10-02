@@ -182,12 +182,17 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    continue
+                    return ""
+                if not isinstance(record, dict):
+                    return ""
                 message = record.get("message") if isinstance(record, dict) else None
                 content = message.get("content") if isinstance(message, dict) else None
-                if isinstance(record, dict) and record.get("type") == "user":
-                    if isinstance(content, str) or isinstance(content, list) and content and all(
-                            isinstance(item, dict) and item.get("type") == "text" for item in content):
+                if record.get("type") == "user":
+                    if not isinstance(content, (str, list)) or isinstance(content, list) and any(
+                            not isinstance(item, dict) or not isinstance(item.get("type"), str) for item in content):
+                        return ""
+                    if isinstance(content, str) or not content or any(
+                            item["type"] != "tool_result" for item in content):
                         # requestJournal context can be reused across native child
                         # turns. A report belongs only to its own prompt.
                         if report or final:

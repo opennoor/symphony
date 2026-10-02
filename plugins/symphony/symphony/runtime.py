@@ -68,7 +68,7 @@ _ROOT_EXECUTION_TOOLS = {"Bash", "PowerShell", "Write", "Edit", "NotebookEdit"}
 _ASSESSED_LEAD_CONTRACT = (
     "delegate implementation, diagnosis, design, review, and product judgment to workers or consultants; "
     "small tasks need one worker; medium: bounded worker packets; large: delegate project work. "
-    "Delegate implementation before editing. Integrate returned worker changes and verify. "
+    "Delegate implementation before editing. After workers return, integrate and run your own native checks. "
     "Use each child's matrix cell. Complete after all children return and verification passes. "
     'If reporting an outcome, use one JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; use blocked or failed if work remains. '
 )
@@ -4418,7 +4418,7 @@ def _assessed_lead_guidance(run: RunState, provider: str) -> str:
             f"({route.get('profile', '')} profile): {model}/{effort}. "
             f"Accepted topology: {route.get('execution', '')}. Keep the root thin. "
             "Relay these exact native spawn arguments; do not omit the role, route or task. "
-            "On Codex, if the task name is occupied, append a unique underscore suffix and keep its lead prefix. "
+            "For occupied Codex task names, add a unique underscore suffix; keep the lead prefix. "
             "SYMPHONY_LEAD_SPAWN_PACKET: " + json.dumps(packet))
 
 

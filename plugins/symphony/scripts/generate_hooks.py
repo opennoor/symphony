@@ -47,10 +47,9 @@ def generated(root=PLUGIN):
             # Agent launches. Discovery and control tools remain available.
             for group in document['hooks']['PreToolUse']:
                 group['matcher'] = 'Agent|SendMessage|Bash|PowerShell|Write|Edit|NotebookEdit'
-        # Claude's Bash command captures this code once for both branches.
-        # Duplicating it in the Windows relay exceeds cmd.exe's command limit.
-        binding = ("$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
-                   if provider == 'claude' else "$b = '" + code.replace("'", "''") + "'")
+        # Capture bootstrap once outside the encoded relay on both hosts.
+        # Base64-expanding it again wastes the native Windows command budget.
+        binding = "$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
         source = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", binding)
         buffer = io.BytesIO()
         # Stored DEFLATE avoids differing zlib/zlib-ng compression heuristics.
@@ -65,7 +64,8 @@ def generated(root=PLUGIN):
                    "[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "')),"
                    "[IO.Compression.CompressionMode]::Decompress))).ReadToEnd()")
         prefix = 'powershell.exe -NoProfile -NonInteractive -Command '
-        windows = 'cmd.exe /c ' + prefix + '"' + wrapper + '"'
+        capture = "[Environment]::SetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP','" + code.replace("'", "''") + "');"
+        windows = 'cmd.exe /c ' + prefix + '"' + capture + wrapper + '"'
         if len(windows) > 8170:
             raise ValueError("Windows hook launcher exceeds cmd.exe's 8191-character limit")
         command = 'python3 -I -c "' + code + '" "${' + variable + '}" ' + provider
