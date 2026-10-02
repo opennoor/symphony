@@ -935,6 +935,15 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
             {"type": "input_text", "text": "Script error:\napply_patch verification failed: Failed to find expected lines in /fixture/greet.py"}])
         self.assertTrue(smoke.fixture_edit("codex", [("exec", source, "", native_success)], Path('/fixture')))
         self.assertFalse(smoke.fixture_edit("codex", [("exec", source, "", native_failure)], Path('/fixture')))
+        bound = 'const patch = ' + json.dumps(call['payload']['input']) + ';\n'
+        for output in ('text(await tools.apply_patch(patch));',
+                       'const r = await tools.apply_patch(patch);\ntext(r)'):
+            self.assertTrue(smoke.fixture_edit('codex', [('exec', bound + output, '', native_success)], Path('/fixture')))
+            self.assertFalse(smoke.fixture_edit('codex', [('exec', bound + output, '', native_failure)], Path('/fixture')))
+        for output in ('const r = await tools.apply_patch(other); text(r)',
+                       'patch = "different"; text(await tools.apply_patch(patch));',
+                       'const r = await tools.apply_patch(patch); text(r); doWork();'):
+            self.assertIsNone(smoke.composed_call(bound + output, 'apply_patch'))
         unknown["payload"]["output"] = "Failed to find expected lines in greet.py"
         self.assertFalse(smoke.fixture_edit("codex", smoke.tool_evidence("codex", [call, unknown]), Path('/fixture')))
         self.assertFalse(smoke.fast_turn_has_only_escalation("codex", [call, failure], []))

@@ -1486,6 +1486,9 @@ def composed_call(source, method, *, output_only=False, serialized=False):
         return None
     source = re.sub(r'^\s*// @exec:[^\n]*\n', '', source).strip()
     argument = JS_STRING if method == "apply_patch" else rf'''\{{(?:{JS_STRING}|[^{{}}"'])*\}}'''
+    bound = re.match(rf'const (?P<variable>\w+)\s*=\s*(?P<patch>{JS_STRING});\s*', source) if method == 'apply_patch' else None
+    if bound:
+        source, argument = source[bound.end():], re.escape(bound['variable'])
     call = rf'tools\.{method}\((?P<argument>{argument})\)'
     wrappers = [rf'text\(await {call}\);?',
                 rf'const (?P<result>\w+)\s*=\s*await {call};\s*text\((?P=result)\);?']
@@ -1496,7 +1499,7 @@ def composed_call(source, method, *, output_only=False, serialized=False):
     for wrapper in wrappers:
         match = re.fullmatch(wrapper, source, re.DOTALL)
         if match:
-            value = match['argument']
+            value = bound['patch'] if bound else match['argument']
             if method == "exec_command":
                 value = re.sub(JS_STRING + r'|([{,]\s*)([A-Za-z_]\w*)(\s*:)',
                     lambda match: match[0] if match[1] is None else f'{match[1]}"{match[2]}"{match[3]}', value)
@@ -1512,11 +1515,6 @@ def composed_call(source, method, *, output_only=False, serialized=False):
                 return json.loads(value)
             except ValueError:
                 return None
-    if method == "apply_patch":
-        match = re.fullmatch(rf'const (?P<variable>\w+) = (?P<patch>{JSON_STRING});\s*'
-                             r'text\(await tools\.apply_patch\((?P=variable)\)\);?', source, re.DOTALL)
-        if match:
-            return json.loads(match['patch'])
     return None
 
 
