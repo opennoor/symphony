@@ -24,17 +24,29 @@ def handlers(relative: str):
 
 
 class PackageContractTests(unittest.TestCase):
-    def test_ci_spends_provider_credits_only_for_release_workflows(self):
+    def test_release_ci_requires_locally_tested_commit_without_provider_calls(self):
         workflow = (PLUGIN.parents[1] / '.github/workflows/ci.yml').read_text()
         triggers = workflow.split('\njobs:', 1)[0]
-        self.assertIn('push:\n    branches: [main]', triggers)
+        self.assertIn('  workflow_dispatch:\n    inputs:\n      tested_sha:', triggers)
+        self.assertIn('        required: true\n        type: string', triggers)
+        self.assertNotIn('push:', triggers)
         self.assertNotIn('pull_request:', triggers)
-        self.assertNotIn('workflow_dispatch:', triggers)
         self.assertNotIn('schedule:', triggers)
+        self.assertIn("  release-candidate:\n    if: github.ref == 'refs/heads/main'", workflow)
+        self.assertIn('TESTED_SHA: ${{ inputs.tested_sha }}', workflow)
+        for forbidden in ('secrets.', 'api.openai.com', 'api.anthropic.com', '@openai/codex',
+                          '@anthropic-ai/claude-code', 'claude.ai/install.sh', 'codex login',
+                          'codex exec', 'claude --print', 'claude.cmd --', 'native_effort_smoke.py',
+                          'native_routing_smoke.py', 'native_managed_concurrency.py',
+                          'windows_native_activation.py', 'claude_start_probe.py', 'claude_isolated_worktree.py',
+                          'refresh_profiles.py --agent-probe', 'refresh_profiles.py --verify'):
+            self.assertNotIn(forbidden, workflow)
         for name in ('verify', 'windows-hooks', 'dockur-windows'):
             self.assertIn(f'  {name}:\n    needs: release-candidate\n'
                           "    if: needs.release-candidate.outputs.pending == 'true'", workflow)
         self.assertIn('needs: [verify, windows-hooks, dockur-windows]', workflow)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", workflow)
+        self.assertIn('--target "$GITHUB_SHA"', workflow)
         refresh = (PLUGIN.parents[1] / '.github/workflows/capability-refresh.yml').read_text()
         self.assertIn('  workflow_dispatch:', refresh)
         self.assertNotIn('  schedule:', refresh)
@@ -42,31 +54,38 @@ class PackageContractTests(unittest.TestCase):
                       'github.event.repository.default_branch)', refresh)
         if os.name == 'nt':
             return  # The release gate runs on Ubuntu; Windows checks its wiring above.
-        command = workflow.split('        id: version\n        run: |\n', 1)[1].split('\n\n', 1)[0]
+        command = workflow.split('        id: version\n', 1)[1].split('        run: |\n', 1)[1].split('\n\n', 1)[0]
         command = '\n'.join(line[10:] for line in command.splitlines())
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             subprocess.run(['git', 'init', '-q', temporary], check=True)
             subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
                             'commit', '-q', '--allow-empty', '-m', 'fixture'], cwd=root, check=True)
+            head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
             manifests = [root / 'plugins/symphony' / provider / 'plugin.json'
                          for provider in ('.claude-plugin', '.codex-plugin')]
             for path in manifests:
                 path.parent.mkdir(parents=True)
             output = root / 'outputs'
-            for version, codex, tagged, expected in (
-                    ('1.7.0', '1.7.0', False, 'pending=true'),
-                    ('1.7.0', '1.7.0', True, 'pending=false'),
-                    ('1.7.1', '1.7.0', False, None),
-                    ('invalid', 'invalid', False, None)):
-                with self.subTest(version=version, codex=codex, tagged=tagged):
+            for version, codex, tagged, tested, dispatched, expected in (
+                    ('1.7.0', '1.7.0', False, head, head, 'pending=true'),
+                    ('1.7.0', '1.7.0', True, head, head, 'pending=false'),
+                    ('1.7.1', '1.7.0', False, head, head, None),
+                    ('invalid', 'invalid', False, head, head, None),
+                    ('1.7.1', '1.7.1', False, '', head, None),
+                    ('1.7.1', '1.7.1', False, 'invalid', head, None),
+                    ('1.7.1', '1.7.1', False, '0' * 40, head, None),
+                    ('1.7.1', '1.7.1', False, head, '0' * 40, None),
+                    ('1.7.1', '1.7.1', False, '0' * 40, '0' * 40, None)):
+                with self.subTest(version=version, codex=codex, tagged=tagged, tested=tested, dispatched=dispatched):
                     for path, value in zip(manifests, (version, codex)):
                         path.write_text(json.dumps({'version': value}))
                     if tagged:
                         subprocess.run(['git', 'tag', 'v' + version], cwd=root, check=True)
                     output.write_text('')
                     result = subprocess.run(['bash', '-e', '-c', command], cwd=root, capture_output=True,
-                                            text=True, env={**os.environ, 'GITHUB_OUTPUT': str(output)})
+                                            text=True, env={**os.environ, 'GITHUB_OUTPUT': str(output),
+                                                            'TESTED_SHA': tested, 'GITHUB_SHA': dispatched})
                     if expected is None:
                         self.assertNotEqual(result.returncode, 0)
                         self.assertEqual(output.read_text(), '')

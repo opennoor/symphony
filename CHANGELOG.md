@@ -2,7 +2,7 @@
 
 ## 1.7.0 — prepared 2026-10-02
 
-- Reserve CI tests and provider API credits for new-version release workflows. Development and PR tests run locally; capability-map releases require an explicit dispatch on the default branch.
+- Require a manual release dispatch for the exact locally reviewed and tested `main` commit. Release CI runs deterministic Linux and Windows checks without provider installs or AI API calls; native testing uses local clients and existing logins. The separate API-backed capability refresh workflow is disabled for this release.
 - Limit fast direct execution to wholly predetermined mechanical work. Tiny features, diagnosis, substantive review, and mixed run-and-fix requests require assessment before changes. Assessed small work uses a worker; the routing matrix controls execution topology.
 - Require successful child work from the current assessment and lead generation before new delegated or mixed runs complete. Preserve the admitted child role and exact lead ownership. Claude scoped credit requires a fresh native child; retained multiple-prompt history has actionable same-lead recovery through fresh bounded delegation. A finished uncredited attempt can be explicitly superseded by a later credited child without blocking Stop. Legacy completion remains compatible.
 - Preserve the original assessment boundary when its already-running assessor confirms the same accepted route after the lead starts. This prevents completed workers from losing credit because of delayed native callbacks; changed routes, new assessor turns, and explicit reassessment still require fresh worker evidence.
