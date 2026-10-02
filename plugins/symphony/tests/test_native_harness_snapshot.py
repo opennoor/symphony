@@ -998,6 +998,22 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertEqual(sorted(len(item['cases'][0]['native_trace']) for item in saved), [14, 100000])
             self.assertLess(len(stderr.getvalue()), 1000)
 
+    def test_isolated_failure_keeps_artifact_and_handles_a_full_stderr_pipe(self):
+        import claude_isolated_worktree as isolated
+        for stderr in (io.StringIO(), Mock(write=Mock(side_effect=BlockingIOError("pipe full")))):
+            with self.subTest(stderr=type(stderr).__name__), tempfile.TemporaryDirectory() as temporary:
+                report = {"cases": [{"native_trace": "x" * 100000}]}
+                with patch.object(isolated, "run_case", side_effect=RuntimeError("native case failed")), \
+                     patch.object(isolated.native, "failure_state", return_value=report), \
+                     patch.object(sys, "argv", ["claude_isolated_worktree.py"]), \
+                     patch.object(sys, "stderr", stderr), \
+                     patch.dict(os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
+                    self.assertEqual(isolated.main(), 1)
+                saved = json.loads((Path(temporary) / "native-claude-isolated-worktree-failure.json").read_text())
+                self.assertEqual(saved["state"], report)
+                if isinstance(stderr, io.StringIO):
+                    self.assertLess(len(stderr.getvalue()), 1000)
+
     def test_private_claude_snapshots_have_exact_ids_and_export_only_disposition_facts(self):
         import native_routing_smoke as smoke
         with tempfile.TemporaryDirectory() as directory:

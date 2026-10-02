@@ -7,10 +7,11 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.store import StateStore, _locked, project_key
+from plugins.symphony.symphony.store import StateStore, _locked, _read_owner_snapshot, project_key
 
 
 class StateStoreTests(unittest.TestCase):
@@ -152,6 +153,34 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual([self.state_path()], matches)
         self.assertTrue(written.is_set())
 
+    def test_windows_owner_snapshot_waits_for_a_normal_parallel_transaction(self):
+        self.store.save(self.project, ProjectState(enabled=True))
+        path = self.state_path()
+        reading = threading.Event()
+        done = threading.Event()
+        snapshots = []
+        errors = []
+
+        def read():
+            reading.set()
+            try:
+                snapshots.append(_read_owner_snapshot(path))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        with patch("plugins.symphony.symphony.store.os", SimpleNamespace(name="nt")):
+            with _locked(path):
+                reader = threading.Thread(target=read)
+                reader.start()
+                self.assertTrue(reading.wait(5))
+                self.assertFalse(done.wait(0.25), "Snapshot abandoned a normal writer transaction")
+            reader.join(5)
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual([path.read_text(encoding="utf-8")], snapshots)
+
     def test_owner_scan_defers_on_busy_unrelated_windows_project(self):
         run = RunState("run", "task", session_id="root", provider="codex")
         self.store.save(self.project, ProjectState(active_run=run,
@@ -166,7 +195,7 @@ class StateStoreTests(unittest.TestCase):
         def hold_other():
             with _locked(other_path):
                 held.set()
-                release.wait(5)
+                release.wait(10)
 
         holder = threading.Thread(target=hold_other)
         holder.start()

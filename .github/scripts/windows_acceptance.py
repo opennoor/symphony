@@ -16,6 +16,7 @@ TESTS = (
     "plugins.symphony.tests.test_store.StateStoreTests.test_empty_windows_lockfile_contends_and_recovers_after_process_exit",
     "plugins.symphony.tests.test_store.StateStoreTests.test_windows_project_key_collapses_case_and_short_path_aliases",
     "plugins.symphony.tests.test_store.StateStoreTests.test_owner_scan_coordinates_with_project_writer_on_windows",
+    "plugins.symphony.tests.test_store.StateStoreTests.test_windows_owner_snapshot_waits_for_a_normal_parallel_transaction",
     "plugins.symphony.tests.test_store.StateStoreTests.test_owner_scan_defers_on_busy_unrelated_windows_project",
     "plugins.symphony.tests.test_store.StateStoreTests.test_new_duplicate_owner_after_prior_lookup_is_not_hidden",
     "plugins.symphony.tests.test_store.StateStoreTests.test_snapshot_scan_and_atomic_replace_remain_compatible",

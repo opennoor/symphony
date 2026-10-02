@@ -393,7 +393,9 @@ def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
 def _read_owner_snapshot(path: Path) -> str:
     """Read while coordinating with Windows' replace-existing limitation."""
     if os.name == "nt":
-        with _locked(path, timeout=0.1):
+        # Match the writer's bounded lock budget: parallel hook transactions
+        # routinely exceed 100 ms, especially on Windows antivirus-scanned files.
+        with _locked(path, timeout=5):
             return path.read_text(encoding="utf-8")
     return path.read_text(encoding="utf-8")
 

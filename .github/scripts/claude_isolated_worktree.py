@@ -439,7 +439,15 @@ def main():
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / "native-claude-isolated-worktree-failure.json").write_text(
                     json.dumps(evidence, indent=2))
-            print(json.dumps(evidence), file=sys.stderr)
+            summary = {"provider": "claude", "case": "isolated-worktree",
+                       "failure": {"type": type(error).__name__, "message": str(error)[:300]},
+                       "hook_count": len(evidence["hooks"]),
+                       "diagnostics_dir": str(destination or "")[:300]}
+            try:
+                print(json.dumps(summary), file=sys.stderr)
+            except OSError:
+                # A full CI pipe must not replace the original case failure.
+                pass
             return 1
     print(json.dumps(result))
     return 0

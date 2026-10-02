@@ -37,6 +37,8 @@ jobs:
       - name: Verify shipped hook digest is stable on Windows
         run: python plugins/symphony/scripts/generate_hooks.py --check
       - name: Execute Windows hooks under Restricted PowerShell policy
+        env:
+          SYMPHONY_FIRST_PIN_ROUNDS: '20'
         run: python .github/scripts/windows_acceptance.py
 
       - name: Replay released 1.5.1 recovering state through candidate Stop on Windows

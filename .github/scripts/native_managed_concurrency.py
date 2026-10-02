@@ -3097,7 +3097,20 @@ def claude_literal_worker_probe(run, home):
             calls, results = native_call_inventory('claude', rows)
             lead_rows = native_rows('claude', home, run['lead_identity']) if run.get('lead_identity') else []
             handbacks = [call for call in calls if call[1] == 'SubagentHandback']
+            parent_deliveries = [item for row in lead_rows if row.get('type') == 'user'
+                for item in row.get('message', {}).get('content', [])
+                if isinstance(item, dict) and item.get('type') == 'tool_result'
+                and isinstance(item.get('content'), list)
+                and any(isinstance(block, dict) and isinstance(block.get('text'), str)
+                    and block['text'].startswith('agentId: ' + worker['identity'] + ' ')
+                    for block in item['content'])]
             item.update(native_reader_available=True, assistant_count=len(assistants),
+                native_parent_result_with_child_footer_count=len(parent_deliveries),
+                native_parent_result_success_count=sum(delivery.get('is_error') is not True
+                                                       for delivery in parent_deliveries),
+                native_parent_result_exact_report_count=sum(bool(delivery['content'])
+                    and delivery['content'][0] == {'type': 'text', 'text': report}
+                    for delivery in parent_deliveries),
                 native_parent_completion_verified=claude_native_parent_completion(
                     lead_rows, terminal, report, run.get('session_id', ''), run.get('lead_identity', ''), worker['identity']),
                 native_parent_notification_count=sum(isinstance(row.get('origin'), dict)
