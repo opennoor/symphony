@@ -401,6 +401,8 @@ def _substantive_child_completed(run: RunState) -> bool:
                 if start and end and end > start > max(work):
                     return True
         return False
+    if contract.get('review_required') is False:
+        return any(proof.get('reviewed') is not True for proof in completed)
     return bool(completed)
 
 

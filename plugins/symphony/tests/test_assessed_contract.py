@@ -135,6 +135,41 @@ class AssessedContractTests(unittest.TestCase):
                     self.worker()
                     self.assertTrue(_substantive_child_completed(self.state.active_run))
 
+    def test_review_only_child_cannot_replace_work_unless_contract_is_legacy(self):
+        for provider in ('codex', 'claude'):
+            for role in ('worker', 'consultant'):
+                for legacy in (False, True):
+                    with self.subTest(provider=provider, role=role, legacy=legacy):
+                        self.begin(provider)
+                        run = self.state.active_run
+                        self.assertIs(run.assessment['substantive_contract']['review_required'], False)
+                        if legacy:
+                            contract = dict(run.assessment['substantive_contract'])
+                            contract.pop('review_required')
+                            self.state = replace(self.state, active_run=replace(run, assessment={
+                                **run.assessment, 'substantive_contract': contract}))
+                        report = 'SYMPHONY_REVIEW: passed'
+                        if role == 'consultant':
+                            report += '\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}'
+                        self.child('reviewer', role, False, 'review-1')
+                        self.child('reviewer', role, True, 'review-1', report=report)
+                        self.assertEqual(_substantive_child_completed(self.state.active_run), legacy)
+                        self.child('lead', 'lead', True, 'lead-1')
+                        if not legacy:
+                            self.assertEqual(self.state.active_run.status, 'recovering')
+                            self.assertIsNone(self.state.active_run.outcome)
+                            self.assertEqual(_stop_block_reason(self.state.active_run)['reason'],
+                                             'substantive_child_missing')
+                            self.state, _ = reduce(self.state, self.event('stop_requested'))
+                            self.assertIsNotNone(self.state.active_run)
+                            self.child('lead', 'lead', False, 'lead-2')
+                            self.worker()
+                            self.child('lead', 'lead', True, 'lead-2')
+                        self.assertEqual(self.state.active_run.status, 'completing')
+                        self.state, _ = reduce(self.state, self.event('stop_requested'))
+                        self.assertIsNone(self.state.active_run)
+                        self.assertEqual(self.state.recent_runs[-1].status, 'completed')
+
     def late_assessor(self, provider):
         self.begin(provider)
         self.state = replace(self.state, event_history=(), active_run=replace(
