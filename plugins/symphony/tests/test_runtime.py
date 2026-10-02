@@ -33,6 +33,11 @@ def codex_agent_type(role, model, effort):
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
+        # Most runtime fixtures emit synthetic hooks without native transcripts.
+        # Native chronology itself is covered by file-backed host-evidence tests.
+        chronology = patch.object(runtime_module, "assessed_completion_chronology", return_value="valid")
+        chronology.start()
+        self.addCleanup(chronology.stop)
         self.spawn_count = 0
         self.root = Path(self.temp.name)
         self.project = self.root / "project"
@@ -2075,6 +2080,62 @@ class RuntimeTests(unittest.TestCase):
         archived = store.load(self.project)
         self.assertIsNone(archived.active_run)
         self.assertEqual("completed", archived.recent_runs[-1].status)
+
+    def test_assessed_stop_requires_native_child_report_order(self):
+        for provider in ('codex', 'claude'):
+            for order in ('valid', 'early', 'unknown'):
+                with self.subTest(provider=provider, order=order):
+                    choice = route_choice(provider=provider)
+                    lead = Delegation('lead', 'lead', 'task', 'completed', choice['model'], choice['effort'])
+                    workers = tuple(Delegation(f'worker-{index}', 'worker', 'task', 'completed',
+                                               choice['model'], choice['effort']) for index in (1, 2))
+                    run = self.seed_run(RunState('run', 'task', lead_identity='lead',
+                        status='completing', outcome={'status': 'completed'},
+                        delegations=(lead, *workers), assessment={
+                            'substantive_contract': {'version': 1, 'epoch': 'e', 'accepted_at': '2026-10-01T00:00:00Z'},
+                            '_terminal_turns': {'lead': ('turn_id:lead-final',)},
+                            '_start_event_ids': ('start-worker-1', 'start-worker-2'),
+                            '_substantive_children': {worker.identity: {
+                                'successful': True, 'epoch': 'e', 'run_id': 'run',
+                                'lead': 'lead', 'parent': 'lead', 'role': 'worker',
+                                'start_event_id': 'start-' + worker.identity,
+                                'owner_generation': 1,
+                            } for worker in workers},
+                        }), provider=provider)
+                    environ = self.claude_environ if provider == 'claude' else self.environ
+                    stop = {**self.payload('', provider), 'hook_event_name': 'Stop'}
+                    with (patch.object(runtime_module, f'{provider}_recovered_lead_event', return_value=None),
+                          patch.object(runtime_module, f'{provider}_completing_lead_turn', return_value=('none', None)),
+                          patch.object(runtime_module, 'assessed_completion_chronology', return_value=order) as proof):
+                        result = handle(stop, environ)
+                    proof.assert_called_once()
+                    stored = StateStore(self.state_root).load(self.project)
+                    if order == 'valid':
+                        self.assertIsNone(stored.active_run)
+                        self.assertEqual('completed', stored.recent_runs[-1].status)
+                    else:
+                        self.assertEqual('block', self.output(result).get('decision'))
+                        self.assertEqual('recovering', stored.active_run.status)
+                        self.assertIsNone(stored.active_run.outcome)
+                        self.assertEqual(run.lead_identity, stored.active_run.assessment['_retryable_lead'])
+
+                    # A still-running worker keeps the normal background-wait path.
+                    working = replace(run, delegations=(lead, replace(workers[0], state='working'), workers[1]))
+                    self.seed_run(working, provider=provider)
+                    with (patch.object(runtime_module, f'{provider}_recovered_lead_event', return_value=None),
+                          patch.object(runtime_module, f'{provider}_completing_lead_turn', return_value=('none', None)),
+                          patch.object(runtime_module, 'assessed_completion_chronology') as proof):
+                        handle({**stop, 'turn_id': 'working-turn'}, environ)
+                    proof.assert_not_called()
+
+    def test_assessed_lead_start_repeats_admitted_acceptance_checks(self):
+        task = 'Make the change. Acceptance: run python -m unittest -q after every worker returns.'
+        run = self.seed_run(RunState('run', task, lead_identity='lead',
+            assessment={'size': 'small', 'complexity': 'simple'}))
+        state = StateStore(self.state_root).load(self.project)
+        guidance = runtime_module._lead_guidance(state, 'codex')
+        self.assertIn(task, guidance)
+        self.assertIn(runtime_module._LEAD_VERIFICATION_CONTRACT, guidance)
 
     def test_completing_run_denies_new_lead_spawn_but_preserves_other_work(self):
         marker = ('SYMPHONY_ROUTE: {"size":"small","complexity":"simple",'

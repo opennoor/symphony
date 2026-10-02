@@ -19,6 +19,7 @@ from .adapters import HookResult, detect_provider, event_from_payload, render
 from .host_evidence import (
     _archived_fast_owner, _instant,
     archived_lead_followup,
+    assessed_completion_chronology,
     claude_archived_sendmessage_sequence, claude_archived_mixed_sendmessage_sequence, claude_sendmessage_source_hash,
     _claude_sendmessage_late_callback,
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
@@ -590,6 +591,30 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         else:
             if not unresolved:
                 state = _finish_pending_batch(state, provider, session, source)
+                scoped = _scope_state(state, f"{provider}:{session}", session, provider)
+                run = scoped.active_run
+                if (run and run.status == "completing" and run.outcome == {"status": "completed"}
+                        and "substantive_contract" in run.assessment
+                        and not any(item.role in {"worker", "consultant"}
+                                    and item.state.lower() in _ACTIVE_STATES | {"interrupted"}
+                                    for item in run.delegations)):
+                    order = assessed_completion_chronology(scoped, session, project, environ)
+                    if order != "valid":
+                        turns = run.assessment.get("_terminal_turns", {}).get(run.lead_identity, ())
+                        token = turns[-1] if turns else ""
+                        failed = _derived(scoped, source, "lead_failed", {
+                            "identity": run.lead_identity, "owner_generation": run.owner_generation,
+                            **({"turn_token": token} if token else {}),
+                        }, "completion-order")
+                        recovered, _ = reduce(scoped, failed)
+                        state = _merge_scope(state, scoped, recovered, f"{provider}:{session}",
+                                             provider, session)
+                        reason = ("The lead reported completion before all child results were available. "
+                                  if order == "early" else
+                                  "Symphony could not verify the lead's native completion order. ")
+                        return state, ((Action("block_stop", {"reason": reason
+                            + "Resume the same lead after all children return, run the acceptance check "
+                              "and report the result again."}),), acknowledged)
             state, actions = dispatch(state, source)
         if unresolved and source.kind in {"session_heartbeat", "user_prompt"}:
             actions += (Action("inject_context", {"text": unresolved_reason}),)
@@ -4170,6 +4195,7 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
         'Every worker spawn uses its exact packaged agent type and a packet beginning `SYMPHONY_ROLE: worker`. '
     )
     return (
+        "Assessed task and acceptance checks from admission:\n" + state.active_run.task + "\n\n"
         "For assessed work, " + _ASSESSED_LEAD_CONTRACT
         + protocol + "Symphony worker routes by the packet's own size/complexity: "
         + "; ".join(_provider_cells(snapshot, "worker"))
@@ -4228,20 +4254,21 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                        "If occupied, append a unique underscore suffix for a fresh child. Keep this fast prefix; "
                        "generic assessed-lead names apply after assessment; never use them for a fast spawn. ")
             return (
+                f"Task to relay in full, including every acceptance check:\n{task}\n\n"
+                "For implementation, diagnosis, run-and-fix, design, review, or uncertainty, "
+                "spawn the assessor directly. Do not probe with another agent or run project commands at the root. "
                 "Symphony fast route: the root is a courier. For a wholly predetermined mechanical objective, "
                 "spawn one capable lead at "
                 f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
                 "`SYMPHONY_FAST_ROUTE: lead` on separate lines. " + spawn +
-                "Substantive or uncertain objectives may go directly to the independent assessor below. "
                 "Relay the whole request and acceptance checks; the root never executes it. Before any changes, the lead "
                 "decides whether the WHOLE objective consists only of predetermined mechanical steps "
                 "with an expected result, scope bounded, requirements clear, risk low, required tools "
                 "(including browser or computer control when needed) available, and verification concrete. "
-                "Eligible examples: run a supplied bash/git command and report its result, or read a specified "
-                "browser page through known steps. Implementation, diagnosis, design, substantive review, "
+                "Examples: supplied bash/git command or specified browser page. "
+                "Implementation, diagnosis, design, substantive review, "
                 "product judgment, mixed work, or uncertainty requires escalation before any changes, "
                 "even for a tiny feature. A run-and-fix request escalates as a whole. "
-                "A tool name or supplied command alone does not establish eligibility. "
                 "Only eligible mechanical work runs directly and returns exact lines "
                 "`SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`. "
                 "Otherwise make no changes and return "
@@ -4252,7 +4279,7 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                    if provider == "claude" else "")
                 + "For assessed-first work, or after an attempted fast lead returns native escalation, "
                 "use this assessment contract: "
-                + _assessed_guidance(task, provider, state, session_id)
+                + _assessed_guidance("", provider, state, session_id)
             )
     return _assessed_guidance(task, provider, state, session_id)
 
@@ -4286,6 +4313,8 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
                  f"`reasoning_effort=\"{effort}\"`, and `fork_turns=\"none\"`. ")
         boost = _boost_status(state, provider, session_id) + " " + spawn
     return (
+        (f"Task to relay in full, including every acceptance check:\n{task}\n\n" if task else "")
+        +
         "Keep the root thin. Spawn the selected assessor with explicit model "
         "and effort and put `SYMPHONY_ROLE: assessor` on its own line. Give it the full objective, constraints "
         "and acceptance checks; await its terminal assessment without sending additional work. "
@@ -4306,7 +4335,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         "Relay the task in full; every part and acceptance check goes in the packet. The lead cannot see this conversation. "
         "The assessor packet must require the exact size/complexity/risk vocabulary above and explain that "
         "substantive small work uses one worker; medium work uses bounded worker packets. "
-        f"{boost}{codex}{claude}Task: {task}"
+        f"{boost}{codex}{claude}"
     )
 
 

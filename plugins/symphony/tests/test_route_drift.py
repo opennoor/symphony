@@ -11,7 +11,9 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.runtime import _route_drift, handle
 from plugins.symphony.symphony.routing import profiles_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
@@ -43,6 +45,9 @@ MARKER = json.dumps(
 class RouteDriftTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
+        chronology = patch.object(runtime_module, "assessed_completion_chronology", return_value="valid")
+        chronology.start()
+        self.addCleanup(chronology.stop)
         root = Path(self.temp.name)
         self.project = root / "project"
         self.project.mkdir()

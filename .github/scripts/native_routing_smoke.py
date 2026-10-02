@@ -1409,6 +1409,7 @@ def worker_launch_verified(provider, evidence, worker, rows=(), parent_identity=
             header = next(row["payload"] for row in rows if row.get("type") == "session_meta")
             spawn = header.get("source", {}).get("subagent", {}).get("thread_spawn", {})
             worker_name = "symphony_worker_" + re.sub(r"\W", "_", worker["requested_tier"]) + "_" + worker["requested_effort"]
+            launched_name = arguments.get("task_name")
             try:
                 returned = json.loads(output)
             except (TypeError, ValueError):
@@ -1416,8 +1417,9 @@ def worker_launch_verified(provider, evidence, worker, rows=(), parent_identity=
             # Native Codex encrypts packets and returns a task path, not UUID.
             # Bind that exact path to the child's own header and canonical parent.
             if (isinstance(returned, dict) and returned.get("task_name") == header.get("agent_path")
-                    and arguments.get("task_name") == worker_name
-                    and parent_path and header.get("agent_path") == parent_path + "/" + worker_name
+                      and isinstance(launched_name, str)
+                      and re.fullmatch(re.escape(worker_name) + r"(?:_[a-z0-9_]+)?", launched_name)
+                      and parent_path and header.get("agent_path") == parent_path + "/" + launched_name
                     and parent_identity and spawn.get("parent_thread_id") == parent_identity):
                 matches += 1
         elif (isinstance(packet, str) and packet.splitlines()[:1] == ["SYMPHONY_ROLE: worker"]
@@ -1486,11 +1488,11 @@ def composed_call(source, method, *, output_only=False, serialized=False):
     argument = JS_STRING if method == "apply_patch" else rf'''\{{(?:{JS_STRING}|[^{{}}"'])*\}}'''
     call = rf'tools\.{method}\((?P<argument>{argument})\)'
     wrappers = [rf'text\(await {call}\);?',
-                rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\);?']
+                rf'const (?P<result>\w+)\s*=\s*await {call};\s*text\((?P=result)\);?']
     if serialized:
-        wrappers.append(rf'const (?P<result>\w+) = await {call};\s*text\(JSON\.stringify\((?P=result)\)\);?')
+        wrappers.append(rf'const (?P<result>\w+)\s*=\s*await {call};\s*text\(JSON\.stringify\((?P=result)\)\);?')
     if output_only:
-        wrappers.append(rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\.output\);?')
+        wrappers.append(rf'const (?P<result>\w+)\s*=\s*await {call};\s*text\((?P=result)\.output\);?')
     for wrapper in wrappers:
         match = re.fullmatch(wrapper, source, re.DOTALL)
         if match:
@@ -1891,6 +1893,13 @@ def structured_root_discovery(name, args, *, provider='', document=None, session
         return isinstance(args, dict)
     if name == 'Skill' and isinstance(args, dict):
         return args.get('skill') in {'symphony', 'symphony:symphony'}
+    if provider == 'codex' and name in {'exec', 'functions.exec'} and isinstance(args, str):
+        # Reading the tool catalogue cannot inspect or alter the project.
+        metadata = (r'const (?P<result>\w+)\s*=\s*ALL_TOOLS\.filter\(x\s*=>\s*'
+                    r'/[a-z|]+/i?\.test\(x\.name\s*\+\s*" "\s*\+\s*x\.description\)\);\s*'
+                    r'text\((?P=result)\);?')
+        if re.fullmatch(metadata, args.strip()):
+            return True
     if provider != 'codex' or not isinstance(document, dict) or project is None:
         return False
     details = (args if name == 'exec_command' else composed_call(args, 'exec_command', serialized=True, output_only=True)
@@ -2385,7 +2394,8 @@ def _lead_delivery_probe(provider, run, home, project, lead):
         "after every worker returns successfully, the canonical assessed lead itself must run exactly python -m unittest -q "
         "in a standalone native tool call and return the full successful result. A worker test or git diff is insufficient.")
     present = lambda text: any(clause in text for clause in clauses) if text is not None else None
-    facts = {'root_native_available': False, 'launch_binding': None, 'launch_prompt_observable': None,
+    facts = {'admitted_task_acceptance_present': present(_observable_probe_text(run.get('task'))),
+             'root_native_available': False, 'launch_binding': None, 'launch_prompt_observable': None,
              'launch_matches_child_prompt': None, 'fixture_acceptance_in_launch': None,
              'start_context_observable': False, 'shared_verification_in_start': None, 'resume_deliveries': None}
     contexts = []
@@ -2535,7 +2545,7 @@ def verify_case_run(provider, case, document, run_state, home, project, greeting
                                                 candidates[0], home, project)
         require(canonical is not None, 'mechanical command lacks exact canonical turn/receipt/followup proof')
         decisions = [canonical]
-    assessed_first = case == 'run-and-fix' and not decisions
+    assessed_first = case in {'feature', 'run-and-fix'} and not decisions
     if assessed_first:
         require(assessed_first_verified(provider, document, run_state, child_rows, home, project,
                                        run_state['assessment']['route']['profile']),

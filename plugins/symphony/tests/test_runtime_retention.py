@@ -101,7 +101,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                                 text=True, env=env, cwd=directory, timeout=20, check=False)
         return result, env
 
-    def test_captured_hooks_and_checker_survive_removed_cache_without_losing_outcome(self):
+    def test_captured_hooks_and_checker_survive_removed_cache_and_require_native_proof(self):
         self.exercise_removed_cache()
 
     def test_new_checker_accepts_only_verified_old_session(self):
@@ -167,7 +167,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             (retained / "symphony" / "runtime.py").write_text("raise RuntimeError('tampered')\n")
             self.assertNotEqual(check().returncode, 0)
 
-    def test_two_active_sessions_finish_from_old_runtime_after_update(self):
+    def test_two_active_sessions_keep_their_owner_after_update_without_native_proof(self):
         for provider in ("codex", "claude"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
@@ -219,12 +219,13 @@ class RuntimeRetentionTests(unittest.TestCase):
                                               _payload(new_root, provider, "Stop", directory, session))
                     self.assertEqual(0, result.returncode, result.stderr)
                 document = json.loads(state_file.read_text())
-                self.assertFalse(document["active_runs"])
-                recent = {run["session_id"]: run for run in document["recent_runs"]
-                          if run["session_id"] in {"old-a", "old-b"}}
-                self.assertEqual({"old-a", "old-b"}, set(recent))
-                self.assertTrue(all(run["status"] == "completed" and
-                                    run["outcome"] == {"status": "completed"} for run in recent.values()))
+                # These fake agent IDs have no native transcript. The retained
+                # runtime must keep each owner recoverable instead of archiving it.
+                self.assertEqual({f"{provider}:old-a", f"{provider}:old-b"},
+                                 set(document["active_runs"]))
+                self.assertTrue(all(run["status"] == "recovering" and run["outcome"] is None
+                                    and run["assessment"]["_retryable_lead"] == "fake-lead"
+                                    for run in document["active_runs"].values()))
 
     def exercise_removed_cache(self, providers=("codex", "claude")):
         for provider in providers:
@@ -291,8 +292,9 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result, _ = self.run_hook(commands["Stop"], root, provider, directory, payloads["Stop"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 document = json.loads(state_file.read_text())
-                self.assertNotIn(f"{provider}:old-session", document["active_runs"])
-                self.assertEqual(document["recent_runs"][-1]["status"], "completed")
+                self.assertEqual(document["active_runs"][f"{provider}:old-session"]["status"], "recovering")
+                self.assertEqual(document["active_runs"][f"{provider}:old-session"]["assessment"]
+                                 ["_retryable_lead"], "fake-lead")
 
     def test_retained_or_source_tampering_fails_closed(self):
         for changed_path in ("symphony/runtime.py", "json.py", "scripts/check_activation.py"):

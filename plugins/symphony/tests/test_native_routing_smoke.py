@@ -895,6 +895,13 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         def verified(calls=evidence):
             return smoke.worker_launch_verified("codex", calls, worker, [own], "lead", "/root/lead")
         self.assertTrue(verified())
+        arguments["task_name"] = "symphony_worker_gpt_6_luna_low_2"
+        own["payload"]["agent_path"] += "_2"
+        evidence[0] = ("spawn_agent", arguments, "", '{"task_name":"/root/lead/symphony_worker_gpt_6_luna_low_2"}')
+        self.assertTrue(verified())
+        own["payload"]["agent_path"] = "/root/lead/symphony_worker_gpt_6_luna_low"
+        arguments["task_name"] = "symphony_worker_gpt_6_luna_low"
+        evidence[0] = ("spawn_agent", arguments, "", '{"task_name":"/root/lead/symphony_worker_gpt_6_luna_low"}')
         self.assertFalse(verified(evidence + evidence))
         self.assertFalse(verified([]))
         own["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"] = "foreign"

@@ -35,7 +35,7 @@ class FastRouteTests(unittest.TestCase):
                 else:
                     self.assertIn('packaged type alone does not identify a fast launch', result.stdout)
                     self.assertIn('SYMPHONY_FAST_ROUTE: lead', result.stdout)
-                self.assertIn('Substantive or uncertain objectives may go directly to the independent assessor', result.stdout)
+                self.assertIn('spawn the assessor directly', result.stdout)
                 self.assertIn('after an attempted fast lead returns native escalation', result.stdout)
 
     def test_enable_control_only_stays_at_root_and_accompanying_task_keeps_routing(self):

@@ -802,5 +802,339 @@ class HostEvidenceTests(unittest.TestCase):
         self.assertEqual("recovering", self.store.load(self.project).active_run.status)
 
 
+class CompletionChronologyTests(unittest.TestCase):
+    """File-backed native evidence, independent of callback arrival times."""
+
+    def fixture(self, provider, *, role='worker', early=False, handback=False, lead_handback=False):
+        import hashlib
+        from plugins.symphony.symphony.host_evidence import assessed_completion_chronology
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        self.project = self.base / 'project'; self.project.mkdir()
+        self.home = self.base / 'home'
+        self.provider = provider
+        self.session = ROOT_ID
+        self.lead = LEAD_ID if provider == 'codex' else 'a1234567890abcde0'
+        self.child = '01a0ec7c-1111-7222-8333-444444444444' if provider == 'codex' else 'b1234567890abcde0'
+        self.model = 'gpt-6-luna' if provider == 'codex' else 'claude-sonnet-5'
+        self.env = {'CODEX_HOME' if provider == 'codex' else 'CLAUDE_CONFIG_DIR': str(self.home)}
+        stamp = lambda second: f'2026-10-02T10:00:{second:02d}+00:00'
+        self.stamp = stamp
+        self.child_report = ('SYMPHONY_DECISION: {"size":"small","complexity":"simple"}'
+                             if role == 'consultant' else 'Work completed.')
+        lead_at = 9 if handback else 8 if early else 12
+        proof = {'run_id': 'run', 'epoch': 'epoch', 'lead': self.lead, 'parent': self.lead,
+                 'owner_generation': 1, 'role': role, 'successful': True, 'start_event_id': 'child-start',
+                 'admitted_at': stamp(6), 'start_parent': self.lead,
+                 'turn': 'turn_id:child-turn' if provider == 'codex' else 'prompt_id:hook-root-context'}
+        if provider == 'claude':
+            proof.update(launch_hash=hashlib.sha256(b'spawn-child').hexdigest(),
+                         native_prompt_hash=hashlib.sha256(b'child-prompt').hexdigest())
+        self.run = RunState('run', 'task', status='completing', provider=provider, session_id=self.session,
+            lead_identity=self.lead, owner_generation=1, started_at=stamp(0), updated_at=stamp(25),
+            outcome={'status': 'completed'}, assessment={
+                'size': 'small', 'complexity': 'simple',
+                'substantive_contract': {'version': 1, 'epoch': 'epoch', 'accepted_at': stamp(1)},
+                '_start_event_ids': ['child-start'], '_substantive_children': {self.child: proof},
+                '_terminal_turns': {self.lead: ['turn_id:lead-turn'], self.child: ['turn_id:child-turn']}},
+            delegations=(Delegation(self.lead, 'lead', 'task', 'completed', self.model, 'low', stamp(23)),
+                         Delegation(self.child, role, 'task', 'completed', self.model, 'low', stamp(24))))
+        self.state = ProjectState(active_run=self.run)
+        self.check = lambda: assessed_completion_chronology(self.state, self.session, self.project, self.env)
+        if provider == 'codex':
+            directory = self.home / 'sessions/2026/10/02'; directory.mkdir(parents=True)
+            self.paths = {identity: directory / f'rollout-{identity}.jsonl'
+                          for identity in (self.session, self.lead, self.child)}
+            def row(kind, payload, second):
+                return {'type': kind, 'payload': payload, 'timestamp': stamp(second)}
+            def header(identity, path, parent=''):
+                return row('session_meta', {'id': identity, 'cwd': str(self.project), 'agent_path': path,
+                    'source': {'subagent': {'thread_spawn': {'parent_thread_id': parent}}} if parent else 'exec'}, 0)
+            def call(name, args, key, second):
+                return row('response_item', {'type': 'function_call', 'name': name,
+                    'arguments': json.dumps(args), 'call_id': key}, second)
+            def result(key, second, output=''):
+                return row('response_item', {'type': 'function_call_output', 'call_id': key, 'output': output}, second)
+            def launch(identity, path, parent, key, second):
+                return [call('spawn_agent', {'task_name': path.rsplit('/', 1)[-1], 'model': self.model,
+                    'reasoning_effort': 'low', 'fork_turns': 'none', 'message': 'Exact task'}, key, second),
+                    row('event_msg', {'type': 'item_completed', 'thread_id': parent, 'item': {
+                        'type': 'SubAgentActivity', 'kind': 'started', 'id': key,
+                        'agent_thread_id': identity, 'agent_path': path}}, second),
+                    result(key, second, json.dumps({'task_name': path}))]
+            def start(token, second):
+                return [row('event_msg', {'type': 'task_started', 'turn_id': token}, second),
+                        row('turn_context', {'turn_id': token, 'model': self.model, 'effort': 'low'}, second)]
+            def end(token, report, authored, completed):
+                return [row('response_item', {'type': 'message', 'role': 'assistant', 'phase': 'final_answer',
+                    'content': [{'type': 'output_text', 'text': report}]}, authored),
+                    row('event_msg', {'type': 'task_complete', 'turn_id': token, 'last_agent_message': report}, completed)]
+            self.rows = {
+                self.session: [header(self.session, '/root'), *launch(self.lead, '/root/lead', self.session, 'spawn-lead', 2)],
+                self.lead: [header(self.lead, '/root/lead', self.session), *start('lead-turn', 3),
+                    *launch(self.child, '/root/lead/child', self.lead, 'spawn-child', 4)],
+                self.child: [header(self.child, '/root/lead/child', self.lead), *start('child-turn', 5)]}
+            if handback:
+                self.rows[self.child] += [call('send_message', {'target': '/root/lead', 'message': self.child_report}, 'handoff', 7), result('handoff', 8)]
+            if lead_handback:
+                self.rows[self.lead] += [call('send_message', {'target': '/root', 'message': 'Task completed.'}, 'lead-handoff', 8), result('lead-handoff', 9)]
+            self.rows[self.child] += end('child-turn', self.child_report, 10, 11)
+            receipt_at = 8 if handback else 11
+            receipt = (row('response_item', {'type': 'agent_message', 'author': '/root/lead/child',
+                'recipient': '/root/lead', 'content': []}, receipt_at) if handback else
+                row('event_msg', {'type': 'item_completed', 'thread_id': self.lead, 'item': {
+                    'type': 'SubAgentActivity', 'kind': 'completed', 'agent_thread_id': self.child,
+                    'agent_path': '/root/lead/child'}}, receipt_at))
+            final = end('lead-turn', 'Task completed.', lead_at if not lead_handback else 12, 13)
+            self.rows[self.lead] += [receipt, *final] if receipt_at <= lead_at else [final[0], receipt, final[1]]
+        else:
+            directory = self.home / f'projects/project/{self.session}/subagents'; directory.mkdir(parents=True)
+            self.paths = {self.lead: directory / f'agent-{self.lead}.jsonl',
+                          self.child: directory / f'agent-{self.child}.jsonl',
+                          self.session: directory.parent.with_suffix('.jsonl')}
+            def row(kind, identity, content, second, uuid, **fields):
+                return {'type': kind, 'sessionId': self.session, 'agentId': identity,
+                    'isSidechain': bool(identity), 'uuid': uuid, 'cwd': str(self.project),
+                    'timestamp': stamp(second), 'effort': 'low',
+                    'message': {'content': content, 'model': self.model, **fields}}
+            def launch(identity, target, role, key, second):
+                return [row('assistant', identity, [{'type': 'tool_use', 'name': 'Agent', 'id': key,
+                    'input': {'subagent_type': f'symphony:symphony-{role}-{self.model}-low',
+                              'prompt': f'Exact task for {target}', 'run_in_background': True}}], second, key),
+                        row('user', identity, [{'type': 'tool_result', 'tool_use_id': key,
+                            'content': 'Background launch acknowledged.'}], second, key + '-result')]
+            def handoff(identity, key, report, second):
+                return [row('assistant', identity, [{'type': 'tool_use', 'name': 'SubagentHandback', 'id': key,
+                    'input': {'message': report}}], second, key, stop_reason='tool_use'),
+                    row('user', identity, [{'type': 'tool_result', 'tool_use_id': key, 'content': 'OK'}], second + 1, key + '-result')]
+            self.rows = {
+                self.session: launch('', self.lead, 'lead', 'spawn-lead', 2),
+                self.lead: [row('user', self.lead, f'Exact task for {self.lead}', 3, 'lead-prompt'),
+                           *launch(self.lead, self.child, role, 'spawn-child', 4)],
+                self.child: [row('user', self.child, f'Exact task for {self.child}', 5, 'child-prompt')]}
+            if handback:
+                self.rows[self.child] += handoff(self.child, 'handoff', self.child_report, 7)
+            if lead_handback:
+                self.rows[self.lead] += handoff(self.lead, 'lead-handoff', 'Task completed.', 8)
+            self.rows[self.child].append(row('assistant', self.child,
+                [{'type': 'text', 'text': self.child_report}], 11, 'child-end', stop_reason='end_turn'))
+            if not early and not handback and not lead_handback:
+                notice = row('user', self.lead,
+                    f'<task-notification><task-id>{self.child}</task-id><status>completed</status>'
+                    f'<result>{self.child_report}</result></task-notification>', 11, 'worker-notification')
+                notice['origin'] = {'kind': 'task-notification', 'producer': 'session-task'}
+                self.rows[self.lead].append(notice)
+            self.rows[self.lead].append(row('assistant', self.lead,
+                [{'type': 'text', 'text': 'Task completed.'}], 12 if lead_handback else lead_at, 'lead-end', stop_reason='end_turn'))
+            for identity, role_name, key, depth in ((self.lead, 'lead', 'spawn-lead', 1), (self.child, role, 'spawn-child', 2)):
+                self.paths[identity].with_suffix('.meta.json').write_text(json.dumps({
+                    'agentType': f'symphony:symphony-{role_name}-{self.model}-low', 'toolUseId': key, 'spawnDepth': depth}))
+        self.write()
+
+    def write(self):
+        for identity, rows in self.rows.items():
+            self.paths[identity].write_text(''.join(json.dumps(row) + '\n' for row in rows))
+
+    def test_native_order_not_callback_arrival_controls_completion(self):
+        for provider in ('codex', 'claude'):
+            for role in ('worker', 'consultant'):
+                for early in (False, True):
+                    with self.subTest(provider=provider, role=role, early=early):
+                        self.fixture(provider, role=role, early=early)
+                        self.assertEqual(self.check(), 'early' if early else 'valid')
+                        # A delayed child callback does not move its native completion.
+                        self.state = replace(self.state, active_run=replace(self.run,
+                            delegations=(self.run.delegations[0], replace(self.run.delegations[1], updated_at=self.stamp(59)))))
+                        self.assertEqual(self.check(), 'early' if early else 'valid')
+
+    def test_final_handoff_can_precede_courtesy_end_but_early_lead_report_cannot(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.fixture(provider, handback=True)
+                self.assertEqual(self.check(), 'valid')
+                self.fixture(provider, lead_handback=True)
+                self.assertEqual(self.check(), 'early')
+
+    def test_child_terminal_without_exact_parent_delivery_cannot_close_the_run(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.fixture(provider)
+                self.rows[self.lead].pop(-3 if provider == 'codex' else -2)
+                self.write()
+                self.assertEqual(self.check(), 'unknown')
+                self.fixture(provider)
+                if provider == 'codex':
+                    self.rows[self.lead][-3]['payload']['item']['agent_thread_id'] = 'foreign'
+                else:
+                    self.rows[self.lead][-2]['origin']['producer'] = 'foreign'
+                self.write()
+                self.assertEqual(self.check(), 'unknown')
+        self.fixture('codex', handback=True)
+        self.rows[self.lead].pop(-3)
+        self.write()
+        self.assertEqual(self.check(), 'unknown')
+
+    def test_missing_foreign_ambiguous_failed_and_unsettled_evidence_is_unknown(self):
+        for provider in ('codex', 'claude'):
+            for case in ('missing', 'foreign-parent', 'foreign-model', 'wrong-generation', 'wrong-epoch',
+                         'missing-proof', 'failed-native', 'duplicate-terminal', 'handoff-failed', 'handoff-duplicate',
+                         'handoff-missing', 'later-work', 'pending-work'):
+                with self.subTest(provider=provider, case=case):
+                    self.fixture(provider, handback=True)
+                    rows = self.rows[self.child]
+                    if case in {'wrong-generation', 'wrong-epoch', 'missing-proof'}:
+                        proof = dict(self.run.assessment['_substantive_children'][self.child])
+                        if case == 'wrong-generation': proof['owner_generation'] = 2
+                        if case == 'wrong-epoch': proof['epoch'] = 'foreign'
+                        self.state = replace(self.state, active_run=replace(self.run, assessment={**self.run.assessment,
+                            '_substantive_children': {} if case == 'missing-proof' else {self.child: proof}}))
+                    elif provider == 'codex':
+                        if case == 'foreign-parent': rows[0]['payload']['source']['subagent']['thread_spawn']['parent_thread_id'] = ROOT_ID
+                        if case == 'foreign-model': rows[2]['payload']['model'] = 'foreign'
+                        if case == 'failed-native': rows[-1]['payload']['type'] = 'task_failed'
+                        if case == 'duplicate-terminal': rows.append(rows[-1])
+                        if case == 'handoff-failed': rows[4]['payload']['output'] = 'Error: unavailable'
+                        if case == 'handoff-duplicate': rows.insert(5, rows[4])
+                        if case == 'handoff-missing': rows.pop(4)
+                        if case in {'later-work', 'pending-work'}:
+                            rows.insert(-2 if case == 'later-work' else 3, {'type': 'response_item',
+                                'timestamp': self.stamp(9 if case == 'later-work' else 6), 'payload': {
+                                    'type': 'function_call', 'name': 'exec_command', 'arguments': '{"cmd":"work"}', 'call_id': 'unsettled'}})
+                    else:
+                        if case == 'foreign-parent': rows[0]['sessionId'] = 'foreign'
+                        if case == 'foreign-model': rows[-1]['message']['model'] = 'foreign'
+                        if case == 'failed-native': rows[-1]['message']['stop_reason'] = 'error'
+                        if case == 'duplicate-terminal': rows.append(rows[-1])
+                        if case == 'handoff-failed': rows[2]['message']['content'][0]['is_error'] = True
+                        if case == 'handoff-duplicate': rows.insert(3, rows[2])
+                        if case == 'handoff-missing': rows.pop(2)
+                        if case in {'later-work', 'pending-work'}:
+                            rows.insert(-1 if case == 'later-work' else 1, {**rows[-1],
+                                'timestamp': self.stamp(9 if case == 'later-work' else 6), 'uuid': 'unsettled',
+                                'message': {'model': self.model, 'stop_reason': 'tool_use', 'content': [{
+                                    'type': 'tool_use', 'name': 'Bash', 'id': 'unsettled', 'input': {'command': 'work'}}]}})
+                    self.write()
+                    if case == 'missing': self.paths[self.child].unlink()
+                    self.assertEqual(self.check(), 'unknown')
+
+    def test_only_durably_terminal_children_before_reassessment_are_excluded(self):
+        for provider in ('codex', 'claude'):
+            for timestamp, status, expected in ((0, 'completed', 'valid'), (0, 'failed', 'valid'),
+                    (0, 'working', 'unknown'), (1, 'completed', 'unknown'), (2, 'completed', 'unknown'),
+                    ('malformed', 'completed', 'unknown')):
+                with self.subTest(provider=provider, timestamp=timestamp, status=status):
+                    self.fixture(provider)
+                    historical = Delegation('historical', 'worker', 'old objective', status, self.model, 'low',
+                        self.stamp(timestamp) if isinstance(timestamp, int) else timestamp)
+                    self.state = replace(self.state, active_run=replace(self.run,
+                        delegations=(*self.run.delegations, historical)))
+                    self.assertEqual(self.check(), expected)
+
+    def test_all_current_children_must_return_before_the_lead_report(self):
+        import hashlib
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.fixture(provider)
+                other = '01a0ec7d-1111-7222-8333-444444444444' if provider == 'codex' else 'c1234567890abcde0'
+                def copied(value):
+                    return json.loads(json.dumps(value).replace(self.child, other).replace('spawn-child', 'spawn-other')
+                        .replace('child-turn', 'other-turn').replace('child-prompt', 'other-prompt')
+                        .replace('/lead/child', '/lead/other'))
+                self.rows[other] = copied(self.rows[self.child])
+                self.paths[other] = self.paths[self.child].with_name(self.paths[self.child].name.replace(self.child, other))
+                if provider == 'codex':
+                    launches = copied(self.rows[self.lead][3:6])
+                    args = json.loads(launches[0]['payload']['arguments']); args['task_name'] = 'other'
+                    launches[0]['payload']['arguments'] = json.dumps(args)
+                    self.rows[self.lead][6:6] = launches
+                    self.rows[other][-2]['timestamp'] = self.stamp(14)
+                    self.rows[self.lead].insert(-1, {'type': 'event_msg', 'timestamp': self.stamp(15),
+                        'payload': {'type': 'item_completed', 'thread_id': self.lead, 'item': {
+                            'type': 'SubAgentActivity', 'kind': 'completed', 'agent_thread_id': other,
+                            'agent_path': '/root/lead/other'}}})
+                    self.rows[self.lead][-1]['timestamp'] = self.stamp(16)
+                else:
+                    self.rows[self.lead][3:3] = copied(self.rows[self.lead][1:3])
+                    self.paths[other].with_suffix('.meta.json').write_text(json.dumps(copied(json.loads(
+                        self.paths[self.child].with_suffix('.meta.json').read_text()))))
+                self.rows[other][-1]['timestamp'] = self.stamp(15)
+                proof = {**self.run.assessment['_substantive_children'][self.child], 'start_event_id': 'other-start'}
+                if provider == 'codex': proof['turn'] = 'turn_id:other-turn'
+                else: proof.update(launch_hash=hashlib.sha256(b'spawn-other').hexdigest(),
+                                   native_prompt_hash=hashlib.sha256(b'other-prompt').hexdigest())
+                self.state = replace(self.state, active_run=replace(self.run,
+                    delegations=(*self.run.delegations, replace(self.run.delegations[1], identity=other)),
+                    assessment={**self.run.assessment, '_start_event_ids': ['child-start', 'other-start'],
+                        '_terminal_turns': {**self.run.assessment['_terminal_turns'], other: ['turn_id:other-turn']},
+                        '_substantive_children': {**self.run.assessment['_substantive_children'], other: proof}}))
+                self.write()
+                self.assertEqual(self.check(), 'early')
+
+    def test_launch_identity_report_scope_and_chronology_are_exact(self):
+        for provider in ('codex', 'claude'):
+            for case in ('missing-launch-result', 'failed-launch-result', 'duplicate-launch', 'foreign-launch',
+                         'wrong-project', 'foreign-lead', 'failed-lead', 'duplicate-lead-terminal',
+                         'reversed-report-time', 'foreign-handoff-target', 'forged-call-row', 'forged-result-row',
+                         'unfinished-new-prompt'):
+                if case == 'foreign-handoff-target' and provider == 'claude':
+                    continue
+                with self.subTest(provider=provider, case=case):
+                    self.fixture(provider, handback=True)
+                    lead = self.rows[self.lead]
+                    worker = self.rows[self.child]
+                    if provider == 'codex':
+                        if case == 'missing-launch-result': lead.pop(5)
+                        if case == 'failed-launch-result': lead[5]['payload']['output'] = 'Error: rejected'
+                        if case == 'duplicate-launch': lead.insert(6, lead[3])
+                        if case == 'foreign-launch': lead[4]['payload']['item']['agent_thread_id'] = 'foreign'
+                        if case == 'wrong-project': worker[0]['payload']['cwd'] = str(self.base / 'foreign')
+                        if case == 'foreign-lead': lead[0]['payload']['source']['subagent']['thread_spawn']['parent_thread_id'] = self.child
+                        if case == 'failed-lead': lead[-1]['payload']['last_agent_message'] = 'SYMPHONY_OUTCOME: {"status":"failed"}'
+                        if case == 'duplicate-lead-terminal': lead.append(lead[-1])
+                        if case == 'reversed-report-time': worker[3]['timestamp'] = self.stamp(1)
+                        if case == 'foreign-handoff-target': worker[3]['payload']['arguments'] = '{"target":"foreign","message":"done"}'
+                        if case == 'forged-call-row': worker[3]['type'] = 'event_msg'
+                        if case == 'forged-result-row': worker[4]['type'] = 'event_msg'
+                        if case == 'unfinished-new-prompt': lead.append({'type': 'event_msg', 'timestamp': self.stamp(15),
+                            'payload': {'type': 'user_message', 'message': 'Continue this task'}})
+                    else:
+                        if case == 'missing-launch-result': lead.pop(2)
+                        if case == 'failed-launch-result': lead[2]['message']['content'][0]['is_error'] = True
+                        if case == 'duplicate-launch': lead.insert(3, lead[1])
+                        if case == 'foreign-launch': lead[1]['message']['content'][0]['input']['subagent_type'] = 'foreign'
+                        if case == 'wrong-project': lead[1]['cwd'] = str(self.base / 'foreign')
+                        if case == 'foreign-lead': self.rows[self.session][0]['sessionId'] = 'foreign'
+                        if case == 'failed-lead': lead[-1]['message']['content'][0]['text'] = 'SYMPHONY_OUTCOME: {"status":"failed"}'
+                        if case == 'duplicate-lead-terminal': lead.append(lead[-1])
+                        if case == 'reversed-report-time': worker[1]['timestamp'] = self.stamp(1)
+                        if case == 'forged-call-row': worker[1]['type'] = 'system'
+                        if case == 'forged-result-row': worker[2]['type'] = 'system'
+                        if case == 'unfinished-new-prompt': lead.append({**lead[0], 'uuid': 'new-prompt', 'timestamp': self.stamp(15)})
+                    self.write()
+                    self.assertEqual(self.check(), 'unknown')
+
+    def test_claude_null_terminal_needs_the_existing_exact_parent_completion_proof(self):
+        for foreground in (False, True):
+            for bad in (False, True):
+                with self.subTest(foreground=foreground, bad=bad):
+                    self.fixture('claude')
+                    self.rows[self.child][-1]['message']['stop_reason'] = None
+                    lead = self.rows[self.lead]
+                    if foreground:
+                        lead[1]['message']['content'][0]['input']['run_in_background'] = False
+                        lead[2]['timestamp'] = self.stamp(11)
+                        lead[2]['message']['content'][0]['content'] = [
+                            {'type': 'text', 'text': 'foreign' if bad else self.child_report},
+                            {'type': 'text', 'text': f"agentId: {self.child} (use SendMessage with to: '{self.child}', "
+                             "summary: '<5-10 word recap>' to continue this agent)\n"
+                             '<usage>subagent_tokens: 1\ntool_uses: 0\nduration_ms: 1</usage>'}]
+                        lead.pop(-2)
+                    else:
+                        lead[-2]['origin']['producer'] = 'foreign' if bad else 'session-task'
+                    self.write()
+                    self.assertEqual(self.check(), 'unknown' if bad else 'valid')
+
+
 if __name__ == "__main__":
     unittest.main()

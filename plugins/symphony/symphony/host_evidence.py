@@ -34,6 +34,433 @@ def _instant(value: object) -> datetime | None:
         return None
 
 
+def _chronology_calls(provider: str, rows: list[dict]):
+    """Keep duplicate results visible when proving a delivered final report."""
+    calls, results = [], {}
+    for index, row in enumerate(rows):
+        when = _instant(row.get('timestamp'))
+        content = [row.get('payload')] if provider == 'codex' else (row.get('message') or {}).get('content', ())
+        for item in content if isinstance(content, list) else ():
+            if not isinstance(item, dict):
+                continue
+            kind = item.get('type')
+            if kind in ({'function_call', 'custom_tool_call'} if provider == 'codex' else {'tool_use'}):
+                if (when is None or row.get('type') != ('response_item' if provider == 'codex' else 'assistant')
+                        or not isinstance(item.get('name'), str) or not item['name']):
+                    return None
+                key = item.get('call_id' if provider == 'codex' else 'id')
+                args = item.get('arguments', item.get('input'))
+                if provider == 'codex' and kind == 'function_call':
+                    args = json.loads(args)
+                calls.append((key, item.get('name'), args, when, index))
+            elif kind in ({'function_call_output', 'custom_tool_call_output'} if provider == 'codex' else {'tool_result'}):
+                if row.get('type') != ('response_item' if provider == 'codex' else 'user'):
+                    return None
+                key = item.get('call_id' if provider == 'codex' else 'tool_use_id')
+                output = item.get('output' if provider == 'codex' else 'content')
+                failed = (item.get('is_error') is True or item.get('isError') is True
+                    or provider == 'codex' and isinstance(output, str) and re.search(
+                        r'Error:|"isError"\s*:\s*true|exit code [1-9]|"exit_code"\s*:\s*[1-9]', output) is not None)
+                results.setdefault(key, []).append((output, when, index, failed))
+    keys = [item[0] for item in calls]
+    if (any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys)
+            or any(left[3] > right[3] for left, right in zip(calls, calls[1:]))):
+        return None
+    return calls, results
+
+
+def _chronology_report(provider: str, rows: list[dict], completed: datetime, report: str,
+                       parent: str, parent_path: str = ''):
+    """Return authored/delivered times, with END still required by the caller.
+
+    A final native handoff may precede a courtesy END. Earlier diagnostic
+    failures are allowed, but every earlier operation must have settled.
+    """
+    times = [_instant(row.get('timestamp')) for row in rows]
+    if (not times or any(when is None for when in times)
+            or any(left > right for left, right in zip(times, times[1:]))):
+        return None
+    inventory = _chronology_calls(provider, rows)
+    if inventory is None or not isinstance(report, str) or not report.strip():
+        return None
+    calls, results = inventory
+    authored = completed
+    if provider == 'codex':
+        finals = [row for row in rows if row.get('type') == 'response_item'
+                  and row['payload'].get('phase') == 'final_answer']
+        if finals:
+            if len(finals) != 1:
+                return None
+            payload = finals[0]['payload']
+            content = payload.get('content')
+            if (payload.get('role') != 'assistant' or not isinstance(content, list)
+                    or any(not isinstance(item, dict) or item.get('type') not in {'text', 'output_text'}
+                           or not isinstance(item.get('text'), str) for item in content)
+                    or '\n'.join(item['text'] for item in content) != report):
+                return None
+            authored = _instant(finals[0].get('timestamp'))
+            if authored is None or authored > completed:
+                return None
+    handbacks = [item for item in calls if item[1] == 'SubagentHandback'] if provider == 'claude' else (
+        [calls[-1]] if calls and calls[-1][1] == 'send_message' else [])
+    boundary = authored
+    if handbacks:
+        if len(handbacks) != 1 or handbacks[0] != calls[-1]:
+            return None
+        handback = handbacks[0]
+        args = handback[2]
+        paired = results.get(handback[0], ())
+        if (not isinstance(args, dict) or not isinstance(args.get('message'), str) or not args['message'].strip()
+                or 'SYMPHONY_OUTCOME:' in args['message'] and _reported_status(args['message']) != 'completed'
+                or 'SYMPHONY_FAST_DECISION:' in args['message']
+                or provider == 'codex' and args.get('target') not in {parent, parent_path}
+                or len(paired) != 1 or paired[0][3] or paired[0][1] is None
+                or not handback[3] <= paired[0][1] <= completed or paired[0][2] <= handback[4]):
+            return None
+        authored, boundary = handback[3], paired[0][1]
+        prior = calls[:-1]
+    else:
+        prior = calls
+    for call in prior:
+        paired = results.get(call[0], ())
+        if (len(paired) != 1 or paired[0][1] is None or not call[3] <= paired[0][1] <= authored
+                or paired[0][2] <= call[4] or handbacks and paired[0][2] >= handbacks[0][4]):
+            return None
+    return authored, boundary if handbacks else completed
+
+
+def _chronology_codex_file(home: Path, identity: str, parent: str, project: Path):
+    sessions = home / 'sessions'
+    if not _CODEX_ID.fullmatch(identity) or sessions.is_symlink():
+        return None
+    paths = tuple(sessions.glob(f'*/*/*/*{identity}.jsonl'))
+    if len(paths) != 1 or any(path.is_symlink() for path in paths[0].parents if sessions in path.parents):
+        return None
+    rows = _complete_native_jsonl(paths[0])
+    if not rows or rows[0].get('type') != 'session_meta' or sum(row.get('type') == 'session_meta' for row in rows) != 1:
+        return None
+    header = rows[0]['payload']
+    if (header.get('id') != identity or header.get('forked_from_id')
+            or not isinstance(header.get('cwd'), str) or not Path(header['cwd']).is_absolute()
+            or Path(header['cwd']).resolve() != project.resolve()):
+        return None
+    if parent:
+        spawn = header
+        for key in ('source', 'subagent', 'thread_spawn'):
+            spawn = spawn.get(key, {}) if isinstance(spawn, dict) else {}
+        if (not isinstance(spawn, dict) or spawn.get('parent_thread_id') != parent
+                or header.get('parent_thread_id') not in {None, parent}
+                or not isinstance(header.get('agent_path'), str) or not header['agent_path'].startswith('/root/')
+                or spawn.get('agent_path') not in {None, header['agent_path']}):
+            return None
+    return rows
+
+
+def _chronology_codex_turn(rows: list[dict], child: Delegation):
+    starts = [(index, row) for index, row in enumerate(rows) if row.get('type') == 'event_msg'
+              and row['payload'].get('type') == 'task_started']
+    tokens = [row['payload'].get('turn_id') for _, row in starts]
+    if not tokens or any(not isinstance(token, str) or not token for token in tokens) or len(set(tokens)) != len(tokens):
+        return None
+    index, start = starts[-1]
+    token = tokens[-1]
+    turn = rows[index:]
+    contexts = [row for row in turn if row.get('type') == 'turn_context']
+    ends = [row for row in turn if row.get('type') == 'event_msg' and row['payload'].get('type') == 'task_complete']
+    if (len(contexts) != 1 or len(ends) != 1
+            or any(row['payload'].get('turn_id') != token for row in (*contexts, *ends))
+            or contexts[0]['payload'].get('model') != child.requested_tier
+            or contexts[0]['payload'].get('effort') != child.requested_effort
+            or any(row['payload'].get('type') in {'task_failed', 'turn_aborted', 'task_interrupted', 'error'} for row in turn)):
+        return None
+    began, completed = _instant(start.get('timestamp')), _instant(ends[0].get('timestamp'))
+    report = ends[0]['payload'].get('last_agent_message')
+    context_at = _instant(contexts[0].get('timestamp'))
+    if (began is None or completed is None or began >= completed or context_at is None
+            or not began <= context_at <= completed
+            or any(_instant(row.get('timestamp')) is None for row in turn)
+            or any(row['payload'].get('turn_id') not in {None, token} for row in turn)
+            or any(row.get('type') in {'response_item', 'turn_context'}
+                   or row['payload'].get('type') in {'user_message', 'task_started'}
+                   for row in turn[turn.index(ends[0]) + 1:])
+            or not isinstance(report, str) or not report.strip()
+            or 'SYMPHONY_OUTCOME:' in report and _reported_status(report) != 'completed'
+            or 'SYMPHONY_FAST_DECISION:' in report):
+        return None
+    return token, began, completed, report, turn
+
+
+def _chronology_codex_launch(parent_rows: list[dict], rows: list[dict], child: Delegation):
+    inventory = _chronology_calls('codex', parent_rows)
+    if inventory is None:
+        return None
+    calls, results = inventory
+    path = rows[0]['payload']['agent_path']
+    parent_path = parent_rows[0]['payload'].get('agent_path') or '/root'
+    candidates = []
+    for call in calls:
+        if call[1] != 'spawn_agent' or not isinstance(call[2], dict):
+            continue
+        args = call[2]
+        activity = [row for row in parent_rows if row.get('type') == 'event_msg'
+            and row['payload'].get('type') == 'item_completed'
+            and row['payload'].get('item', {}).get('id') == call[0]
+            and row['payload']['item'].get('type') == 'SubAgentActivity'
+            and row['payload']['item'].get('kind') == 'started']
+        paired = results.get(call[0], ())
+        try:
+            output = json.loads(paired[0][0]) if len(paired) == 1 and isinstance(paired[0][0], str) else None
+        except ValueError:
+            output = None
+        if not any(row['payload']['item'].get('agent_thread_id') == child.identity for row in activity) and not (
+                isinstance(output, dict) and output.get('task_name') == path):
+            continue
+        if (path != parent_path + '/' + str(args.get('task_name')) or args.get('fork_turns') != 'none'
+                or args.get('model') != child.requested_tier or args.get('reasoning_effort') != child.requested_effort
+                or not isinstance(args.get('message'), str) or not args['message']
+                or len(paired) != 1 or paired[0][3] or paired[0][1] is None or paired[0][2] <= call[4]
+                or paired[0][1] < call[3] or not isinstance(output, dict) or output.get('task_name') != path
+                or len(activity) != 1 or activity[0]['payload'].get('thread_id') != parent_rows[0]['payload']['id']
+                or activity[0]['payload']['item'].get('agent_thread_id') != child.identity
+                or activity[0]['payload']['item'].get('agent_path') != path
+                or _instant(activity[0].get('timestamp')) is None
+                or not call[3] <= _instant(activity[0]['timestamp']) <= paired[0][1]
+                or not call[4] < parent_rows.index(activity[0]) < paired[0][2]):
+            return None
+        candidates.append((call[3], paired[0][1]))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _chronology_claude_launch(rows: list[dict], launch_hash: str, session: str, parent: str, project: Path):
+    inventory = _chronology_calls('claude', rows)
+    if inventory is None:
+        return None
+    calls, results = inventory
+    matching = [call for call in calls if hashlib.sha256(call[0].encode()).hexdigest() == launch_hash]
+    if len(matching) != 1:
+        return None
+    call = matching[0]
+    row = rows[call[4]]
+    paired = results.get(call[0], ())
+    if (call[1] != 'Agent' or not isinstance(call[2], dict)
+            or row.get('type') != 'assistant' or row.get('sessionId') != session
+            or (row.get('agentId') or '') != parent or row.get('isSidechain', False) is not bool(parent)
+            or not isinstance(row.get('cwd'), str) or not Path(row['cwd']).is_absolute()
+            or Path(row['cwd']).resolve() != project.resolve()
+            or len(paired) != 1 or paired[0][3] or paired[0][1] is None
+            or paired[0][1] < call[3] or paired[0][2] <= call[4]):
+        return None
+    result_row = rows[paired[0][2]]
+    if (result_row.get('type') != 'user' or result_row.get('sessionId') != session
+            or (result_row.get('agentId') or '') != parent
+            or result_row.get('isSidechain', False) is not bool(parent)):
+        return None
+    return call[3], paired[0][1], call[2]
+
+
+def assessed_completion_chronology(state: ProjectState, session: str, project: Path,
+                                   environ: Mapping[str, str]) -> str:
+    """Prove children returned before the current assessed lead's final report.
+
+    Native completion is independent of callback arrival. This read-only gate
+    never supplies missing lifecycle credit or accepts a report on its own.
+    """
+    try:
+        run = state.active_run
+        if (not run or run.session_id != session or run.provider not in {'codex', 'claude'}
+                or run.status != 'completing' or run.outcome != {'status': 'completed'}
+                or type(run.owner_generation) is not int):
+            return 'unknown'
+        contract = run.assessment.get('substantive_contract')
+        if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int or contract['version'] != 1
+                or not isinstance(contract.get('epoch'), str) or not contract['epoch']
+                or (accepted := _instant(contract.get('accepted_at'))) is None):
+            return 'unknown'
+        leads = [item for item in run.delegations if item.identity == run.lead_identity and item.role == 'lead']
+        children = []
+        for item in run.delegations:
+            if item.role not in {'worker', 'consultant'}:
+                continue
+            updated = _instant(item.updated_at)
+            if updated is None:
+                return 'unknown'
+            # Reassessment keeps historical delegations. Only a durable
+            # terminal strictly before this epoch can be excluded.
+            if updated < accepted and item.state.lower() in {'completed', 'done', 'success', 'succeeded',
+                    'failed', 'interrupted', 'cancelled', 'canceled', 'error', 'terminated'}:
+                continue
+            children.append(item)
+        if (len(leads) != 1 or leads[0].state.lower() not in {'completed', 'done', 'success', 'succeeded'}
+                or not children or len({item.identity for item in children}) != len(children)):
+            return 'unknown'
+        lead = leads[0]
+        proofs = run.assessment.get('_substantive_children', {})
+        for child in children:
+            proof = proofs.get(child.identity)
+            if (child.state.lower() not in {'completed', 'done', 'success', 'succeeded'}
+                    or not isinstance(proof, Mapping) or proof.get('successful') is not True
+                    or any(proof.get(key) != value for key, value in {
+                        'run_id': run.run_id, 'epoch': contract['epoch'], 'lead': lead.identity,
+                        'parent': lead.identity, 'role': child.role, 'owner_generation': run.owner_generation}.items())
+                    or type(proof.get('owner_generation')) is not int
+                    or proof.get('start_event_id') not in run.assessment.get('_start_event_ids', ())
+                    or child.identity in run.assessment.get('_invalid_consultants', ())):
+                return 'unknown'
+        boundaries = []
+        if run.provider == 'codex':
+            home = Path(environ.get('CODEX_HOME') or Path.home() / '.codex')
+            root = _chronology_codex_file(home, session, '', project)
+            rows = _chronology_codex_file(home, lead.identity, session, project)
+            if root is None or rows is None:
+                return 'unknown'
+            native = _chronology_codex_turn(rows, lead)
+            launch = _chronology_codex_launch(root, rows, lead)
+            if (native is None or launch is None or _instant(run.started_at) is None
+                    or not _instant(run.started_at) <= launch[0] <= native[1]
+                    or f'turn_id:{native[0]}' not in run.assessment.get('_terminal_turns', {}).get(lead.identity, ())):
+                return 'unknown'
+            lead_times = _chronology_report('codex', native[4], native[2], native[3], session,
+                                             root[0]['payload'].get('agent_path') or '/root')
+            for child in children:
+                child_rows = _chronology_codex_file(home, child.identity, lead.identity, project)
+                if child_rows is None:
+                    return 'unknown'
+                terminal = _chronology_codex_turn(child_rows, child)
+                launched = _chronology_codex_launch(rows, child_rows, child)
+                if (terminal is None or launched is None or not accepted <= launched[0] <= terminal[1]
+                        or proofs[child.identity].get('turn') != f'turn_id:{terminal[0]}'
+                        or f'turn_id:{terminal[0]}' not in run.assessment.get('_terminal_turns', {}).get(child.identity, ())):
+                    return 'unknown'
+                times = _chronology_report('codex', terminal[4], terminal[2], terminal[3], lead.identity,
+                                            rows[0]['payload']['agent_path'])
+                if times is None:
+                    return 'unknown'
+                # The child's own terminal is not proof that its lead received
+                # the result. Native SubAgentActivity records that delivery.
+                handback = times[1] < terminal[2]
+                delivered = ([row for row in rows if row.get('type') == 'response_item'
+                    and row['payload'].get('type') == 'agent_message'
+                    and row['payload'].get('author') == child_rows[0]['payload']['agent_path']
+                    and row['payload'].get('recipient') == rows[0]['payload']['agent_path']
+                    and (when := _instant(row.get('timestamp'))) is not None
+                    and times[0] <= when <= times[1]] if handback else
+                    [row for row in rows if row.get('type') == 'event_msg'
+                    and row['payload'].get('type') == 'item_completed'
+                    and row['payload'].get('thread_id') == lead.identity
+                    and row['payload'].get('item', {}).get('type') == 'SubAgentActivity'
+                    and row['payload']['item'].get('kind') == 'completed'
+                    and row['payload']['item'].get('agent_thread_id') == child.identity
+                    and row['payload']['item'].get('agent_path') == child_rows[0]['payload']['agent_path']])
+                receipt = _instant(delivered[0].get('timestamp')) if len(delivered) == 1 else None
+                if receipt is None or receipt < (times[0] if handback else terminal[2]):
+                    return 'unknown'
+                boundaries.append(max(launched[1], times[1], receipt))
+        else:
+            native = _claude_native_lead_event(state, session, project, environ,
+                require_missing=False, allow_assessed_markerless=True)
+            if native is None:
+                return 'unknown'
+            home = Path(environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+            paths = tuple((home / 'projects').glob(f'*/{session}/subagents/agent-{lead.identity}.jsonl'))
+            if len(paths) != 1:
+                return 'unknown'
+            rows = _native_jsonl(paths[0])
+            prompt = next((index for index, row in enumerate(rows) if row.get('uuid') == native.payload['prompt_id']), None)
+            if prompt is None:
+                return 'unknown'
+            turn = rows[prompt + 1:]
+            lead_times = _chronology_report('claude', turn, _instant(native.observed_at),
+                                             native.payload['last_assistant_message'], session)
+            if lead_times is None:
+                return 'unknown'
+            # ACK-only historical worker continuations never change their
+            # original credit. Re-prove the existing committed mixed sequence
+            # instead of treating its later worker prompts as fresh work.
+            sequences = run.assessment.get('_claude_sendmessage_sequences', ())
+            candidates = [sequence for sequence in sequences if isinstance(sequence, Mapping)
+                and sequence.get('lead') == lead.identity and sequence.get('owner_generation') == run.owner_generation
+                and isinstance(sequence.get('historical_workers'), Mapping)]
+            for sequence in reversed(candidates):
+                origins = sequence['historical_workers'].get('origins', {})
+                if not isinstance(origins, Mapping) or set(origins) != {child.identity for child in children}:
+                    continue
+                if any(child.role != 'worker' or origins[child.identity].get('proof') != proofs[child.identity]
+                       or origins[child.identity].get('contract') != contract for child in children):
+                    return 'unknown'
+                replay = claude_archived_mixed_sendmessage_sequence(state, (), session, project, environ,
+                    committed_run=run, committed_anchor=sequence)
+                if replay is None or replay[1][-1].event_id != native.event_id:
+                    continue
+                boundaries = [_instant(sequence.get('archived_at')),
+                    *(_instant(item.observed_at) for item in replay[4]['natives'])]
+                if any(when is None for when in boundaries):
+                    return 'unknown'
+                return 'valid' if all(when < lead_times[0] for when in boundaries) else 'early'
+            meta = json.loads(paths[0].with_suffix('.meta.json').read_text(encoding='utf-8'))
+            root = _native_jsonl(paths[0].parent.parent.with_suffix('.jsonl'))
+            launch = _chronology_claude_launch(root, hashlib.sha256(meta['toolUseId'].encode()).hexdigest(),
+                                              session, '', project)
+            first = next((row for row in rows if row.get('type') == 'user'
+                          and isinstance(row.get('message', {}).get('content'), str)), None)
+            if launch is None or first is None or launch[2].get('prompt') != first['message']['content']:
+                return 'unknown'
+            for child in children:
+                proof = proofs[child.identity]
+                source = Event('', 'subagent_stopped', run.updated_at, {'provider': 'claude', 'session_id': session,
+                    'agent_id': child.identity, 'parent_thread_id': lead.identity, 'cwd': str(project)})
+                binding = claude_substantive_launch(run, source, child.role, proof.get('admitted_at'), environ)
+                if binding is None or any(proof.get(key) != value for key, value in binding.items()):
+                    return 'unknown'
+                launched = _chronology_claude_launch(rows, binding['launch_hash'], session, lead.identity, project)
+                if launched is None:
+                    return 'unknown'
+                child_rows = _native_jsonl(paths[0].parent / f'agent-{child.identity}.jsonl')
+                if not child_rows:
+                    return 'unknown'
+                child_prompt = next((index for index, row in enumerate(child_rows) if row.get('type') == 'user'
+                    and hashlib.sha256(str(row.get('uuid')).encode()).hexdigest() == binding['native_prompt_hash']), None)
+                terminal = _claude_historical_worker_terminal(child_rows, child_prompt, child.identity, session,
+                    child.requested_tier, child.requested_effort, parent_rows=rows, parent=lead.identity,
+                    launch_hash=binding['launch_hash']) if child_prompt is not None else None
+                if terminal is None:
+                    return 'unknown'
+                times = _chronology_report('claude', child_rows[child_prompt + 1:], _instant(terminal.observed_at),
+                                             terminal.payload['last_assistant_message'], lead.identity)
+                if times is None:
+                    return 'unknown'
+                if times[1] >= lead_times[0]:
+                    return 'early'
+                if times[1] == _instant(terminal.observed_at):
+                    # An end_turn on the child is not proof that a background
+                    # result reached its lead. Require the exact native parent
+                    # notification (or foreground Agent result) before report.
+                    completed = _instant(terminal.observed_at)
+                    endings = [row for row in child_rows[child_prompt + 1:]
+                        if row.get('type') == 'assistant' and _instant(row.get('timestamp')) == completed
+                        and '\n'.join(item.get('text', '') for item in row.get('message', {}).get('content', ())
+                                      if isinstance(item, dict) and item.get('type') == 'text')
+                        == terminal.payload['last_assistant_message']]
+                    if len(endings) != 1:
+                        return 'unknown'
+                    delivery = endings[0]
+                    if not claude_native_parent_completion(rows, delivery,
+                            terminal.payload['last_assistant_message'], session, lead.identity,
+                            child.identity, prompt=child_rows[child_prompt],
+                            launch_hash=binding['launch_hash'], allow_end_turn=True):
+                        return 'unknown'
+                    if not claude_native_parent_completion(rows, delivery,
+                            terminal.payload['last_assistant_message'], session, lead.identity,
+                            child.identity, before=lead_times[0], prompt=child_rows[child_prompt],
+                            launch_hash=binding['launch_hash'], allow_end_turn=True):
+                        return 'early'
+                boundaries.append(max(launched[1], times[1]))
+        if lead_times is None:
+            return 'unknown'
+        return 'valid' if all(when < lead_times[0] for when in boundaries) else 'early'
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return 'unknown'
+
+
 def codex_unmanaged_pre_run_terminal(
     state: ProjectState, source: Event, session: str, project: Path,
     environ: Mapping[str, str], result_id: str,
@@ -1967,11 +2394,13 @@ def _claude_historical_worker_origin(
 def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report: str,
                                     session: str, parent: str, identity: str,
                                     *, before: datetime | None = None,
-                                    prompt: Mapping | None = None, launch_hash: str = '') -> bool:
+                                    prompt: Mapping | None = None, launch_hash: str = '',
+                                    allow_end_turn: bool = False) -> bool:
     """Prove a NULL stop reason from the native task producer's exact delivery."""
     message = terminal.get('message', {})
     completed = _instant(terminal.get('timestamp'))
-    if (not isinstance(message, Mapping) or 'stop_reason' not in message or message['stop_reason'] is not None
+    if (not isinstance(message, Mapping) or 'stop_reason' not in message
+            or message['stop_reason'] not in ({None, 'end_turn'} if allow_end_turn else {None})
             or not isinstance(terminal.get('uuid'), str) or not terminal['uuid'] or completed is None
             or terminal.get('sessionId') != session or terminal.get('agentId') != identity
             or terminal.get('isSidechain') is not True or terminal.get('isApiErrorMessage') is True

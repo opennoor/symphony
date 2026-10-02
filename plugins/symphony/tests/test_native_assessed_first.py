@@ -93,6 +93,18 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 values = self.fixture(provider)
                 self.assertTrue(smoke.assessed_first_verified(provider, *values[:6]))
 
+    def test_feature_without_fast_lead_requires_exact_assessor_first_proof(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                document, run, children, home, project, _, _, _ = self.fixture(provider)
+                with (patch.object(smoke, 'native_rows', side_effect=lambda _provider, _home, identity: children[identity]),
+                      patch.object(smoke, 'fast_native_identity', return_value=False),
+                      patch.object(smoke, 'assessed_first_verified', return_value=False) as authority):
+                    with self.assertRaisesRegex(RuntimeError, 'substantive objective lacks exact assessor-first authority'):
+                        smoke.verify_case_run(provider, 'feature', document, run, home, project,
+                                              project / 'greet.py', '', None, {})
+                authority.assert_called_once()
+
     def test_rejected_assessor_messages_expose_only_exact_native_control_facts(self):
         for case in ('uuid', 'path', 'foreign', 'encrypted', 'changed', 'interrupt',
                      'failed', 'duplicate-result', 'missing-native-delivery', 'after-final'):
@@ -166,6 +178,7 @@ class NativeAssessedFirstTests(unittest.TestCase):
                     facts = smoke.lead_integration_probe('claude', run, home, project)
                 self.assertFalse(facts['accepted'])
                 delivery = facts['delivery']
+                self.assertIsNone(delivery['admitted_task_acceptance_present'])
                 self.assertEqual(delivery['root_native_available'], case != 'missing-root')
                 self.assertEqual(delivery['shared_verification_in_start'],
                                  None if case == 'no-context' else case != 'old-context')
@@ -182,6 +195,16 @@ class NativeAssessedFirstTests(unittest.TestCase):
                                      None if case == 'encrypted-resume' else True)
                 for private in ('PRIVATE_', 'private_', str(project), run['session_id'], run['lead_identity']):
                     self.assertNotIn(private, json.dumps(facts))
+
+    def test_lead_delivery_reports_only_presence_of_admitted_acceptance(self):
+        _, run, children, home, project, _, _, _ = self.fixture('claude')
+        run['task'] = smoke.FIXTURE_INSTRUCTIONS
+        lead = children[run['lead_identity']]
+        self.assertTrue(smoke._lead_delivery_probe('claude', run, home, project, lead)
+                        ['admitted_task_acceptance_present'])
+        run['task'] = 'gAAAAopaque_private_ciphertext'
+        self.assertIsNone(smoke._lead_delivery_probe('claude', run, home, project, lead)
+                          ['admitted_task_acceptance_present'])
 
     def test_codex_lead_packet_diagnostics_require_native_binding_and_visible_text(self):
         for case in ('exact', 'encrypted', 'missing-delivery'):
@@ -409,6 +432,29 @@ class NativeAssessedFirstTests(unittest.TestCase):
                             name = 'exec'; arguments = 'text(await tools.exec_command(' + json.dumps(arguments) + ')); text(await tools.exec_command({cmd:"work"}));'
                         self.assertFalse(smoke.structured_root_discovery(name, arguments, provider='codex',
                             document=changed, session=run['session_id'], project=project))
+
+    def test_codex_metadata_lookup_and_compact_checker_keep_assessor_first(self):
+        document, run, children, home, project, profile, roots, write = self.fixture('codex')
+        retained, original = str(home / ('a' * 64)), str(home / 'plugin')
+        document['activation'] = {'codex': {'session_id': run['session_id'],
+            'runtime_root': retained, 'plugin_root': original}}
+        lookup = 'const t = ALL_TOOLS.filter(x => /symphony|activation|assess/i.test(x.name+" "+x.description));\ntext(t);'
+        checker = ('const r=await tools.exec_command({cmd:'
+                   + json.dumps(smoke._retained_activation_command(retained, original))
+                   + '});\ntext(JSON.stringify(r));')
+        for ordinal, source in enumerate((lookup, checker)):
+            self.assertTrue(smoke.structured_root_discovery('exec', source, provider='codex',
+                document=document, session=run['session_id'], project=project))
+            roots.insert(1 + ordinal, {'type': 'response_item', 'timestamp': at(0), 'payload': {
+                'type': 'custom_tool_call', 'name': 'exec', 'call_id': 'bootstrap-' + str(ordinal),
+                'input': source}})
+        write()
+        self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
+        for source in (lookup + '\nawait tools.exec_command({cmd:"touch x"});',
+                       lookup.replace('text(t)', 'text(await tools.exec_command({cmd:"touch x"}))'),
+                       checker.replace('check_activation.py', 'do_work.py')):
+            self.assertFalse(smoke.structured_root_discovery('exec', source, provider='codex',
+                document=document, session=run['session_id'], project=project))
 
     def test_claude_background_assessment_can_be_accepted_before_final_courtesy_turn(self):
         document, run, children, home, project, profile, roots, write = self.fixture('claude')
