@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.7.0 — prepared 2026-10-01
+## 1.7.0 — prepared 2026-10-02
 
 - Limit fast direct execution to wholly predetermined mechanical work. Tiny features, diagnosis, substantive review, and mixed run-and-fix requests require assessment before changes. Assessed small work uses a worker; the routing matrix controls execution topology.
 - Require successful child work from the current assessment and lead generation before new delegated or mixed runs complete. Preserve the admitted child role and exact lead ownership. Claude scoped credit requires a fresh native child; retained multiple-prompt history has actionable same-lead recovery through fresh bounded delegation. Legacy completion remains compatible.
@@ -9,6 +9,7 @@
 - Retain ambiguous first-arriving Claude terminals after continuation commit. New-source acknowledgments require the original transaction boundary; late Starts must be observed no later than their native terminal, and unseen Stops need an explicit matching native turn ID. Prompt context alone cannot prove a child invocation. Exact committed retries remain compatible.
 - Bind new Claude fast runs to the exact accepted native launch so a parent call recorded before its hook can reconcile safely. Repeated native Stop releases the host turn while retaining unresolved work and displaying recovery guidance.
 - Reconcile ordinary Claude completion across prompt-context changes and markerless resumed turns, including a first Stop held by unfinished work.
+- Accept Claude's native background Agent completion notifications, including automatic backgrounding and batched notices, only when the child, launch, exact report, and delivery time agree. An early launch acknowledgement cannot complete a worker.
 - Acknowledge an unadmitted preliminary Codex child only when exact native evidence and complete retained history prove its escalation finished before managed work began. Record an explicit unmanaged disposition without task or lead credit. Clarify the distinct fast and assessed lead names.
 - Preserve accepted legacy risk text during route recovery while keeping new assessment validation strict.
 - Reconcile committed archived fast-lead escalation callbacks after the actual 1.6.0 serializer removes newer receipt fields, using surviving exact run and native evidence for acknowledgement only. Missing or conflicting proof remains retained; reloading alone does not restore trimmed evidence.

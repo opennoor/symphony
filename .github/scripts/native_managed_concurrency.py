@@ -3139,8 +3139,7 @@ def claude_literal_worker_probe(run, home):
                     prompt=next((row for row in rows if row.get('type') == 'user'
                         and isinstance(row.get('message', {}).get('content'), str)), None), launch_hash=launch_hash),
                 native_parent_notification_count=sum(isinstance(row.get('origin'), dict)
-                    and row['origin'].get('kind') == 'task-notification'
-                    and row['origin'].get('producer') == 'session-task' for row in lead_rows),
+                    and row['origin'].get('kind') == 'task-notification' for row in lead_rows),
                 final_activity_is_terminal=bool(activity) and activity[-1] is terminal,
                   terminal_is_end_turn=terminal.get('message', {}).get('stop_reason') == 'end_turn',
                   terminal_stop_reason_present='stop_reason' in terminal.get('message', {}),

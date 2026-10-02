@@ -2412,6 +2412,7 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
             or report != '\n'.join(item.get('text', '') for item in message['content'] if item['type'] == 'text')):
         return False
     matching = []
+    bound_launch_id = None
     # Foreground Agent calls deliver a completed report as a native tool_result,
     # not as a task notification. Bind the exact launch independently through
     # the child's metadata; an asynchronous launch ACK is never a completion.
@@ -2437,6 +2438,7 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
                 or not isinstance(prompt.get('uuid'), str) or not prompt['uuid']
                 or launched is None or began is None or not launched <= began < completed):
             return False
+        bound_launch_id = call['id']
         if inputs.get('run_in_background') is not None and inputs['run_in_background'] is not False:
             deliveries = []
         else:
@@ -2463,19 +2465,31 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
                 and isinstance(content[0].get('text'), str)
                 and re.fullmatch(re.escape(report) + r'\n{1,2}' + footer,
                                  content[0]['text']) is not None)
+            # Claude can automatically background Agent even when the call did
+            # not request it. Its early tool result is an ACK; the later native
+            # task notification must still deliver the exact child report.
+            async_ack = (isinstance(content, list) and len(content) == 1
+                and isinstance(content[0], dict) and content[0].get('type') == 'text'
+                and isinstance(content[0].get('text'), str)
+                and content[0]['text'].startswith('Async agent launched successfully.')
+                and re.search(r'(?m)^agentId: ' + re.escape(identity) + r'(?:\s|$)',
+                              content[0]['text']) is not None)
             if (row.get('type') != 'user' or row.get('sessionId') != session
                     or (row.get('agentId') or '') != parent
                     or row.get('isSidechain') is not bool(parent)
                     or row.get('isApiErrorMessage') is True
                     or not isinstance(row.get('uuid'), str) or not row['uuid']
-                    or when is None or when < completed or before is not None and when >= before
+                    or when is None or (when < launched if async_ack else
+                        when < completed or before is not None and when >= before)
                     or result.get('is_error') is not None and result['is_error'] is not False
-                    or not (separate or combined)):
+                    or not (async_ack or separate or combined)):
                 return False
-            matching.append(row)
+            if not async_ack:
+                matching.append(row)
     for row in rows:
         origin = row.get('origin')
-        if not isinstance(origin, Mapping) or origin.get('kind') != 'task-notification' or origin.get('producer') != 'session-task':
+        if (not isinstance(origin, Mapping) or origin.get('kind') != 'task-notification'
+                or origin.get('producer') not in ((None, 'session-task') if bound_launch_id else ('session-task',))):
             continue
         message = row.get('message')
         content = message.get('content') if isinstance(message, Mapping) else None
@@ -2485,32 +2499,56 @@ def claude_native_parent_completion(rows: list[dict], terminal: Mapping, report:
         if not isinstance(content, str):
             return False
         content = content.strip()
-        if content.startswith('<system-reminder>') and content.endswith('</system-reminder>'):
-            content = content[len('<system-reminder>'):-len('</system-reminder>')].strip()
-        try:
-            notification = ET.fromstring(content)
-        except ET.ParseError:
-            return False
-        if notification.findtext('task-id') != identity:
-            continue
-        when = _instant(row.get('timestamp'))
-        tags = [item.tag for item in notification]
-        result = notification.find('result')
-        if (row.get('type') != 'user' or row.get('sessionId') != session
-                or (row.get('agentId') or '') != parent or row.get('isSidechain') is not bool(parent)
-                or not isinstance(row.get('uuid'), str) or not row['uuid']
-                or 'isMeta' in row and row['isMeta'] is not True
-                or when is None or when < completed or before is not None and when >= before
-                or notification.tag != 'task-notification' or notification.attrib
-                or notification.text and notification.text.strip()
-                or any(item.tail and item.tail.strip() for item in notification)
-                or len(tags) != len(set(tags)) or set(tags) - {'task-id', 'status', 'summary', 'result', 'usage'}
-                or any(item.attrib or len(item) for item in notification if item.tag != 'usage')
-                or any(item.tag == 'note' for item in notification.iter())
-                or notification.findtext('status') != 'completed'
-                or result is None or len(result) or result.attrib or result.text != report):
-            return False
-        matching.append(row)
+        if bound_launch_id:
+            opening, closing = '<task-notification>', '</task-notification>'
+            fragments = re.findall(re.escape(opening) + r'.*?' + re.escape(closing), content, re.DOTALL)
+            if (len(fragments) != content.count(opening)
+                    or len(fragments) != content.count(closing)):
+                if identity in content or bound_launch_id in content:
+                    return False
+                continue
+        elif content.startswith('<system-reminder>') and content.endswith('</system-reminder>'):
+            fragments = [content[len('<system-reminder>'):-len('</system-reminder>')].strip()]
+        else:
+            fragments = [content]
+        for fragment in fragments:
+            try:
+                notification = ET.fromstring(fragment)
+            except ET.ParseError:
+                if not bound_launch_id or identity in fragment or bound_launch_id in fragment:
+                    return False
+                continue
+            if notification.findtext('task-id') != identity:
+                continue
+            when = _instant(row.get('timestamp'))
+            tags = [item.tag for item in notification]
+            result = notification.find('result')
+            modern_notice = bool(bound_launch_id and notification.find('tool-use-id') is not None)
+            allowed = ({'task-id', 'tool-use-id', 'output-file', 'status', 'summary', 'note', 'result', 'usage'}
+                       if modern_notice else {'task-id', 'status', 'summary', 'result', 'usage'})
+            usage = notification.find('usage')
+            if (row.get('type') != 'user' or row.get('sessionId') != session
+                    or (row.get('agentId') or '') != parent or row.get('isSidechain') is not bool(parent)
+                    or not isinstance(row.get('uuid'), str) or not row['uuid']
+                    or 'isMeta' in row and row['isMeta'] is not True
+                    or when is None or when < completed or before is not None and when >= before
+                    or notification.tag != 'task-notification' or notification.attrib
+                    or notification.text and notification.text.strip()
+                    or any(item.tail and item.tail.strip() for item in notification)
+                    or len(tags) != len(set(tags)) or set(tags) - allowed
+                    or any(item.attrib or len(item) for item in notification if item.tag != 'usage')
+                    or usage is not None and (usage.attrib or usage.text and usage.text.strip()
+                        or len({item.tag for item in usage}) != len(usage)
+                        or any(item.tag not in {'subagent_tokens', 'tool_uses', 'duration_ms'}
+                            or item.attrib or len(item) or item.tail and item.tail.strip()
+                            or not (item.text or '').isdigit() for item in usage))
+                    or modern_notice and (notification.findtext('tool-use-id') != bound_launch_id
+                        or not (notification.findtext('summary') or '').strip())
+                    or not modern_notice and origin.get('producer') != 'session-task'
+                    or notification.findtext('status') != 'completed'
+                    or result is None or len(result) or result.attrib or result.text != report):
+                return False
+            matching.append(row)
     return len(matching) == 1
 
 

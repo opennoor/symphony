@@ -208,6 +208,68 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
                     'claude-sonnet-5', 'low', parent_rows=rows, parent=parent,
                     launch_hash=launch_hash) is not None, expected)
 
+    def test_background_worker_uses_bound_native_task_notification(self):
+        from copy import deepcopy
+        from plugins.symphony.symphony.host_evidence import _instant
+        for case in ('valid', 'preface', 'batched', 'late-ack', 'explicit-background', 'wrong-task', 'wrong-tool', 'wrong-result',
+                     'wrong-status', 'missing-result', 'duplicate', 'duplicate-in-one-row', 'foreign-origin',
+                     'wrong-ack-owner', 'early', 'late', 'unbound'):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prepare()
+                report = 'Original worker success.'
+                call = {'type': 'assistant', 'sessionId': SESSION, 'agentId': LEAD,
+                    'isSidechain': True, 'uuid': 'native-parent-call',
+                    'timestamp': '2026-09-29T02:01:20Z', 'message': {'content': [{
+                        'type': 'tool_use', 'name': 'Agent', 'id': 'original-worker-launch',
+                        'input': {'prompt': self.rows[0]['message']['content']}}]}}
+                ack = {'type': 'user', 'sessionId': SESSION, 'agentId': LEAD,
+                    'isSidechain': True, 'uuid': 'async-launch-ack',
+                    'timestamp': '2026-09-29T02:01:22Z', 'message': {'content': [{
+                        'type': 'tool_result', 'tool_use_id': 'original-worker-launch',
+                        'content': [{'type': 'text', 'text':
+                            f'Async agent launched successfully.\nagentId: {WORKER}'}]}]}}
+                content = (f'<task-notification><task-id>{WORKER}</task-id>'
+                    '<tool-use-id>original-worker-launch</tool-use-id>'
+                    '<output-file>/tmp/worker-output</output-file><status>completed</status>'
+                    f'<summary>Worker finished.</summary><note>Read the output if needed.</note>'
+                    f'<result>{report}</result><usage><subagent_tokens>10</subagent_tokens>'
+                    '<tool_uses>1</tool_uses><duration_ms>120</duration_ms></usage>'
+                    '</task-notification>')
+                notice = {'type': 'user', 'sessionId': SESSION, 'agentId': LEAD,
+                    'isSidechain': True, 'isMeta': True, 'uuid': 'native-parent-result',
+                    'timestamp': '2026-09-29T02:01:40.5Z',
+                    'origin': {'kind': 'task-notification'}, 'message': {'content': content}}
+                rows = [call, ack, notice]
+                if case == 'preface': notice['message']['content'] = 'Native task completed.\n' + content
+                if case == 'batched': notice['message']['content'] = (
+                    '<task-notification><task-id>foreign</task-id><status>completed</status>'
+                    '<summary>Other task.</summary></task-notification>\n' + content)
+                if case == 'explicit-background': call['message']['content'][0]['input']['run_in_background'] = True
+                if case == 'late-ack': ack['timestamp'] = '2026-09-29T02:01:40.25Z'
+                if case == 'wrong-task': notice['message']['content'] = content.replace(WORKER, 'foreign')
+                if case == 'wrong-tool': notice['message']['content'] = content.replace('original-worker-launch', 'foreign-launch')
+                if case == 'wrong-result': notice['message']['content'] = content.replace(report, 'Other result.')
+                if case == 'wrong-status': notice['message']['content'] = content.replace('<status>completed</status>', '<status>failed</status>')
+                if case == 'missing-result': notice['message']['content'] = content.replace(f'<result>{report}</result>', '')
+                if case == 'duplicate': rows.append(deepcopy(notice))
+                if case == 'duplicate-in-one-row': notice['message']['content'] = content + '\n' + content
+                if case == 'foreign-origin': notice['origin'] = {'kind': 'user'}
+                if case == 'wrong-ack-owner': ack['message']['content'][0]['content'][0]['text'] = (
+                    ack['message']['content'][0]['content'][0]['text'].replace(WORKER, 'foreign'))
+                if case == 'early': notice['timestamp'] = '2026-09-29T02:01:39Z'
+                if case == 'late': notice['timestamp'] = self.rows[2]['timestamp']
+                launch_hash = hashlib.sha256(b'original-worker-launch').hexdigest()
+                if case == 'unbound': launch_hash = ''
+                expected = case in {'valid', 'preface', 'batched', 'late-ack', 'explicit-background'}
+                self.assertEqual(claude_native_parent_completion(rows, self.rows[1], report,
+                    SESSION, LEAD, WORKER, before=_instant(self.rows[2]['timestamp']),
+                    prompt=self.rows[0], launch_hash=launch_hash, allow_end_turn=True), expected)
+                if expected:
+                    self.assertIsNotNone(_claude_historical_worker_terminal(
+                        self.rows, 0, WORKER, SESSION, 'claude-sonnet-5', 'low',
+                        parent_rows=rows, parent=LEAD, launch_hash=launch_hash))
+
     def prepare_send(self, *, persist_start=False):
         self.prepare(persist_start=persist_start)
         parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
