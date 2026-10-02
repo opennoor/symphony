@@ -4087,12 +4087,15 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                      f"Pass `model=\"{fast['model']}\"`, `reasoning_effort=\"{fast['effort']}\"`, "
                      f"`fork_turns=\"none\"`, and `task_name=\"{fast_name}\"` exactly. "
                      "The initial fast lead must keep this reserved fast name. Generic assessed-lead "
-                     "names below apply only after escalation; never use them for this first spawn. ")
+                     "names below apply only after independent assessment; never use them for a fast spawn. ")
             return (
-                "Symphony fast route: the root is a courier. Spawn one capable lead at "
+                "Symphony fast route: the root is a courier. For a wholly predetermined mechanical objective, "
+                "spawn one capable lead at "
                 f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
                 "`SYMPHONY_FAST_ROUTE: lead` on separate lines. " + spawn +
-                "Relay the entire task and its acceptance checks. Before any changes, the lead must "
+                "Substantive or uncertain objectives may go directly to the independent assessor below. "
+                "Relay the whole request; the root never executes it. "
+                "If you attempt the fast path, relay the entire task and its acceptance checks. Before any changes, the lead must "
                 "decide whether the WHOLE objective consists only of predetermined mechanical steps "
                 "with an expected result, scope bounded, requirements clear, risk low, required tools "
                 "(including browser or computer control when needed) available, and verification concrete. "
@@ -4110,7 +4113,8 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                 "wait for native terminal results, and use normal Stop reconciliation. "
                 + ("Claude agents run in the background; end your turn after spawning and wait for the host result. "
                    if provider == "claude" else "")
-                + "Only after the fast lead's native escalation result, follow this assessment and delegation contract: "
+                + "For assessed-first work, or after an attempted fast lead returns native escalation, "
+                "use this assessment contract: "
                 + _assessed_guidance(task, provider, state, session_id)
             )
     return _assessed_guidance(task, provider, state, session_id)
@@ -4159,8 +4163,8 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         "and verifies results. Use the matrix for each child packet's own size/complexity. "
         "After verification and all children have returned, native successful assessed completion is sufficient. "
         "If supplied, a `SYMPHONY_OUTCOME:` report must be one valid JSON line; use blocked or failed when work remains. "
-        "Archived followup only reconciles the same bounded task. A new or substantive objective starts a fresh "
-        "assessment and delegation scope; never credit previous-task workers to it. "
+        "Archived followup only reconciles the same bounded task. New objectives need a fresh managed scope; "
+        "substantive work needs fresh assessment. Never credit previous-task workers to it. "
         "Relay the task in full: the lead cannot see this conversation, so if the request has several parts, "
         "every part goes in the packet and the acceptance check covers all of them. "
         "The assessor packet must require the exact size/complexity/risk vocabulary above and explain that "

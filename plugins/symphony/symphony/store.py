@@ -161,8 +161,8 @@ def _run_from_dict(value: Any) -> RunState:
 
 
 def _available_terminal_receipts(
-    runs: tuple[RunState, ...], existing: tuple[dict[str, str], ...],
-) -> tuple[dict[str, str], ...]:
+    runs: tuple[RunState, ...], existing: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
     """Keep lineage still present in older run records before archive trim."""
     receipts = list(existing)
     results = {(item["provider"], item["session"], item["run_id"], item["result"])

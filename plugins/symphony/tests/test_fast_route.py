@@ -29,12 +29,13 @@ class FastRouteTests(unittest.TestCase):
                 if provider == 'codex':
                     name = 'symphony_lead_fast_' + selected['model'].replace('-', '_').replace('.', '_') + '_' + selected['effort']
                     self.assertIn('task_name=\\"' + name + '\\"', result.stdout)
-                    self.assertIn('never use them for this first spawn', result.stdout)
+                    self.assertIn('never use them for a fast spawn', result.stdout)
                     self.assertIn('for assessor and assessed lead', result.stdout)
                 else:
                     self.assertIn('packaged type alone does not identify a fast launch', result.stdout)
                     self.assertIn('SYMPHONY_FAST_ROUTE: lead', result.stdout)
-                self.assertIn("Only after the fast lead's native escalation result", result.stdout)
+                self.assertIn('Substantive or uncertain objectives may go directly to the independent assessor', result.stdout)
+                self.assertIn('after an attempted fast lead returns native escalation', result.stdout)
 
     def test_enable_control_only_stays_at_root_and_accompanying_task_keeps_routing(self):
         for provider in ('codex', 'claude'):

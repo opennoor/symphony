@@ -93,6 +93,9 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                 if record.get("type") != "session_meta" and not header_seen:
                     continue
                 if record.get("type") == "session_meta":
+                    identity = record_payload.get("id")
+                    if not isinstance(identity, str) or not identity:
+                        return {}
                     # A fork contains copied ancestor headers and turns after
                     # its own first header. They are not this child's evidence.
                     if header_seen:
@@ -100,8 +103,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                         own_turn = False
                         continue
                     header_seen = True
-                    identity = record_payload.get("id")
-                    if not isinstance(identity, str) or not identity or identity != callback_identity:
+                    if identity != callback_identity:
                         return {}
                     forked = bool(record_payload.get("forked_from_id"))
                     own_turn = not forked and not callback_turn
@@ -142,8 +144,6 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                                             and isinstance(item.get("text"), str))
                         if "SYMPHONY_FAST_ROUTE: lead" in message:
                             found["task"] = message
-                if {"task_name", "model_reasoning_effort", "task"} <= found.keys():
-                    break
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return found
     return found

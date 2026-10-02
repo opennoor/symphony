@@ -1874,7 +1874,10 @@ def _claude_historical_worker_origin(
              and _instant(proof['admitted_at']) <= _instant(event.observed_at) <= archived]
     receipts = [receipt for receipt in state.terminal_receipts
                 if receipt.get('provider') == 'claude' and receipt.get('session') == run.session_id
-                and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity]
+                and receipt.get('run_id') == run.run_id and receipt.get('agent') == identity
+                # The store retains empty lineage placeholders before a child
+                # returns. Only result-bearing receipts can prove its outcome.
+                and receipt.get('result') != '']
     if expected_origin is not None:
         expected_receipt = expected_origin.get('receipt')
         if not isinstance(expected_receipt, Mapping):

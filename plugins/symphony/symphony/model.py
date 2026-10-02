@@ -147,6 +147,6 @@ class ProjectState:
     # long as this root can resume. Never trim these receipts silently: an old
     # callback could otherwise complete a newer run that reused its child ID.
     # Each receipt contains only identities and a result hash, not message text.
-    terminal_receipts: tuple[Mapping[str, str], ...] = ()
+    terminal_receipts: tuple[Mapping[str, object], ...] = ()
     event_history: tuple[Event, ...] = ()
     needs_reassessment: bool = False

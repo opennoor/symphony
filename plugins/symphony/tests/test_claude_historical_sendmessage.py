@@ -27,7 +27,7 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
     write_root_prompt = fixture.ClaudeSendMessageTests.write_root_prompt
     queue = fixture.ClaudeSendMessageTests.queue
 
-    def prepare(self):
+    def prepare(self, *, persist_start=False):
         fixture.ClaudeSendMessageTests.prepare(self)
         lead_rows = [json.loads(line) for line in self.child.read_text().splitlines()]
         lead_rows.insert(1, {'type': 'assistant', 'sessionId': SESSION, 'agentId': LEAD,
@@ -58,12 +58,18 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
             'model': 'claude-sonnet-5', 'model_reasoning_effort': 'low'}
         state, _ = _observe_delegation(state, Event('worker-start', 'subagent_started',
             '2026-09-29T02:01:22+00:00', payload), self.environ)
+        if persist_start:
+            # A real assessed run already retained the assessor's terminal ID.
+            state = replace(state, active_run=replace(state.active_run, assessment={
+                **state.active_run.assessment, '_terminal_event_ids': ('a' * 64,)}))
+            self.store.save(self.project, state)
+            state = self.store.load(self.project)
         state, _ = _observe_delegation(state, Event('worker-stop', 'subagent_stopped',
             '2026-09-29T02:01:41+00:00', {**payload, 'status': 'completed',
             'last_assistant_message': 'Original worker success.'}), self.environ)
         self.original = replace(state.active_run, status='completed', outcome={'status': 'completed'},
                                 updated_at=self.archived.updated_at)
-        self.state = replace(state, active_run=None, recent_runs=(self.original,))
+        self.state = replace(state, active_run=None, active_runs={}, recent_runs=(self.original,))
         self.assertTrue(self.original.assessment['_substantive_children'][WORKER]['successful'])
         self.rows.extend([
             {**self.rows[0], 'uuid': 'worker-send-prompt', 'timestamp': '2026-09-29T02:04:11Z',
@@ -74,11 +80,19 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
                          'content': [{'type': 'text', 'text': 'Original work remains complete.'}]}}])
         self.write_worker()
 
+    def test_original_worker_survives_native_start_persistence(self):
+        self.prepare(persist_start=True)
+        receipts = [item for item in self.state.terminal_receipts if item.get('agent') == WORKER]
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(sum(bool(item.get('result')) for item in receipts), 1)
+        self.assertIsNotNone(_claude_historical_worker_origin(
+            self.state, self.original, WORKER, self.project, self.environ))
+
     def write_worker(self):
         self.worker.write_text(''.join(json.dumps(row) + '\n' for row in self.rows))
 
-    def prepare_send(self):
-        self.prepare()
+    def prepare_send(self, *, persist_start=False):
+        self.prepare(persist_start=persist_start)
         parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
         parent[-2:-2] = [
             {'type': 'assistant', 'sessionId': SESSION, 'cwd': str(self.project),
@@ -135,7 +149,7 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
         for hook in ('Stop', 'SessionStart', 'UserPromptSubmit'):
             with self.subTest(hook=hook):
                 self.setUp()
-                self.prepare_send()
+                self.prepare_send(persist_start=True)
                 sources = tuple(sorted((*self.events, *self.worker_events), key=lambda event: event.observed_at))
                 self.assertIsNotNone(claude_archived_mixed_sendmessage_sequence(
                     self.state, sources, SESSION, self.project, self.environ))
@@ -612,11 +626,13 @@ class HistoricalClaudeSendMessageTests(unittest.TestCase):
 
     def test_missing_original_credit_scope_or_receipt_holds(self):
         self.prepare()
-        for case in ('missing-receipt', 'wrong-receipt-parent', 'missing-start', 'missing-terminal',
+        for case in ('missing-receipt', 'conflicting-result', 'wrong-receipt-parent', 'missing-start', 'missing-terminal',
                      'failed-proof', 'foreign-generation', 'foreign-epoch', 'wrong-launch-hash'):
             with self.subTest(case=case):
                 state, run = self.state, self.original
                 if case == 'missing-receipt': state = replace(state, terminal_receipts=())
+                if case == 'conflicting-result': state = replace(state, terminal_receipts=(
+                    *state.terminal_receipts, {**state.terminal_receipts[0], 'result': 'f' * 64}))
                 if case == 'wrong-receipt-parent': state = replace(state, terminal_receipts=(
                     {**state.terminal_receipts[0], 'parent': 'foreign'},))
                 if case == 'missing-start': state = replace(state, event_history=state.event_history[1:])

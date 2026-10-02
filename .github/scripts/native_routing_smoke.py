@@ -46,10 +46,14 @@ class GreetingTests(unittest.TestCase):
 """
 FIXTURE_INSTRUCTIONS = (
     "This is a disposable greeting fixture. Use native apply_patch, Write, or Edit for file changes. "
-    "Verify the integrated result with exactly python -m unittest -q in one standalone native "
+    "Relay this fixture acceptance contract unchanged to the canonical assessed lead. After ALL workers "
+    "return successfully, the canonical lead itself must run exactly python -m unittest -q; a worker's "
+    "test run or git diff does not fulfill this lead integration check. Use one standalone native "
     "exec_command (Codex) or Bash (Claude) invocation. Return the full structured tool result, "
     "including exit code and output. On Codex use text(await tools.exec_command({\"cmd\":\"python -m unittest -q\"})); "
-    "Do not batch verification with other commands or print only result.output.\n")
+    "Do not batch verification with other commands or print only result.output. "
+    "If supplying SYMPHONY_OUTCOME, return exactly one line with status completed, failed, or blocked; "
+    "never substitute successful or duplicate a marker.\n")
 
 
 def setup_prompt(provider):
@@ -174,6 +178,8 @@ def failure_diagnostics(provider, root, document):
             'assessed_completion': [assessed_completion_probe(provider, home, run, document) for run in runs
                                     if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             'root_native_launches': root_launches,
+            'assessed_first_authority': [assessed_first_probe(provider, document, run, home, root / 'primary')
+                for run in runs if run.get('provider') == provider and run.get('assessment', {}).get('size')],
             **({'claude_phases': claude_phase_diagnostics(root, home)} if provider == 'claude' else {}),
             'claude_completion': [claude_completion_probe(document, run.get('session_id'), root / 'primary', home)
                 for run in document.get('active_runs', {}).values()
@@ -1583,6 +1589,17 @@ def unittest_verified(evidence, project=None):
     return False
 
 
+def native_cli_command(provider, executable, project, session, prompt, budget, resume=False):
+    if provider == 'codex':
+        return [executable, 'exec', *(['resume'] if resume else []), '--dangerously-bypass-hook-trust',
+                '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
+                '--model', 'gpt-6-luna', '-c', 'model_reasoning_effort="low"',
+                '-c', 'features.multi_agent=true', *([session] if resume else ['-C', str(project)]), prompt]
+    return [executable, '--print', '--model', 'haiku', '--max-budget-usd', str(budget),
+            '--permission-mode', 'bypassPermissions', '--output-format', 'json',
+            '--resume' if resume else '--session-id', session, prompt]
+
+
 def check_case(provider, root, candidate, case, timeout, budget, requested_profile=None):
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("SYMPHONY_") and key not in {"CODEX_SESSION_ID", "CLAUDECODE"}}
@@ -1606,7 +1623,14 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
     executable = shutil.which(provider)
     require(bool(executable), "native CLI executable is unavailable")
     session = str(uuid.uuid4())
-    prompt = CASES[case]
+    prompt = CASES[case] + (' This is the required fast-eligibility escalation probe: first relay the complete '
+        'request to the offered fast lead. That lead must use NO tools and make NO changes before returning '
+        'SYMPHONY_FAST_DECISION: escalate. Only then request independent assessment and bounded delegation.'
+        if case == 'feature' else '')
+    if case != 'command':
+        prompt += (' Relay the fixture integration check unchanged: after every worker returns successfully, '
+            'the canonical assessed lead itself must run exactly python -m unittest -q in a standalone native '
+            'tool call and return the full successful result. A worker test or git diff is insufficient.')
     logs = root / "logs"
     logs.mkdir()
     phases = []
@@ -1623,15 +1647,7 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
             phases[-1].update(root_session=session, root_rows_before=len(rows) if rows is not None else
                 0 if not list((home / 'projects').glob(f'*/{session}.jsonl')) else None)
         (logs / 'phases.json').write_text(json.dumps(phases))
-        if provider == "codex":
-            command = [executable, "exec", "--dangerously-bypass-hook-trust",
-                       "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-                       "--model", "gpt-6-luna", "-c", 'model_reasoning_effort="low"',
-                       "-c", "features.multi_agent=true", "-C", str(project), prompt]
-        else:
-            command = [executable, "--print", "--model", "haiku", "--max-budget-usd", str(budget),
-                       "--permission-mode", "bypassPermissions", "--output-format", "json",
-                       "--resume" if resume else "--session-id", session, prompt]
+        command = native_cli_command(provider, executable, project, session, prompt, budget, resume)
         with (logs / "stdout").open("a", encoding="utf-8") as output, (logs / "stderr").open("a", encoding="utf-8") as errors:
             if provider == 'claude':
                 phases[-1]['stdout_begin'] = output.tell()
@@ -1690,6 +1706,386 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
         require(child_record is not None and not child_record.get("pending") and not child_record.get("overflow"),
                 "bound child callbacks remain unresolved")
     home = Path(env["CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"])
+    receipt = verify_case_run(provider, case, document, run_state, home, project, greeting,
+                              initial_hash, first_change_after_ns, fast)
+    if case == 'command':
+        original = run_state
+        original_receipts = tuple(document.get('terminal_receipts', ()))
+        # A new user objective is distinct from continuation of the old child.
+        # The first archive and empty inbox have already been verified above.
+        run('New wholly mechanical Symphony objective: run python -m unittest -q again and report the result. '
+            'The preceding objective is archived. Use a fresh fast lead for this new objective, '
+            'without resuming the preceding child.', True, 'objective')
+        document = json.loads(state_path.read_text(encoding='utf-8'))
+        if provider == 'claude' and active(document):
+            run('Reconcile only the new mechanical objective and finish after its background result.', True, 'reconcile')
+            document = json.loads(state_path.read_text(encoding='utf-8'))
+            if (active(document) or {}).get('status') == 'completing':
+                run('/symphony:stop', True, 'stop')
+                document = json.loads(state_path.read_text(encoding='utf-8'))
+        require(active(document) is None, 'second mechanical objective did not archive')
+        fresh = fresh_command_run_verified(document, original, provider, session, original_receipts,
+                                           store, greeting, initial_hash)
+        second = verify_case_run(provider, case, document, fresh, home, project, greeting,
+                                 initial_hash, first_change_after_ns, fast)
+        receipt['fresh_objectives_same_root'] = 2
+        receipt['second_fresh_objective'] = second
+    return receipt
+
+
+def fresh_command_run_verified(document, original, provider, session, original_receipts,
+                               store, greeting, initial_hash):
+    runs = [item for item in document.get('recent_runs', [])
+            if item.get('provider') == provider and item.get('session_id') == session]
+    require(len(runs) == 2 and sum(item == original for item in runs) == 1,
+            'second mechanical objective changed or reused the first archived run')
+    fresh = next(item for item in runs if item != original)
+    old_ids = {item.get('identity') for item in original.get('delegations', [])}
+    new_ids = {item.get('identity') for item in fresh.get('delegations', [])}
+    require(fresh.get('run_id') != original.get('run_id') and fresh.get('status') == 'completed'
+            and fresh.get('outcome', {}).get('status') == 'completed'
+            and old_ids and new_ids and not old_ids.intersection(new_ids)
+            and host_evidence._instant(fresh.get('started_at')) is not None
+            and host_evidence._instant(original.get('updated_at')) is not None
+            and host_evidence._instant(fresh['started_at']) > host_evidence._instant(original['updated_at']),
+            'second mechanical objective has no fresh postarchive owner and identity')
+    require(all(receipt in document.get('terminal_receipts', ()) for receipt in original_receipts),
+            'second objective changed the first terminal receipts')
+    old_receipts = [item for item in original_receipts if item.get('run_id') == original['run_id']
+                    and item.get('provider') == provider and item.get('session') == session]
+    new_receipts = [item for item in document.get('terminal_receipts', ()) if item.get('run_id') == fresh['run_id']
+                    and item.get('provider') == provider and item.get('session') == session]
+    require(old_receipts and new_receipts and all(item.get('agent') in new_ids for item in new_receipts)
+            and not {item.get('result') for item in old_receipts}.intersection(
+                item.get('result') for item in new_receipts), 'new objective inherited terminal receipt evidence')
+    for identity in (session, *store.aliases_for_owner(provider, session)):
+        record = store.session_record(provider, identity)
+        require(record is not None and not record.get('pending') and not record.get('overflow'),
+                'second mechanical objective retained unresolved callbacks')
+    require(fingerprint(greeting) == initial_hash, 'second mechanical objective changed the fixture')
+    return fresh
+
+
+def native_call_inventory(provider, rows):
+    """Retain every native attempt and unique paired result; never overwrite IDs."""
+    calls, results = [], {}
+    for ordinal, row in enumerate(rows):
+        when = host_evidence._instant(row.get('timestamp'))
+        if provider == 'codex':
+            payload = row.get('payload', {})
+            if payload.get('type') in {'function_call', 'custom_tool_call'}:
+                args = payload.get('arguments', payload.get('input'))
+                if payload.get('type') == 'function_call' and isinstance(args, str):
+                    args = json.loads(args)
+                calls.append((payload.get('call_id'), payload.get('name'), args, when, ordinal, row))
+            elif payload.get('type') in {'function_call_output', 'custom_tool_call_output'}:
+                results.setdefault(payload.get('call_id'), []).append((payload.get('output'), when, ordinal, False))
+        else:
+            message = row.get('message', {})
+            content = message.get('content') if isinstance(message, dict) else None
+            for item in content if isinstance(content, list) else ():
+                if not isinstance(item, dict):
+                    continue
+                if item.get('type') == 'tool_use':
+                    calls.append((item.get('id'), item.get('name'), item.get('input'), when, ordinal, row))
+                elif item.get('type') == 'tool_result':
+                    results.setdefault(item.get('tool_use_id'), []).append(
+                        (item.get('content'), when, ordinal, item.get('is_error') is True))
+    ids = [item[0] for item in calls]
+    require(all(isinstance(value, str) and value for value in ids) and len(set(ids)) == len(ids)
+            and all(item[3] is not None for item in calls)
+            and all(left[3] <= right[3] for left, right in zip(calls, calls[1:])), 'native root call inventory is malformed or duplicated')
+    return calls, results
+
+
+def structured_root_discovery(name, args):
+    if name in {'Read', 'Glob', 'Grep', 'read_file', 'AskUserQuestion', 'request_user_input'}:
+        return isinstance(args, dict)
+    return (name == 'Skill' and isinstance(args, dict)
+            and args.get('skill') in {'symphony', 'symphony:symphony'})
+
+
+def assessed_first_verified(provider, document, run, child_rows, home, project, profile):
+    """Prove assessor-first authority; absent fast markers alone prove nothing."""
+    try:
+        session = run['session_id']
+        assessors = [item for item in run['delegations'] if item['role'] == 'assessor']
+        if len(assessors) != 1 or assessors[0]['state'] != 'completed':
+            return False
+        assessor = assessors[0]
+        identity = assessor['identity']
+        expected = snapshot_for(provider, profile).tiers['strongest']
+        if (assessor['requested_tier'], assessor['requested_effort']) != (expected, 'high'):
+            return False
+        contract = run['assessment'].get('substantive_contract')
+        if (not isinstance(contract, dict) or type(contract.get('version')) is not int or contract['version'] != 1
+                or not isinstance(contract.get('epoch'), str) or not contract['epoch']):
+            return False
+        accepted = host_evidence._instant(contract.get('accepted_at'))
+        history = document.get('event_history', ())
+        admissions = [item for item in history if item.get('event_id') == contract['epoch'] + ':assessment:assessment_accepted'
+                      and item.get('kind') == 'assessment_accepted' and item.get('observed_at') == contract['accepted_at']]
+        terminals = [item for item in history if item.get('event_id') == contract['epoch'] + ':delegation:delegation_updated'
+                     and item.get('kind') == 'delegation_updated' and item.get('payload', {}).get('identity') == identity
+                     and item.get('payload', {}).get('state') == 'completed']
+        if (accepted is None or len(admissions) != 1 or len(terminals) != 1
+                or any(admissions[0].get('payload', {}).get(key) != run['assessment'].get(key)
+                       for key in ('size', 'complexity', 'risk', 'substantive_contract'))):
+            return False
+        rows = child_rows[identity]
+        lead_rows = child_rows[run['lead_identity']]
+        if identity == run['lead_identity']:
+            return False
+        if provider == 'codex':
+            paths = list((home / 'sessions').rglob('*' + session + '.jsonl'))
+            if len(paths) != 1:
+                return False
+            root = _complete_native_jsonl(paths[0])
+            if (not root or root[0].get('type') != 'session_meta' or root[0]['payload'].get('id') != session
+                    or root[0]['payload'].get('source') != 'exec' or root[0]['payload'].get('forked_from_id')
+                    or not Path(root[0]['payload'].get('cwd', '')).is_absolute()
+                    or Path(root[0]['payload'].get('cwd', '')).resolve() != project.resolve()
+                    or not worker_transcript_is_unforked(provider, rows, identity)
+                    or not worker_transcript_is_unforked(provider, lead_rows, run['lead_identity'])):
+                return False
+            if rows[0].get('type') != 'session_meta' or lead_rows[0].get('type') != 'session_meta':
+                return False
+            lead_header = lead_rows[0]['payload']
+            if (lead_header.get('id') != run['lead_identity']
+                    or lead_header.get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id') != session
+                    or not Path(lead_header.get('cwd', '')).is_absolute()
+                    or Path(lead_header['cwd']).resolve() != project.resolve()):
+                return False
+            header = rows[0]['payload']
+            spawn = header.get('source', {}).get('subagent', {}).get('thread_spawn', {})
+            task = 'symphony_assessor_' + re.sub(r'\W', '_', expected) + '_high'
+            path = header.get('agent_path', spawn.get('agent_path'))
+            if (header.get('id') != identity or spawn.get('parent_thread_id') != session
+                    or path != '/root/' + task or header.get('agent_path', path) != path
+                    or spawn.get('agent_path', path) != path
+                    or not Path(header.get('cwd', '')).is_absolute()
+                    or Path(header['cwd']).resolve() != project.resolve()):
+                return False
+            calls, results = native_call_inventory(provider, root)
+            launches = [item for item in calls if item[1] == 'spawn_agent']
+            if not launches:
+                return False
+            call = launches[0]
+            args = call[2]
+            paired = results.get(call[0], ())
+            if (not isinstance(args, dict) or args.get('task_name') != task or args.get('model') != expected
+                    or args.get('reasoning_effort') != 'high' or args.get('fork_turns') != 'none'
+                    or len(paired) != 1):
+                return False
+            result, returned, result_index, _ = paired[0]
+            output = json.loads(result) if isinstance(result, str) else None
+            activity = [(index, row) for index, row in enumerate(root) if row.get('type') == 'event_msg'
+                and row.get('payload', {}).get('type') == 'item_completed'
+                and row['payload'].get('item', {}).get('id') == call[0]]
+            if (not isinstance(output, dict) or output.get('task_name') != path or len(activity) != 1
+                    or activity[0][1]['payload'].get('thread_id') != session
+                    or activity[0][1]['payload']['item'].get('type') != 'SubAgentActivity'
+                    or activity[0][1]['payload']['item'].get('kind') != 'started'
+                    or activity[0][1]['payload']['item'].get('agent_thread_id') != identity
+                    or activity[0][1]['payload']['item'].get('agent_path') != path):
+                return False
+            starts = [row for row in rows if row.get('type') == 'event_msg' and row['payload'].get('type') == 'task_started']
+            ends = [row for row in rows if row.get('type') == 'event_msg' and row['payload'].get('type') == 'task_complete']
+            contexts = [row for row in rows if row.get('type') == 'turn_context']
+            if (len(starts) != 1 or len(ends) != 1 or len(contexts) != 1
+                    or not isinstance(starts[0]['payload'].get('turn_id'), str) or not starts[0]['payload']['turn_id']
+                    or ends[0]['payload'].get('turn_id') != starts[0]['payload']['turn_id']
+                    or contexts[0]['payload'].get('turn_id') != starts[0]['payload']['turn_id']
+                    or contexts[0]['payload'].get('model') != expected or contexts[0]['payload'].get('effort') != 'high'
+                    or any(row.get('type') == 'event_msg' and row['payload'].get('type') in
+                           {'task_failed', 'turn_aborted', 'task_interrupted', 'error'} for row in rows)):
+                return False
+            began = host_evidence._instant(starts[0].get('timestamp'))
+            completed = host_evidence._instant(ends[0].get('timestamp'))
+            reports = [(ends[0]['payload'].get('last_agent_message'), completed)]
+            reports.extend((assistant_text(provider, row), host_evidence._instant(row.get('timestamp')))
+                           for row in rows if row.get('type') == 'response_item'
+                           and row['payload'].get('phase') == 'final_answer')
+            lead_starts = [row for row in lead_rows if row.get('type') == 'event_msg'
+                           and row['payload'].get('type') == 'task_started']
+        else:
+            paths = list((home / 'projects').glob(f'*/{session}.jsonl'))
+            if len(paths) != 1:
+                return False
+            root = _native_jsonl(paths[0])
+            if root is None:
+                return False
+            calls, results = native_call_inventory(provider, root)
+            launches = [item for item in calls if item[1] == 'Agent']
+            if not launches:
+                return False
+            call = launches[0]
+            args, launch_row = call[2], call[5]
+            meta = json.loads((paths[0].with_suffix('') / 'subagents' / f'agent-{identity}.meta.json').read_text())
+            label = f'symphony:symphony-assessor-{expected}-high'
+            paired = results.get(call[0], ())
+            if (not isinstance(args, dict) or args.get('subagent_type') != label
+                    or args.get('model', expected) != expected or not isinstance(args.get('prompt'), str)
+                    or not args['prompt'].strip() or meta.get('toolUseId') != call[0]
+                    or meta.get('agentType') != label or type(meta.get('spawnDepth')) is not int or meta['spawnDepth'] != 1
+                    or len(paired) != 1 or paired[0][3]
+                    or launch_row.get('sessionId') != session or launch_row.get('agentId')
+                    or launch_row.get('isSidechain') is True or not Path(launch_row.get('cwd', '')).is_absolute()
+                    or Path(launch_row['cwd']).resolve() != project.resolve()):
+                return False
+            result, returned, result_index, _ = paired[0]
+            # Meta binds the exact child UUID; result must independently carry
+            # that same ID, never a substring from arbitrary report prose.
+            text = result if isinstance(result, str) else '\n'.join(
+                item['text'] for item in result if isinstance(item, dict) and item.get('type') == 'text')
+            if len(re.findall(r'(?m)^agentId: ' + re.escape(identity) + r'(?:[ \t]|$)', text)) != 1:
+                return False
+            activity = [row for row in rows if row.get('type') in {'user', 'assistant'}]
+            if any(row.get('sessionId') != session or row.get('agentId') != identity
+                   or row.get('isSidechain') is not True or row.get('isApiErrorMessage') is True for row in activity):
+                return False
+            prompts = [row for row in activity if row['type'] == 'user' and isinstance(row.get('message', {}).get('content'), str)]
+            assistants = [row for row in activity if row['type'] == 'assistant']
+            if (len(prompts) != 1 or prompts[0]['message']['content'] != args['prompt']
+                    or not prompts[0].get('uuid') or not assistants
+                    or activity[-1] is not assistants[-1] or assistants[-1]['message'].get('stop_reason') != 'end_turn'
+                    or any(row['message'].get('model') != expected
+                           or row.get('effort', 'high') != 'high' for row in assistants)):
+                return False
+            began = host_evidence._instant(prompts[0].get('timestamp'))
+            completed = host_evidence._instant(assistants[-1].get('timestamp'))
+            reports = [(assistant_text(provider, row), host_evidence._instant(row.get('timestamp')))
+                       for row in assistants]
+            lead_activity = [row for row in lead_rows if row.get('type') in {'user', 'assistant'}]
+            lead_meta = json.loads((paths[0].with_suffix('') / 'subagents' / f'agent-{run["lead_identity"]}.meta.json').read_text())
+            lead = next(item for item in run['delegations'] if item['identity'] == run['lead_identity'])
+            if (not lead_activity or any(row.get('sessionId') != session or row.get('agentId') != run['lead_identity']
+                                         or row.get('isSidechain') is not True for row in lead_activity)
+                    or type(lead_meta.get('spawnDepth')) is not int or lead_meta['spawnDepth'] != 1
+                    or lead_meta.get('agentType') != f'symphony:symphony-lead-{lead["requested_tier"]}-{lead["requested_effort"]}'):
+                return False
+            lead_starts = [row for row in lead_activity if row.get('type') == 'user'
+                           and isinstance(row.get('message', {}).get('content'), str)]
+        if (began is None or completed is None or returned is None or not lead_starts
+                or call[3] > began or call[3] > returned or call[4] >= result_index
+                or began > completed or accepted < began
+                or completed >= host_evidence._instant(lead_starts[0].get('timestamp'))
+                or accepted >= host_evidence._instant(lead_starts[0].get('timestamp'))):
+            return False
+        # No prior launch can vanish just because it failed or had no result.
+        # Unknown execution/write wrappers before admission stay unverified.
+        if any(item != call and item[3] <= accepted and not (
+                    structured_root_discovery(item[1], item[2])
+                    or provider == 'codex' and item[1] == 'wait_agent' and isinstance(item[2], dict))
+               for item in calls):
+            return False
+        available = False
+        for report, reported_at in reports:
+            marker_lines = [line.strip() for line in report.splitlines()
+                            if line.strip().startswith('SYMPHONY_ASSESSMENT:')]
+            if not marker_lines:
+                continue
+            if len(marker_lines) != 1 or reported_at is None or not began <= reported_at <= completed:
+                return False
+            packet = json.loads(marker_lines[0].partition(':')[2])
+            if not isinstance(packet, dict) or any(packet.get(key) != run['assessment'].get(key)
+                                                   for key in ('size', 'complexity', 'risk')):
+                return False
+            available |= reported_at <= accepted
+        return available
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def assessed_first_probe(provider, document, run, home, project):
+    """Expose exact proof stage, never native arguments, identities or paths."""
+    facts = {'accepted': False, 'source_line': None, 'root_call_count': 0, 'root_launch_count': 0}
+    def trace(frame, event, value):
+        if frame.f_code is not assessed_first_verified.__code__:
+            return None
+        if event == 'return':
+            facts.update(accepted=value is True, source_line=frame.f_lineno)
+            calls = frame.f_locals.get('calls', ())
+            if isinstance(calls, (tuple, list)):
+                facts['root_call_count'] = len(calls)
+                facts['root_launch_count'] = sum(item[1] in {'Agent', 'spawn_agent'} for item in calls)
+        return trace
+    previous = sys.gettrace()
+    try:
+        children = {item['identity']: native_rows(provider, home, item['identity']) for item in run['delegations']}
+        sys.settrace(trace)
+        assessed_first_verified(provider, document, run, children, home, project,
+                                run['assessment']['route']['profile'])
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+        facts['source_unavailable'] = True
+    finally:
+        sys.settrace(previous)
+    return facts
+
+
+def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows, project):
+    """A worker's test output cannot stand in for the lead's later integration call."""
+    try:
+        calls, results = native_call_inventory(provider, lead_rows)
+        returned = []
+        for worker in workers:
+            matches = []
+            for call_id, name, args, called, index, _ in calls:
+                if name != ('spawn_agent' if provider == 'codex' else 'Agent'):
+                    continue
+                paired = results.get(call_id, ())
+                if len(paired) != 1 or paired[0][3] or paired[0][1] is None or paired[0][2] <= index:
+                    continue
+                output, when, _, _ = paired[0]
+                if provider == 'codex':
+                    header = child_rows[worker['identity']][0]['payload']
+                    exact = isinstance(output, str) and json.loads(output).get('task_name') == header.get('agent_path')
+                else:
+                    text = output if isinstance(output, str) else '\n'.join(
+                        block['text'] for block in output if isinstance(block, dict) and block.get('type') == 'text')
+                    exact = len(re.findall(r'(?m)^agentId: ' + re.escape(worker['identity']) + r'(?:[ \t]|$)', text)) == 1
+                if exact:
+                    rows = child_rows[worker['identity']]
+                    if provider == 'codex':
+                        terminals = [row for row in rows if row.get('type') == 'event_msg'
+                                     and row.get('payload', {}).get('type') == 'task_complete']
+                        if len(terminals) != 1 or any(row.get('type') == 'event_msg'
+                            and row.get('payload', {}).get('type') in {
+                                'task_failed', 'turn_aborted', 'task_interrupted', 'error'} for row in rows):
+                            return False
+                        completed = host_evidence._instant(terminals[0].get('timestamp'))
+                    else:
+                        activity = [row for row in rows if row.get('type') in {'user', 'assistant'}]
+                        if (not activity or activity[-1].get('type') != 'assistant'
+                                or activity[-1].get('message', {}).get('stop_reason') != 'end_turn'
+                                or any(row.get('isApiErrorMessage') is True for row in activity)):
+                            return False
+                        completed = host_evidence._instant(activity[-1].get('timestamp'))
+                    if completed is None:
+                        return False
+                    matches.append(max(when, completed))
+            if len(matches) != 1:
+                return False
+            returned.extend(matches)
+        if not returned:
+            return False
+        boundary = max(returned)
+        for call_id, _, _, called, index, row in calls:
+            paired = results.get(call_id, ())
+            if (called <= boundary or len(paired) != 1 or paired[0][3]
+                    or paired[0][1] is None or paired[0][1] < called or paired[0][2] <= index):
+                continue
+            if unittest_verified(tool_evidence(provider, [row, lead_rows[paired[0][2]]]), project):
+                return True
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+        pass
+    return False
+
+
+def verify_case_run(provider, case, document, run_state, home, project, greeting,
+                    initial_hash, first_change_after_ns, fast):
+    """Verify one archived objective; this never creates or resumes a native turn."""
+    session = run_state['session_id']
     children = run_state.get("delegations", [])
     child_rows = {item["identity"]: native_rows(provider, home, item["identity"]) for item in children}
     decisions = []
@@ -1710,12 +2106,21 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
                                                 candidates[0], home, project)
         require(canonical is not None, 'mechanical command lacks exact canonical turn/receipt/followup proof')
         decisions = [canonical]
-    require(len(decisions) == 1 and decisions[0][1] == expected, "native fast lead made the wrong semantic decision")
-    fast_identity, _, terminal_time = decisions[0]
-    observed_fast = next(item for item in children if item["identity"] == fast_identity)
-    require((observed_fast["requested_tier"], observed_fast["requested_effort"]) == (fast["model"], fast["effort"]),
-            "native fast lead disagrees with the selected capable/medium route")
-    fast_evidence = tool_evidence(provider, child_rows[fast_identity])
+    assessed_first = case == 'run-and-fix' and not decisions
+    if assessed_first:
+        require(assessed_first_verified(provider, document, run_state, child_rows, home, project,
+                                       run_state['assessment']['route']['profile']),
+                'substantive objective lacks exact assessor-first authority')
+        fast_identity, terminal_time, observed_fast, fast_evidence = None, None, {}, []
+        routing_path = 'assessed_first'
+    else:
+        require(len(decisions) == 1 and decisions[0][1] == expected, 'native fast lead made the wrong semantic decision')
+        fast_identity, _, terminal_time = decisions[0]
+        observed_fast = next(item for item in children if item['identity'] == fast_identity)
+        require((observed_fast['requested_tier'], observed_fast['requested_effort']) == (fast['model'], fast['effort']),
+                'native fast lead disagrees with the selected capable/medium route')
+        fast_evidence = tool_evidence(provider, child_rows[fast_identity])
+        routing_path = 'fast_direct' if case == 'command' else 'fast_escalated'
     workers = [item for item in children if item["role"] == "worker"]
     assessors = [item for item in children if item["role"] == "assessor"]
     if case == "command":
@@ -1737,11 +2142,15 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
         execution = route_for(Assessment(assessment["size"], assessment["complexity"], assessment["risk"])).execution
         require(assessment["topology"] == execution == assessment["route"]["execution"],
                 "native assessed topology disagrees with the matrix")
-        require(fast_turn_has_only_escalation(provider, child_rows[fast_identity], fast_evidence, fast_identity),
-                "substantive fast turn performed tools; before-change proof is unverified")
-        terminal_ns = int(datetime.fromisoformat(terminal_time.replace("Z", "+00:00")).timestamp() * 1e9)
-        require(first_change_after_ns is not None and first_change_after_ns > terminal_ns,
-                "fixture was not observed unchanged after fast escalation")
+        if not assessed_first:
+            require(fast_turn_has_only_escalation(provider, child_rows[fast_identity], fast_evidence, fast_identity),
+                    'substantive fast turn performed tools; before-change proof is unverified')
+            boundary = host_evidence._instant(terminal_time)
+        else:
+            boundary = host_evidence._instant(assessment['substantive_contract']['accepted_at'])
+        require(boundary is not None and first_change_after_ns is not None
+                and first_change_after_ns > int(boundary.timestamp() * 1e9),
+                'fixture was not observed unchanged after its routing boundary')
         lead_evidence = tool_evidence(provider, child_rows[run_state["lead_identity"]])
         parent_path = ""
         if provider == "codex":
@@ -1757,15 +2166,17 @@ def check_case(provider, root, candidate, case, timeout, budget, requested_profi
                     "worker native launch/result is not bound to the canonical assessed lead")
         require(any(fixture_edit(provider, tool_evidence(provider, child_rows[item["identity"]]), project) for item in workers),
                 "fixture edit has no successful worker-origin native tool evidence")
-        require(unittest_verified(lead_evidence, project),
-                "lead integration has no successful native verification call")
+        require(lead_verifies_after_worker_returns(provider, child_rows[run_state['lead_identity']],
+                                                  workers, child_rows, project),
+                "lead integration has no successful native verification call after worker returns")
     oracle = "from greet import greet; assert greet('Ada') == 'Hello, Ada!'"
     if case == "feature":
         oracle += "; assert greet('Ada', uppercase=True) == 'HELLO, ADA!'"
     result = subprocess.run([sys.executable, "-c", oracle], cwd=project, capture_output=True)
     require(result.returncode == 0, "final greeting fixture failed its external acceptance check")
-    return {"case": case, "fast_decision": expected, "fast_model": observed_fast["requested_tier"],
-            "fast_effort": observed_fast["requested_effort"],
+    return {"case": case, "routing_path": routing_path,
+            **({"fast_decision": expected, "fast_model": observed_fast["requested_tier"],
+                "fast_effort": observed_fast["requested_effort"]} if not assessed_first else {}),
             "assessment": {key: run_state["assessment"].get(key) for key in ("size", "complexity", "topology")},
             "workers": len(workers), "worker_edit_verified": case != "command", "pending_callbacks": 0,
             "worker_packet_role_marker_observed": provider == "claude" and case != "command",
@@ -1792,7 +2203,7 @@ def main():
     receipt = {"provider": args.provider, "native_routing": [], "browser_evidence": "instruction contract only"}
     try:
         for case in ((args.case,) if args.case else CASES):
-            with tempfile.TemporaryDirectory(prefix="symphony-native-routing-") as scratch:
+            with tempfile.TemporaryDirectory(prefix="symphony-native-routing-", ignore_cleanup_errors=True) as scratch:
                 try:
                     receipt["native_routing"].append(check_case(args.provider, Path(scratch),
                         args.candidate_plugin_root.resolve(), case, args.timeout, args.budget, args.profile))
