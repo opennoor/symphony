@@ -403,7 +403,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
                          'message': worker_text}
     else:
         worker_packet = {'subagent_type': f"symphony:symphony-worker-{worker['model']}-{worker['effort']}",
-                         'prompt': worker_text}
+                         'run_in_background': False, 'prompt': worker_text}
     worker_contract = (
         'After your native start hook releases, YOU as the canonical lead must spawn exactly one bounded '
         'worker using WORKER_SPAWN_PACKET verbatim as native spawn arguments; the root never substitutes '

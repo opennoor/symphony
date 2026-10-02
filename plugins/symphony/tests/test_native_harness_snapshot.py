@@ -588,6 +588,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     else:
                         self.assertEqual(packet['subagent_type'],
                                          f"symphony:symphony-worker-{selected['model']}-{selected['effort']}")
+                        self.assertIs(packet['run_in_background'], False)
                     message = packet.get('message', packet.get('prompt'))
                     self.assertTrue(message.startswith('SYMPHONY_ROLE: worker\n'))
                     own = json.loads(message.split('\n', 1)[1])

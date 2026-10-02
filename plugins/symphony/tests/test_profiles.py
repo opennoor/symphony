@@ -550,6 +550,11 @@ class AgentFileContractTests(unittest.TestCase):
         ]
         self.assertEqual(problems, [])
 
+    def test_claude_leads_request_direct_child_results(self):
+        generator = self.generator()
+        self.assertIn('`run_in_background: false`', generator.BODIES['lead'])
+        self.assertIn('An asynchronous launch acknowledgment is not a result', generator.BODIES['lead'])
+
     def test_the_floor_profile_can_spawn_an_assessor(self):
         # The assessor opens the run, so a floor-profile account that cannot
         # spawn one is an account Symphony can never govern at all.

@@ -88,6 +88,7 @@ class ClaudeIsolatedWorktreeTests(unittest.TestCase):
             self.assertIn('"topology":"delegated"', packet['prompt'])
             worker = json.loads(packet['prompt'].partition('WORKER_SPAWN_PACKET: ')[2])
             self.assertEqual(worker['subagent_type'], 'symphony:symphony-worker-claude-sonnet-5-5-low')
+            self.assertIs(worker['run_in_background'], False)
             self.assertTrue(worker['prompt'].startswith('SYMPHONY_ROLE: worker\n'))
             self.assertIn(str(Path(sys.executable)).replace('\\', '/'), packet['prompt'])
             self.assertNotIn('gate.py', worker['prompt'])

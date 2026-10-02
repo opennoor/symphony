@@ -51,8 +51,10 @@ DESCRIPTIONS = {
 }
 
 WAITING = (
-    "Agents you spawn run in the background: after spawning, end your turn and you are woken with "
-    "each result. Never wait by polling output files with Bash, sleep, or Monitor."
+    "Pass `run_in_background: false` on every child Agent call so its result returns to you before "
+    "you finish. In sessions where Claude forces background execution, end your turn and wait for "
+    "the native completion notification. An asynchronous launch acknowledgment is not a result. "
+    "Never poll output files with Bash, sleep, or Monitor."
 )
 
 PRACTICES = (
