@@ -302,6 +302,38 @@ class PackageContractTests(unittest.TestCase):
                 self.assertFalse(marker.exists(), 'empty or relative PATH searched the current project')
                 self.assertLess(time.monotonic() - began, 8)
 
+    @unittest.skipUnless(os.name == 'nt', 'needs Windows drive-root paths')
+    def test_native_windows_discovery_keeps_drive_root_absolute(self):
+        ps = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            drive_root = work.anchor
+            marker = work / 'decoy-ran'
+            self._probe_executable(work, name='python.exe', marker=marker)
+            good = work / 'working'
+            good.mkdir()
+            self._probe_executable(good, name='python.exe')
+            relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text()
+            inspect = relay.split('$ps=', 1)[0] + (
+                '[Console]::WriteLine($ds[0]);'
+                '[Console]::WriteLine((N ([IO.Path]::GetDirectoryName('
+                '$env:SYMPHONY_ROOT_CANDIDATE))))')
+            env = {**os.environ, 'PATH': drive_root,
+                   'SYMPHONY_ROOT_CANDIDATE': str(Path(drive_root) / 'python.exe')}
+            result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command', inspect],
+                                    cwd=work, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [drive_root, drive_root])
+            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                    relay.replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)')
+                         .replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                    text=True, timeout=15, cwd=work,
+                    env={**os.environ, 'PATH': drive_root + os.pathsep + str(good), variable: temporary})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), '123')
+                self.assertFalse(marker.exists(), 'drive-root PATH searched the current project')
+
     @unittest.skipUnless(Path('/usr/bin/python3').is_file(), 'needs a second system Python')
     def test_generated_launchers_match_system_python_compression_backend(self):
         import hashlib

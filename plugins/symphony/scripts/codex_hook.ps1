@@ -3,12 +3,13 @@ $b = '__SYMPHONY_BOOTSTRAP__'
 $v = '__SYMPHONY_PROVIDER__'
 $root=$env:PLUGIN_ROOT;if($v -eq 'claude'){$root=$env:CLAUDE_PLUGIN_ROOT}
 $py=$null
-$why='No candidates'
-$dirs=@($env:PATH -split [IO.Path]::PathSeparator | ForEach-Object {$d=$_.Trim();if($d.StartsWith('"') -and $d.EndsWith('"')) {$d=$d.Trim('"')};if([IO.Path]::IsPathRooted($d) -and ($d -match '^(?:[a-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::DirectorySeparatorChar -eq '/') -and $d -notmatch '["\x00-\x1f]') {$d.TrimEnd('\','/')}})
-$dirs=@($dirs | Where-Object {$_ -notlike '\\*'})+@($dirs | Where-Object {$_ -like '\\*'})
-$parts=@('');foreach($d in $dirs) {if($parts[-1].Length+$d.Length -gt 3000) {$parts+='';};$parts[-1]+=$d+';'}
+$w='No candidates'
+function N($d) {$d=$d.TrimEnd('\','/');if($d -match '^[a-z]:$') {$d+='\'};$d}
+$ds=@($env:PATH -split [IO.Path]::PathSeparator | ForEach-Object {$d=$_.Trim();if($d.StartsWith('"') -and $d.EndsWith('"')) {$d=$d.Trim('"')};if([IO.Path]::IsPathRooted($d) -and ($d -match '^(?:[a-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::DirectorySeparatorChar -eq '/') -and $d -notmatch '["\x00-\x1f]') {N $d}})
+$ds=@($ds | Where-Object {$_ -notlike '\\*'})+@($ds | Where-Object {$_ -like '\\*'})
+$ps=@('');foreach($d in $ds) {if($ps[-1].Length+$d.Length -gt 3000) {$ps+='';};$ps[-1]+=$d+';'}
 $all=@();$cs=@();$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);$end=[DateTime]::UtcNow.AddSeconds(3)
-foreach($part in $parts) {
+foreach($part in $ps) {
 $p=$null
 try {
 $q=[Diagnostics.ProcessStartInfo]::new($env:SystemRoot+'\System32\cmd.exe','/d /u /v:off /c for %d in ("%SYMPHONY_PY_PATH:;=" "%") do @for %n in (python.exe python3.exe py.exe) do @if exist "%~d\%n" @echo "%~d\%n"')
@@ -16,9 +17,9 @@ $q.EnvironmentVariables['SYMPHONY_PY_PATH']=$part.TrimEnd(';')
 $q.UseShellExecute=$false;$q.RedirectStandardOutput=$true;$q.StandardOutputEncoding=[Text.Encoding]::Unicode
 $ms=[int]($end-[DateTime]::UtcNow).TotalMilliseconds;if($ms -le 0) {break}
 $p=[Diagnostics.Process]::Start($q);$out=$p.StandardOutput.ReadToEndAsync()
-if(-not $p.WaitForExit($ms)) {$why='Python discovery timed out';$p.Kill();[void]$p.WaitForExit(250)}
-if($out.Wait(250)) {foreach($line in $out.Result -split '\r?\n') {if($line -match '^"([^"\r\n]+)"$') {$src=$Matches[1];if($dirs -contains [IO.Path]::GetDirectoryName($src).TrimEnd('\','/') -and $seen.Add($src)) {$all += [pscustomobject]@{Name=[IO.Path]::GetFileName($src);Source=$src}}}}}
-} catch {$why='Python discovery failed: '+$_.Exception.Message} finally {if($p) {$p.Dispose()}}
+if(-not $p.WaitForExit($ms)) {$w='Python discovery timed out';$p.Kill();[void]$p.WaitForExit(250)}
+if($out.Wait(250)) {foreach($line in $out.Result -split '\r?\n') {if($line -match '^"([^"\r\n]+)"$') {$src=$Matches[1];if($ds -contains (N ([IO.Path]::GetDirectoryName($src))) -and $seen.Add($src)) {$all += [pscustomobject]@{Name=[IO.Path]::GetFileName($src);Source=$src}}}}}
+} catch {$w='Python discovery failed: '+$_.Exception.Message} finally {if($p) {$p.Dispose()}}
 }
 foreach($n in 0,1) {foreach($name in 'python.exe','python3.exe','py.exe') {$cs+=@($all | Where-Object Name -eq $name | Select-Object -Skip $n -First 1)}}
 $end=[DateTime]::UtcNow.AddSeconds(4)
@@ -36,13 +37,13 @@ $q.RedirectStandardOutput=$true
 $q.RedirectStandardError=$true
 $p=[Diagnostics.Process]::Start($q)
 $p.StandardInput.Close()
-if(-not $p.WaitForExit([Math]::Min(1500,$ms))) {$why=$c.Source+': probe timed out';try {$p.Kill()} catch {};continue}
+if(-not $p.WaitForExit([Math]::Min(1500,$ms))) {$w=$c.Source+': probe timed out';try {$p.Kill()} catch {};continue}
 $path=$p.StandardOutput.ReadToEnd().Trim()
 if($p.ExitCode -eq 0 -and [IO.Path]::IsPathRooted($path) -and (Test-Path -LiteralPath $path -PathType Leaf)) {$py=$path;break}
-$why=$c.Source+': probe exit '+$p.ExitCode
-} catch {$why=$c.Source+': '+$_.Exception.Message;continue} finally {if($p) {$p.Dispose()}}
+$w=$c.Source+': probe exit '+$p.ExitCode
+} catch {$w=$c.Source+': '+$_.Exception.Message;continue} finally {if($p) {$p.Dispose()}}
 }
-if(-not $py) {[Console]::Error.WriteLine('Symphony pending activation: no working Python 3.10+ on PATH;'+$why);exit 1}
+if(-not $py) {[Console]::Error.WriteLine('Symphony pending activation: no working Python 3.10+ on PATH;'+$w);exit 1}
 $i=[Diagnostics.ProcessStartInfo]::new($py,'-I -X utf8 -c "'+$b+'" "'+$root+'" '+$v)
 $i.UseShellExecute=$false
 $i.RedirectStandardInput=$true
