@@ -12,6 +12,7 @@
 - Preserve accepted legacy risk text during route recovery while keeping new assessment validation strict.
 - Reconcile committed archived fast-lead escalation callbacks after the actual 1.6.0 serializer removes newer receipt fields, using surviving exact run and native evidence for acknowledgement only. Missing or conflicting proof remains retained; reloading alone does not restore trimmed evidence.
 - Supply an activation checker pinned to the verified interpreter running the hook, and probe Windows interpreter candidates before use. Preserve launcher expressions when Codex selects an outer PowerShell shell. Keep generated launchers reproducible across supported Python compression backends.
+- Record obsolete tool-free Claude continuation acknowledgments as superseded only after an exactly owned completing successor. Preserve their callback identity through crash recovery without inventing successful receipts or worker credit. Tokenless Codex callbacks retain only header-bound metadata when resumed turns are ambiguous.
 
 Native checks target Codex CLI 0.159.3 for the `latest` profile. CLI 0.158.0 needs `SYMPHONY_PROFILE=full` because its native spawn path rejects `gpt-6.1-sol`. Existing sessions retain their reviewed runtime until reload or restart; installing an update alone does not prove current-session activation.
 

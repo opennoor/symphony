@@ -76,20 +76,27 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     header_seen = False
     forked = False
     own_turn = True
+    native_contexts = 0
+    legacy_ambiguous = False
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
-            for index, line in enumerate(handle):
-                if index >= 64:
-                    break
+            # A prefix cannot prove that a tokenless callback has only one turn.
+            for line in handle:
                 try:
                     record = json.loads(line)
                 except ValueError:
+                    if header_seen and not callback_turn:
+                        legacy_ambiguous = True
                     continue
                 if not isinstance(record, dict):
+                    if header_seen and not callback_turn:
+                        legacy_ambiguous = True
                     continue
                 if not isinstance(record.get("payload", {}), dict):
                     if record.get("type") == "session_meta":
                         return {}
+                    if header_seen and not callback_turn:
+                        legacy_ambiguous = True
                     continue
                 record_payload = record.get("payload", {})
                 if record.get("type") != "session_meta" and not header_seen:
@@ -103,6 +110,7 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     if header_seen:
                         forked = True
                         own_turn = False
+                        legacy_ambiguous = not callback_turn
                         continue
                     header_seen = True
                     if identity != callback_identity:
@@ -121,6 +129,10 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     if parent_thread_id:
                         found["parent_thread_id"] = str(parent_thread_id)
                 elif record.get("type") == "turn_context":
+                    native_contexts += 1
+                    if not callback_turn and native_contexts > 1:
+                        legacy_ambiguous = True
+                        own_turn = False
                     if forked:
                         own_turn = bool(callback_turn and record_payload.get("turn_id") == callback_turn)
                     elif callback_turn:
@@ -147,8 +159,9 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                         if "SYMPHONY_FAST_ROUTE: lead" in message:
                             found["task"] = message
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return found
-    return found
+        legacy_ambiguous = not callback_turn
+    return {key: value for key, value in found.items()
+            if not legacy_ambiguous or key in {'task_name', 'parent_thread_id'}}
 
 
 def _claude_handback_report(payload: dict[str, Any]) -> str:

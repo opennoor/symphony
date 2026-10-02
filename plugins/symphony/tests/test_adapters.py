@@ -90,8 +90,55 @@ class AdapterContractTests(unittest.TestCase):
             codex = event_from_payload("codex", payload)
             claude = event_from_payload("claude", payload)
             self.assertEqual(codex.payload["parent_thread_id"], "lead-thread")
-            self.assertEqual(codex.payload["model_reasoning_effort"], "high")
+            self.assertNotIn("model_reasoning_effort", codex.payload)
             self.assertIn('"blocked"', claude.payload["last_assistant_message"])
+
+    def test_legacy_codex_callback_never_combines_resumed_native_turns(self):
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child',
+                'agent_path': '/root/symphony_lead_fast_first_medium',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}
+            first = {'type': 'turn_context', 'payload': {'turn_id': 'first-turn', 'model': 'first', 'effort': 'medium'}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}
+            later = {'type': 'turn_context', 'payload': {'turn_id': 'later-turn', 'model': 'later', 'effort': 'high'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for padding in (0, 70):
+                    with self.subTest(hook=hook, padding=padding):
+                        rows = [header, first, task] + [{'type': 'metadata'}] * padding + [later]
+                        transcript.write_text('\n'.join(json.dumps(row) for row in rows))
+                        payload = {'hook_event_name': hook, 'agent_id': 'child', 'model': 'callback',
+                                   'agent_transcript_path': str(transcript)}
+                        event = event_from_payload('codex', payload)
+                        self.assertEqual(event.payload['model'], 'callback')
+                        self.assertNotIn('model_reasoning_effort', event.payload)
+                        self.assertNotIn('task', event.payload)
+                        self.assertEqual(event.payload['parent_thread_id'], 'root')
+                        self.assertEqual(event.payload['task_name'], 'symphony_lead_fast_first_medium')
+                        bound = event_from_payload('codex', {**payload, 'turn_id': 'later-turn'})
+                        self.assertEqual(bound.payload['model'], 'later')
+                        self.assertEqual(bound.payload['model_reasoning_effort'], 'high')
+                        self.assertNotIn('task', bound.payload)
+
+    def test_legacy_codex_callback_requires_a_complete_context_inventory(self):
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / 'child.jsonl'
+            rows = [{'type': 'session_meta', 'payload': {'id': 'child', 'agent_path': '/root/lead',
+                     'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}},
+                    {'type': 'turn_context', 'payload': {'model': 'first', 'effort': 'medium'}},
+                    {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}]
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for tail in ('{"type":"turn_context","payload":',
+                             '{"type":"turn_context","payload":null}', '[]'):
+                    with self.subTest(hook=hook, tail=tail):
+                        transcript.write_text('\n'.join(json.dumps(row) for row in rows) + '\n' + tail)
+                        event = event_from_payload('codex', {'hook_event_name': hook, 'agent_id': 'child',
+                            'agent_transcript_path': str(transcript), 'model': 'callback'})
+                        self.assertEqual(event.payload['model'], 'callback')
+                        self.assertNotIn('model_reasoning_effort', event.payload)
+                        self.assertNotIn('task', event.payload)
+                        self.assertEqual(event.payload['task_name'], 'lead')
+                        self.assertEqual(event.payload['parent_thread_id'], 'root')
 
     def test_codex_transcript_metadata_requires_exact_nonempty_header_and_callback_identity(self):
         with TemporaryDirectory() as temp:
