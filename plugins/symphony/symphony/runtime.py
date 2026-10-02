@@ -593,12 +593,16 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 state = _finish_pending_batch(state, provider, session, source)
                 scoped = _scope_state(state, f"{provider}:{session}", session, provider)
                 run = scoped.active_run
-                if (run and run.status == "completing" and run.outcome == {"status": "completed"}
+                outcome_status = run.outcome.get("status") if run and isinstance(run.outcome, Mapping) else None
+                if (run and run.status == "completing"
+                        and isinstance(outcome_status, str)
+                        and outcome_status.lower() in {"completed", "done", "success", "succeeded"}
                         and "substantive_contract" in run.assessment
                         and not any(item.role in {"worker", "consultant"}
                                     and item.state.lower() in _ACTIVE_STATES | {"interrupted"}
                                     for item in run.delegations)):
-                    order = assessed_completion_chronology(scoped, session, project, environ)
+                    evidence = replace(scoped, active_run=replace(run, outcome={"status": "completed"}))
+                    order = assessed_completion_chronology(evidence, session, project, environ)
                     if order != "valid":
                         turns = run.assessment.get("_terminal_turns", {}).get(run.lead_identity, ())
                         token = turns[-1] if turns else ""
@@ -615,6 +619,8 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                         return state, ((Action("block_stop", {"reason": reason
                             + "Resume the same lead after all children return, run the acceptance check "
                               "and report the result again."}),), acknowledged)
+                    if run.outcome != evidence.active_run.outcome:
+                        state = _merge_scope(state, scoped, evidence, f"{provider}:{session}", provider, session)
             state, actions = dispatch(state, source)
         if unresolved and source.kind in {"session_heartbeat", "user_prompt"}:
             actions += (Action("inject_context", {"text": unresolved_reason}),)

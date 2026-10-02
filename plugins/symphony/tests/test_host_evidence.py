@@ -948,6 +948,20 @@ class CompletionChronologyTests(unittest.TestCase):
                             delegations=(self.run.delegations[0], replace(self.run.delegations[1], updated_at=self.stamp(59)))))
                         self.assertEqual(self.check(), 'early' if early else 'valid')
 
+    def test_success_alias_in_native_lead_report_keeps_chronology_gate(self):
+        for provider in ('codex', 'claude'):
+            for status in ('done', 'success', 'succeeded', 'SUCCESS'):
+                with self.subTest(provider=provider, status=status):
+                    self.fixture(provider)
+                    report = f'Task completed.\nSYMPHONY_OUTCOME: {{"status":"{status}"}}'
+                    if provider == 'codex':
+                        self.rows[self.lead][-2]['payload']['content'][0]['text'] = report
+                        self.rows[self.lead][-1]['payload']['last_agent_message'] = report
+                    else:
+                        self.rows[self.lead][-1]['message']['content'][0]['text'] = report
+                    self.write()
+                    self.assertEqual('valid', self.check())
+
     def test_final_handoff_can_precede_courtesy_end_but_early_lead_report_cannot(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):

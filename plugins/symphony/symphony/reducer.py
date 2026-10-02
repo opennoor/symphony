@@ -416,8 +416,11 @@ def _lead_completed(state: ProjectState, event: Event):
     if run.status == "recovering":
         return state, (Action("block_completion", {"reason": "lead_recovery_required"}),)
     outcome = event.payload.get("outcome")
-    if not _valid_outcome(outcome):
+    if (not _valid_outcome(outcome)
+            or "substantive_contract" in run.assessment and "status" not in outcome):
         return state, (Action("block_completion", {"reason": "outcome_missing"}),)
+    if "substantive_contract" in run.assessment:
+        outcome = {"status": "completed"}
     if not _substantive_child_completed(run):
         assessment = {**run.assessment, '_substantive_child_missing': True}
         token = event.payload.get('turn_token') or run.assessment.get('_active_turns', {}).get(identity)

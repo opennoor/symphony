@@ -2132,6 +2132,40 @@ class RuntimeTests(unittest.TestCase):
                         handle({**stop, 'turn_id': 'working-turn'}, environ)
                     proof.assert_not_called()
 
+    def test_assessed_stop_checks_stored_success_aliases(self):
+        for provider in ('codex', 'claude'):
+            for status in ('done', 'success', 'succeeded', 'SUCCESS'):
+                for order in ('valid', 'early'):
+                    with self.subTest(provider=provider, status=status, order=order):
+                        choice = route_choice(provider=provider)
+                        lead = Delegation('lead', 'lead', 'task', 'completed', choice['model'], choice['effort'])
+                        worker = Delegation('worker', 'worker', 'task', 'completed', choice['model'], choice['effort'])
+                        self.seed_run(RunState('run', 'task', lead_identity='lead', status='completing',
+                            outcome={'status': status}, delegations=(lead, worker), assessment={
+                                'substantive_contract': {'version': 1, 'epoch': 'e', 'accepted_at': '2026-10-01T00:00:00Z'},
+                                '_terminal_turns': {'lead': ('turn_id:lead-final',)},
+                                '_start_event_ids': ('start-worker',),
+                                '_substantive_children': {'worker': {'successful': True, 'epoch': 'e',
+                                    'run_id': 'run', 'lead': 'lead', 'parent': 'lead', 'role': 'worker',
+                                    'start_event_id': 'start-worker', 'owner_generation': 1}},
+                            }), provider=provider)
+                        environ = self.claude_environ if provider == 'claude' else self.environ
+                        stop = {**self.payload('', provider), 'hook_event_name': 'Stop'}
+                        with (patch.object(runtime_module, f'{provider}_recovered_lead_event', return_value=None),
+                              patch.object(runtime_module, f'{provider}_completing_lead_turn', return_value=('none', None)),
+                              patch.object(runtime_module, 'assessed_completion_chronology', return_value=order) as proof):
+                            result = handle(stop, environ)
+                        proof.assert_called_once()
+                        self.assertEqual({'status': 'completed'}, proof.call_args.args[0].active_run.outcome)
+                        stored = StateStore(self.state_root).load(self.project)
+                        if order == 'valid':
+                            self.assertIsNone(stored.active_run)
+                            self.assertEqual('completed', stored.recent_runs[-1].status)
+                            self.assertEqual({'status': 'completed'}, stored.recent_runs[-1].outcome)
+                        else:
+                            self.assertEqual('block', self.output(result).get('decision'))
+                            self.assertEqual('recovering', stored.active_run.status)
+
     def test_assessed_lead_start_repeats_admitted_acceptance_checks(self):
         task = 'Make the change. Acceptance: run python -m unittest -q after every worker returns.'
         run = self.seed_run(RunState('run', task, lead_identity='lead',

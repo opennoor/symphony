@@ -711,6 +711,8 @@ def _reported_status(message: object) -> str | None:
     except (TypeError, ValueError):
         return None
     status = outcome.get("status") if isinstance(outcome, dict) else None
+    if isinstance(status, str) and status.lower() in {"completed", "done", "success", "succeeded"}:
+        return "completed"
     return status if isinstance(status, str) and status else None
 
 

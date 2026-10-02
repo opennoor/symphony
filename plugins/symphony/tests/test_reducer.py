@@ -365,6 +365,29 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertEqual(state.active_run, original.active_run)
         self.assertEqual(actions, (Action("block_completion", {"reason": "outcome_missing"}),))
 
+    def test_assessed_success_outcomes_are_canonical_before_stop(self):
+        original = running_state(delegations=[delegation("worker-1", "completed")])
+        run = replace(original.active_run, assessment={
+            "substantive_contract": {"version": 1, "epoch": "epoch", "accepted_at": NOW},
+            "_start_event_ids": ("child-start",),
+            "_substantive_children": {"worker-1": {
+                "successful": True, "epoch": "epoch", "run_id": "run-1",
+                "lead": "lead-1", "parent": "lead-1", "role": "worker",
+                "start_event_id": "child-start", "owner_generation": 1,
+            }},
+        })
+        original = replace(original, active_run=run)
+        for status in ("completed", "done", "success", "succeeded", "SUCCESS"):
+            with self.subTest(status=status):
+                state, actions = reduce(original, event("lead_completed", identity="lead-1",
+                    outcome={"status": status, "summary": "Done"}))
+                self.assertEqual({"status": "completed"}, state.active_run.outcome)
+                self.assertEqual("permit_completion", actions[0].kind)
+        state, actions = reduce(original, event("lead_completed", identity="lead-1",
+            outcome={"summary": "Done"}))
+        self.assertEqual(original.active_run, state.active_run)
+        self.assertEqual("block_completion", actions[0].kind)
+
     def test_replayed_event_is_idempotent(self):
         enable = event("enable", event_id="stable-event")
         state, _ = reduce(ProjectState(), enable)
