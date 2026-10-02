@@ -32,7 +32,8 @@ class PackageContractTests(unittest.TestCase):
         self.assertNotIn('push:', triggers)
         self.assertNotIn('pull_request:', triggers)
         self.assertNotIn('schedule:', triggers)
-        self.assertIn("  release-candidate:\n    if: github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("  release-candidate:\n    if: github.event_name == 'workflow_dispatch' "
+                      "&& github.ref_type == 'branch'", workflow)
         self.assertIn('TESTED_SHA: ${{ inputs.tested_sha }}', workflow)
         for forbidden in ('secrets.', 'api.openai.com', 'api.anthropic.com', '@openai/codex',
                           '@anthropic-ai/claude-code', 'claude.ai/install.sh', 'codex login',
@@ -44,8 +45,8 @@ class PackageContractTests(unittest.TestCase):
         for name in ('verify', 'windows-hooks', 'dockur-windows'):
             self.assertIn(f'  {name}:\n    needs: release-candidate\n'
                           "    if: needs.release-candidate.outputs.pending == 'true'", workflow)
-        self.assertIn('needs: [verify, windows-hooks, dockur-windows]', workflow)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("  release:\n    needs: [verify, windows-hooks, dockur-windows]\n"
+                      "    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", workflow)
         self.assertIn('--target "$GITHUB_SHA"', workflow)
         refresh = (PLUGIN.parents[1] / '.github/workflows/capability-refresh.yml').read_text()
         self.assertIn('  workflow_dispatch:', refresh)

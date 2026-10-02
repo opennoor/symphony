@@ -187,7 +187,9 @@ The package smoke supports `activation`, `managed-run`, `unmarked-spawn`, `inter
 
 ### Receiving capability updates
 
-Symphony ships its tier-to-model map inside the release. Maintainers review and test the final `main` commit locally, using installed Codex and Claude clients with existing logins for native checks. They then dispatch Symphony CI with that full `tested_sha`; CI repeats deterministic Linux and Windows checks and publishes only that commit, without installing provider clients or calling AI APIs. The API-backed Capability refresh workflow is disabled for this release. Installing does not subscribe you to those releases: both hosts leave a third-party plugin at the version you installed until you ask for a newer one.
+Symphony ships its tier-to-model map inside the release. For final release validation, maintainers review and test a frozen candidate branch locally, using installed Codex and Claude clients with existing logins for native checks. They dispatch Symphony CI on that branch with its full `tested_sha`; CI repeats deterministic Linux and Windows checks without installing provider clients or calling AI APIs. Candidate branches cannot publish. Merge only after these gates pass and the proposed merge preserves the tested tree: marketplace updates can expose the new plugin as soon as it reaches `main`. After reviewing and testing the merged `main` commit locally, dispatch its exact `tested_sha` to repeat the gates and publish that commit. The API-backed Capability refresh workflow is disabled for this release.
+
+Installing does not subscribe you to those releases: both hosts leave a third-party plugin at the version you installed until you ask for a newer one.
 
 ```bash
 claude plugin update symphony

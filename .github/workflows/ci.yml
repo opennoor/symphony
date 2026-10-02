@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       tested_sha:
-        description: Full main commit SHA reviewed and tested locally with installed provider logins
+        description: Full release candidate commit SHA reviewed and tested locally with installed provider logins
         required: true
         type: string
 
 jobs:
   release-candidate:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref_type == 'branch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
