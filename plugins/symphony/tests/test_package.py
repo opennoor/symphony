@@ -50,8 +50,7 @@ class PackageContractTests(unittest.TestCase):
         refresh = (PLUGIN.parents[1] / '.github/workflows/capability-refresh.yml').read_text()
         self.assertIn('  workflow_dispatch:', refresh)
         self.assertNotIn('  schedule:', refresh)
-        self.assertIn("  refresh:\n    if: github.ref == format('refs/heads/{0}', "
-                      'github.event.repository.default_branch)', refresh)
+        self.assertIn('  refresh:\n    if: ${{ false }}\n', refresh)
         if os.name == 'nt':
             return  # The release gate runs on Ubuntu; Windows checks its wiring above.
         command = workflow.split('        id: version\n', 1)[1].split('        run: |\n', 1)[1].split('\n\n', 1)[0]

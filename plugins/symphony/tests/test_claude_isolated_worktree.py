@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
+from plugins.symphony.symphony.host_evidence import _packet_purpose
 from plugins.symphony.symphony.model import Event, ProjectState, RunState
 from plugins.symphony.symphony.runtime import _prepare_delegation
 
@@ -90,6 +91,7 @@ class ClaudeIsolatedWorktreeTests(unittest.TestCase):
             self.assertEqual(worker['subagent_type'], 'symphony:symphony-worker-claude-sonnet-5-5-low')
             self.assertIs(worker['run_in_background'], False)
             self.assertTrue(worker['prompt'].startswith('SYMPHONY_ROLE: worker\n'))
+            self.assertEqual(_packet_purpose(worker['prompt']), 'substantive')
             self.assertIn(str(Path(sys.executable)).replace('\\', '/'), packet['prompt'])
             self.assertNotIn('gate.py', worker['prompt'])
             self.assertIn('An Agent launch acknowledgment is not a worker result', packet['prompt'])

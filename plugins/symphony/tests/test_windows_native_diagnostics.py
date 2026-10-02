@@ -72,8 +72,9 @@ class WindowsNativeDiagnosticsTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('pwsh') or sys.platform == 'win32', 'needs PowerShell')
     def test_encoded_private_clock_preserves_input_with_literal_paths_and_utf8(self):
-        # A workspace temporary directory is also visible to snap-based pwsh.
-        with TemporaryDirectory(prefix="clock path ' ", dir=Path(__file__).parent) as directory:
+        # Snap pwsh cannot see the host /tmp, including checkouts placed there.
+        visible_root = Path.home() if sys.platform == 'linux' else Path(__file__).parent
+        with TemporaryDirectory(prefix="clock path ' ", dir=visible_root) as directory:
             root = Path(directory).resolve()
             home = root / 'home'
             home.mkdir()

@@ -1,7 +1,7 @@
 name: Capability refresh
 
-# Provider calls are reserved for an intentional capability-map release.
-# Development and scheduled checks must not spend API credits.
+# Paused for the 1.7.0 release: validation uses local subscription logins.
+# Restoring API-backed refresh requires an explicit reviewed code change.
 on:
   workflow_dispatch:
 
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   refresh:
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

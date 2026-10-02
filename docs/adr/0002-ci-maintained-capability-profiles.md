@@ -4,7 +4,7 @@ The 1.0.0 design promised runtime capability resolution: live provider capabilit
 
 ## Consequences
 
-From 1.7.0, native release checks run locally through installed Codex and Claude clients with existing logins. Publishing requires a manual Symphony CI dispatch on `main` with the exact locally reviewed and tested commit as `tested_sha`. CI rejects a different commit, repeats deterministic Linux and Windows checks, and publishes a new manifest version without provider client installs or AI API calls. The separate API-backed Capability refresh workflow is disabled for this release; its retained definition is manual-only.
+From 1.7.0, native release checks run locally through installed Codex and Claude clients with existing logins. Publishing requires a manual Symphony CI dispatch on `main` with the exact locally reviewed and tested commit as `tested_sha`. CI rejects a different commit, repeats deterministic Linux and Windows checks, and publishes a new manifest version without provider client installs or AI API calls. The separate API-backed Capability refresh workflow is disabled for this release; its retained definition has an unconditional false job guard, including for manual dispatch. Restoring it requires a reviewed code change.
 
 The persisted `capabilities` field is removed rather than left unwritten. On Claude Code it was worse than dead: the required model is compared against the model token parsed out of a packaged agent filename, so a snapshot naming any token without a matching agent file would block every lead spawn permanently, and the bad value was persisted into the recorded route so it survived retries. Deleting the field closes that hazard; a CI-generated agent-file set keeps the coupling satisfiable by construction.
 

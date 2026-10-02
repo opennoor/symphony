@@ -218,9 +218,10 @@ def _payload(
     elif event in ("PreToolUse", "PostToolUse"):
         # Claude reports a spawn before launch; Codex registers no such hook.
         payload["tool_name"] = "Agent"
+        purpose = "purpose: substantive\n" if agent_role in {"worker", "consultant"} else ""
         payload["tool_input"] = {
             "subagent_type": f"symphony-{agent_role}-{model}-{effort}",
-            "prompt": f"SYMPHONY_ROLE: {agent_role}\nexercise the package lifecycle",
+            "prompt": f"SYMPHONY_ROLE: {agent_role}\n{purpose}exercise the package lifecycle",
         }
     elif event in ("SubagentStart", "SubagentStop"):
         payload["agent_id"] = f"fake-{agent_role}"

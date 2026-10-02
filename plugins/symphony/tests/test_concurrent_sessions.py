@@ -16,6 +16,8 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.model import Action, Delegation, ProjectState, RunState
@@ -409,16 +411,25 @@ class ConcurrentSessionTests(unittest.TestCase):
                     session, progress
                 )) for session, progress in zip(("root-b", "root-c"), progresses)]
                 started = time.monotonic()
-                for process in processes:
-                    process.start()
-                for session, process, progress in zip(("root-b", "root-c"), processes, progresses):
-                    process.join(timeout=20)
-                    if process.is_alive():
-                        process.terminate()
-                        process.join()
-                    self.assertEqual(0, process.exitcode,
-                                     f"{provider}/{session}: {progress.value}/105 heartbeats completed "
-                                     f"in {time.monotonic() - started:.1f}s")
+                try:
+                    for process in processes:
+                        process.start()
+                    for session, process, progress in zip(("root-b", "root-c"), processes, progresses):
+                        process.join(timeout=20)
+                        if process.is_alive():
+                            process.terminate()
+                            process.join()
+                        self.assertEqual(0, process.exitcode,
+                                         f"{provider}/{session}: {progress.value}/105 heartbeats completed "
+                                         f"in {time.monotonic() - started:.1f}s")
+                finally:
+                    # A failure for one process must not leave its sibling
+                    # writing into a temporary directory that tearDown removes.
+                    for process in processes:
+                        if process.pid is not None:
+                            if process.is_alive():
+                                process.terminate()
+                            process.join()
                 handle({**failed, "stop_hook_active": True}, env)
                 handle(self.payload("root-a", "SubagentStop", provider=provider,
                                     agent_id="worker-a", status="completed"), env)
@@ -610,6 +621,46 @@ class ConcurrentSessionTests(unittest.TestCase):
                 self.assertEqual("block", blocked.get("decision"))
                 self.assertEqual("root-b", store.load(other).active_run.session_id)
                 self.assertIsNone(store.load(self.project).active_run)
+
+
+class ConcurrentFixtureCleanupTests(unittest.TestCase):
+    def test_failed_first_churn_process_reaps_its_sibling_before_temp_cleanup(self):
+        processes = []
+
+        class StalledProcess:
+            def __init__(self, *, target, args):
+                self.state_dir = Path(args[1])
+                self.pid = None
+                self.exitcode = None
+                self.reaped_with_state_present = False
+                processes.append(self)
+
+            def start(self):
+                self.pid = len(processes)
+
+            def is_alive(self):
+                return self.pid is not None and self.exitcode is None
+
+            def terminate(self):
+                self.exitcode = -15
+
+            def join(self, timeout=None):
+                if not self.is_alive():
+                    self.reaped_with_state_present = self.state_dir.is_dir()
+
+        context = SimpleNamespace(Value=lambda *args, **kwargs: SimpleNamespace(value=0),
+                                  Process=StalledProcess)
+        case = ConcurrentSessionTests("test_foreign_churn_cannot_replay_a_recovered_lead_failure")
+        result = unittest.TestResult()
+        with patch.object(multiprocessing, "get_context", return_value=context):
+            case.run(result)
+
+        self.assertEqual([], result.errors)
+        self.assertEqual(2, len(result.failures))
+        self.assertEqual(4, len(processes))
+        self.assertTrue(all(process.reaped_with_state_present for process in processes))
+        self.assertFalse(any(process.is_alive() for process in processes))
+        self.assertFalse(case.project.exists())
 
 
 if __name__ == "__main__":

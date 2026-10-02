@@ -254,7 +254,7 @@ def prompt(project):
     gate_command = shlex.join([str(Path(sys.executable)).replace("\\", "/"), gate, "isolated"])
     worker_packet = {'subagent_type': f'symphony:symphony-worker-{MODEL}-low',
                      'run_in_background': False,
-                     'prompt': 'SYMPHONY_ROLE: worker\n' + json.dumps({
+                     'prompt': 'SYMPHONY_ROLE: worker\npurpose: substantive\n' + json.dumps({
                          'objective': 'Return the literal callback report GATE_RELEASED.',
                          'ownership': 'Only this bounded literal report under the owning isolated lead.',
                          'constraints': 'No applicable capability phase. Do not inspect files, run commands, edit files or delegate.',
