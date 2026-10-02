@@ -82,7 +82,11 @@ def _chronology_report(provider: str, rows: list[dict], completed: datetime, rep
     A final native handoff may precede a courtesy END. Earlier diagnostic
     failures are allowed, but every earlier operation must have settled.
     """
-    times = [_instant(row.get('timestamp')) for row in rows]
+    # Claude's generated attachments can be appended ahead of an assistant
+    # message with an earlier timestamp. They are not execution boundaries;
+    # retain all rows in the tool inventory to reject disguised calls/results.
+    times = [_instant(row.get('timestamp')) for row in rows
+             if provider != 'claude' or row.get('type') != 'attachment']
     if (not times or any(when is None for when in times)
             or any(left > right for left, right in zip(times, times[1:]))):
         return None

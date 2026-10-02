@@ -1064,6 +1064,56 @@ class CompletionChronologyTests(unittest.TestCase):
                             delegations=(self.run.delegations[0], replace(self.run.delegations[1], updated_at=self.stamp(59)))))
                         self.assertEqual(self.check(), 'early' if early else 'valid')
 
+    def test_claude_attachment_clock_skew_does_not_reorder_delivered_work(self):
+        for identity_role in ('worker', 'lead'):
+            with self.subTest(identity_role=identity_role):
+                self.purpose_fixture('claude')
+                worker = self.rows[self.child][-1]
+                worker['message']['content'][0]['text'] = 'GATE_RELEASED'
+                lead = self.rows[self.lead]
+                lead[1]['message']['content'][0]['input']['run_in_background'] = False
+                lead[2]['timestamp'] = self.stamp(11)
+                lead[2]['message']['content'][0]['content'] = [
+                    {'type': 'text', 'text': 'GATE_RELEASED'},
+                    {'type': 'text', 'text': f"agentId: {self.child} (use SendMessage with to: '{self.child}', "
+                     "summary: '<5-10 word recap>' to continue this agent)\n"
+                       '<usage>subagent_tokens: 1\ntool_uses: 0\nduration_ms: 1</usage>'}]
+                lead.pop(-2)
+                lead[-1]['message']['content'][0]['text'] = 'GATE_RELEASED\nSYMPHONY_OUTCOME: {"status":"completed"}'
+                identity = self.child if identity_role == 'worker' else self.lead
+                terminal = self.rows[identity][-1]
+                # Claude can append a generated attachment stamped 1ms after
+                # the assistant message that follows it in the native file.
+                attachment = {key: value for key, value in terminal.items() if key != 'message'}
+                attachment.update(type='attachment', uuid='attachment-clock-skew',
+                                  timestamp=terminal['timestamp'].replace('+00:00', '.001+00:00'))
+                self.rows[identity].insert(-1, attachment)
+                self.write()
+                self.assertEqual('valid', self.check())
+
+    def test_claude_prior_order_failure_requires_a_fresh_native_completion(self):
+        self.purpose_fixture('claude')
+        failure = Event('stop:completion-order:lead_failed', 'lead_failed', self.stamp(13),
+                        {'identity': self.lead, 'owner_generation': 1})
+        self.state = replace(self.state, event_history=(failure,))
+        self.assertEqual('unknown', self.check())
+        original = self.rows[self.lead][-1]
+        self.rows[self.lead].append({**self.rows[self.lead][0], 'uuid': 'recovery-prompt',
+            'timestamp': self.stamp(14), 'message': {'content': 'Verify the existing child result again.'}})
+        self.write()
+        self.assertEqual('unknown', self.check())
+        self.rows[self.lead].append({**original, 'uuid': 'recovery-result', 'timestamp': self.stamp(15),
+            'message': {**original['message'], 'content': [{'type': 'text',
+                'text': 'Verified.\nSYMPHONY_OUTCOME: {"status":"completed"}'}]}})
+        self.write()
+        self.assertEqual('valid', self.check())
+
+    def test_codex_attachment_like_row_does_not_relax_chronology(self):
+        self.fixture('codex')
+        self.rows[self.child].insert(-1, {'type': 'attachment', 'payload': {}, 'timestamp': self.stamp(12)})
+        self.write()
+        self.assertEqual('unknown', self.check())
+
     def test_success_alias_in_native_lead_report_keeps_chronology_gate(self):
         for provider in ('codex', 'claude'):
             for status in ('done', 'success', 'succeeded', 'SUCCESS'):
@@ -1345,7 +1395,8 @@ class CompletionChronologyTests(unittest.TestCase):
 
     def test_claude_worker_completion_keeps_settled_tools_inside_its_native_turn(self):
         for stop_reason in (None, 'end_turn'):
-            for case in ('valid', 'mixed', 'missing-result', 'duplicate-result', 'foreign-result', 'text-only'):
+            for case in ('valid', 'mixed', 'missing-result', 'duplicate-result', 'foreign-result',
+                         'reversed-result-time', 'attachment-call', 'attachment-result', 'text-only'):
                 with self.subTest(stop_reason=stop_reason, case=case):
                     self.fixture('claude')
                     terminal = self.rows[self.child][-1]
@@ -1358,6 +1409,9 @@ class CompletionChronologyTests(unittest.TestCase):
                         'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'worker-test', 'content': 'OK'}]}}
                     if case == 'mixed': result['message']['content'].append({'type': 'text', 'text': 'Native tool context.'})
                     if case == 'foreign-result': result['message']['content'][0]['tool_use_id'] = 'foreign'
+                    if case == 'reversed-result-time': result['timestamp'] = self.stamp(7).replace('+00:00', '.999+00:00')
+                    if case == 'attachment-call': call['type'] = 'attachment'
+                    if case == 'attachment-result': result['type'] = 'attachment'
                     if case == 'text-only': result['message']['content'] = [{'type': 'text', 'text': 'New task.'}]
                     self.rows[self.child][1:1] = [call, *([] if case == 'missing-result' else [result]),
                                                 *([result] if case == 'duplicate-result' else [])]
