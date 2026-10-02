@@ -363,10 +363,11 @@ def _substantive_child_completed(run: RunState) -> bool:
         return True
     contract = run.assessment['substantive_contract']
     if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int
-            or contract['version'] != 1
+            or contract['version'] not in {1, 2}
             or not isinstance(contract.get('epoch'), str) or not contract['epoch']
             or not isinstance(contract.get('accepted_at'), str) or not contract['accepted_at']
-            or ('review_required' in contract and type(contract['review_required']) is not bool)):
+            or ('review_required' in contract and type(contract['review_required']) is not bool)
+            or contract['version'] == 2 and type(contract.get('review_required')) is not bool):
         return False
     proofs = run.assessment.get('_substantive_children', {})
     if not isinstance(proofs, Mapping):
@@ -384,25 +385,28 @@ def _substantive_child_completed(run: RunState) -> bool:
                 and proof.get('role') == child.role
                 and isinstance(proof.get('start_event_id'), str)
                 and proof['start_event_id'] in run.assessment.get('_start_event_ids', ())
-                  and proof.get('owner_generation') == run.owner_generation
+                    and proof.get('owner_generation') == run.owner_generation
+                    and (contract['version'] == 1 or isinstance(proof.get('purpose'), str)
+                         and proof['purpose'] in {'substantive', 'independent_review'})
                   and (child.role != 'consultant' or child.identity not in run.assessment.get('_invalid_consultants', ()))):
             completed.append(proof)
-    # Pre-1.7 accepted contracts lack this flag; changing their rule mid-run
-    # would strand leads after a plugin update.
+    # Version 1 never admitted purpose; keep its accepted completion rules.
+    work = [proof for proof in completed if (proof.get('purpose') == 'substantive'
+            if contract['version'] == 2 else proof.get('reviewed') is not True)]
     if contract.get('review_required') is True:
-        work = [_proof_instant(proof.get('completed_at')) for proof in completed
-                if proof.get('reviewed') is not True]
-        if not work or any(instant is None for instant in work):
+        completed_work = [_proof_instant(proof.get('completed_at')) for proof in work]
+        if not completed_work or any(instant is None for instant in completed_work):
             return False
         for proof in completed:
-            if proof.get('reviewed') is True:
+            if (proof.get('reviewed') is True
+                    and (contract['version'] == 1 or proof.get('purpose') == 'independent_review')):
                 start = _proof_instant(proof.get('admitted_at'))
                 end = _proof_instant(proof.get('completed_at'))
-                if start and end and end > start > max(work):
+                if start and end and end > start > max(completed_work):
                     return True
         return False
     if contract.get('review_required') is False:
-        return any(proof.get('reviewed') is not True for proof in completed)
+        return bool(work)
     return bool(completed)
 
 

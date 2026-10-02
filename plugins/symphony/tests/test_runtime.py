@@ -38,6 +38,11 @@ class RuntimeTests(unittest.TestCase):
         chronology = patch.object(runtime_module, "assessed_completion_chronology", return_value="valid")
         chronology.start()
         self.addCleanup(chronology.stop)
+        self.native_launches = {}
+        binding = patch.object(runtime_module, 'codex_substantive_launch',
+                               side_effect=lambda run, source, *args: self.native_launches.get(source.payload.get('agent_id')))
+        binding.start()
+        self.addCleanup(binding.stop)
         self.spawn_count = 0
         self.root = Path(self.temp.name)
         self.project = self.root / "project"
@@ -133,6 +138,8 @@ class RuntimeTests(unittest.TestCase):
                               snapshot_for(provider, run.assessment['route']['profile']))
         self.spawn_count += 1
         identity = f'fixture-worker-{self.spawn_count}'
+        purpose = 'independent_review' if review else 'substantive'
+        self.native_launches[identity] = {'parent': run.lead_identity, 'purpose': purpose}
         agent_type = (claude_agent_type('worker', {'model': choice['lead_model'], 'effort': choice['lead_effort']})
                       if provider == 'claude' else codex_agent_type('worker', choice['lead_model'], choice['lead_effort']))
         worker = {**self.payload('', provider), 'provider': provider, 'hook_event_name': 'SubagentStart', 'agent_id': identity,
@@ -145,7 +152,7 @@ class RuntimeTests(unittest.TestCase):
             home = self.root / 'claude-native'
             environ = {**environ, 'CLAUDE_CONFIG_DIR': str(home)}
             write_claude_child_launch(home, self.project, run, identity, 'worker',
-                choice['lead_model'], choice['lead_effort'], f'worker-{self.spawn_count}')
+                choice['lead_model'], choice['lead_effort'], f'worker-{self.spawn_count}', purpose=purpose)
         handle(worker, environ)
         handle({**worker, 'hook_event_name': 'SubagentStop', 'status': 'completed',
                 **({'last_assistant_message': 'SYMPHONY_REVIEW: passed'} if review else {})}, environ)
@@ -3292,6 +3299,7 @@ class RuntimeTests(unittest.TestCase):
             "agent_type": "symphony_consultant_gpt_6_high",
             "parent_thread_id": "lead-1",
         }
+        self.native_launches['consultant-1'] = {'parent': 'lead-1', 'purpose': 'substantive'}
         handle(lead, self.environ)
         handle(consultant, self.environ)
 

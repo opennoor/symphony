@@ -480,7 +480,11 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 with patch.object(smoke, 'native_rows', side_effect=[canonical, rows]):
                     native.require_assessed_lead_set(values, project, project, 'lead', document=proof)
             check_candidate()
-            for key, value in (('version', True), ('version', 2), ('epoch', ''), ('accepted_at', 'invalid'),
+            version_two = copy.deepcopy(candidate)
+            version_two['assessment']['substantive_contract'].update(version=2, review_required=False)
+            check_candidate(version_two)
+            for key, value in (('version', True), ('version', 0), ('version', 3), ('version', '2'), ('version', None),
+                               ('epoch', ''), ('accepted_at', 'invalid'),
                                ('accepted_at', '2026-10-01T00:00:01+00:00'), ('accepted_at', '2026-10-01T00:00:04+00:00')):
                 altered = copy.deepcopy(candidate)
                 altered['assessment']['substantive_contract'][key] = value
@@ -591,14 +595,14 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                                          (selected['model'], selected['effort']))
                         self.assertEqual(packet['fork_turns'], 'none')
                         self.assertEqual(packet['task_name'], 'symphony_worker_' +
-                                         re.sub(r'\W', '_', selected['model']) + '_' + selected['effort'])
+                                         re.sub(r'\W', '_', selected['model']) + '_' + selected['effort'] + '__substantive')
                     else:
                         self.assertEqual(packet['subagent_type'],
                                          f"symphony:symphony-worker-{selected['model']}-{selected['effort']}")
                         self.assertIs(packet['run_in_background'], False)
                     message = packet.get('message', packet.get('prompt'))
-                    self.assertTrue(message.startswith('SYMPHONY_ROLE: worker\n'))
-                    own = json.loads(message.split('\n', 1)[1])
+                    self.assertTrue(message.startswith('SYMPHONY_ROLE: worker\npurpose: substantive\n'))
+                    own = json.loads(message.split('\n', 2)[2])
                     self.assertEqual((own['size'], own['complexity']), ('small', 'simple'))
                     self.assertEqual(own['return_contract'], 'Return exactly GATE_RELEASED without Markdown.')
                     self.assertIn('YOU as the canonical lead must spawn exactly one', lead)
@@ -683,6 +687,29 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         self.assertIn("native hook holds the unfinished task", deferred_packet["message"])
         self.assertIn("WAIT", deferred_packet["message"])
         self.assertIn("only READY permits", deferred_packet["message"])
+
+    def test_current_native_child_packets_declare_supported_purpose(self):
+        from plugins.symphony.symphony.host_evidence import _codex_child_purpose, _packet_purpose
+        from plugins.symphony.symphony.model import Delegation
+        for provider, profile in (('codex', 'base'), ('codex', 'latest'), ('claude', 'base')):
+            with self.subTest(provider=provider, profile=profile):
+                prompt = native.prompt(provider, 'a', True, Path('/tmp/native-project'), codex_profile=profile)
+                if provider == 'codex':
+                    lead = json.loads(re.search(r'LEAD_SPAWN_PACKET: (\{[^\n]+\})', prompt).group(1))
+                    task = lead['message']
+                else:
+                    task = json.loads(re.search(r'LEAD_TASK_TEXT: (.+)$', prompt, re.MULTILINE).group(1))
+                expected = [('WORKER_SPAWN_PACKET', 'worker', 'substantive')]
+                if provider == 'codex' and profile != 'base':
+                    expected.append(('REVIEW_SPAWN_PACKET', 'consultant', 'independent_review'))
+                for marker, role, purpose in expected:
+                    packet = json.loads(re.search(marker + r': (\{[^\n]+\})', task).group(1))
+                    text = packet.get('message', packet.get('prompt'))
+                    self.assertEqual('SYMPHONY_ROLE: ' + role, text.splitlines()[0])
+                    self.assertEqual(purpose, _packet_purpose(text))
+                    if provider == 'codex':
+                        child = Delegation('child', role, '', 'working', packet['model'], packet['reasoning_effort'])
+                        self.assertEqual(purpose, _codex_child_purpose(packet['task_name'], child))
 
     def test_mixed_codex_upgrade_uses_packaged_full_route(self):
         profiles = json.loads((PLUGIN / "profiles.json").read_text())["providers"]["codex"]["profiles"]

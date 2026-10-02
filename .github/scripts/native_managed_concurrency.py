@@ -389,7 +389,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
     profile_id = codex_profile if provider == 'codex' else 'sonnet-5-5'
     profile = next(item for item in profiles['providers'][provider]['profiles'] if item['id'] == profile_id)
     worker = profile['matrix']['small/simple']
-    worker_text = 'SYMPHONY_ROLE: worker\n' + json.dumps({
+    worker_text = 'SYMPHONY_ROLE: worker\npurpose: substantive\n' + json.dumps({
         'objective': 'Return the literal callback report GATE_RELEASED.',
         'ownership': 'Only this bounded literal report under the owning lead.',
         'evidence': 'The owning lead has already returned from its native start hook.',
@@ -398,16 +398,16 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
         'return_contract': 'Return exactly GATE_RELEASED without Markdown.',
         'size': 'small', 'complexity': 'simple'})
     if provider == 'codex':
-        worker_packet = {'task_name': 'symphony_worker_' + re.sub(r'\W', '_', worker['model']) + '_' + worker['effort'],
+        worker_packet = {'task_name': 'symphony_worker_' + re.sub(r'\W', '_', worker['model']) + '_' + worker['effort'] + '__substantive',
                          'model': worker['model'], 'reasoning_effort': worker['effort'], 'fork_turns': 'none',
                          'message': worker_text}
     else:
         worker_packet = {'subagent_type': f"symphony:symphony-worker-{worker['model']}-{worker['effort']}",
                          'run_in_background': False, 'prompt': worker_text}
     review_needed = provider == 'codex' and codex_profile != 'base' and not released_direct_version
-    review_packet = ({'task_name': lead_role['task_name'].replace('symphony_lead_', 'symphony_consultant_', 1) + '_review',
+    review_packet = ({'task_name': lead_role['task_name'].replace('symphony_lead_', 'symphony_consultant_', 1) + '__independent_review',
                       'model': lead_role['model'], 'reasoning_effort': lead_role['effort'], 'fork_turns': 'none',
-                      'message': 'SYMPHONY_ROLE: consultant\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}\n' + json.dumps({
+                      'message': 'SYMPHONY_ROLE: consultant\npurpose: independent_review\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}\n' + json.dumps({
                           'objective': 'Independently check the prior literal GATE_RELEASED worker result.',
                           'ownership': 'Review only; make no changes.',
                           'evidence': 'The lead verified the first worker returned exactly GATE_RELEASED.',
@@ -2899,7 +2899,7 @@ def require_assessed_lead_set(run, home, project, canonical, *, released_old_ver
     contract = assessment.get('substantive_contract')
     route = assessment.get('route')
     scoped_candidate = ('_fast_escalated' not in assessment and isinstance(contract, dict)
-        and type(contract.get('version')) is int and contract['version'] == 1
+        and type(contract.get('version')) is int and contract['version'] in {1, 2}
         and isinstance(contract.get('epoch'), str) and bool(contract['epoch'])
         and isinstance(route, dict) and route.get('execution') in {'delegated', 'mixed'})
     escalated = (assessment.get('_fast_escalated') is True

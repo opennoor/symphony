@@ -94,12 +94,14 @@ BODIES = {
         "- large: administer. Delegate all project work to workers and keep only planning, "
         "integration, and verification.\n"
         "- When the route calls for an independent check (high risk, or small/complex), a different "
-        "consultant or worker reviews the completed substantive work. Give that child a review-only packet. "
+        "consultant or worker reviews the completed substantive work. Give that child a review-only packet "
+        "with `purpose: independent_review`. Task work, including a requested review deliverable, uses "
+        "`purpose: substantive`. Purpose stays with the original launch; use a fresh child to change it. "
         "Its own final report must contain exactly one `SYMPHONY_REVIEW: passed` line only when "
         "all findings are resolved; an implementation child's self-review cannot count.\n\n"
         "Spawn each child as `symphony:symphony-<role>-<model>-<effort>`, choosing the type for the "
         "packet's own size/complexity from the table Symphony gives you at start. Put "
-        "`SYMPHONY_ROLE: <role>` on the first line, then objective, ownership, evidence, constraints, "
+        "`SYMPHONY_ROLE: <role>` on the first line, then purpose, objective, ownership, evidence, constraints, "
         "acceptance_check, return_contract, size, and complexity. A consultant packet also needs one "
         "`SYMPHONY_DECISION: {\"size\":\"...\",\"complexity\":\"...\"}` line. Name the "
         "applicable capability and evidence check in each child packet. " + WAITING + " "
@@ -122,7 +124,7 @@ BODIES = {
         "Superpowers TDD or the smallest meaningful native check; for bugs use a compatible "
         "diagnosing-bugs skill or reproduce and fix the cause. Use Ponytail's reuse/native check. "
         "Use any compatible skill the packet names, and verify your result before you report.\n\n"
-        "If assigned an independent review, review only and return exactly one "
+        "For `purpose: independent_review`, review only and return exactly one "
         "`SYMPHONY_REVIEW: passed` line only when all findings are resolved; otherwise report findings without it.\n\n"
         + PRACTICES
     ),
@@ -134,7 +136,7 @@ BODIES = {
     "consultant": (
         _CONSULTANT_CONTRACT + "For an independent review use compatible `ce-code-review` or Matt Pocock "
         "`code-review`, or compare the exact diff with requirements and affected callers. "
-        "For external facts use Context7 or dated official sources. When asked for a review, "
+        "For external facts use Context7 or dated official sources. For `purpose: independent_review`, "
         "review independently and do not fix the code. Return exactly one `SYMPHONY_REVIEW: passed` "
         "line only when all findings are resolved; otherwise report findings without it.\n\n" + PRACTICES
     ),

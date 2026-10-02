@@ -2,6 +2,7 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from uuid import NAMESPACE_URL, uuid5
 
 from plugins.symphony.scripts.generate_hooks import bootstrap, generated
 from plugins.symphony.scripts.package_smoke import _payload, _role_model, _write_claude_child_launch
@@ -103,6 +105,43 @@ class RuntimeRetentionTests(unittest.TestCase):
 
     def test_captured_hooks_and_checker_survive_removed_cache_and_require_native_proof(self):
         self.exercise_removed_cache()
+
+    def write_codex_worker_launch(self, directory, run, worker):
+        """Supply native worker ownership, without inventing lead completion."""
+        home = directory / 'empty codex home' / 'sessions' / '2026' / '10' / '03'
+        home.mkdir(parents=True, exist_ok=True)
+        lead = next(item for item in run['delegations'] if item['identity'] == run['lead_identity'])
+        model, effort = worker['model'], worker['model_reasoning_effort']
+        lead_name = f"symphony_lead_{lead['requested_tier'].replace('-', '_').replace('.', '_')}_{lead['requested_effort']}"
+        parent_path = '/root/' + lead_name
+        child_path = parent_path + '/' + worker['agent_type']
+        launched = datetime.now(timezone.utc) - timedelta(milliseconds=3)
+        self.assertGreater(launched, datetime.fromisoformat(run['assessment']['substantive_contract']['accepted_at']))
+
+        def row(kind, payload, offset):
+            return {'type': kind, 'payload': payload,
+                    'timestamp': (launched + timedelta(milliseconds=offset)).isoformat()}
+
+        def header(identity, path, parent):
+            return row('session_meta', {'id': identity, 'cwd': str(directory), 'agent_path': path,
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': parent, 'agent_path': path}}}}, 0)
+
+        parent = [header(run['lead_identity'], parent_path, run['session_id']),
+            row('response_item', {'type': 'function_call', 'name': 'spawn_agent', 'call_id': 'worker-launch',
+                'arguments': json.dumps({'task_name': worker['agent_type'], 'model': model,
+                    'reasoning_effort': effort, 'fork_turns': 'none', 'message': 'gAAAAopaque-native-packet'})}, 0),
+            row('event_msg', {'type': 'item_completed', 'thread_id': run['lead_identity'], 'item': {
+                'type': 'SubAgentActivity', 'kind': 'started', 'id': 'worker-launch',
+                'agent_thread_id': worker['agent_id'], 'agent_path': child_path}}, 1),
+            row('response_item', {'type': 'function_call_output', 'call_id': 'worker-launch',
+                'output': json.dumps({'task_name': child_path})}, 3)]
+        child = [header(worker['agent_id'], child_path, run['lead_identity']),
+            row('event_msg', {'type': 'task_started', 'turn_id': worker['turn_id']}, 2),
+            row('turn_context', {'turn_id': worker['turn_id'], 'model': model, 'effort': effort}, 2)]
+        for identity, records in ((run['lead_identity'], parent), (worker['agent_id'], child)):
+            (home / f'rollout-{identity}.jsonl').write_text(
+                ''.join(json.dumps(record) + '\n' for record in records), encoding='utf-8')
+        return home / f"rollout-{worker['agent_id']}.jsonl"
 
     def test_new_checker_accepts_only_verified_old_session(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -233,6 +272,22 @@ class RuntimeRetentionTests(unittest.TestCase):
                 directory = Path(temporary)
                 (directory / "base64.py").write_text("raise RuntimeError('untrusted project import')\n")
                 root = self.materialize(directory, "Reviewed Old Plugin With Spaces")
+                session = str(uuid5(NAMESPACE_URL, 'retention-old-session')) if provider == 'codex' else 'old-session'
+                identities = {f'fake-{role}': str(uuid5(NAMESPACE_URL, f'retention-{role}'))
+                              for role in ('assessor', 'lead', 'worker')} if provider == 'codex' else {}
+
+                def payload_for(package, event, role='lead'):
+                    payload = _payload(package, provider, event, directory, session, role)
+                    if provider == 'codex':
+                        for key in ('agent_id', 'parent_thread_id'):
+                            if key in payload:
+                                payload[key] = identities[payload[key]]
+                        turn_role = role if event in ('SubagentStart', 'SubagentStop') else 'root'
+                        payload['turn_id'] = str(uuid5(NAMESPACE_URL, f'retention-{turn_role}-turn'))
+                        if role == 'worker' and 'agent_type' in payload:
+                            payload['agent_type'] += '__substantive'
+                    return payload
+
                 commands = {event: self.command(root, provider, event) for event in
                             ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop")}
                 checker_code = bootstrap(root)
@@ -240,16 +295,16 @@ class RuntimeRetentionTests(unittest.TestCase):
                 for event, role in (("SessionStart", "assessor"), ("UserPromptSubmit", "assessor"),
                                     ("SubagentStart", "assessor"), ("SubagentStop", "assessor"),
                                     ("SubagentStart", "lead")):
-                    payload = _payload(root, provider, event, directory, "old-session", role)
+                    payload = payload_for(root, event, role)
                     result, env = self.run_hook(commands[event], root, provider, directory, payload)
                     self.assertEqual(result.returncode, 0, result.stderr)
                 # Prepare captured payloads before removing all the old files.
                 for event in ("SubagentStop", "UserPromptSubmit", "Stop"):
-                    payloads[event] = _payload(root, provider, event, directory, "old-session", "lead")
+                    payloads[event] = payload_for(root, event)
                 payloads["UserPromptSubmit"]["prompt"] = "$symphony:symphony status" if provider == "codex" else "/symphony:status"
                 state_file = next((directory / "state").glob("*.v2.json"))
                 document = json.loads(state_file.read_text())
-                self.assertIn(f"{provider}:old-session", document["active_runs"])
+                self.assertIn(f"{provider}:{session}", document["active_runs"])
                 retained = Path(document["activation"][provider]["runtime_root"])
                 # A newer session uses its separately reviewed package; the old
                 # captured command must never resolve to this version.
@@ -266,25 +321,43 @@ class RuntimeRetentionTests(unittest.TestCase):
                 shutil.rmtree(root)
                 if provider == "codex":
                     checked = subprocess.run([sys.executable, "-I", str(new_root / "scripts/check_activation.py")],
-                                             cwd=directory, env={**env, "CODEX_SESSION_ID": "old-session"},
+                                             cwd=directory, env={**env, "CODEX_SESSION_ID": session},
                                              capture_output=True, text=True, check=False)
                     self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+                worker_transcript = None
                 for event in ('SubagentStart', 'SubagentStop'):
-                    worker = _payload(new_root, provider, event, directory, 'old-session', 'worker')
+                    worker = payload_for(new_root, event, 'worker')
+                    if provider == 'codex':
+                        if event == 'SubagentStart':
+                            run = json.loads(state_file.read_text())['active_runs'][f'codex:{session}']
+                            self.assertEqual(2, run['assessment']['substantive_contract']['version'])
+                            worker_transcript = self.write_codex_worker_launch(directory, run, worker)
+                        else:
+                            terminal = {'type': 'event_msg', 'timestamp': datetime.now(timezone.utc).isoformat(),
+                                'payload': {'type': 'task_complete', 'turn_id': worker['turn_id'],
+                                            'last_agent_message': worker['last_assistant_message']}}
+                            with worker_transcript.open('a', encoding='utf-8') as stream:
+                                stream.write(json.dumps(terminal) + '\n')
+                        worker['agent_transcript_path'] = str(worker_transcript)
                     result, _ = self.run_hook(commands[event], root, provider, directory, worker)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                if provider == 'codex':
+                    run = json.loads(state_file.read_text())['active_runs'][f'codex:{session}']
+                    proof = run['assessment']['_substantive_children'][identities['fake-worker']]
+                    self.assertEqual('substantive', proof['purpose'])
+                    self.assertTrue(proof['successful'])
                 for event in ("SubagentStop", "UserPromptSubmit"):
                     result, env = self.run_hook(commands[event], root, provider, directory, payloads[event])
                     self.assertEqual(result.returncode, 0, result.stderr)
                 document = json.loads(state_file.read_text())
                 self.assertEqual(document["activation"][provider]["plugin_version"], old_version)
                 self.assertEqual(document["activation"][provider]["runtime_root"], str(retained))
-                outcome_run = document["active_runs"].get(f"{provider}:old-session") or document["recent_runs"][-1]
+                outcome_run = document["active_runs"].get(f"{provider}:{session}") or document["recent_runs"][-1]
                 self.assertIsNotNone(outcome_run["outcome"])
                 if provider == "codex":
                     checked = subprocess.run([sys.executable, "-I", "-c", checker_code,
                                               str(root), "codex", "--check-activation"], cwd=directory,
-                                             env={**env, "CODEX_SESSION_ID": "old-session"}, capture_output=True,
+                                             env={**env, "CODEX_SESSION_ID": session}, capture_output=True,
                                              text=True, check=False)
                     self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr + json.dumps({
                         "expected_source": str(root.resolve()), "expected_runtime": str(retained.resolve()),
@@ -292,9 +365,19 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result, _ = self.run_hook(commands["Stop"], root, provider, directory, payloads["Stop"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 document = json.loads(state_file.read_text())
-                self.assertEqual(document["active_runs"][f"{provider}:old-session"]["status"], "recovering")
-                self.assertEqual(document["active_runs"][f"{provider}:old-session"]["assessment"]
-                                 ["_retryable_lead"], "fake-lead")
+                pending = document["active_runs"][f"{provider}:{session}"]
+                if provider == "codex":
+                    # The native parent launch proves the worker's purpose but
+                    # contains no lead turn/result. The earlier freshness guard
+                    # must block before completion-order recovery can run.
+                    stopped = json.loads(result.stdout)
+                    self.assertEqual("block", stopped["decision"])
+                    self.assertIn("could not verify the tracked lead's latest native turn", stopped["reason"])
+                    self.assertEqual("completing", pending["status"])
+                    self.assertFalse(any(run["run_id"] == pending["run_id"] for run in document["recent_runs"]))
+                else:
+                    self.assertEqual("recovering", pending["status"])
+                    self.assertEqual("fake-lead", pending["assessment"]["_retryable_lead"])
 
     def test_retained_or_source_tampering_fails_closed(self):
         for changed_path in ("symphony/runtime.py", "json.py", "scripts/check_activation.py"):

@@ -25,4 +25,6 @@ For a control-only invocation, execute or reconcile the control at the root and 
 
 Hook task reminders may be clipped. The full original request or assigned packet governs; relay every task part and acceptance check.
 
+Worker and consultant purpose is `substantive` for task work (including a requested review deliverable), or `independent_review` for separate verification only. Claude packets declare `purpose: <purpose>`. Codex names append `__<purpose>` before any unique underscore suffix. Purpose is bound to the original native launch; use a fresh child to change it. Independent review findings cannot replace substantive work.
+
 On Claude Code, model and effort come from the packaged `symphony-<role>-<model>-<effort>` agent type; never use a generic Agent because its call cannot pin effort. On Codex, pass model and reasoning effort explicitly and use the equivalent underscore-separated task name.

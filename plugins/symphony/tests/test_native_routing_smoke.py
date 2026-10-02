@@ -30,6 +30,13 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         self.assertIn('source_line', facts)
         self.assertNotIn('PRIVATE_SENTINEL', json.dumps(facts))
 
+        rows = [{'type': 'response_item', 'payload': {'type': 'custom_tool_call',
+                 'name': 'functions.exec', 'input': 'PRIVATE_SENTINEL'}}]
+        with patch.object(smoke, 'native_rows', return_value=rows):
+            facts = smoke.lead_integration_probe('codex', run, Path('/private-home'), Path('/private-project'))
+        self.assertEqual(facts['raw_tool_categories']['exec_wrapper'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(facts))
+
     def test_native_fixtures_supply_the_same_instructions_to_both_hosts(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider), TemporaryDirectory() as temporary:
@@ -372,7 +379,7 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         with patch.object(smoke, 'native_rows', return_value=rows):
             result = smoke.assessed_completion_probe('claude', Path('/missing'), run)
         self.assertTrue(result['retryable_lead_present'])
-        self.assertTrue(result['contract_version_one'])
+        self.assertTrue(result['contract_version_supported'])
         self.assertEqual(result['child_proof_counts']['successful'], 1)
         self.assertEqual(result['child_proof_counts']['parent_bound'], 1)
         self.assertEqual(result['supplied_outcome_categories']['blocked'], 1)

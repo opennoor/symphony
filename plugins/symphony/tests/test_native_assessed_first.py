@@ -93,6 +93,16 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 values = self.fixture(provider)
                 self.assertTrue(smoke.assessed_first_verified(provider, *values[:6]))
 
+    def test_assessor_first_accepts_known_contract_versions_only(self):
+        for provider in ('codex', 'claude'):
+            for version in (1, 2, 0, 3, True, '2', None):
+                with self.subTest(provider=provider, version=version):
+                    values = self.fixture(provider)
+                    contract = values[1]['assessment']['substantive_contract']
+                    contract.update(version=version, review_required=False)
+                    self.assertEqual(smoke.assessed_first_verified(provider, *values[:6]),
+                                     type(version) is int and version in {1, 2})
+
     def test_feature_without_fast_lead_requires_exact_assessor_first_proof(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):

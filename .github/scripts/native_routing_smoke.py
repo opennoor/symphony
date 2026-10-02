@@ -1413,7 +1413,7 @@ def assessed_completion_probe(provider, home, run, document=None, project=None):
     return {'completion_replay': chronology,
             'claude_child_binding': claude_child_binding_probe(home, run, document) if provider == 'claude' else [],
             'contract_present': 'substantive_contract' in assessment,
-            'contract_version_one': isinstance(contract, dict) and type(contract.get('version')) is int and contract['version'] == 1,
+            'contract_version_supported': isinstance(contract, dict) and type(contract.get('version')) is int and contract['version'] in {1, 2},
             'child_proof_counts': counts, 'retryable_lead_present': bool(assessment.get('_retryable_lead')),
             'substantive_child_missing': assessment.get('_substantive_child_missing') is True,
             'route_mismatch_present': bool(assessment.get('_lead_route_mismatch')),
@@ -2004,7 +2004,7 @@ def assessed_first_verified(provider, document, run, child_rows, home, project, 
         if (assessor['requested_tier'], assessor['requested_effort']) != (expected, 'high'):
             return False
         contract = run['assessment'].get('substantive_contract')
-        if (not isinstance(contract, dict) or type(contract.get('version')) is not int or contract['version'] != 1
+        if (not isinstance(contract, dict) or type(contract.get('version')) is not int or contract['version'] not in {1, 2}
                 or not isinstance(contract.get('epoch'), str) or not contract['epoch']):
             return False
         accepted = host_evidence._instant(contract.get('accepted_at'))
@@ -2571,6 +2571,7 @@ def lead_integration_probe(provider, run, home, project):
         workers = [item for item in run['delegations'] if item['role'] == 'worker']
         facts['delivery'] = _lead_delivery_probe(provider, run, home, project, lead)
         facts['commands'] = command_witness_probe(provider, lead, project)
+        facts['raw_tool_categories'] = raw_tool_categories(provider, lead)
         sys.settrace(trace)
         lead_verifies_after_worker_returns(provider, lead, workers, children, project, run)
     except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError) as error:

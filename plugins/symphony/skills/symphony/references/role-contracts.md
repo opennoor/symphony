@@ -66,6 +66,7 @@ The JSON values must use the matrix vocabulary above. The accepted topology alwa
 Every lead, worker, and consultant receives only the bounded context needed for its assignment. Every packet has these exact fields:
 
 ```yaml
+purpose: substantive | independent_review
 objective: <one bounded outcome or decision>
 ownership: <files, subsystem, or decision authority>
 evidence: <relevant facts and sources>
@@ -75,6 +76,10 @@ return_contract: <result and evidence to return>
 size: small | medium | large
 complexity: simple | mixed | complex
 ```
+
+For workers and consultants, `substantive` means the task's actual deliverable, including a requested review, diagnosis, or design. `independent_review` means a separate verification-only assignment. Its findings never count as substantive work, whether the review passes or fails. Purpose belongs to the original launch; start a fresh child to change it.
+
+New version 2 completion contracts require native evidence of that declared purpose. Claude binds the packet's exact `purpose:` line to the owning lead's Agent launch. Codex may encrypt the packet in native records, so its worker and consultant task names must end in `__substantive` or `__independent_review`, followed by an optional unique underscore suffix: for example, `symphony_worker_gpt_6_luna_low__substantive_ui`. Keep the existing role/model/effort prefix. Symphony binds that name to the native parent spawn, started activity, result, and child identity. A callback, final report, or followup cannot supply or change purpose. Version 1 and older accepted runs keep their original completion rules.
 
 **Bounded means scoped, never abridged.** A lead spawned with `fork_turns="none"` cannot see the request the user actually made, so the packet is the only copy. If the user asked for five things, `objective` states all five and `acceptance_check` is satisfied only when every one of them is met. Dropping items to make an objective read as a single sentence loses work silently: nothing downstream compares what was asked against what was done, and the completion gate checks only that no agent is still running. Split a request across several packets when the items are genuinely independent, and say so in each, but never narrow the request to fit the field.
 
@@ -94,7 +99,7 @@ Symphony's hooks enforce supported routing and lifecycle events. They do not obs
 - A large lead is an inexpensive administrator: delegate project work and reserve consultant capacity for narrow decisions.
 - After verifying the integrated result and receiving all child results, native successful assessed completion is sufficient. An optional `SYMPHONY_OUTCOME` report must be one valid JSON line; use `blocked` or `failed` when work remains. Duplicate, conflicting or malformed reports keep the run recoverable. Fast and archived followup completion retain their explicit marker requirements.
 - Newly accepted delegated and mixed routes require successful substantive worker or classified consultant evidence from the current assessment, lead and owner generation. Missing evidence holds completion; resume the same lead to delegate the remaining work, integrate and verify its result, then report completion again. Older route records without this contract retain their recovery behavior.
-- When `independent_review` is true, a separate worker or consultant reviews the completed substantive work. Its own successful final report contains exactly one `SYMPHONY_REVIEW: passed` line only after all findings are resolved. Completion needs both that scoped review proof and a different scoped substantive child. Existing in-flight contracts keep their accepted completion rules after an update.
+- When `independent_review` is true, a separate worker or consultant with that purpose reviews the completed substantive work. Its own successful final report contains exactly one `SYMPHONY_REVIEW: passed` line only after all findings are resolved. Completion needs both that scoped review proof and a different scoped substantive child. Review success does not determine the child's purpose. Existing in-flight contracts keep their accepted completion rules after an update.
 - Scoped child evidence preserves its admitted Start role and exact lead ownership. Claude credit requires a fresh child with one native prompt and an exact Agent launch in the canonical lead's transcript. Preserve reused child history and repair invalid consultant decisions; delegate fresh bounded work when multiple prompts prevent assigning that child to this invocation.
 - Archived followup only reconciles the same bounded task and retains its valid child evidence. A new or substantive objective starts a fresh assessment and delegation scope; previous-task workers cannot satisfy it. Agents judge that semantic boundary; marker strings alone cannot prove that a request is a continuation.
 - On Claude, root `SendMessage` can continue the archived assessed lead using its exact original agent ID and a literal message. Each delivery, native child turn and retained callback must agree in order. Intermediate successful native turns acknowledge their reports; only the final valid completed outcome can complete the task. Competing deliveries, uncertain child ownership or missing original-run proof remain pending. Repeated Stop retries cannot supply that proof; inspect status and preserve the original session's evidence while recovering the same owner.

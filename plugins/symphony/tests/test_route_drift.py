@@ -73,8 +73,12 @@ class RouteDriftTests(unittest.TestCase):
         worker = {**lead, "agent_id": "route-worker", "agent_type": "worker",
                   "parent_thread_id": lead["agent_id"], "task": "SYMPHONY_ROLE: worker",
                   "turn_id": "worker-turn"}
-        handle(worker, self.env(profile))
-        handle({**worker, "hook_event_name": "SubagentStop", "status": "completed"}, self.env(profile))
+        # This synthetic route fixture models a verified substantive launch;
+        # file-backed host tests exercise the native binding separately.
+        with patch.object(runtime_module, 'codex_substantive_launch',
+                          return_value={'parent': lead['agent_id'], 'purpose': 'substantive'}):
+            handle(worker, self.env(profile))
+            handle({**worker, "hook_event_name": "SubagentStop", "status": "completed"}, self.env(profile))
 
     def output(self, result) -> dict:
         return json.loads(result.stdout) if result.stdout else {}

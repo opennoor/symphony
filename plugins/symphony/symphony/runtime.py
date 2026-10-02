@@ -17,7 +17,7 @@ from typing import Mapping
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
 from .host_evidence import (
-    _archived_fast_owner, _instant,
+    _archived_fast_owner, _instant, _packet_purpose,
     archived_lead_followup,
     assessed_completion_chronology,
     claude_archived_sendmessage_sequence, claude_archived_mixed_sendmessage_sequence, claude_sendmessage_source_hash,
@@ -25,6 +25,7 @@ from .host_evidence import (
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
     claude_substantive_launch,
+    codex_substantive_launch,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
     codex_unmanaged_pre_run_terminal,
@@ -70,16 +71,21 @@ _CODEX_LIFECYCLE_GUIDANCE = (
     "Reuse returned evidence. Wake idle children for work/evidence with followup_task; send_message only queues. "
     "wait_agent only for active work; timeout_ms<=60000. "
 )
+_CHILD_PURPOSE_GUIDANCE = (
+    "Purpose: substantive (work/review) or independent_review (verification only). "
+    "Codex suffix: __<purpose>[_unique]; Claude: `purpose: <purpose>`. "
+)
 _LEAD_VERIFICATION_CONTRACT = (
     "After all children return, integrate and execute your packet's acceptance_check yourself with native tools; "
     "worker checks cannot substitute. If you ended a WAITING turn, do this on waking before completion."
 )
 _ASSESSED_LEAD_CONTRACT = (
     "delegate implementation, diagnosis, design, review, and product judgment to workers or consultants; "
-    "small tasks need one worker; medium: bounded worker packets; large: delegate project work. "
+    "small tasks need one worker; medium: bounded packets; large: delegate project work. "
     "Delegate implementation before editing. " + _LEAD_VERIFICATION_CONTRACT
     + " Use each child's matrix cell. Complete only after verification passes. "
-    'Outcome JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; use blocked or failed if work remains. '
+    'Outcome: `SYMPHONY_OUTCOME: {"status":"completed"}`; blocked/failed if unfinished. '
+    + _CHILD_PURPOSE_GUIDANCE
 )
 _ASSESSOR_CONTRACT = (
     "Assess the bounded task yourself; do not spawn agents or execute the task. "
@@ -2465,7 +2471,7 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
     if not run or not run.lead_identity:
         return state
     contract = run.assessment.get('substantive_contract')
-    if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int or contract['version'] != 1
+    if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int or contract['version'] not in {1, 2}
             or not isinstance(contract.get('epoch'), str) or not contract['epoch']
             or not isinstance(contract.get('accepted_at'), str)
             or source.observed_at < contract['accepted_at']):
@@ -2497,11 +2503,13 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
                   and proof.get('start_parent') in ('', run.lead_identity)
                   and source.payload.get('parent_thread_id') in (None, '', run.lead_identity))
     if consistent and run.provider == 'codex' and proof.get('start_parent') == run.lead_identity:
-        binding = {'parent': run.lead_identity}
+        binding = (codex_substantive_launch(run, source, role, proof['admitted_at'], environ)
+                   if contract['version'] == 2 and environ is not None else
+                   {'parent': run.lead_identity} if contract['version'] == 1 else None)
     elif consistent and run.provider == 'claude' and environ is not None:
         binding = claude_substantive_launch(run, source, role, proof['admitted_at'], environ)
-        if binding and any(proof.get(key) is not None and proof.get(key) != value for key, value in binding.items()):
-            binding = None
+    if binding and any(proof.get(key) is not None and proof.get(key) != value for key, value in binding.items()):
+        binding = None
     report = source.payload.get('last_assistant_message')
     review_lines = ([line.strip() for line in report.splitlines()
                      if line.strip().startswith('SYMPHONY_REVIEW:')]
@@ -3505,6 +3513,11 @@ def _prepare_delegation(
         return state, (_block_tool(f"Register the selected lead before spawning a Symphony {role}."),)
     if role == "consultant" and not _decision_markers(values):
         return state, (_block_tool("Add SYMPHONY_DECISION JSON with decision-local size and complexity, then retry."),)
+    contract = state.active_run.assessment.get('substantive_contract', {}) if state.active_run else {}
+    if (provider == 'claude' and role in {'worker', 'consultant'}
+            and isinstance(contract, Mapping) and contract.get('version') == 2
+            and not _packet_purpose(values.get('prompt'))):
+        return state, (_block_tool('Add exactly one purpose: substantive|independent_review line to the child packet, then retry.'),)
 
     launch_selection = None
     if role == "assessor":
@@ -3761,7 +3774,7 @@ def _accept_assessment(
         return replace(state, active_run=replace(run, assessment={**recorded,
                        'substantive_contract': confirmed})), ()
     if route.execution in {'delegated', 'mixed'}:
-        accepted['substantive_contract'] = {'version': 1, 'epoch': source.event_id,
+        accepted['substantive_contract'] = {'version': 2, 'epoch': source.event_id,
                                             'accepted_at': source.observed_at,
                                             'review_required': route.independent_review}
         if run and provider == run.provider and _marker_value(values, 'SYMPHONY_ROLE:') == 'lead':
@@ -4240,9 +4253,9 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
                 'SYMPHONY_ASSESSMENT JSON report before selecting or resuming the matrix lead.')
     snapshot = _snapshot(state, provider)
     protocol = (
-        'Worker spawns: explicit model, reasoning_effort, fork_turns="none", '
-        'task_name=symphony_worker_<model>_<effort> (unique suffix if occupied). '
-        'Bounded packet: first line SYMPHONY_ROLE: worker, then objective/ownership/evidence/'
+        'Workers: explicit model, reasoning_effort, fork_turns="none", '
+        'task_name=symphony_worker_<model>_<effort>__<purpose>. '
+        'Bounded packet starts SYMPHONY_ROLE: worker; objective/ownership/evidence/'
         'constraints/acceptance_check/return_contract/size/complexity. '
         + _CODEX_LIFECYCLE_GUIDANCE
         if provider == "codex" else
@@ -4260,7 +4273,7 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
         + (f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
            if provider == "claude" else
            f". Consultants: model={snapshot.tiers['strongest']}, reasoning_effort=high, "
-           'fork_turns="none", name `symphony_consultant_<model>_<effort>` (unique suffix if occupied), '
+           'fork_turns="none", name `symphony_consultant_<model>_<effort>__<purpose>`, '
            'SYMPHONY_ROLE: consultant; SYMPHONY_DECISION JSON in packet and own final report.')
         + "\n\nTask reminder (full assigned packet governs if clipped):\n" + state.active_run.task
     )
@@ -4359,7 +4372,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
     )
     if provider == "codex":
         snapshot = _snapshot(state, provider) if state else snapshot_for(provider)
-        codex += ("Exact profile cells override tiers for lead and worker; never reuse the fast lead selection: "
+        codex += ("Exact cells override tiers; never reuse the fast lead selection: "
                   + "; ".join(_provider_cells(snapshot, "lead")) + ". ")
     boost = ""
     if state is not None and provider:
@@ -4384,13 +4397,13 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         "Only the assessed lead spawns workers/consultants with explicit model/effort and matching SYMPHONY_ROLE. "
         "Consultants need SYMPHONY_DECISION JSON with decision-local size and complexity. "
         'Relay the child spawn protocol in the lead packet: on Codex every worker uses `fork_turns="none"`, '
-        'explicit model/reasoning_effort from its own cell, underscore `symphony_worker_<model>_<effort>` '
-          'task name with a unique suffix if occupied, and a packet starting `SYMPHONY_ROLE: worker`. '
+        'explicit model/reasoning_effort from its own cell, name `symphony_worker_<model>_<effort>__<purpose>`, '
+        'and a packet starting `SYMPHONY_ROLE: worker`. '
         "Relay this matrix lead contract (assessor topology is advisory): "
         + _ASSESSED_LEAD_CONTRACT
         + "Archived followup reconciles only the same task. New objectives need fresh scope; "
         "substantive tasks also need fresh assessment and fresh worker evidence. "
-        "Relay all task parts and acceptance checks; the lead cannot see this conversation. "
+        "Relay every part of the task and its acceptance checks in full; the lead cannot see this conversation. "
         "Assessor packets require that exact size/complexity/risk vocabulary; substantive small work uses one worker. "
         f"{boost}{codex}{claude}"
         + (f"\n\nTask reminder (full original request governs if clipped):\n{task}" if task else "")
@@ -4544,7 +4557,10 @@ def _substantive_recovery_guidance(run: RunState | None, provider: str) -> str:
               if isinstance(contract, Mapping) and contract.get('review_required') is True else '')
     return ('Resume the SAME registered lead; this assessed route needs successful substantive worker '
             'or classified consultant evidence from the current assessment and owner generation. '
-            + review + native + 'Reconcile a verifiable current-scope worker Start, or launch a fresh bounded worker '
+            + review + native + (_CHILD_PURPOSE_GUIDANCE +
+                'Purpose stays tied to the original launch; use a fresh child for a different purpose. '
+                if isinstance(contract, Mapping) and contract.get('version') == 2 else '')
+            + 'Reconcile a verifiable current-scope worker Start, or launch a fresh bounded worker '
             'whose Start and successful terminal are observed. Relay to the lead: '
             + _LEAD_VERIFICATION_CONTRACT + ' Then let that lead report completion again. Preserve this run and ownership.')
 

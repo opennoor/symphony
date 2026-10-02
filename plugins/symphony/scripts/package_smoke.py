@@ -25,7 +25,7 @@ class SmokeFailure(RuntimeError):
     pass
 
 
-def _write_claude_child_launch(home, project, run, identity, role, model, effort, turn):
+def _write_claude_child_launch(home, project, run, identity, role, model, effort, turn, *, purpose='substantive'):
     """Model the host's exact lead→Agent link for deterministic package fixtures."""
     directory = Path(home) / 'projects' / '-fixture' / run['session_id'] / 'subagents'
     directory.mkdir(parents=True, exist_ok=True)
@@ -34,6 +34,7 @@ def _write_claude_child_launch(home, project, run, identity, role, model, effort
     lead = next(item for item in run['delegations'] if item['identity'] == run['lead_identity'])
     child_type = f'symphony:symphony-{role}-{model}-{effort}'
     launch_id = f'toolu_{identity}_{turn}'.replace(':', '_')
+    packet = f'purpose: {purpose}\nComplete the assigned bounded work.'
     accepted = datetime.fromisoformat(run['assessment']['substantive_contract']['accepted_at'])
     launched = accepted + timedelta(milliseconds=1)
     child.with_suffix('.meta.json').write_text(json.dumps({
@@ -45,13 +46,13 @@ def _write_claude_child_launch(home, project, run, identity, role, model, effort
     rows.append({'type': 'assistant', 'sessionId': run['session_id'], 'agentId': run['lead_identity'],
                  'isSidechain': True, 'cwd': str(project), 'timestamp': launched.isoformat(),
                  'message': {'content': [{'type': 'tool_use', 'name': 'Agent', 'id': launch_id,
-                                         'input': {'subagent_type': child_type}}]}})
+                                         'input': {'subagent_type': child_type, 'prompt': packet}}]}})
     parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
     child_rows = [json.loads(line) for line in child.read_text(encoding='utf-8').splitlines()] if child.exists() else []
     child_rows.append({'type': 'user', 'sessionId': run['session_id'], 'agentId': identity,
         'isSidechain': True, 'uuid': f'child-prompt-{turn}',
         'timestamp': (launched + timedelta(milliseconds=1)).isoformat(),
-        'message': {'content': 'Complete the assigned bounded work.'}})
+        'message': {'content': packet}})
     child.write_text(''.join(json.dumps(row) + '\n' for row in child_rows), encoding='utf-8')
     return parent, child
 

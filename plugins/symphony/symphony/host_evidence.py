@@ -264,6 +264,63 @@ def _chronology_claude_launch(rows: list[dict], launch_hash: str, session: str, 
     return call[3], paired[0][1], call[2]
 
 
+def _packet_purpose(packet: object) -> str:
+    """Read an explicit assignment, never infer purpose from review prose."""
+    if not isinstance(packet, str):
+        return ''
+    purposes = [line.strip().removeprefix('purpose:').strip() for line in packet.splitlines()
+                if line.strip().startswith('purpose:')]
+    return purposes[0] if len(purposes) == 1 and purposes[0] in {'substantive', 'independent_review'} else ''
+
+
+def _codex_child_purpose(path: object, child: Delegation) -> str:
+    if not isinstance(path, str):
+        return ''
+    model = re.sub(r'[^a-z0-9]', '_', child.requested_tier)
+    prefix = f'symphony_{child.role}_{model}_{child.requested_effort}__'
+    match = re.fullmatch(re.escape(prefix) + r'(substantive|independent_review)(?:_[a-z0-9]+)*', path.rsplit('/', 1)[-1])
+    return match[1] if match else ''
+
+
+def codex_substantive_launch(run: RunState, source: Event, role: str, started_at: str,
+                            environ: Mapping[str, str]) -> dict[str, str] | None:
+    """Bind purpose to the native launch name, whose packet may be encrypted.
+
+    Start can precede the parent spawn result. Completion revalidates the same
+    original launch; a followup or final report cannot change its purpose.
+    """
+    try:
+        identity = str(source.payload.get('agent_id') or source.payload.get('subagent_id') or '')
+        contract = run.assessment.get('substantive_contract', {})
+        accepted = _instant(contract.get('accepted_at')) if isinstance(contract, Mapping) else None
+        admitted, observed = _instant(started_at), _instant(source.observed_at)
+        cwd = source.payload.get('cwd')
+        if (run.provider != 'codex' or source.payload.get('provider') != 'codex'
+                or source.payload.get('session_id') != run.session_id
+                or role not in {'worker', 'consultant'} or not run.lead_identity
+                or accepted is None or admitted is None or observed is None
+                or not accepted <= admitted <= observed
+                or not isinstance(cwd, str) or not Path(cwd).is_absolute()):
+            return None
+        children = [item for item in run.delegations if item.identity == identity and item.role == role]
+        if len(children) != 1:
+            return None
+        child = children[0]
+        home = Path(environ.get('CODEX_HOME') or Path.home() / '.codex')
+        project = Path(cwd).resolve()
+        parent = _chronology_codex_file(home, run.lead_identity, run.session_id, project)
+        rows = _chronology_codex_file(home, identity, run.lead_identity, project)
+        if parent is None or rows is None:
+            return None
+        launch = _chronology_codex_launch(parent, rows, child)
+        purpose = _codex_child_purpose(rows[0]['payload'].get('agent_path'), child)
+        if launch is None or not purpose or not accepted <= launch[0] <= admitted or launch[1] > observed:
+            return None
+        return {'parent': run.lead_identity, 'purpose': purpose}
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def assessed_completion_chronology(state: ProjectState, session: str, project: Path,
                                    environ: Mapping[str, str]) -> str:
     """Prove children returned before the current assessed lead's final report.
@@ -278,7 +335,7 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                 or type(run.owner_generation) is not int):
             return 'unknown'
         contract = run.assessment.get('substantive_contract')
-        if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int or contract['version'] != 1
+        if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int or contract['version'] not in {1, 2}
                 or not isinstance(contract.get('epoch'), str) or not contract['epoch']
                 or (accepted := _instant(contract.get('accepted_at'))) is None):
             return 'unknown'
@@ -355,6 +412,8 @@ def assessed_completion_chronology(state: ProjectState, session: str, project: P
                 terminal = _chronology_codex_turn(child_rows, child)
                 launched = _chronology_codex_launch(rows, child_rows, child)
                 if (terminal is None or launched is None or not accepted <= launched[0] <= terminal[1]
+                        or contract['version'] == 2 and _codex_child_purpose(
+                            child_rows[0]['payload'].get('agent_path'), child) != proofs[child.identity].get('purpose')
                         or proofs[child.identity].get('turn') != f'turn_id:{terminal[0]}'
                         or f'turn_id:{terminal[0]}' not in run.assessment.get('_terminal_turns', {}).get(child.identity, ())):
                     return 'unknown'
@@ -947,8 +1006,14 @@ def _claude_substantive_launch(
             or prompt.get('isSidechain') is not True or when is None or not launched <= when <= observed
             or not isinstance(prompt_id, str) or not prompt_id):
         return None
-    return {'parent': lead_id, 'launch_hash': hashlib.sha256(launch_id.encode()).hexdigest(),
-            'native_prompt_hash': hashlib.sha256(prompt_id.encode()).hexdigest()}
+    binding = {'parent': lead_id, 'launch_hash': hashlib.sha256(launch_id.encode()).hexdigest(),
+               'native_prompt_hash': hashlib.sha256(prompt_id.encode()).hexdigest()}
+    if contract.get('version') == 2:
+        purpose = _packet_purpose(values.get('prompt'))
+        if not purpose:
+            return None
+        binding['purpose'] = purpose
+    return binding
 
 
 def _claude_native_lead_event(
@@ -2379,7 +2444,7 @@ def _claude_historical_worker_origin(
             or not isinstance(run.outcome, Mapping) or run.outcome.get('status') != 'completed'
             or run.unreconciled
             or not isinstance(contract, Mapping) or type(contract.get('version')) is not int
-            or contract['version'] != 1 or not isinstance(contract.get('epoch'), str) or not contract['epoch']
+            or contract['version'] not in {1, 2} or not isinstance(contract.get('epoch'), str) or not contract['epoch']
             or not isinstance(proof, Mapping)
             or proof.get('role') != 'worker' or proof.get('successful') is not True
             or proof.get('epoch') != contract.get('epoch') or proof.get('run_id') != run.run_id

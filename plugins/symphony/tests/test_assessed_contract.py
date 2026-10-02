@@ -36,6 +36,15 @@ class AssessedContractTests(unittest.TestCase):
     def begin(self, provider, *, legacy=False, sizing=None):
         self.provider = provider
         self.sequence = 0
+        self.native_launches = {}
+        if not hasattr(self, '_native_binding_patch'):
+            # Synthetic lifecycle IDs have no host transcript. File-backed
+            # host-evidence tests validate the native launch binding itself.
+            self._native_binding_patch = patch(
+                'plugins.symphony.symphony.runtime.codex_substantive_launch',
+                side_effect=lambda run, source, *args: self.native_launches.get(source.payload.get('agent_id')))
+            self._native_binding_patch.start()
+            self.addCleanup(self._native_binding_patch.stop)
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.project = Path(temporary.name) / 'project'
@@ -59,7 +68,8 @@ class AssessedContractTests(unittest.TestCase):
         self.state, _ = _accept_assessment(self.state, self.event('subagent_stopped'),
                                             self.provider, {}, sizing or Assessment('small', 'simple'))
 
-    def child(self, identity, role, terminal, turn, *, status='completed', report='', parent=None, hook_fields=None):
+    def child(self, identity, role, terminal, turn, *, status='completed', report='', parent=None, hook_fields=None,
+              purpose='substantive'):
         route = self.state.active_run.assessment['route']
         fields = {'provider': self.provider, 'session_id': 'root', 'agent_id': identity,
                   'cwd': str(self.project),
@@ -72,12 +82,15 @@ class AssessedContractTests(unittest.TestCase):
                 fields.pop(key, None)
             else:
                 fields[key] = value
+        if not terminal and role in {'worker', 'consultant'}:
+            self.native_launches.setdefault(identity, {'parent': fields.get('parent_thread_id'), 'purpose': purpose})
         if terminal:
             fields.update(status=status, last_assistant_message=report)
         elif self.provider == 'claude' and role in {'worker', 'consultant'}:
             from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
             write_claude_child_launch(self.environ['CLAUDE_CONFIG_DIR'], self.project,
-                self.state.active_run, identity, role, fields['model'], fields['model_reasoning_effort'], turn)
+                self.state.active_run, identity, role, fields['model'], fields['model_reasoning_effort'], turn,
+                purpose=purpose)
         self.state, actions = _observe_delegation(self.state, self.event(
             'subagent_stopped' if terminal else 'subagent_started', **fields), self.environ)
         return actions
@@ -99,10 +112,10 @@ class AssessedContractTests(unittest.TestCase):
                     self.assertEqual(self.state.active_run.status, 'recovering')
                     self.assertIn('SYMPHONY_REVIEW: passed', _recovery_guidance(self.state, provider))
                     self.child('lead', 'lead', False, 'lead-2')
-                    self.child('unmarked-review', 'consultant', False, 'review-1')
+                    self.child('unmarked-review', 'consultant', False, 'review-1', purpose='independent_review')
                     self.child('unmarked-review', 'consultant', True, 'review-1', report=decision)
                     self.assertFalse(_substantive_child_completed(self.state.active_run))
-                    self.child('reviewer', 'consultant', False, 'review-2')
+                    self.child('reviewer', 'consultant', False, 'review-2', purpose='independent_review')
                     self.child('reviewer', 'consultant', True, 'review-2',
                                report=decision + '\nSYMPHONY_REVIEW: passed')
                     self.assertTrue(_substantive_child_completed(self.state.active_run))
@@ -111,17 +124,17 @@ class AssessedContractTests(unittest.TestCase):
 
                 with self.subTest(provider=provider, sizing=sizing, case='self-review'):
                     self.begin(provider, sizing=sizing)
-                    self.child('reviewer', 'worker', False, 'review-1')
+                    self.child('reviewer', 'worker', False, 'review-1', purpose='independent_review')
                     self.child('reviewer', 'worker', True, 'review-1', report='SYMPHONY_REVIEW: passed')
                     self.assertFalse(_substantive_child_completed(self.state.active_run))
 
                 with self.subTest(provider=provider, sizing=sizing, case='stale-review'):
                     self.begin(provider, sizing=sizing)
-                    self.child('early-reviewer', 'worker', False, 'review-1')
+                    self.child('early-reviewer', 'worker', False, 'review-1', purpose='independent_review')
                     self.child('early-reviewer', 'worker', True, 'review-1', report='SYMPHONY_REVIEW: passed')
                     self.worker()
                     self.assertFalse(_substantive_child_completed(self.state.active_run))
-                    self.child('fresh-reviewer', 'worker', False, 'review-2')
+                    self.child('fresh-reviewer', 'worker', False, 'review-2', purpose='independent_review')
                     self.child('fresh-reviewer', 'worker', True, 'review-2', report='SYMPHONY_REVIEW: passed')
                     self.assertTrue(_substantive_child_completed(self.state.active_run))
 
@@ -130,6 +143,7 @@ class AssessedContractTests(unittest.TestCase):
                     run = self.state.active_run
                     contract = dict(run.assessment['substantive_contract'])
                     contract.pop('review_required')
+                    contract['version'] = 1
                     self.state = replace(self.state, active_run=replace(run, assessment={**run.assessment,
                                          'substantive_contract': contract}))
                     self.worker()
@@ -146,12 +160,13 @@ class AssessedContractTests(unittest.TestCase):
                         if legacy:
                             contract = dict(run.assessment['substantive_contract'])
                             contract.pop('review_required')
+                            contract['version'] = 1
                             self.state = replace(self.state, active_run=replace(run, assessment={
                                 **run.assessment, 'substantive_contract': contract}))
                         report = 'SYMPHONY_REVIEW: passed'
                         if role == 'consultant':
                             report += '\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}'
-                        self.child('reviewer', role, False, 'review-1')
+                        self.child('reviewer', role, False, 'review-1', purpose='independent_review')
                         self.child('reviewer', role, True, 'review-1', report=report)
                         self.assertEqual(_substantive_child_completed(self.state.active_run), legacy)
                         self.child('lead', 'lead', True, 'lead-1')
@@ -169,6 +184,37 @@ class AssessedContractTests(unittest.TestCase):
                         self.state, _ = reduce(self.state, self.event('stop_requested'))
                         self.assertIsNone(self.state.active_run)
                         self.assertEqual(self.state.recent_runs[-1].status, 'completed')
+
+    def test_findings_only_review_and_later_pass_cannot_replace_substantive_work(self):
+        decision = '\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}'
+        for provider in ('codex', 'claude'):
+            for role in ('worker', 'consultant'):
+                with self.subTest(provider=provider, role=role):
+                    self.begin(provider, sizing=Assessment('small', 'simple', 'high'))
+                    self.child('findings', role, False, 'findings-1', purpose='independent_review')
+                    self.child('findings', role, True, 'findings-1', report='Found a defect.' + decision)
+                    self.child('reviewer', role, False, 'review-1', purpose='independent_review')
+                    self.child('reviewer', role, True, 'review-1', report='SYMPHONY_REVIEW: passed' + decision)
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+                    self.child('lead', 'lead', True, 'lead-1')
+                    self.state, _ = reduce(self.state, self.event('stop_requested'))
+                    self.assertIsNotNone(self.state.active_run)
+                    self.assertEqual(_stop_block_reason(self.state.active_run)['reason'], 'substantive_child_missing')
+                    self.assertFalse(self.state.recent_runs)
+
+    def test_requested_substantive_review_is_work_even_when_it_reports_passed(self):
+        for provider in ('codex', 'claude'):
+            for role in ('worker', 'consultant'):
+                with self.subTest(provider=provider, role=role):
+                    self.begin(provider)
+                    self.child('audit', role, False, 'audit-1', purpose='substantive')
+                    report = 'SYMPHONY_REVIEW: passed\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}'
+                    self.child('audit', role, True, 'audit-1', report=report)
+                    self.assertTrue(_substantive_child_completed(self.state.active_run))
+                    self.child('lead', 'lead', True, 'lead-1')
+                    self.state, _ = reduce(self.state, self.event('stop_requested'))
+                    self.assertIsNone(self.state.active_run)
+                    self.assertEqual(self.state.recent_runs[-1].status, 'completed')
 
     def late_assessor(self, provider):
         self.begin(provider)
@@ -770,6 +816,7 @@ class AssessedContractTests(unittest.TestCase):
                     write_claude_child_launch(self.environ['CLAUDE_CONFIG_DIR'], self.project,
                         self.state.active_run, 'tokenless-worker', 'worker', fields['model'],
                         fields['model_reasoning_effort'], 'tokenless')
+                self.native_launches['tokenless-worker'] = {'parent': 'lead', 'purpose': 'substantive'}
                 start = self.event('subagent_started', **fields)
                 self.state, _ = _observe_delegation(self.state, start, self.environ)
                 terminal = self.event('subagent_stopped', **fields, status='completed')
