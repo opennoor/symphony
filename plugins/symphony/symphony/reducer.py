@@ -522,6 +522,8 @@ def _stop_block_reason(run: RunState) -> dict | None:
     mismatch = run.assessment.get("_lead_route_mismatch")
     if mismatch:
         return {"reason": mismatch}
+    if not run.lead_identity and not _valid_outcome(run.outcome):
+        return {"reason": "lead_not_started"}
     if not _substantive_child_completed(run):
         return {"reason": "substantive_child_missing"}
     if not _valid_outcome(run.outcome):

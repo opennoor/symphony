@@ -844,8 +844,9 @@ class RuntimeTests(unittest.TestCase):
                             guidance = self.flush(provider)
                             self.assertIn(f"Selected {provider} lead ({profile_id} profile): {model}/{effort}", guidance)
                             if provider == 'codex':
-                                self.assertIn('task_name `' + codex_agent_type('lead', model, effort) + '`', guidance)
-                                self.assertIn('fork_turns="none"', guidance)
+                                packet = json.loads(guidance.split('SYMPHONY_LEAD_SPAWN_PACKET: ', 1)[1].splitlines()[0])
+                                self.assertEqual(packet['task_name'], codex_agent_type('lead', model, effort))
+                                self.assertEqual(packet['fork_turns'], 'none')
 
                             proceed = "/symphony:proceed" if provider == "claude" else "$symphony:symphony proceed"
                             handle(self.payload(proceed, provider), environ)

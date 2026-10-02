@@ -1472,9 +1472,6 @@ def _transition(
         state, delegation_actions = _prepare_delegation(state, source, provider)
         actions += delegation_actions
     elif source.kind in {"subagent_started", "subagent_stopped"}:
-        if source.kind == "subagent_started":
-            state, deferred = _consume_parent_actions(state)
-            actions += deferred
         launches = state.active_run.assessment.get('_pending_delegations', ()) if state.active_run else ()
         launches = tuple(launches) if isinstance(launches, (list, tuple)) else ()
         state, observed_actions = _observe_delegation(state, source, environ)
@@ -1496,6 +1493,12 @@ def _transition(
                 and state.active_run.lead_identity == str(payload.get("agent_id") or "")
             ):
                 # SubagentStart context reaches the starting agent, not the root.
+                # The accepted spawn instruction is obsolete once that lead is
+                # registered. Other deferred parent guidance stays for the root.
+                assessment = dict(state.active_run.assessment)
+                assessment['_pending_parent_actions'] = [item for item in assessment.get('_pending_parent_actions', ())
+                    if not str(item.get('payload', {}).get('text', '')).startswith('Symphony accepted the assessed route.')]
+                state = replace(state, active_run=replace(state.active_run, assessment=assessment))
                 actions += (Action("inject_context", {"text": _lead_guidance(state, provider)}),)
     elif source.kind in {"post_tool_use", "post_tool_failed"}:
         state = _discard_failed_spawn(state, source, provider)
@@ -3974,6 +3977,9 @@ def _render_actions(
             rendered.append(Action('inject_context', {'text': _substantive_recovery_guidance(state.active_run, provider)}))
         elif action.kind == "block_stop":
             text = _stop_block_text(action.payload, provider, scope)
+            if (action.payload.get('reason') == 'lead_not_started' and state.active_run
+                    and isinstance(state.active_run.assessment.get('route'), Mapping)):
+                text += ' ' + _assessed_lead_guidance(state.active_run, provider)
             if (state.active_run and state.active_run.assessment.get('_fast_escalated')
                     and not state.active_run.assessment.get('size')):
                 text += (' Request a fresh independent assessment of the full current objective, '
@@ -4055,18 +4061,10 @@ def _render_actions(
                 rendered.append(Action("inject_context", {"text":
                     "The observed lead is unavailable. Spawn one safe replacement at the recorded owner generation."}))
         elif action.kind == "route_run":
-            route = state.active_run.assessment.get("route", {}) if state.active_run else {}
-            model, effort = _required_lead_route(state.active_run.assessment) if state.active_run else ("", "")
-            profile = route.get("profile", "") if isinstance(route, Mapping) else ""
-            task_name = 'symphony_lead_' + re.sub(r'\W', '_', model) + '_' + effort
-            agent = (f" as `symphony:symphony-lead-{model}-{effort}`" if provider == "claude" else
-                     f" with task_name `{task_name}` and fork_turns=\"none\"") if model else ""
-            rendered.append(Action("inject_context", {"text":
-                f"Symphony accepted the assessed route. Selected {provider} lead"
-                f" ({profile} profile): {model}/{effort}. Spawn only this model and effort{agent} "
-                "with the accepted SYMPHONY_ROUTE marker; keep the root thin. "
-                f"Accepted topology: {route.get('execution', '')}. Relay this lead contract: "
-                + _ASSESSED_LEAD_CONTRACT}))
+            if state.active_run:
+                rendered.append(Action("inject_context", {"text": _assessed_lead_guidance(state.active_run, provider)}))
+            else:
+                rendered.append(Action('inject_context', {'text': 'Symphony has no current assessed run; request fresh assessment before launching a lead.'}))
         elif action.kind == "reject_lead_replacement":
             lead = state.active_run.lead_identity if state.active_run else "the registered lead"
             rendered.append(Action("inject_context", {"text":
@@ -4402,6 +4400,26 @@ def _refresh_completion_guidance(
         if action.kind == "inject_context" and action.payload.get("text") == old else action
         for action in actions
     )
+
+
+def _assessed_lead_guidance(run: RunState, provider: str) -> str:
+    route = run.assessment.get('route', {})
+    model, effort = _required_lead_route(run.assessment)
+    sizing = {key: run.assessment[key] for key in ('size', 'complexity', 'risk', 'rationale', 'topology')
+              if key in run.assessment}
+    message = ('SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: ' + json.dumps(sizing) + '\n'
+               + run.task + '\nLead contract: ' + _ASSESSED_LEAD_CONTRACT)
+    packet = ({'task_name': 'symphony_lead_' + re.sub(r'\W', '_', model) + '_' + effort,
+               'model': model, 'reasoning_effort': effort, 'fork_turns': 'none', 'message': message}
+              if provider == 'codex' else
+              {'subagent_type': f'symphony:symphony-lead-{model}-{effort}',
+               'description': 'Execute the assessed task', 'run_in_background': True, 'prompt': message})
+    return (f"Symphony accepted the assessed route. Selected {provider} lead "
+            f"({route.get('profile', '')} profile): {model}/{effort}. "
+            f"Accepted topology: {route.get('execution', '')}. Keep the root thin. "
+            "Relay these exact native spawn arguments; do not omit the role, route or task. "
+            "On Codex, if the task name is occupied, append a unique underscore suffix and keep its lead prefix. "
+            "SYMPHONY_LEAD_SPAWN_PACKET: " + json.dumps(packet))
 
 
 def _substantive_recovery_guidance(run: RunState | None, provider: str) -> str:

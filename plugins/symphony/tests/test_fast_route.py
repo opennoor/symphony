@@ -323,6 +323,7 @@ class FastRouteTests(unittest.TestCase):
                 self.assertEqual(self.run_state().owner_generation, 2)
                 guidance = json.loads(started_lead.stdout)['hookSpecificOutput']['additionalContext']
                 self.assertIn('SYMPHONY_ROLE: worker', guidance)
+                self.assertNotIn('SYMPHONY_LEAD_SPAWN_PACKET:', guidance)
                 if provider == 'codex':
                     self.assertIn('fork_turns="none"', guidance)
                     self.assertIn('symphony_worker_<model>_<effort>', guidance)

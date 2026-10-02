@@ -230,6 +230,12 @@ class NativeAssessedFirstTests(unittest.TestCase):
                             smoke.shlex.join(['cat', str(Path(original) / 'skills/symphony/SKILL.md')]),
                             smoke.shlex.join(['cat', str(Path(retained) / 'skills/symphony/references/role-contracts.md')]),
                             'cat AGENTS.md']
+                reference = str(Path(retained) / 'skills/symphony/references/role-contracts.md')
+                for arguments in (['cat', '--', reference], ['sed', '-n', '1,200p', reference],
+                                  ['Get-Content', '-LiteralPath', reference],
+                                  ['cat', str(Path(original) / 'profiles.json')]):
+                    self.assertTrue(smoke.structured_root_discovery('exec_command', {'cmd': smoke.shlex.join(arguments)},
+                        provider='codex', document=document, session=run['session_id'], project=project))
                 for ordinal, command in enumerate(commands):
                     arguments = {'cmd': command, 'workdir': str(project)}
                     name = 'exec_command'
@@ -244,7 +250,9 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 write()
                 self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
                 for command in ('python -m unittest -q', 'cat greet.py', 'cat AGENTS.md; touch greet.py',
-                                'cat AGENTS.md && true', 'cat $(touch greet.py)/AGENTS.md', commands[0] + '; true'):
+                                'cat AGENTS.md && true', 'cat $(touch greet.py)/AGENTS.md', commands[0] + '; true',
+                                'sed -i s/a/b/ AGENTS.md', 'sed -n 1,200p greet.py',
+                                'Get-Content -LiteralPath greet.py', 'Get-Content -LiteralPath AGENTS.md | Remove-Item greet.py'):
                     with self.subTest(rejected=command):
                         self.assertFalse(smoke.structured_root_discovery('exec_command', {'cmd': command},
                             provider='codex', document=document, session=run['session_id'], project=project))

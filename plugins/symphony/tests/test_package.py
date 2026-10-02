@@ -159,12 +159,40 @@ class PackageContractTests(unittest.TestCase):
                        "elseif ($Name -eq 'python3.exe') { [pscustomobject]@{Name=$Name;Source='"
                        + executable + "'} } }\n")
             relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+            relay = relay.replace('$discover = {', '$discover = {' + command)
             for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
                 result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
-                    command + relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                    relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
                     text=True, timeout=15, env={**os.environ, variable: temporary})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), '123')
+
+    @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
+    def test_windows_discovery_timeout_preserves_candidates_without_running_the_hook_twice(self):
+        import time
+        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        executable = sys.executable.replace("'", "''")
+        for partial in ('none', 'complete', 'truncated-tail'):
+            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                with self.subTest(partial=partial, provider=provider), tempfile.TemporaryDirectory() as temporary:
+                    relay = (PLUGIN / 'scripts/codex_hook.ps1').read_text().replace('__SYMPHONY_BOOTSTRAP__', 'print(123)')
+                    candidate = ("[pscustomobject]@{Name='python3.exe';Source='" + executable
+                                 + "'} | ConvertTo-Json -Compress; ") if partial != 'none' else ''
+                    if partial == 'truncated-tail':
+                        candidate += "[Console]::Write('{bad'); "
+                    relay = relay.replace('$discover = {', '$discover = {' + candidate + 'Start-Sleep -Seconds 20; ')
+                    began = time.monotonic()
+                    result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                        relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                        text=True, timeout=10, env={**os.environ, variable: temporary})
+                    self.assertLess(time.monotonic() - began, 8)
+                    if partial != 'none':
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), '123')
+                    else:
+                        self.assertEqual(result.returncode, 1)
+                        self.assertEqual(result.stdout, '')
+                        self.assertIn('Python discovery timed out', result.stderr)
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_accepts_a_slow_working_interpreter_probe(self):

@@ -8,7 +8,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
+from plugins.symphony.symphony.model import Action, Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony.reducer import _substantive_child_completed, _stop_block_reason, reduce
 from plugins.symphony.symphony.store import StateStore
 from plugins.symphony.symphony.routing import Assessment, snapshot_for
@@ -189,6 +189,35 @@ class AssessedContractTests(unittest.TestCase):
                 self.state, _ = reduce(self.state, self.event('stop_requested'))
                 self.assertIsNone(self.state.active_run)
                 self.assertEqual(self.state.recent_runs[-1].status, 'completed')
+
+    def test_missing_lead_receives_the_exact_selected_spawn_packet(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.begin(provider)
+                run = replace(self.state.active_run, lead_identity=None, delegations=(), status='assessed',
+                              task='Implement feature A, fix B, and verify both.')
+                self.state = replace(self.state, active_run=run)
+                reason = _stop_block_reason(run)
+                self.assertEqual(reason, {'reason': 'lead_not_started'})
+                action = _render_actions((Action('block_stop', reason),), self.state, provider)[0]
+                text = action.payload['reason']
+                self.assertNotIn('SAME registered lead', text)
+                packet = json.loads(text.split('SYMPHONY_LEAD_SPAWN_PACKET: ', 1)[1])
+                route = run.assessment['route']
+                if provider == 'codex':
+                    self.assertEqual(packet['task_name'], 'symphony_lead_' + route['lead_model'].replace('-', '_').replace('.', '_') + '_' + route['lead_effort'])
+                    self.assertEqual((packet['model'], packet['reasoning_effort'], packet['fork_turns']),
+                                     (route['lead_model'], route['lead_effort'], 'none'))
+                    message = packet['message']
+                else:
+                    self.assertEqual(packet['subagent_type'], f"symphony:symphony-lead-{route['lead_model']}-{route['lead_effort']}")
+                    self.assertTrue(packet['run_in_background'])
+                    message = packet['prompt']
+                self.assertTrue(message.startswith('SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: '))
+                self.assertIn(run.task, message)
+                self.assertIn('Delegate implementation before editing', message)
+                fresh = _render_actions((Action('route_run', {}),), self.state, provider)[0]
+                self.assertEqual(json.loads(fresh.payload['text'].split('SYMPHONY_LEAD_SPAWN_PACKET: ', 1)[1]), packet)
 
     def test_pending_failed_foreign_and_stale_children_cannot_satisfy_scope(self):
         for provider in ('codex', 'claude'):

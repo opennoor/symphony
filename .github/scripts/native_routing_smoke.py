@@ -1924,8 +1924,14 @@ def structured_root_discovery(name, args, *, provider='', document=None, session
                        for root in (original, retained) for relative in (
                            'SKILL.md', 'references/role-contracts.md',
                            'references/provider-activation.md', 'references/capability-routing.md'))
-        return (len(argv) >= 2 and argv[0] == 'cat'
-                and all((project / value).resolve() in allowed for value in argv[1:]))
+        allowed.update((Path(root) / relative).resolve() for root in (original, retained)
+                       for relative in ('profiles.json', 'model-policy.json'))
+        paths = (argv[2:] if len(argv) >= 3 and argv[:2] == ['cat', '--'] else
+                 argv[1:] if len(argv) >= 2 and argv[0] == 'cat' else
+                 argv[3:] if len(argv) == 4 and argv[:2] == ['sed', '-n']
+                    and re.fullmatch(r'[1-9]\d*(?:,[1-9]\d*)?p', argv[2]) else
+                 argv[2:] if len(argv) == 3 and argv[:2] == ['Get-Content', '-LiteralPath'] else [])
+        return bool(paths) and all((project / value).resolve() in allowed for value in paths)
     except (ValueError, OSError):
         return False
 

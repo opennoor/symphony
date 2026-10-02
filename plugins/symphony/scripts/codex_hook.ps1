@@ -5,7 +5,19 @@ $root = [Environment]::GetEnvironmentVariable($(if ($v -eq 'codex') { 'PLUGIN_RO
 $py = $null
 $why = 'No Python executable found'
 $began = [DateTime]::UtcNow
-$cs = @(foreach ($n in 0,1) { foreach ($name in 'python.exe','python3.exe','py.exe') { Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue | Select-Object -Skip $n -First 1 } })
+$discover = {[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); foreach ($n in 0,1) { foreach ($name in 'python.exe','python3.exe','py.exe') { Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue | Select-Object -Skip $n -First 1 | Select-Object Name,Source | ConvertTo-Json -Compress } }}.ToString()
+$cs = @()
+$p = $null
+try {
+$q = [Diagnostics.ProcessStartInfo]::new([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName, '-NoProfile -NonInteractive -Command "' + $discover + '"')
+$q.UseShellExecute = $false
+$q.RedirectStandardOutput = $true
+$q.StandardOutputEncoding = [Text.UTF8Encoding]::new()
+$p = [Diagnostics.Process]::Start($q)
+$out = $p.StandardOutput.ReadToEndAsync()
+if (-not $p.WaitForExit(3000)) { $why = 'Python discovery timed out'; $p.Kill(); [void]$p.WaitForExit(250) }
+if ($out.Wait(250)) { foreach ($line in $out.Result -split '\r?\n') { try { $c = ConvertFrom-Json $line; if ($c.Name -in 'python.exe','python3.exe','py.exe' -and $c.Source -is [string]) { $cs += $c } } catch {} } }
+} catch { $why = 'Python discovery failed: ' + $_.Exception.Message } finally { if ($p) { $p.Dispose() } }
 $enumerationMs = [int]([DateTime]::UtcNow - $began).TotalMilliseconds
 $until = [DateTime]::UtcNow.AddSeconds(4)
 $attempts = 0
