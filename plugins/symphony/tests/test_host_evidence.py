@@ -882,7 +882,9 @@ class CompletionChronologyTests(unittest.TestCase):
             self.rows[self.child] += end('child-turn', self.child_report, 10, 11)
             receipt_at = 8 if handback else 11
             receipt = (row('response_item', {'type': 'agent_message', 'author': '/root/lead/child',
-                'recipient': '/root/lead', 'content': []}, receipt_at) if handback else
+                'recipient': '/root/lead', 'content': [{'type': 'input_text', 'text':
+                    'Message Type: MESSAGE\nTask name: /root/lead\nSender: /root/lead/child\nPayload:\n'
+                    + self.child_report}]}, receipt_at) if handback else
                 row('event_msg', {'type': 'item_completed', 'thread_id': self.lead, 'item': {
                     'type': 'SubAgentActivity', 'kind': 'completed', 'agent_thread_id': self.child,
                     'agent_path': '/root/lead/child'}}, receipt_at))
@@ -988,6 +990,29 @@ class CompletionChronologyTests(unittest.TestCase):
         self.rows[self.lead].pop(-3)
         self.write()
         self.assertEqual(self.check(), 'unknown')
+
+    def test_codex_handback_delivery_can_follow_the_send_ack(self):
+        for case in ('valid', 'encrypted', 'foreign-message', 'missing', 'duplicate', 'early', 'before-send'):
+            with self.subTest(case=case):
+                self.fixture('codex', handback=True)
+                receipt = self.rows[self.lead][-3]
+                receipt['timestamp'] = '2026-10-02T10:00:08.500+00:00'
+                if case == 'encrypted':
+                    packet = {'target': '/root/lead', 'message': 'gAAAAopaque_report'}
+                    self.rows[self.child][3]['payload']['arguments'] = json.dumps(packet)
+                    receipt['payload']['content'] = [
+                        {'type': 'input_text', 'text': 'Message Type: MESSAGE\nTask name: /root/lead\nSender: /root/lead/child\nPayload:\n'},
+                        {'type': 'encrypted_content', 'encrypted_content': packet['message']}]
+                if case == 'foreign-message': receipt['payload']['content'][0]['text'] += 'unrelated'
+                if case == 'missing': self.rows[self.lead].remove(receipt)
+                if case == 'duplicate': self.rows[self.lead].insert(-3, receipt)
+                if case == 'early':
+                    receipt['timestamp'] = self.stamp(10)
+                    self.rows[self.lead][-3:-1] = list(reversed(self.rows[self.lead][-3:-1]))
+                if case == 'before-send': receipt['timestamp'] = self.stamp(6)
+                self.write()
+                expected = 'valid' if case in {'valid', 'encrypted'} else 'early' if case == 'early' else 'unknown'
+                self.assertEqual(self.check(), expected)
 
     def test_missing_foreign_ambiguous_failed_and_unsettled_evidence_is_unknown(self):
         for provider in ('codex', 'claude'):
@@ -1154,11 +1179,13 @@ class CompletionChronologyTests(unittest.TestCase):
                     self.assertEqual(self.check(), 'unknown')
 
     def test_claude_null_terminal_needs_the_existing_exact_parent_completion_proof(self):
-        for foreground in (False, True):
+        from itertools import product
+        from plugins.symphony.tests.test_claude_historical_sendmessage import HANDBACK_FRAME
+        for foreground, stop_reason in product((False, True, 'framed'), (None, 'end_turn')):
             for bad in (False, True):
-                with self.subTest(foreground=foreground, bad=bad):
+                with self.subTest(foreground=foreground, stop_reason=stop_reason, bad=bad):
                     self.fixture('claude')
-                    self.rows[self.child][-1]['message']['stop_reason'] = None
+                    self.rows[self.child][-1]['message']['stop_reason'] = stop_reason
                     lead = self.rows[self.lead]
                     if foreground:
                         lead[1]['message']['content'][0]['input']['run_in_background'] = False
@@ -1167,7 +1194,12 @@ class CompletionChronologyTests(unittest.TestCase):
                             {'type': 'text', 'text': 'foreign' if bad else self.child_report},
                             {'type': 'text', 'text': f"agentId: {self.child} (use SendMessage with to: '{self.child}', "
                              "summary: '<5-10 word recap>' to continue this agent)\n"
-                             '<usage>subagent_tokens: 1\ntool_uses: 0\nduration_ms: 1</usage>'}]
+                               '<usage>subagent_tokens: 1\ntool_uses: 0\nduration_ms: 1</usage>'}]
+                        if foreground == 'framed':
+                            report, footer = lead[2]['message']['content'][0]['content']
+                            lead[2]['message']['content'][0]['content'] = [{'type': 'text',
+                                'text': HANDBACK_FRAME + '\n  ' + report['text'].replace('\n', '\n  ')
+                                    + '\n' + footer['text']}]
                         lead.pop(-2)
                     else:
                         lead[-2]['origin']['producer'] = 'foreign' if bad else 'session-task'

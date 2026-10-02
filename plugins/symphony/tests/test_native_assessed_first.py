@@ -392,6 +392,7 @@ class NativeAssessedFirstTests(unittest.TestCase):
                             smoke.shlex.join(['cat', str(Path(original) / 'skills/symphony/SKILL.md')]),
                             smoke.shlex.join(['cat', str(Path(retained) / 'skills/symphony/references/role-contracts.md')]),
                             'cat AGENTS.md']
+                commands.extend([commands[1] + ' && ' + commands[2], commands[2] + '; cat AGENTS.md'])
                 reference = str(Path(retained) / 'skills/symphony/references/role-contracts.md')
                 for arguments in (['cat', '--', reference], ['sed', '-n', '1,200p', reference],
                                   ['Get-Content', '-LiteralPath', reference],
@@ -426,7 +427,9 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 write()
                 self.assertTrue(smoke.assessed_first_verified('codex', document, run, children, home, project, profile))
                 for command in ('python -m unittest -q', 'cat greet.py', 'cat AGENTS.md; touch greet.py',
-                                'cat AGENTS.md && true', 'cat $(touch greet.py)/AGENTS.md', commands[0] + '; true',
+                                'cat AGENTS.md && true', 'cat AGENTS.md &&', '&& cat AGENTS.md',
+                                'cat AGENTS.md & cat AGENTS.md', 'cat AGENTS.md || cat AGENTS.md',
+                                'cat $(touch greet.py)/AGENTS.md', commands[0] + '; true',
                                 'sed -i s/a/b/ AGENTS.md', 'sed -n 1,200p greet.py',
                                 'Get-Content -LiteralPath greet.py', 'Get-Content -LiteralPath AGENTS.md | Remove-Item greet.py'):
                     with self.subTest(rejected=command):
@@ -453,10 +456,12 @@ class NativeAssessedFirstTests(unittest.TestCase):
         document['activation'] = {'codex': {'session_id': run['session_id'],
             'runtime_root': retained, 'plugin_root': original}}
         lookup = 'const t = ALL_TOOLS.filter(x => /symphony|activation|assess/i.test(x.name+" "+x.description));\ntext(t);'
+        serialized = ('const matches = ALL_TOOLS.filter(x => /check_activation|symphony/i.test(x.name+" "+x.description));\n'
+                      'text(JSON.stringify(matches));')
         checker = ('const r=await tools.exec_command({cmd:'
                    + json.dumps(smoke._retained_activation_command(retained, original))
                    + '});\ntext(JSON.stringify(r));')
-        for ordinal, source in enumerate((lookup, checker)):
+        for ordinal, source in enumerate((lookup, serialized, checker)):
             self.assertTrue(smoke.structured_root_discovery('exec', source, provider='codex',
                 document=document, session=run['session_id'], project=project))
             roots.insert(1 + ordinal, {'type': 'response_item', 'timestamp': at(0), 'payload': {

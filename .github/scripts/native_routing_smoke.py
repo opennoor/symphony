@@ -1896,8 +1896,8 @@ def structured_root_discovery(name, args, *, provider='', document=None, session
     if provider == 'codex' and name in {'exec', 'functions.exec'} and isinstance(args, str):
         # Reading the tool catalogue cannot inspect or alter the project.
         metadata = (r'const (?P<result>\w+)\s*=\s*ALL_TOOLS\.filter\(x\s*=>\s*'
-                    r'/[a-z|]+/i?\.test\(x\.name\s*\+\s*" "\s*\+\s*x\.description\)\);\s*'
-                    r'text\((?P=result)\);?')
+                    r'/[a-z_|]+/i?\.test\(x\.name\s*\+\s*" "\s*\+\s*x\.description\)\);\s*'
+                    r'text\((?:(?P=result)|JSON\.stringify\((?P=result)\))\);?')
         if re.fullmatch(metadata, args.strip()):
             return True
     if provider != 'codex' or not isinstance(document, dict) or project is None:
@@ -1945,12 +1945,21 @@ def structured_root_discovery(name, args, *, provider='', document=None, session
         allowed.update((Path(root) / relative).resolve() for root in (original, retained)
                        for relative in ('profiles.json', 'model-policy.json',
                            '.codex-plugin/migrated-command-skills/source-command-help/SKILL.md'))
-        paths = (argv[2:] if len(argv) >= 3 and argv[:2] == ['cat', '--'] else
-                 argv[1:] if len(argv) >= 2 and argv[0] == 'cat' else
-                 argv[3:] if len(argv) == 4 and argv[:2] == ['sed', '-n']
-                    and re.fullmatch(r'[1-9]\d*(?:,[1-9]\d*)?p', argv[2]) else
-                 argv[2:] if len(argv) == 3 and argv[:2] == ['Get-Content', '-LiteralPath'] else [])
-        return bool(paths) and all((project / value).resolve() in allowed for value in paths)
+        commands = [[]]
+        for word in argv:
+            if word in {'&&', ';'}:
+                commands.append([])
+            else:
+                commands[-1].append(word)
+        for command in commands:
+            paths = (command[2:] if len(command) >= 3 and command[:2] == ['cat', '--'] else
+                     command[1:] if len(command) >= 2 and command[0] == 'cat' else
+                     command[3:] if len(command) == 4 and command[:2] == ['sed', '-n']
+                        and re.fullmatch(r'[1-9]\d*(?:,[1-9]\d*)?p', command[2]) else
+                     command[2:] if len(command) == 3 and command[:2] == ['Get-Content', '-LiteralPath'] else [])
+            if not paths or not all((project / value).resolve() in allowed for value in paths):
+                return False
+        return True
     except (ValueError, OSError):
         return False
 
