@@ -11,7 +11,7 @@ from unittest.mock import patch
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony.reducer import _substantive_child_completed, _stop_block_reason, reduce
 from plugins.symphony.symphony.store import StateStore
-from plugins.symphony.symphony.routing import Assessment
+from plugins.symphony.symphony.routing import Assessment, snapshot_for
 from plugins.symphony.symphony.runtime import (
     _accept_assessment, _observe_delegation, _queue_pending_delegation,
     _recovery_guidance, _render_actions,
@@ -85,6 +85,87 @@ class AssessedContractTests(unittest.TestCase):
     def worker(self, identity='worker', turn='worker-1', *, status='completed', parent=None):
         self.child(identity, 'worker', False, turn, parent=parent)
         return self.child(identity, 'worker', True, turn, status=status, parent=parent)
+
+    def late_assessor(self, provider):
+        self.begin(provider)
+        self.state = replace(self.state, event_history=(), active_run=replace(
+            self.state.active_run, status='assessing', assessment={}, lead_identity=None, delegations=()))
+        fields = {'provider': provider, 'session_id': 'root', 'agent_id': 'assessor', 'role': 'assessor',
+                  'task': 'SYMPHONY_ROLE: assessor', 'model': snapshot_for(provider).tiers['strongest'],
+                  'model_reasoning_effort': 'high', 'turn_id' if provider == 'codex' else 'prompt_id': 'assessor-turn'}
+        self.state, _ = _observe_delegation(self.state, self.event('subagent_started', **fields), self.environ)
+        self.state, _ = _accept_assessment(self.state, self.event('pre_tool_use'), provider,
+            {'message': 'SYMPHONY_ROLE: lead'}, Assessment('small', 'simple'))
+        self.child('lead', 'lead', False, 'lead-1')
+        self.worker()
+        return fields
+
+    def test_late_original_assessor_confirms_without_expiring_completed_worker(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                fields = self.late_assessor(provider)
+                contract = self.state.active_run.assessment['substantive_contract']
+                proofs = self.state.active_run.assessment['_substantive_children']
+                self.assertTrue(_substantive_child_completed(self.state.active_run))
+                stopped = self.event('subagent_stopped', **fields, status='completed', last_assistant_message=
+                    'SYMPHONY_ASSESSMENT: {"size":"small","complexity":"simple","risk":"normal","rationale":"Confirmed after handback"}')
+                if provider == 'claude':
+                    stopped = replace(stopped, payload={**stopped.payload, 'prompt_id': 'later-root-context'})
+                self.state, _ = _observe_delegation(self.state, stopped, self.environ)
+                self.assertEqual(self.state.active_run.assessment['substantive_contract'],
+                                 {key: value for key, value in contract.items() if key != 'confirmation'})
+                self.assertEqual(self.state.active_run.assessment['_substantive_children'], proofs)
+                self.assertTrue(_substantive_child_completed(self.state.active_run))
+                before = self.state
+                self.state, _ = _observe_delegation(self.state, stopped, self.environ)
+                self.assertEqual(self.state, before)
+                self.child('lead', 'lead', True, 'lead-1')
+                self.state, _ = reduce(self.state, self.event('stop_requested'))
+                self.assertIsNone(self.state.active_run)
+                self.assertEqual(self.state.recent_runs[-1].status, 'completed')
+
+    def test_assessor_confirmation_is_single_use_not_a_later_terminal_shortcut(self):
+        fields = self.late_assessor('claude')
+        report = 'SYMPHONY_ASSESSMENT: {"size":"small","complexity":"simple","risk":"normal"}'
+        self.state, _ = _observe_delegation(self.state, self.event('subagent_stopped',
+            **{**fields, 'prompt_id': 'first-root-context'}, status='completed', last_assistant_message=report), self.environ)
+        contract = self.state.active_run.assessment['substantive_contract']
+        self.assertTrue(_substantive_child_completed(self.state.active_run))
+        self.state, _ = _observe_delegation(self.state, self.event('subagent_stopped',
+            **{**fields, 'prompt_id': 'later-context'}, status='completed', last_assistant_message=report), self.environ)
+        self.assertNotEqual(self.state.active_run.assessment['substantive_contract']['epoch'], contract['epoch'])
+        self.assertFalse(_substantive_child_completed(self.state.active_run))
+
+    def test_changed_assessment_invocation_or_scope_never_reuses_worker_credit(self):
+        for provider in ('codex', 'claude'):
+            for case in ('reassess', 'risk', 'profile', 'generation', 'run', 'session', 'provider',
+                         'foreign-assessor', 'restarted-assessor', 'foreign-callback-session',
+                         'foreign-native-turn', 'predates-start'):
+                with self.subTest(provider=provider, case=case):
+                    fields = self.late_assessor(provider)
+                    original = self.state.active_run.assessment['substantive_contract']
+                    sizing = Assessment('small', 'simple', 'high' if case == 'risk' else 'normal')
+                    run = self.state.active_run
+                    if case == 'reassess': self.state = replace(self.state, needs_reassessment=True)
+                    if case == 'generation': self.state = replace(self.state, active_run=replace(run, owner_generation=2))
+                    if case == 'run': self.state = replace(self.state, active_run=replace(run, run_id='new-run'))
+                    if case == 'session': self.state = replace(self.state, active_run=replace(run, session_id='new-root'))
+                    if case == 'provider': self.state = replace(self.state, active_run=replace(run, provider='foreign'))
+                    if case == 'profile':
+                        recorded = {**run.assessment, 'route': {**run.assessment['route'], 'profile': 'foreign'}}
+                        self.state = replace(self.state, active_run=replace(run, assessment=recorded))
+                    if case == 'foreign-assessor': fields['agent_id'] = 'foreign'
+                    if case == 'foreign-callback-session': fields['session_id'] = 'foreign'
+                    if case == 'foreign-native-turn': fields['turn_id'] = 'foreign-native-turn'
+                    if case == 'restarted-assessor':
+                        self.state, _ = _observe_delegation(self.state, self.event('subagent_started',
+                            **{**fields, 'turn_id' if provider == 'codex' else 'prompt_id': 'new-assessor-turn'}), self.environ)
+                    source = self.event('subagent_stopped', **fields)
+                    if case == 'predates-start': source = replace(source, observed_at='2026-10-01T13:00:00+00:00')
+                    self.state, _ = _accept_assessment(self.state, source,
+                                                       provider, {}, sizing)
+                    self.assertNotEqual(self.state.active_run.assessment['substantive_contract']['epoch'], original['epoch'])
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
 
     def test_missing_worker_recovers_same_lead_then_archives_cleanly(self):
         for provider in ('codex', 'claude'):

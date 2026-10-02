@@ -945,6 +945,33 @@ class NativeRoutingEvidenceTests(unittest.TestCase):
         self.assertEqual(smoke.assistant_text("claude", report), "SYMPHONY_FAST_DECISION: escalate")
         self.assertFalse(smoke.fast_turn_has_only_escalation("claude", [call], []))
 
+    def test_literal_shell_apply_patch_requires_bound_cwd_and_successful_native_result(self):
+        project = Path('/fixture')
+        patch = "*** Begin Patch\n*** Update File: greet.py\n@@\n-    return f'hello, {name}!'\n+    return f'Hello, {name}!'\n*** End Patch"
+        command = "apply_patch <<'PATCH'\n" + patch + "\nPATCH"
+        body = "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nM greet.py\n"
+        def evidence(command=command, body=body, workdir='/fixture', suffix=''):
+            source = 'const r = await tools.exec_command(' + json.dumps({'cmd': command, 'workdir': workdir}) + ');\ntext(r.output);' + suffix
+            output = json.dumps([{'type': 'input_text', 'text': 'Script completed\n'},
+                                 {'type': 'input_text', 'text': body}])
+            return [('exec', source, '', output)]
+        self.assertTrue(smoke.fixture_edit('codex', evidence(), project))
+        hidden_patch = "*** Begin Patch\n*** Update File: other.py\n@@\n-a\n+b\n*** End Patch\nPATCH\n: <<'REST'\n*** Update File: greet.py\n*** End Patch"
+        self.assertFalse(smoke.fixture_edit('codex', evidence(
+            command="apply_patch <<'PATCH'\n" + hidden_patch + "\nPATCH",
+            body=body.replace('M greet.py', 'M other.py')), project))
+        for altered in (evidence(body=body.replace('Exit code: 0', 'Exit code: 1')),
+                        evidence(body='Success. Updated the following files:\nM greet.py'),
+                        evidence(workdir='/foreign'), evidence(command=command + '\necho success'),
+                        evidence(command=command.replace('greet.py', '../greet.py')),
+                        evidence(command=command.replace("<<'PATCH'", '<<PATCH')),
+                        evidence(suffix='text("forged success");')):
+            self.assertFalse(smoke.fixture_edit('codex', altered, project))
+        # Braces and key-like text inside a quoted string are data.
+        value = {'cmd': "cat file,{private:unchanged}", 'workdir': '/fixture'}
+        source = 'text(await tools.exec_command(' + json.dumps(value) + '));'
+        self.assertEqual(smoke.composed_call(source, 'exec_command'), value)
+
     def test_verification_requires_an_executed_unittest_command(self):
         output = '"exit_code": 0, "output": "Ran 2 tests. OK"'
         self.assertTrue(smoke.unittest_verified([("exec_command", {"cmd": "python -m unittest -q"}, "", output)]))

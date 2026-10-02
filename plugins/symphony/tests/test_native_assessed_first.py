@@ -224,6 +224,11 @@ class NativeAssessedFirstTests(unittest.TestCase):
                 check = lambda values: smoke.lead_verifies_after_worker_returns(
                     provider, values, [worker], children, Path('/fixture'), run)
                 self.assertTrue(check(rows))
+                if provider == 'codex':
+                    rejected = call('spawn_agent', {}, 'rejected', 0)
+                    refusal = result('rejected', 'unused', 0)
+                    refusal['payload']['output'] = 'agent_name must use only lowercase letters, digits, and underscores'
+                    self.assertTrue(check([rejected, refusal, *rows]))
                 early = deepcopy(verify); early['timestamp'] = at(3)
                 early_result = deepcopy(checked); early_result['timestamp'] = at(4)
                 self.assertFalse(check([launch, launched, early, early_result]))

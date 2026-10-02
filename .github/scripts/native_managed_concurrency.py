@@ -3097,7 +3097,9 @@ def claude_literal_worker_probe(run, home):
             handbacks = [call for call in calls if call[1] == 'SubagentHandback']
             item.update(native_reader_available=True, assistant_count=len(assistants),
                 final_activity_is_terminal=bool(activity) and activity[-1] is terminal,
-                terminal_is_end_turn=terminal.get('message', {}).get('stop_reason') == 'end_turn',
+                  terminal_is_end_turn=terminal.get('message', {}).get('stop_reason') == 'end_turn',
+                  terminal_stop_reason_present='stop_reason' in terminal.get('message', {}),
+                  terminal_stop_reason_null=terminal.get('message', {}).get('stop_reason') is None,
                 terminal_has_uuid=bool(terminal.get('uuid')),
                 prior_end_turn_count=sum(row.get('message', {}).get('stop_reason') == 'end_turn' for row in assistants[:-1]),
                 api_error_count=sum(row.get('isApiErrorMessage') is True for row in assistants),
@@ -3859,14 +3861,24 @@ def failure_state(root, provider):
         if provider == 'claude' and case == 'case' and (root / 'claude-home').is_dir():
             native_home = root / 'claude-home'
         recovery_probes = {}
-        if provider == "claude" and case == "live-update":
-            native_home = root / "claude-live-update-home"
+        if provider == "claude":
+            from native_claude_followup import sequence_rejection_probe
+            from symphony import host_evidence
+            from symphony.model import Event
+            from symphony.store import _state_from_dict
             for label, session in cli_sessions.items():
+                project = case_root / ("second" if label == "b" and
+                                       (case_root / "second").exists() else "primary")
                 if f"claude:{session}" in document.get("active_runs", {}):
-                    project = case_root / ("second" if label == "b" and
-                                           (case_root / "second").exists() else "primary")
                     recovery_probes[label] = claude_recovery_probe(
                         document, session, project, native_home)
+                pending = [Event(item["event_id"], item["kind"], item["observed_at"], item["payload"])
+                           for record in raw_session_records if record.get("owner_session") == session
+                           for item in record.get("pending", ())]
+                if pending:
+                    recovery_probes.setdefault(label, {})["archived_sequence"] = sequence_rejection_probe(
+                        _state_from_dict(document), pending, session, project,
+                        {"CLAUDE_CONFIG_DIR": str(native_home)}, host_evidence, mixed=True)
         completion_probes = {}
         if provider == "codex":
             native_home = (root / "codex-live-update-home" if case == "live-update" else
@@ -3936,6 +3948,7 @@ def failure_state(root, provider):
     elif provider == "claude":
         for case in cases:
             home = (root / "claude-live-update-home" if case["case"] == "live-update" else
+                    root / "claude-home" if case["case"] == "case" and (root / "claude-home").is_dir() else
                     root / "claude-baseline-home")
             runs = [*case["active_runs"], *case["recent_runs"]]
             for label, session in case["cli_session_ids"].items():

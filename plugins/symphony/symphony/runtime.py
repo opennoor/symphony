@@ -2461,6 +2461,11 @@ def _observe_delegation(
             return state, opening
         updated = dict(assessment)
         updated["_start_event_ids"] = (*assessment.get("_start_event_ids", ()), source.event_id)
+        if _observed_role(source.payload) == 'assessor':
+            starts = dict(assessment.get('_assessor_starts', {}))
+            starts[str(identity)] = {'event_id': source.event_id, 'observed_at': source.observed_at,
+                                    'turn': token, 'turn_kind': _child_turn_kind(source.payload)}
+            updated['_assessor_starts'] = starts
         if source.payload.get("provider") == "codex":
             active_turns = dict(assessment.get("_active_turns", {}))
             # An accepted start without a native turn ID is still a new epoch.
@@ -3595,9 +3600,46 @@ def _accept_assessment(
         "topology": route.execution,
         "route": route_data,
     }
+    run = state.active_run
+    recorded = run.assessment if run else {}
+    contract = recorded.get('substantive_contract', {})
+    confirmation = contract.get('confirmation', {}) if isinstance(contract, Mapping) else {}
+    assessor = str(source.payload.get('agent_id') or source.payload.get('subagent_id') or '')
+    start = recorded.get('_assessor_starts', {}).get(assessor, {})
+    starts = [item for item in state.event_history if item.kind == 'delegation_updated'
+              and item.payload.get('identity') == assessor and item.payload.get('role') == 'assessor'
+              and item.payload.get('state') == 'working']
+    if (run and not state.needs_reassessment and source.kind == 'subagent_stopped'
+            and _observed_role(source.payload) == 'assessor' and starts
+            and provider == run.provider and source.payload.get('session_id') == run.session_id
+            and confirmation == {'assessor': assessor, 'start_event_id': starts[-1].event_id,
+                                 'run_id': run.run_id, 'session': run.session_id,
+                                 'provider': provider, 'generation': run.owner_generation, 'native_start': start}
+            and _instant(start.get('observed_at')) is not None and _instant(source.observed_at) is not None
+            and _instant(source.observed_at) >= _instant(start['observed_at'])
+            and _substantive_turn_matches(provider, start.get('turn'), _child_turn_token(source.payload),
+                                          start.get('turn_kind'), _child_turn_kind(source.payload))
+            and all(recorded.get(key) == accepted[key] for key in ('size', 'complexity', 'risk', 'route'))):
+        # The lead may receive the report before the assessor's Stop callback.
+        # Confirmation of that same invocation must not expire its workers.
+        confirmed = {key: value for key, value in contract.items() if key != 'confirmation'}
+        return replace(state, active_run=replace(run, assessment={**recorded,
+                       'substantive_contract': confirmed})), ()
     if route.execution in {'delegated', 'mixed'}:
         accepted['substantive_contract'] = {'version': 1, 'epoch': source.event_id,
                                             'accepted_at': source.observed_at}
+        if run and provider == run.provider and _marker_value(values, 'SYMPHONY_ROLE:') == 'lead':
+            waiting = [item for item in run.delegations if item.role == 'assessor' and item.state == 'working']
+            if len(waiting) == 1:
+                starts = [item for item in state.event_history if item.kind == 'delegation_updated'
+                          and item.payload.get('identity') == waiting[0].identity
+                          and item.payload.get('role') == 'assessor' and item.payload.get('state') == 'working']
+                native_start = recorded.get('_assessor_starts', {}).get(waiting[0].identity)
+                if starts and isinstance(native_start, Mapping):
+                    accepted['substantive_contract']['confirmation'] = {
+                        'assessor': waiting[0].identity, 'start_event_id': starts[-1].event_id,
+                        'run_id': run.run_id, 'session': run.session_id,
+                        'provider': provider, 'generation': run.owner_generation, 'native_start': dict(native_start)}
     return reduce(state, _derived(state, source, "assessment_accepted", accepted, "assessment"))
 
 
@@ -4104,6 +4146,7 @@ def _claude_guidance(state: ProjectState | None, session_id: str = "") -> str:
     return (
         access +
         f"On Claude Code, spawn the assessor as `symphony:symphony-assessor-{assessor['model']}-{assessor['effort']}` "
+        "using that exact `subagent_type`, without a model alias override, "
         "and the lead by its assessed cell: " + "; ".join(cells) + ". "
         "Agents run in the background: after a spawn, end your turn and Claude Code wakes you with the "
         "agent's result. Never wait by polling with Bash, sleep, Monitor, or by reading the agent's output "
@@ -4167,8 +4210,8 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
     """The same assessor/lead packet contract for escalation and direct assessment."""
     claude = _claude_guidance(state, session_id) if provider == "claude" else ""
     codex = (
-        "On Codex, use `fork_turns=\"none\"` for assessor and assessed lead, name them "
-          "`symphony_<role>_<model>_<effort>` with a unique underscore suffix if occupied, and require one exact "
+        "On Codex, use `fork_turns=\"none\"` for assessor and assessed lead. Task names replace model punctuation "
+        "with underscores: gpt-6.1-sol becomes gpt_6_1_sol. Append a unique suffix if occupied. Require one exact "
         "`SYMPHONY_ASSESSMENT: {\"size\":\"small|medium|large\",\"complexity\":\"simple|mixed|complex\",\"risk\":\"normal|high\","
         "\"rationale\":\"...\",\"topology\":\"...\"}` line. "
         if provider == "codex"
@@ -4185,11 +4228,13 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         requested = _boost_preference(state, provider, session_id)
         selected = assessor_selection(_snapshot(state, provider), requested)
         model, effort = selected["model"], selected["effort"]
+        task_name = f"symphony_assessor_{re.sub(r'[^a-z0-9]', '_', model)}_{effort}"
         spawn = (f"Use agent type `symphony:symphony-assessor-{model}-{effort}`. " if provider == "claude"
-                 else f"Pass `model=\"{model}\"`, `reasoning_effort=\"{effort}\"`, and `fork_turns=\"none\"`. ")
+                 else f"Pass `task_name=\"{task_name}\"`, `model=\"{model}\"`, "
+                 f"`reasoning_effort=\"{effort}\"`, and `fork_turns=\"none\"`. ")
         boost = _boost_status(state, provider, session_id) + " " + spawn
     return (
-        "Symphony owns execution topology. Keep the root thin. Spawn the selected assessor with explicit model "
+        "Keep the root thin. Spawn the selected assessor with explicit model "
         "and effort and put `SYMPHONY_ROLE: assessor` on its own line. Then select the lead mechanically from the "
         "nine-cell matrix; the assessor must not become the lead. Spawn the lead with explicit model and effort, "
         "put `SYMPHONY_ROLE: lead` on its own line, and include one exact line in its task: "
@@ -4201,7 +4246,7 @@ def _assessed_guidance(task: str, provider: str, state: ProjectState | None, ses
         'Relay the child spawn protocol in the lead packet: on Codex every worker uses `fork_turns="none"`, '
         'explicit model/reasoning_effort from its own cell, underscore `symphony_worker_<model>_<effort>` '
           'task name with a unique suffix if occupied, and a packet starting `SYMPHONY_ROLE: worker`. '
-        "The matrix fixes execution topology; the assessor's topology is advisory. Relay this lead contract: "
+        "Relay this matrix lead contract (assessor topology is advisory): "
         "assign substantive work to workers or consultants; small tasks need one worker, medium tasks need "
         "bounded worker packets, and large tasks delegate project work. The lead coordinates, integrates, "
         "and verifies results. Use the matrix for each child packet's own size/complexity. "

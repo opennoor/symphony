@@ -1456,20 +1456,24 @@ def tool_evidence(provider, rows):
 JSON_STRING = r'"(?:[^"\\]|\\.)*"'
 
 
-def composed_call(source, method):
+def composed_call(source, method, *, output_only=False):
     """Recognize only a single literal native tool invocation, never evaluate JS."""
     if not isinstance(source, str):
         return None
     source = re.sub(r'^\s*// @exec:[^\n]*\n', '', source).strip()
-    argument = JSON_STRING if method == "apply_patch" else r'\{[^{}]*\}'
+    argument = JSON_STRING if method == "apply_patch" else rf'\{{(?:{JSON_STRING}|[^{{}}"])*\}}'
     call = rf'tools\.{method}\((?P<argument>{argument})\)'
-    for wrapper in (rf'text\(await {call}\);?',
-                    rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\);?'):
+    wrappers = [rf'text\(await {call}\);?',
+                rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\);?']
+    if output_only:
+        wrappers.append(rf'const (?P<result>\w+) = await {call};\s*text\((?P=result)\.output\);?')
+    for wrapper in wrappers:
         match = re.fullmatch(wrapper, source, re.DOTALL)
         if match:
             value = match['argument']
             if method == "exec_command":
-                value = re.sub(r'([{,]\s*)([A-Za-z_]\w*)(\s*:)', r'\1"\2"\3', value)
+                value = re.sub(JSON_STRING + r'|([{,]\s*)([A-Za-z_]\w*)(\s*:)',
+                    lambda match: match[0] if match[1] is None else f'{match[1]}"{match[2]}"{match[3]}', value)
             try:
                 return json.loads(value)
             except ValueError:
@@ -1501,6 +1505,34 @@ def fixture_edit(provider, evidence, project):
                     and blocks[1].get("text") == "{}" and "Failed" not in output)
             except (ValueError, AttributeError):
                 pass
+        if provider == 'codex' and name in {'exec_command', 'exec', 'functions.exec'} and not patch:
+            details = arguments if name == 'exec_command' else composed_call(arguments, 'exec_command', output_only=True)
+            if not isinstance(details, dict):
+                continue
+            shell = re.fullmatch(r"apply_patch <<'(?P<delimiter>[A-Z_]+)'\n(?P<patch>\*\*\* Begin Patch\n.*\n\*\*\* End Patch)\n(?P=delimiter)",
+                                 details.get('cmd', ''), re.DOTALL)
+            if (not shell or shell['delimiter'] in shell['patch'].splitlines()
+                    or Path(details.get('workdir', project)).resolve() != project.resolve()):
+                continue
+            try:
+                native = json.loads(output)
+                if name in {'exec', 'functions.exec'}:
+                    if (not isinstance(native, list) or len(native) != 2
+                            or not native[0].get('text', '').startswith('Script completed')
+                            or native[1].get('type') != 'input_text'):
+                        continue
+                    native = native[1]['text']
+                    try:
+                        native = json.loads(native)
+                    except ValueError:
+                        pass
+                positive_result = ((isinstance(native, dict) and type(native.get('exit_code')) is int
+                                    and native['exit_code'] == 0 and 'Success. Updated the following files:' in native.get('output', ''))
+                                   or (isinstance(native, str) and native.startswith('Exit code: 0\n')
+                                       and 'Success. Updated the following files:' in native))
+                patch = shell['patch']
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
         if positive_result and isinstance(patch, str) and patch.startswith("*** Begin Patch\n") and patch.rstrip().endswith("*** End Patch"):
             paths = re.findall(r'^\*\*\* (?:Update|Add) File: (.+)$', patch, re.MULTILINE)
             if any((Path(path) if Path(path).is_absolute() else project / path).resolve() == target.resolve() for path in paths):
@@ -2030,6 +2062,26 @@ def assessed_first_probe(provider, document, run, home, project):
             if isinstance(calls, (tuple, list)):
                 facts['root_call_count'] = len(calls)
                 facts['root_launch_count'] = sum(item[1] in {'Agent', 'spawn_agent'} for item in calls)
+                facts['pre_admission_unsupported_calls'] = sum(item != frame.f_locals.get('call')
+                    and frame.f_locals.get('accepted') is not None and item[3] <= frame.f_locals['accepted']
+                    and not (structured_root_discovery(item[1], item[2])
+                             or provider == 'codex' and item[1] == 'wait_agent' and isinstance(item[2], dict))
+                    for item in calls)
+            args = frame.f_locals.get('args', {})
+            call = frame.f_locals.get('call')
+            paired = frame.f_locals.get('paired', ())
+            expected = frame.f_locals.get('expected')
+            meta = frame.f_locals.get('meta', {})
+            if isinstance(args, dict) and call:
+                facts.update(first_type_matches=args.get('subagent_type') == frame.f_locals.get('label')
+                             if provider == 'claude' else args.get('task_name') == frame.f_locals.get('task'),
+                    first_explicit_model_present='model' in args,
+                    first_model_matches=args.get('model', expected) == expected,
+                    first_effort_matches=args.get('reasoning_effort') == 'high' if provider == 'codex' else True,
+                    first_fork_none=args.get('fork_turns') == 'none' if provider == 'codex' else True,
+                    first_result_count=len(paired), first_result_failed=bool(paired) and paired[0][3],
+                    first_meta_call_matches=meta.get('toolUseId') == call[0] if provider == 'claude' else True,
+                    first_meta_type_matches=meta.get('agentType') == frame.f_locals.get('label') if provider == 'claude' else True)
         return trace
     previous = sys.gettrace()
     try:
@@ -2060,7 +2112,11 @@ def lead_verifies_after_worker_returns(provider, lead_rows, workers, child_rows,
                 output, when, _, _ = paired[0]
                 if provider == 'codex':
                     header = child_rows[worker['identity']][0]['payload']
-                    exact = isinstance(output, str) and json.loads(output).get('task_name') == header.get('agent_path')
+                    try:
+                        launched = json.loads(output) if isinstance(output, str) else None
+                    except ValueError:
+                        continue  # A rejected launch is not the later successful child's launch.
+                    exact = isinstance(launched, dict) and launched.get('task_name') == header.get('agent_path')
                 else:
                     proof = (run or {}).get('assessment', {}).get('_substantive_children', {}).get(worker['identity'], {})
                     scope = {'run_id': (run or {}).get('run_id'), 'lead': (run or {}).get('lead_identity'),
@@ -2151,6 +2207,8 @@ def lead_integration_probe(provider, run, home, project):
                          returned_workers=len(values.get('returned', ())),
                          worker_matches=len(values.get('matches', ())),
                          integration_boundary_present=values.get('boundary') is not None)
+        elif kind == 'exception':
+            facts.update(exception_type=result[0].__name__, exception_line=frame.f_lineno)
         return trace
     previous = sys.gettrace()
     try:

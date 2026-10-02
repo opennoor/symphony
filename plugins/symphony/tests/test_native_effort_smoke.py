@@ -39,3 +39,13 @@ class NativeEffortSmokeTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 0, "OK", "")):
             with self.assertRaisesRegex(RuntimeError, "not reported"):
                 smoke.check("codex", Path(__file__).parents[1])
+
+    def test_failed_native_budget_is_reported_without_message_contents(self):
+        version = subprocess.CompletedProcess([], 0, "native-version", "")
+        failure = subprocess.CompletedProcess([], 1, json.dumps({
+            "subtype": "error_max_budget_usd", "result": "private native message"}), "private stderr")
+        with patch.object(smoke.shutil, "which", return_value="claude"), patch.object(
+                smoke.subprocess, "run", side_effect=[version, failure]):
+            with self.assertRaises(RuntimeError) as caught:
+                smoke.check("claude", Path(__file__).parents[1])
+        self.assertEqual(str(caught.exception), "claude command failed (exit 1); error_max_budget_usd")
