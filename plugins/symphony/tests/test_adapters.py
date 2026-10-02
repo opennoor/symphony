@@ -161,6 +161,22 @@ class AdapterContractTests(unittest.TestCase):
                 self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
                                  "Final.")
 
+    def test_non_string_claude_callback_cannot_import_a_handback(self):
+        rows = [
+            {"type": "user", "uuid": "turn", "message": {"content": "Task."}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SubagentHandback",
+                "input": {"message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Final."}]}}]
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "child.jsonl"
+            transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding="utf-8")
+            for callback in (None, False, 0, []):
+                with self.subTest(callback=callback):
+                    payload = {"hook_event_name": "SubagentStop", "agent_id": "child",
+                               "agent_transcript_path": str(transcript), "last_assistant_message": callback}
+                    self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
+                                     callback)
+
     def test_claude_handback_stays_in_its_native_child_turn(self):
         blocked = 'SYMPHONY_OUTCOME: {"status":"blocked"}'
         completed = 'SYMPHONY_OUTCOME: {"status":"completed"}'

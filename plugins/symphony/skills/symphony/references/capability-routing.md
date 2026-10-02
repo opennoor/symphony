@@ -6,7 +6,7 @@
 |---|---|---|---|
 | small / simple | capable/medium | delegated, one worker | none |
 | small / mixed | capable/high | delegated, one worker | optional narrow |
-| small / complex | strongest/high | delegated, one worker | optional independent check |
+| small / complex | strongest/high | delegated, one worker | required independent check |
 | medium / simple | balanced/medium | selective delegation | none |
 | medium / mixed | balanced/high | selective delegation | optional narrow |
 | medium / complex | capable/high | selective delegation | reserve one slot |
@@ -14,7 +14,7 @@
 | large / mixed | economy/medium | administrative delegation | reserve one slot |
 | large / complex | economy/medium | administrative delegation | strongest/high bounded decisions |
 
-Risk is `normal` or `high`. `high` raises a lead effort of `low` to `medium` and requires an independent check. Risk never changes the reported size or complexity. Reserved consultation means an available concurrency slot, not an idle agent.
+Risk is `normal` or `high`. `high` raises a lead effort of `low` to `medium` and requires an independent check. A different worker or consultant reviews completed substantive work and reports `SYMPHONY_REVIEW: passed` only after resolving findings. Risk never changes the reported size or complexity. Reserved consultation means an available concurrency slot, not an idle agent.
 
 The fixed matrix and these risk rules are authoritative for topology; an assessor's recommended topology is advisory input. Assessed substantive work goes to workers or consultants. Small tasks need one worker; medium tasks use bounded worker packets. The lead coordinates, integrates, and verifies results. `mixed` means worker execution with lead integration and verification.
 

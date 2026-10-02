@@ -125,7 +125,7 @@ class RuntimeTests(unittest.TestCase):
         ))
         return run
 
-    def complete_substantive_worker(self, provider='codex', environ=None):
+    def complete_substantive_worker(self, provider='codex', environ=None, *, review=False):
         """Supply native child work for newly assessed completion fixtures."""
         environ = environ or (self.claude_environ if provider == 'claude' else self.environ)
         run = StateStore(self.state_root).load(self.project).active_run
@@ -137,7 +137,8 @@ class RuntimeTests(unittest.TestCase):
                       if provider == 'claude' else codex_agent_type('worker', choice['lead_model'], choice['lead_effort']))
         worker = {**self.payload('', provider), 'provider': provider, 'hook_event_name': 'SubagentStart', 'agent_id': identity,
                   'agent_type': agent_type, 'parent_thread_id': run.lead_identity,
-                  'task': 'SYMPHONY_ROLE: worker\nComplete the bounded fixture work',
+                  'task': ('SYMPHONY_ROLE: worker\nReview the bounded fixture work' if review else
+                           'SYMPHONY_ROLE: worker\nComplete the bounded fixture work'),
                   'model': choice['lead_model'], 'model_reasoning_effort': choice['lead_effort']}
         if provider == 'claude':
             from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
@@ -146,7 +147,8 @@ class RuntimeTests(unittest.TestCase):
             write_claude_child_launch(home, self.project, run, identity, 'worker',
                 choice['lead_model'], choice['lead_effort'], f'worker-{self.spawn_count}')
         handle(worker, environ)
-        handle({**worker, 'hook_event_name': 'SubagentStop', 'status': 'completed'}, environ)
+        handle({**worker, 'hook_event_name': 'SubagentStop', 'status': 'completed',
+                **({'last_assistant_message': 'SYMPHONY_REVIEW: passed'} if review else {})}, environ)
 
     def test_enable_persists_and_next_task_requests_bounded_assessment(self):
         enabled = handle(self.payload("$symphony:symphony enable"), self.environ)
@@ -882,6 +884,8 @@ class RuntimeTests(unittest.TestCase):
                             }
                             handle(lead, environ)
                             self.complete_substantive_worker(provider, environ)
+                            if route.independent_review:
+                                self.complete_substantive_worker(provider, environ, review=True)
                             handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                                     "last_assistant_message": "Completed"}, environ)
                             completing = StateStore(self.state_root).load(self.project)

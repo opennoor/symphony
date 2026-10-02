@@ -354,11 +354,13 @@ def _substantive_child_completed(run: RunState) -> bool:
     if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int
             or contract['version'] != 1
             or not isinstance(contract.get('epoch'), str) or not contract['epoch']
-            or not isinstance(contract.get('accepted_at'), str) or not contract['accepted_at']):
+            or not isinstance(contract.get('accepted_at'), str) or not contract['accepted_at']
+            or ('review_required' in contract and type(contract['review_required']) is not bool)):
         return False
     proofs = run.assessment.get('_substantive_children', {})
     if not isinstance(proofs, Mapping):
         return False
+    completed = []
     for child in run.delegations:
         proof = proofs.get(child.identity)
         if (child.role in {'worker', 'consultant'}
@@ -371,10 +373,15 @@ def _substantive_child_completed(run: RunState) -> bool:
                 and proof.get('role') == child.role
                 and isinstance(proof.get('start_event_id'), str)
                 and proof['start_event_id'] in run.assessment.get('_start_event_ids', ())
-                and proof.get('owner_generation') == run.owner_generation
-                and (child.role != 'consultant' or child.identity not in run.assessment.get('_invalid_consultants', ()))):
-            return True
-    return False
+                  and proof.get('owner_generation') == run.owner_generation
+                  and (child.role != 'consultant' or child.identity not in run.assessment.get('_invalid_consultants', ()))):
+            completed.append(proof)
+    # Pre-1.7 accepted contracts lack this flag; changing their rule mid-run
+    # would strand leads after a plugin update.
+    if contract.get('review_required') is True:
+        return (any(proof.get('reviewed') is True for proof in completed)
+                and any(proof.get('reviewed') is not True for proof in completed))
+    return bool(completed)
 
 
 def _lead_completed(state: ProjectState, event: Event):

@@ -230,6 +230,8 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
         return ""
     turns.append((prompt_id, report, final))
     callback = payload.get("last_assistant_message")
+    if "last_assistant_message" in payload and not isinstance(callback, str):
+        return ""
     if 'turn_id' in payload:
         matching = [turn for turn in turns if isinstance(payload['turn_id'], str)
                     and payload['turn_id'] and turn[0] == payload['turn_id'] and callback == turn[2]]

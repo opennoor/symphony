@@ -2478,8 +2478,14 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
         binding = claude_substantive_launch(run, source, role, proof['admitted_at'], environ)
         if binding and any(proof.get(key) is not None and proof.get(key) != value for key, value in binding.items()):
             binding = None
+    report = source.payload.get('last_assistant_message')
+    review_lines = ([line.strip() for line in report.splitlines()
+                     if line.strip().startswith('SYMPHONY_REVIEW:')]
+                    if isinstance(report, str) else [])
     proofs[identity] = {**proof, **(binding or {}),
-                        'successful': successful and binding is not None}
+                        'successful': successful and binding is not None,
+                        'reviewed': successful and binding is not None
+                        and review_lines == ['SYMPHONY_REVIEW: passed']}
     if proofs[identity]['successful'] is True:
         admitted = _instant(proofs[identity].get('admitted_at'))
         accepted = _instant(contract['accepted_at'])
@@ -3731,7 +3737,8 @@ def _accept_assessment(
                        'substantive_contract': confirmed})), ()
     if route.execution in {'delegated', 'mixed'}:
         accepted['substantive_contract'] = {'version': 1, 'epoch': source.event_id,
-                                            'accepted_at': source.observed_at}
+                                            'accepted_at': source.observed_at,
+                                            'review_required': route.independent_review}
         if run and provider == run.provider and _marker_value(values, 'SYMPHONY_ROLE:') == 'lead':
             waiting = [item for item in run.delegations if item.role == 'assessor' and item.state == 'working']
             if len(waiting) == 1:
@@ -4478,6 +4485,8 @@ def _assessed_lead_guidance(run: RunState, provider: str) -> str:
     sizing = {key: run.assessment[key] for key in ('size', 'complexity', 'risk', 'rationale', 'topology')
               if key in run.assessment}
     message = ('SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: ' + json.dumps(sizing) + '\n'
+               + ('Independent review: a different child reports `SYMPHONY_REVIEW: passed` after substantive work.\n'
+                  if route.get('independent_review') is True else '')
                + run.task + '\nLead contract: ' + _ASSESSED_LEAD_CONTRACT)
     packet = ({'task_name': 'symphony_lead_' + re.sub(r'\W', '_', model) + '_' + effort,
                'model': model, 'reasoning_effort': effort, 'fork_turns': 'none', 'message': message}
@@ -4498,9 +4507,13 @@ def _substantive_recovery_guidance(run: RunState | None, provider: str) -> str:
               'Use SendMessage to resume that same agent. Claude scoped credit requires a fresh worker or '
               'consultant with one native prompt and an exact Agent launch by this lead. Preserve reused '
               'child history, repair any invalid consultant decisions, then launch a fresh bounded child. ')
+    contract = run.assessment.get('substantive_contract') if run else None
+    review = (' For independent_review, keep the substantive child and add a different review-only '
+              'worker or consultant whose own successful report ends with `SYMPHONY_REVIEW: passed`. '
+              if isinstance(contract, Mapping) and contract.get('review_required') is True else '')
     return ('Resume the SAME registered lead; this assessed route needs successful substantive worker '
             'or classified consultant evidence from the current assessment and owner generation. '
-            + native + 'Reconcile a verifiable current-scope worker Start, or launch a fresh bounded worker '
+            + review + native + 'Reconcile a verifiable current-scope worker Start, or launch a fresh bounded worker '
             'whose Start and successful terminal are observed. Relay to the lead: '
             + _LEAD_VERIFICATION_CONTRACT + ' Then let that lead report completion again. Preserve this run and ownership.')
 

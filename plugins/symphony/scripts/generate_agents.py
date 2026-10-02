@@ -93,8 +93,10 @@ BODIES = {
         "- medium: assign substantive work to bounded worker packets; integrate and verify the results.\n"
         "- large: administer. Delegate all project work to workers and keep only planning, "
         "integration, and verification.\n"
-        "- When the route calls for an independent check (high risk, or small/complex), a separate "
-        "consultant or worker performs the review. Never review your own work.\n\n"
+        "- When the route calls for an independent check (high risk, or small/complex), a different "
+        "consultant or worker reviews the completed substantive work. Give that child a review-only packet. "
+        "Its own final report must contain exactly one `SYMPHONY_REVIEW: passed` line only when "
+        "all findings are resolved; an implementation child's self-review cannot count.\n\n"
         "Spawn each child as `symphony:symphony-<role>-<model>-<effort>`, choosing the type for the "
         "packet's own size/complexity from the table Symphony gives you at start. Put "
         "`SYMPHONY_ROLE: <role>` on the first line, then objective, ownership, evidence, constraints, "
@@ -120,6 +122,8 @@ BODIES = {
         "Superpowers TDD or the smallest meaningful native check; for bugs use a compatible "
         "diagnosing-bugs skill or reproduce and fix the cause. Use Ponytail's reuse/native check. "
         "Use any compatible skill the packet names, and verify your result before you report.\n\n"
+        "If assigned an independent review, review only and return exactly one "
+        "`SYMPHONY_REVIEW: passed` line only when all findings are resolved; otherwise report findings without it.\n\n"
         + PRACTICES
     ),
     "assessor": (
@@ -137,7 +141,8 @@ BODIES = {
         _CONSULTANT_CONTRACT + "For an independent review use compatible `ce-code-review` or Matt Pocock "
         "`code-review`, or compare the exact diff with requirements and affected callers. "
         "For external facts use Context7 or dated official sources. When asked for a review, "
-        "review independently and do not fix the code.\n\n" + PRACTICES
+        "review independently and do not fix the code. Return exactly one `SYMPHONY_REVIEW: passed` "
+        "line only when all findings are resolved; otherwise report findings without it.\n\n" + PRACTICES
     ),
 }
 

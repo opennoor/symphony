@@ -182,7 +182,11 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn('$p.WaitForExit([Math]::Min(2500,$ms))', source)
         self.assertIn('$end=[DateTime]::UtcNow.AddSeconds(4)', source)
         self.assertEqual(source.count('-I -X utf8 -c'), 2)
-        self.assertGreaterEqual(load_json('hooks/codex.json')['hooks']['Interrupt'][0]['hooks'][0]['timeout'], 10)
+        for manifest in ('hooks/codex.json', 'hooks/hooks.json'):
+            for groups in load_json(manifest)['hooks'].values():
+                for group in groups:
+                    for hook in group['hooks']:
+                        self.assertGreaterEqual(hook['timeout'], 20, manifest)
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries(self):

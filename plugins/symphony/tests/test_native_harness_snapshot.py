@@ -699,6 +699,13 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertEqual((packet["task_name"], packet["model"],
                                       packet["reasoning_effort"]),
                                      (role["task_name"], role["model"], role["effort"]))
+                    if marker == "LEAD_SPAWN_PACKET":
+                        reviewer = json.loads(re.search(r"REVIEW_SPAWN_PACKET: (\{[^\n]+\})",
+                                                        packet["message"]).group(1))
+                        self.assertTrue(reviewer["task_name"].endswith("_review"))
+                        self.assertIn("SYMPHONY_ROLE: consultant", reviewer["message"])
+                        self.assertIn("SYMPHONY_DECISION:", reviewer["message"])
+                        self.assertIn("SYMPHONY_REVIEW: passed", reviewer["message"])
                 with tempfile.TemporaryDirectory() as temporary, \
                         patch.object(native.shutil, "which", return_value="codex"), \
                         patch.object(native.subprocess, "Popen") as popen:

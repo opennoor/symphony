@@ -404,6 +404,22 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
     else:
         worker_packet = {'subagent_type': f"symphony:symphony-worker-{worker['model']}-{worker['effort']}",
                          'run_in_background': False, 'prompt': worker_text}
+    review_needed = provider == 'codex' and codex_profile != 'base' and not released_direct_version
+    review_packet = ({'task_name': lead_role['task_name'].replace('symphony_lead_', 'symphony_consultant_', 1) + '_review',
+                      'model': lead_role['model'], 'reasoning_effort': lead_role['effort'], 'fork_turns': 'none',
+                      'message': 'SYMPHONY_ROLE: consultant\nSYMPHONY_DECISION: {"size":"small","complexity":"simple"}\n' + json.dumps({
+                          'objective': 'Independently check the prior literal GATE_RELEASED worker result.',
+                          'ownership': 'Review only; make no changes.',
+                          'evidence': 'The lead verified the first worker returned exactly GATE_RELEASED.',
+                          'constraints': 'Do not inspect files, execute commands, edit, or delegate.',
+                          'acceptance_check': 'The supplied literal report is exactly GATE_RELEASED.',
+                          'return_contract': 'Return SYMPHONY_DECISION: {"size":"small","complexity":"simple"} and SYMPHONY_REVIEW: passed on separate lines if the check passes.',
+                          'size': 'small', 'complexity': 'simple'})} if review_needed else None)
+    review_contract = (
+        'This small/complex route also requires an independent check. After the substantive worker returns, '
+        'spawn REVIEW_SPAWN_PACKET verbatim as a separate consultant; await its classified native '
+        'SYMPHONY_REVIEW: passed report before completing. Preserve both child results on followup. '
+        'REVIEW_SPAWN_PACKET: ' + json.dumps(review_packet) + '\n' if review_needed else '')
     worker_contract = (
         'After your native start hook releases, YOU as the canonical lead must spawn exactly one bounded '
         'worker using WORKER_SPAWN_PACKET verbatim as native spawn arguments; the root never substitutes '
@@ -411,6 +427,7 @@ def prompt(provider, label, recover, project, *, defer_recovery=False,
         'Relay its return_contract unchanged: the worker final report, or SubagentHandback message if '
         'background, is exactly GATE_RELEASED, with no outcome marker, preface, Markdown or explanation. '
         'This literal callback report performs no capability phase. '
+        + review_contract +
         'Then return your own specified GATE_RELEASED/outcome lines. Use only the exact requested '
         'completed or blocked enum; never substitute successful. Do not search for a callback command '
         'or gate file. Preserve the successful worker result for same-task followup; do not spawn duplicate '

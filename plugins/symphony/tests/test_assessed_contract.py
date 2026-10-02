@@ -33,7 +33,7 @@ class AssessedContractTests(unittest.TestCase):
         exec(compile(source, 'released-v1.6.0/store.py', 'exec'), module.__dict__)
         return module.StateStore(root)
 
-    def begin(self, provider, *, legacy=False):
+    def begin(self, provider, *, legacy=False, sizing=None):
         self.provider = provider
         self.sequence = 0
         temporary = TemporaryDirectory()
@@ -44,7 +44,7 @@ class AssessedContractTests(unittest.TestCase):
         self.state = ProjectState(enabled=True, active_run=RunState(
             'run', 'Implement a small feature', 'assessing', provider=provider,
             session_id='root', started_at='2026-10-01T14:00:00+00:00'))
-        self.assess()
+        self.assess(sizing)
         if legacy:
             assessment = dict(self.state.active_run.assessment)
             assessment.pop('substantive_contract')
@@ -55,9 +55,9 @@ class AssessedContractTests(unittest.TestCase):
         self.sequence += 1
         return Event(f'event-{self.sequence}', kind, f'2026-10-01T14:00:{self.sequence:02d}+00:00', payload)
 
-    def assess(self):
+    def assess(self, sizing=None):
         self.state, _ = _accept_assessment(self.state, self.event('subagent_stopped'),
-                                            self.provider, {}, Assessment('small', 'simple'))
+                                            self.provider, {}, sizing or Assessment('small', 'simple'))
 
     def child(self, identity, role, terminal, turn, *, status='completed', report='', parent=None, hook_fields=None):
         route = self.state.active_run.assessment['route']
@@ -85,6 +85,45 @@ class AssessedContractTests(unittest.TestCase):
     def worker(self, identity='worker', turn='worker-1', *, status='completed', parent=None):
         self.child(identity, 'worker', False, turn, parent=parent)
         return self.child(identity, 'worker', True, turn, status=status, parent=parent)
+
+    def test_flagged_route_needs_a_distinct_successful_independent_review(self):
+        decision = 'SYMPHONY_DECISION: {"size":"small","complexity":"simple"}'
+        for provider in ('codex', 'claude'):
+            for sizing in (Assessment('small', 'simple', 'high'), Assessment('small', 'complex')):
+                with self.subTest(provider=provider, sizing=sizing):
+                    self.begin(provider, sizing=sizing)
+                    self.assertTrue(self.state.active_run.assessment['substantive_contract']['review_required'])
+                    self.worker()
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+                    self.child('lead', 'lead', True, 'lead-1')
+                    self.assertEqual(self.state.active_run.status, 'recovering')
+                    self.assertIn('SYMPHONY_REVIEW: passed', _recovery_guidance(self.state, provider))
+                    self.child('lead', 'lead', False, 'lead-2')
+                    self.child('unmarked-review', 'consultant', False, 'review-1')
+                    self.child('unmarked-review', 'consultant', True, 'review-1', report=decision)
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+                    self.child('reviewer', 'consultant', False, 'review-2')
+                    self.child('reviewer', 'consultant', True, 'review-2',
+                               report=decision + '\nSYMPHONY_REVIEW: passed')
+                    self.assertTrue(_substantive_child_completed(self.state.active_run))
+                    self.child('lead', 'lead', True, 'lead-2')
+                    self.assertEqual(self.state.active_run.status, 'completing')
+
+                with self.subTest(provider=provider, sizing=sizing, case='self-review'):
+                    self.begin(provider, sizing=sizing)
+                    self.child('reviewer', 'worker', False, 'review-1')
+                    self.child('reviewer', 'worker', True, 'review-1', report='SYMPHONY_REVIEW: passed')
+                    self.assertFalse(_substantive_child_completed(self.state.active_run))
+
+                with self.subTest(provider=provider, sizing=sizing, case='old-contract'):
+                    self.begin(provider, sizing=sizing)
+                    run = self.state.active_run
+                    contract = dict(run.assessment['substantive_contract'])
+                    contract.pop('review_required')
+                    self.state = replace(self.state, active_run=replace(run, assessment={**run.assessment,
+                                         'substantive_contract': contract}))
+                    self.worker()
+                    self.assertTrue(_substantive_child_completed(self.state.active_run))
 
     def late_assessor(self, provider):
         self.begin(provider)
