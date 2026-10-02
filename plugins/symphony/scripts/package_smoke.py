@@ -475,10 +475,18 @@ def _exercise(
         send('SubagentStart', agent_role='worker')
         send('SubagentStop', agent_role='worker')
         send("SubagentStop")
-        if _blocks_stop(send("Stop")):
-            raise SmokeFailure("a returned native lead still blocked Stop")
-        if any(_has_active_run(document) for document in _state_documents(state_dir)):
-            raise SmokeFailure("the returned lead was not reconciled")
+        blocked = _blocks_stop(send("Stop"))
+        captured = 'base64.b64decode(' in _event_command(_hook_config(root, provider), 'SubagentStop')['command']
+        if captured:
+            # Fake agent IDs have no native transcript. The reviewed runtime
+            # must retain the owner instead of archiving a fabricated result.
+            recovering = [document.get('active_runs', {}).get(f'{provider}:fake-session')
+                          for document in _state_documents(state_dir)]
+            if not blocked or not any(run and run['status'] == 'recovering' and run['outcome'] is None
+                    and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in recovering):
+                raise SmokeFailure("unproved native lead was not retained for same-owner recovery")
+        elif blocked or any(_has_active_run(document) for document in _state_documents(state_dir)):
+            raise SmokeFailure("the synthetic lead was not reconciled")
         activation.append("guarded")
     elif scenario == "unmarked-spawn":
         if provider != "claude":
@@ -572,12 +580,13 @@ def _exercise(
                 raise SmokeFailure(f"retained old hook failed after cache removal: {stale.stderr}")
             stopped = subprocess.run(stale_stop, input=json.dumps({"hook_event_name": "Stop", "session_id": "old-session",
                                      "cwd": str(project)}), capture_output=True, text=True, env=stale_env, timeout=15)
-            if stopped.returncode or _blocks_stop(json.loads(stopped.stdout) if stopped.stdout.strip() else None):
-                raise SmokeFailure("retained Stop failed to reconcile the returned lead")
-            if not any(run.get("session_id") == "old-session" and run.get("status") == "completed"
-                       and run.get("outcome") for doc in _state_documents(state_dir)
-                       for run in doc.get("recent_runs", [])):
-                raise SmokeFailure("old session lost its durable lead outcome after cache removal")
+            if stopped.returncode or not _blocks_stop(json.loads(stopped.stdout) if stopped.stdout.strip() else None):
+                raise SmokeFailure("retained Stop bypassed missing native proof after cache removal")
+            recovering = [doc.get('active_runs', {}).get(f'{provider}:old-session')
+                          for doc in _state_documents(state_dir)]
+            if not any(run and run['status'] == 'recovering' and run['outcome'] is None
+                       and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in recovering):
+                raise SmokeFailure("old session lost its recoverable owner after cache removal")
         else:
             # Pre-retention captured commands cannot be repaired retroactively.
             if stale.returncode == 0 or str(old_root / "scripts" / "symphony_hook.py") not in stale.stderr:
