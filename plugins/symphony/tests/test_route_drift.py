@@ -11,7 +11,9 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.runtime import _route_drift, handle
 from plugins.symphony.symphony.routing import profiles_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
@@ -43,6 +45,9 @@ MARKER = json.dumps(
 class RouteDriftTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
+        chronology = patch.object(runtime_module, "assessed_completion_chronology", return_value="valid")
+        chronology.start()
+        self.addCleanup(chronology.stop)
         root = Path(self.temp.name)
         self.project = root / "project"
         self.project.mkdir()
@@ -63,6 +68,17 @@ class RouteDriftTests(unittest.TestCase):
             "turn_id": "turn-1",
             "model": "codex-model",
         }
+
+    def complete_worker(self, lead: dict, profile: str):
+        worker = {**lead, "agent_id": "route-worker", "agent_type": "worker",
+                  "parent_thread_id": lead["agent_id"], "task": "SYMPHONY_ROLE: worker",
+                  "turn_id": "worker-turn"}
+        # This synthetic route fixture models a verified substantive launch;
+        # file-backed host tests exercise the native binding separately.
+        with patch.object(runtime_module, 'codex_substantive_launch',
+                          return_value={'parent': lead['agent_id'], 'purpose': 'substantive'}):
+            handle(worker, self.env(profile))
+            handle({**worker, "hook_event_name": "SubagentStop", "status": "completed"}, self.env(profile))
 
     def output(self, result) -> dict:
         return json.loads(result.stdout) if result.stdout else {}
@@ -202,6 +218,7 @@ class RouteDriftTests(unittest.TestCase):
             "model_reasoning_effort": BASE_ROUTE["effort"],
         }
         handle(lead, self.env("base"))
+        self.complete_worker(lead, "base")
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("base"))
         state = StateStore(self.state_root).load(self.project)
@@ -223,6 +240,8 @@ class RouteDriftTests(unittest.TestCase):
         handle(lead, self.env("full"))
         self.start("base", "stranger")
         self.assertEqual(StateStore(self.state_root).load(self.project).active_run.session_id, "session-1")
+
+        self.complete_worker(lead, "full")
 
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("full"))
@@ -254,6 +273,7 @@ class RouteDriftTests(unittest.TestCase):
             "model": BASE_ROUTE["model"], "model_reasoning_effort": BASE_ROUTE["effort"],
         }
         handle(replacement, self.env("base"))
+        self.complete_worker(replacement, "base")
         handle({**replacement, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("base"))
         state = StateStore(self.state_root).load(self.project)

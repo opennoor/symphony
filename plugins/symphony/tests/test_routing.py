@@ -12,6 +12,12 @@ from plugins.symphony.symphony.routing import (
 
 
 class RoutingTests(unittest.TestCase):
+    def test_router_rejects_unknown_and_malformed_risk(self):
+        for risk in ('low', 'material concerns', 'critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
+            with self.subTest(risk=risk), self.assertRaises(ValueError):
+                route_for(Assessment('small', 'simple', risk=risk))
+        self.assertEqual(route_for(Assessment('small', 'simple')).risk, 'normal')
+
     def test_model_comparison_uses_reviewed_capability_ranks(self):
         self.assertFalse(model_is_weaker("gpt-6-sol", "gpt-6-luna"))
         self.assertFalse(model_is_weaker("gpt-5.6-luna", "gpt-6-luna"))
@@ -20,9 +26,9 @@ class RoutingTests(unittest.TestCase):
 
     def test_nine_cell_matrix(self):
         expected = {
-            ("small", "simple"): ("capable", "medium", "direct", "none"),
-            ("small", "mixed"): ("capable", "high", "direct", "optional"),
-            ("small", "complex"): ("strongest", "high", "direct", "independent-check"),
+            ("small", "simple"): ("capable", "medium", "delegated", "none"),
+            ("small", "mixed"): ("capable", "high", "delegated", "optional"),
+            ("small", "complex"): ("strongest", "high", "delegated", "independent-check"),
             ("medium", "simple"): ("balanced", "medium", "mixed", "none"),
             ("medium", "mixed"): ("balanced", "high", "mixed", "optional"),
             ("medium", "complex"): ("capable", "high", "mixed", "reserved"),

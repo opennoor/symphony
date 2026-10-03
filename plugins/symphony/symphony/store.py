@@ -109,16 +109,28 @@ def _delegation_from_dict(value: Any) -> Delegation:
     )
 
 
-def _receipt_from_dict(value: Any) -> dict[str, str]:
+def _receipt_from_dict(value: Any) -> dict[str, object]:
     receipt = _object(value, "terminal receipt")
     required = ("provider", "session", "agent", "run_id",
                 "turn", "result", "parent", "lead")
     optional = ("status", "native_agent_type", "native_model", "native_effort",
-                "native_launch_prompt_hash")
+                "native_launch_prompt_hash", "native_terminal_id", "native_report_hash")
+    if 'native_fast_escalation' in receipt and type(receipt['native_fast_escalation']) is not bool:
+        raise ValueError('terminal receipt.native_fast_escalation must be a boolean')
+    if 'native_owner_generation' in receipt and (
+            type(receipt['native_owner_generation']) is not int or receipt['native_owner_generation'] < 0):
+        raise ValueError('terminal receipt.native_owner_generation must be a nonnegative integer')
     return {**{key: _text(receipt.get(key), f"terminal receipt.{key}")
                for key in required},
             **{key: _text(receipt.get(key, ""), f"terminal receipt.{key}")
-               for key in optional}}
+               for key in optional},
+            **({'native_followup_start_id': _text(receipt['native_followup_start_id'],
+                    'terminal receipt.native_followup_start_id')}
+               if 'native_followup_start_id' in receipt else {}),
+            **({'native_owner_generation': receipt['native_owner_generation']}
+               if 'native_owner_generation' in receipt else {}),
+            **({'native_fast_escalation': receipt['native_fast_escalation']}
+               if 'native_fast_escalation' in receipt else {})}
 
 
 def _run_from_dict(value: Any) -> RunState:
@@ -154,8 +166,8 @@ def _run_from_dict(value: Any) -> RunState:
 
 
 def _available_terminal_receipts(
-    runs: tuple[RunState, ...], existing: tuple[dict[str, str], ...],
-) -> tuple[dict[str, str], ...]:
+    runs: tuple[RunState, ...], existing: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
     """Keep lineage still present in older run records before archive trim."""
     receipts = list(existing)
     results = {(item["provider"], item["session"], item["run_id"], item["result"])
@@ -334,13 +346,15 @@ def _local_lock(path: Path) -> threading.Lock:
 def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     local = _local_lock(path)
+    deadline = None if timeout is None else time.monotonic() + timeout
     if timeout is None:
         local.acquire()
     elif not local.acquire(timeout=timeout):
         raise TimeoutError(f"state lock timed out: {path}")
     try:
         with path.with_name(path.name + ".lock").open("a+b") as lock_file:
-            deadline = time.monotonic() + (5 if timeout is None else timeout)
+            if deadline is None:
+                deadline = time.monotonic() + 5
             if fcntl is not None:
                 if timeout is None:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -378,10 +392,11 @@ def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
         local.release()
 
 
-def _read_owner_snapshot(path: Path) -> str:
+def _read_owner_snapshot(path: Path, timeout: float = 5) -> str:
     """Read while coordinating with Windows' replace-existing limitation."""
     if os.name == "nt":
-        with _locked(path, timeout=0.1):
+        # Share the scan's remaining budget across all project snapshots.
+        with _locked(path, timeout=timeout):
             return path.read_text(encoding="utf-8")
     return path.read_text(encoding="utf-8")
 
@@ -564,11 +579,15 @@ class StateStore:
     ) -> tuple[Path, ...] | None:
         """Find active root or child ancestors; None means a snapshot could not be read."""
         matches: list[Path] = []
+        deadline = time.monotonic() + 5
         for path in self.root.glob("*.v2.json"):
             if path.is_symlink():
                 continue
             try:
-                state = _state_from_dict(json.loads(_read_owner_snapshot(path)))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                state = _state_from_dict(json.loads(_read_owner_snapshot(path, remaining)))
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 # A missing or invalid snapshot cannot prove this root has no
                 # other owner. Defer instead of trusting the event's CWD.

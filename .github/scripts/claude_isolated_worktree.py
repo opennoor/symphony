@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -227,6 +228,8 @@ def scratch_claude(root, package):
         "SubagentStop": [{"hooks": [{"type": "command", "command": command}]}],
     }
     settings_file.write_text(json.dumps(settings))
+    native.install_hook_capture('claude', root, home, private_children=True,
+                                candidate_source=package)
     return env, home
 
 
@@ -246,15 +249,31 @@ def verify_lead_model(env, root):
 
 def prompt(project):
     route = ('{"size":"small","complexity":"simple","risk":"normal",'
-             '"rationale":"disposable native worktree hook check","topology":"direct"}')
+             '"rationale":"disposable native worktree hook check","topology":"delegated"}')
     gate = str(project / "gate.py").replace("\\", "/")
+    gate_command = shlex.join([str(Path(sys.executable)).replace("\\", "/"), gate, "isolated"])
+    worker_packet = {'subagent_type': f'symphony:symphony-worker-{MODEL}-low',
+                     'run_in_background': False,
+                     'prompt': 'SYMPHONY_ROLE: worker\npurpose: substantive\n' + json.dumps({
+                         'objective': 'Return the literal callback report GATE_RELEASED.',
+                         'ownership': 'Only this bounded literal report under the owning isolated lead.',
+                         'constraints': 'No applicable capability phase. Do not inspect files, run commands, edit files or delegate.',
+                         'acceptance_check': 'The worker finishes successfully with exactly GATE_RELEASED.',
+                         'return_contract': 'Return exactly GATE_RELEASED on successful completion.',
+                         'size': 'small', 'complexity': 'simple'})}
     lead_packet = {"subagent_type": LEAD_AGENT,
                    "description": "Check isolated Symphony lead gate",
                    "run_in_background": True,
                    "isolation": "worktree",
                    "prompt": (f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\n"
-                              f"Run `python '{gate}' isolated` once, wait for GATE_RELEASED, "
-                              'then return exactly SYMPHONY_OUTCOME: {"status":"completed"}.')}
+                              'Run exactly ' + gate_command + ' first as one native Bash command. '
+                              'Only after it exits zero with GATE_RELEASED, spawn exactly one worker '
+                              'using WORKER_SPAWN_PACKET unchanged. '
+                              'An Agent launch acknowledgment is not a worker result: yield without '
+                              'an outcome until the host delivers the worker result. '
+                              'Await its successful GATE_RELEASED result, verify it, '
+                              'then return exactly SYMPHONY_OUTCOME: {"status":"completed"}. '
+                              'WORKER_SPAWN_PACKET: ' + json.dumps(worker_packet))}
     return (
         "/symphony:start Disposable native Claude isolated Agent hook check. "
         "Spawn one Symphony assessor and await its assessment: SYMPHONY_ASSESSMENT: "
@@ -331,7 +350,7 @@ def run_case(root, package, timeout, budget):
             raise RuntimeError("SubagentStart hook did not contain lead agent_id")
         if not state_path.is_file():
             raise RuntimeError("isolated lead did not register in its root project")
-        before_release = json.loads(state_path.read_text())
+        before_release = native.read_state_snapshot(state_path)
         original_run = before_release.get("active_runs", {}).get(f"claude:{session}")
         if (not original_run or original_run.get("lead_identity") != lead_id
                 or original_run.get("status") != "active"):
@@ -349,7 +368,7 @@ def run_case(root, package, timeout, budget):
                                      logs, "isolated")
                 resumed = True
             if resumed and state_path.exists():
-                document = json.loads(state_path.read_text())
+                document = native.read_state_snapshot(state_path)
                 matching = [run for run in document.get("recent_runs", [])
                             if run.get("session_id") == session]
                 if (len(matching) == 1 and matching[0].get("status") == "completed"
@@ -363,7 +382,7 @@ def run_case(root, package, timeout, budget):
                                and item.get("plugin_version") == version for item in profiles):
                         raise RuntimeError("isolated root used another Symphony plugin version")
                     for record_path in state.glob(".session-*.json"):
-                        record = json.loads(record_path.read_text())
+                        record = native.read_state_snapshot(record_path)
                         if record.get("pending") or record.get("overflow"):
                             raise RuntimeError("isolated root retained unresolved callbacks")
                     return {"provider": "claude", "case": "isolated-worktree",
@@ -390,7 +409,8 @@ def run_case(root, package, timeout, budget):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        shutil.rmtree(home, ignore_errors=True)
+        # main() collects fixed failure facts before its TemporaryDirectory
+        # removes the private native home and all other disposable evidence.
 
 
 def main():
@@ -420,7 +440,15 @@ def main():
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / "native-claude-isolated-worktree-failure.json").write_text(
                     json.dumps(evidence, indent=2))
-            print(json.dumps(evidence), file=sys.stderr)
+            summary = {"provider": "claude", "case": "isolated-worktree",
+                       "failure": {"type": type(error).__name__, "message": str(error)[:300]},
+                       "hook_count": len(evidence["hooks"]),
+                       "diagnostics_dir": str(destination or "")[:300]}
+            try:
+                print(json.dumps(summary), file=sys.stderr)
+            except OSError:
+                # A full CI pipe must not replace the original case failure.
+                pass
             return 1
     print(json.dumps(result))
     return 0

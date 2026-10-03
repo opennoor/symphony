@@ -1,19 +1,69 @@
 """Fast lead gates on native lifecycle facts for both providers."""
 
 import json
+import hashlib
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from plugins.symphony.scripts.generate_agents import BODIES
 from plugins.symphony.symphony.model import Event
-from plugins.symphony.symphony.runtime import handle
+from plugins.symphony.symphony.runtime import handle, _assessment_from_marker, _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT, _decision_markers
 from plugins.symphony.symphony.routing import Assessment, fast_lead_selection, profiles_for, resolve_tier, route_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
 
 
 class FastRouteTests(unittest.TestCase):
+    def test_fast_launch_identity_is_distinct_from_later_assessed_names(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.tearDown()
+                self.setUp()
+                self.hook(provider, 'SessionStart')
+                control = '$symphony:symphony enable' if provider == 'codex' else '/symphony:enable'
+                self.hook(provider, 'UserPromptSubmit', prompt=control)
+                result = self.hook(provider, 'UserPromptSubmit', prompt='Implement a bounded feature')
+                selected = fast_lead_selection(snapshot_for(provider, profiles_for(provider)[0]['id']))
+                if provider == 'codex':
+                    name = 'symphony_lead_fast_' + selected['model'].replace('-', '_').replace('.', '_') + '_' + selected['effort']
+                    self.assertIn('task_name=\\"' + name + '\\"', result.stdout)
+                    self.assertIn('never use them for a fast spawn', result.stdout)
+                    self.assertIn('append a unique underscore suffix for a fresh child', result.stdout)
+                    self.assertIn('for assessor and assessed lead', result.stdout)
+                else:
+                    self.assertIn('packaged type alone does not identify a fast launch', result.stdout)
+                    self.assertIn('SYMPHONY_FAST_ROUTE: lead', result.stdout)
+                self.assertIn('spawn the assessor directly', result.stdout)
+                self.assertIn('after an attempted fast lead returns native escalation', result.stdout)
+
+    def test_enable_control_only_stays_at_root_and_accompanying_task_keeps_routing(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.tearDown()
+                self.setUp()
+                control = '$symphony:symphony enable' if provider == 'codex' else '/symphony:enable'
+                self.hook(provider, 'SessionStart')
+                for _ in range(2):
+                    result = self.hook(provider, 'UserPromptSubmit', prompt=control)
+                    self.assertIn('control-only invocation', result.stdout)
+                    self.assertNotIn('Symphony fast route:', result.stdout)
+                    self.assertIsNone(self.run_state())
+                routed = self.hook(provider, 'UserPromptSubmit', prompt=control + ' Run python -m unittest -q')
+                self.assertIn('Symphony fast route:', routed.stdout)
+                plain = self.hook(provider, 'UserPromptSubmit', prompt='Run python -m unittest -q')
+                self.assertIn('Symphony fast route:', plain.stdout)
+
+    def test_provider_assessment_markers_reject_invalid_risk_and_keep_legacy_default(self):
+        for provider in ('codex', 'claude'):
+            for risk in ('low', 'material concerns', 'critical', '', None, 1, False, ['normal'], {'risk': 'normal'}):
+                with self.subTest(provider=provider, risk=risk):
+                    report = 'SYMPHONY_ASSESSMENT: ' + json.dumps({'size': 'small', 'complexity': 'simple', 'risk': risk})
+                    self.assertIsNone(_assessment_from_marker({'provider': provider, 'last_assistant_message': report}, 'SYMPHONY_ASSESSMENT:'))
+            report = 'SYMPHONY_ASSESSMENT: {"size":"small","complexity":"simple"}'
+            self.assertEqual(_assessment_from_marker({'provider': provider, 'last_assistant_message': report}, 'SYMPHONY_ASSESSMENT:').risk, 'normal')
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.project = Path(self.temp.name) / "project"
@@ -34,11 +84,11 @@ class FastRouteTests(unittest.TestCase):
     def run_state(self):
         return self.store.load(self.project).active_run
 
-    def start_fast(self, provider, profile=None, model=None, effort="medium", identity="fast-1"):
+    def start_fast(self, provider, profile=None, model=None, effort="medium", identity="fast-1", launch_id="auto", root_prompt=None):
         self.hook(provider, "SessionStart", profile)
         selected = fast_lead_selection(snapshot_for(provider, profile or profiles_for(provider)[0]["id"]))
         model = model or selected["model"]
-        packet = "SYMPHONY_ROLE: lead\nSYMPHONY_FAST_ROUTE: lead\nHandle bounded task"
+        packet = "SYMPHONY_ROLE: lead\nSYMPHONY_FAST_ROUTE: lead\nRun git status --short and report the result"
         agent_type = (f"symphony:symphony-lead-{model}-{effort}" if provider == "claude"
                       else f"symphony_lead_fast_{model.replace('-', '_').replace('.', '_')}_{effort}")
         tool_input = ({"subagent_type": agent_type, "prompt": packet} if provider == "claude"
@@ -46,11 +96,58 @@ class FastRouteTests(unittest.TestCase):
                             "fork_turns": "none", "task_name": agent_type})
         prepared = self.hook(provider, "PreToolUse", profile,
                              tool_name="Agent" if provider == "claude" else "spawn_agent",
-                             tool_use_id="fast-spawn-" + identity, tool_input=tool_input)
+                             tool_use_id="fast-spawn-" + identity if launch_id == 'auto' else launch_id,
+                             prompt_id=root_prompt,
+                             tool_input=tool_input)
         started = {"agent_id": identity, "agent_type": agent_type, "task": packet}
         if "deny" not in prepared.stdout and "block" not in prepared.stdout:
-            self.hook(provider, "SubagentStart", profile, **started)
+            self.last_fast_start = self.hook(provider, "SubagentStart", profile, **started)
         return prepared, started
+
+    def test_only_accepted_claude_fast_launch_freezes_bounded_native_id(self):
+        for provider, launch_id in (('claude', 'toolu_launch'), ('codex', 'toolu_launch'),
+                                   *(('claude', value) for value in (None, '', ' whitespace ', 1, 'a' * 161))):
+            with self.subTest(provider=provider, launch_id=launch_id):
+                self.tearDown()
+                self.setUp()
+                self.start_fast(provider, launch_id=launch_id, root_prompt='root-prompt')
+                assessment = self.run_state().assessment
+                if provider == 'claude' and launch_id == 'toolu_launch':
+                    self.assertEqual(assessment['_claude_fast_launch_hash'],
+                                     hashlib.sha256(launch_id.encode()).hexdigest())
+                    self.assertNotIn('_claude_fast_root_prompt_hash', assessment)
+                    blocked = self.hook(provider, 'PreToolUse', tool_name='Agent', tool_use_id='different',
+                        tool_input={'subagent_type': f"symphony:symphony-lead-{assessment['_fast_route']['model']}-medium",
+                                    'prompt': 'SYMPHONY_ROLE: lead\nSYMPHONY_FAST_ROUTE: lead\nRun a command'})
+                    self.assertIn('deny', blocked.stdout)
+                    self.assertEqual(self.run_state().assessment['_claude_fast_launch_hash'],
+                                     assessment['_claude_fast_launch_hash'])
+                else:
+                    self.assertNotIn('_claude_fast_launch_hash', assessment)
+
+    def test_fast_start_retry_and_continuation_get_only_fast_contract(self):
+        for provider in ('codex', 'claude'):
+            for phase in ('first', 'retry', 'continuation'):
+                with self.subTest(provider=provider, phase=phase):
+                    self.tearDown()
+                    self.setUp()
+                    _, started = self.start_fast(provider)
+                    result = self.last_fast_start
+                    if phase != 'first':
+                        self.stop_fast(provider, started,
+                            'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+                            if phase == 'continuation' else '',
+                            status='completed' if phase == 'continuation' else 'failed')
+                        result = self.hook(provider, 'SubagentStart', **started,
+                            **({'turn_id': 'next-turn'} if provider == 'codex' else {'prompt_id': 'next-turn'}))
+                    guidance = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
+                    self.assertIn('registered Symphony fast lead', guidance)
+                    self.assertIn('WHOLE objective', guidance)
+                    self.assertIn('escalation before any changes', guidance)
+                    self.assertIn('Do not spawn workers', guidance)
+                    self.assertIn('SYMPHONY_FAST_DECISION: escalate', guidance)
+                    self.assertNotIn('Symphony worker routes', guidance)
+                    self.assertNotIn('Every worker spawn', guidance)
 
     def stop_fast(self, provider, started, report, status="completed", profile=None):
         self.hook(provider, "SubagentStop", profile, **started,
@@ -62,11 +159,11 @@ class FastRouteTests(unittest.TestCase):
         selected = fast_lead_selection(snapshot_for(provider, profiles_for(provider)[0]["id"]))
         model = selected["model"]
         task_name = f"symphony_lead_fast_{model.replace('-', '_').replace('.', '_')}_medium"
-        full_task = "Handle bounded task\nCheck the second requested condition"
+        full_task = "Run git status --short and report the result\nConfirm the command exited successfully"
         packet = f"SYMPHONY_ROLE: lead\nSYMPHONY_FAST_ROUTE: lead\n{full_task}"
         transcript = Path(self.temp.name) / "fast.jsonl"
         transcript.write_text("\n".join((
-            json.dumps({"type": "session_meta", "payload": {"agent_path": f"/root/{task_name}"}}),
+            json.dumps({"type": "session_meta", "payload": {"id": "fast-native", "agent_path": f"/root/{task_name}"}}),
             json.dumps({"type": "turn_context", "payload": {"model": observed_model or model, "effort": "medium"}}),
             json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user",
                       "content": [{"type": "input_text", "text": packet}]}}),
@@ -90,6 +187,95 @@ class FastRouteTests(unittest.TestCase):
                 self.hook(provider, "Stop")
                 self.assertIsNone(self.run_state())
                 self.assertEqual(self.store.load(self.project).recent_runs[-1].status, "completed")
+
+    def test_native_guidance_limits_direct_work_to_whole_mechanical_objectives(self):
+        # These assertions protect the agent contract, not a semantic classifier.
+        # Real model decisions are exercised separately by native routing smoke.
+        for provider in ("codex", "claude"):
+            for task in ("Run git status --short and report the result",
+                         "Read the specified browser page through known steps",
+                         "Add a tiny uppercase feature",
+                         "Run the checks and fix any failures"):
+                with self.subTest(provider=provider, task=task):
+                    self.hook(provider, "SessionStart")
+                    control = "/symphony:start " if provider == "claude" else "$symphony:symphony start "
+                    result = self.hook(provider, "UserPromptSubmit", prompt=control + task)
+                    payload = json.loads(result.stdout)
+                    text = payload["hookSpecificOutput"]["additionalContext"]
+                    self.assertIn(task, text)
+                    self.assertIn("WHOLE objective consists only of predetermined mechanical steps", text)
+                    self.assertIn("before any changes", text)
+                    self.assertIn("bash/git command", text)
+                    self.assertIn("browser page", text)
+                    self.assertIn("even for a tiny feature", text)
+                    self.assertIn("run-and-fix request escalates as a whole", text)
+                    for substantive in ("Implementation", "diagnosis", "design", "substantive review",
+                                        "product judgment", "mixed work", "uncertainty"):
+                        self.assertIn(substantive, text)
+                    self.assertIn("SYMPHONY_FAST_DECISION: escalate", text)
+                    self.assertIn('"complexity":"simple|mixed|complex"', text)
+                    self.assertIn('"risk":"normal|high"', text)
+                    self.assertIn("substantive small work uses one worker", text)
+                    self.assertIsNone(self.run_state())
+        lead = BODIES["lead"]
+        self.assertIn("WHOLE objective consists only of predetermined mechanical steps", lead)
+        self.assertIn("assign the substantive work to one worker", lead)
+        self.assertIn("assign substantive work to bounded worker packets", lead)
+        self.assertNotIn("do quick glue work", lead)
+        self.assertIn('risk normal/high', BODIES["assessor"])
+        self.assertIn("substantive small work", BODIES["assessor"])
+
+    def test_assessor_topology_cannot_override_worker_execution(self):
+        for provider in ("codex", "claude"):
+            for size, expected in (("small", "delegated"), ("medium", "mixed")):
+                with self.subTest(provider=provider, size=size):
+                    self.tearDown()
+                    self.setUp()
+                    self.hook(provider, "SessionStart")
+                    strongest = profiles_for(provider)[0]["tiers"]["strongest"]
+                    agent_type = (f"symphony:symphony-assessor-{strongest}-high" if provider == "claude"
+                                  else f"symphony_assessor_{strongest.replace('-', '_').replace('.', '_')}_high")
+                    packet = "SYMPHONY_ROLE: assessor\nAdd a tiny uppercase feature"
+                    tool_input = ({"subagent_type": agent_type, "prompt": packet} if provider == "claude"
+                                  else {"model": strongest, "reasoning_effort": "high", "message": packet})
+                    self.hook(provider, "PreToolUse", tool_name="Agent" if provider == "claude" else "spawn_agent",
+                              tool_input=tool_input, tool_use_id="assessor")
+                    started = {"agent_id": "assessor", "agent_type": agent_type, "task": packet}
+                    self.hook(provider, "SubagentStart", **started)
+                    report = json.dumps({"size": size, "complexity": "simple", "risk": "normal",
+                                         "rationale": "tiny implementation", "topology": "direct"})
+                    self.hook(provider, "SubagentStop", **started, status="completed",
+                              last_assistant_message="SYMPHONY_ASSESSMENT: " + report)
+                    assessment = self.run_state().assessment
+                    self.assertEqual(assessment["topology"], expected)
+                    self.assertEqual(assessment["route"]["execution"], expected)
+                    status = "/symphony:status" if provider == "claude" else "$symphony:symphony status"
+                    output = self.hook(provider, "UserPromptSubmit", prompt=status).stdout
+                    self.assertIn("Topology: " + expected, output)
+                    self.assertIn("Accepted topology: " + expected, output)
+                    self.assertIn("small tasks need one worker", output)
+                    self.assertIn("Delegate implementation before editing", output)
+                    self.assertIn('SYMPHONY_OUTCOME:', output)
+
+    def test_codex_exact_profile_cells_and_handoff_fit_the_host_context_limit(self):
+        manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks/codex.json").read_text())
+        limit = manifest["hooks"]["UserPromptSubmit"][0]["hooks"][0]["additionalContextLimit"]
+        for profile in profiles_for("codex"):
+            with self.subTest(profile=profile["id"]):
+                self.tearDown()
+                self.setUp()
+                self.hook("codex", "SessionStart", profile["id"])
+                task = ("Add a tiny feature. " + "Acceptance detail. " * 30).strip()
+                response = self.hook("codex", "UserPromptSubmit", profile["id"], prompt="$symphony:symphony start " + task)
+                text = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
+                self.assertLess(len(text), limit)
+                self.assertIn(task, text)
+                self.assertIn("never reuse the fast lead selection", text)
+                self.assertIn("await its terminal assessment without sending additional work", text)
+                for size in ("small", "medium", "large"):
+                    for complexity in ("simple", "mixed", "complex"):
+                        route = resolve_tier(route_for(Assessment(size, complexity)), snapshot_for("codex", profile["id"]))
+                        self.assertIn(f"{size}/{complexity} `{route['lead_model']}/{route['lead_effort']}`", text)
 
     def test_escalation_waits_for_independent_assessor_before_replacement(self):
         for provider in ("codex", "claude"):
@@ -115,7 +301,11 @@ class FastRouteTests(unittest.TestCase):
                 self.hook(provider, "PreToolUse", tool_name="Agent" if provider == "claude" else "spawn_agent",
                           tool_input=tool_input, tool_use_id="assessor-spawn")
                 assessor = {"agent_id": "assessor-2", "agent_type": assessor_type, "task": packet}
-                self.hook(provider, "SubagentStart", **assessor)
+                started_assessor = self.hook(provider, "SubagentStart", **assessor)
+                context = json.loads(started_assessor.stdout)['hookSpecificOutput']['additionalContext']
+                self.assertIn(_ASSESSOR_CONTRACT, context)
+                self.assertIn(_ASSESSOR_CONTRACT, BODIES['assessor'])
+                self.assertIsNotNone(_assessment_from_marker({'last_assistant_message': _ASSESSOR_CONTRACT}, 'SYMPHONY_ASSESSMENT:'))
                 self.assertEqual(self.run_state().lead_identity, "fast-1")
                 self.hook(provider, "SubagentStop", **assessor, status="completed",
                           last_assistant_message='SYMPHONY_ASSESSMENT: {"size":"medium","complexity":"mixed","risk":"normal","rationale":"not bounded","topology":"mixed"}')
@@ -133,9 +323,33 @@ class FastRouteTests(unittest.TestCase):
                 prepared = self.hook(provider, "PreToolUse", tool_name="Agent" if provider == "claude" else "spawn_agent",
                                      tool_input=tool_input, tool_use_id="lead-spawn")
                 self.assertNotIn("deny", prepared.stdout)
-                self.hook(provider, "SubagentStart", agent_id="lead-2", agent_type=lead_type, task=packet)
+                started_lead = self.hook(provider, "SubagentStart", agent_id="lead-2", agent_type=lead_type, task=packet)
                 self.assertEqual(self.run_state().lead_identity, "lead-2")
                 self.assertEqual(self.run_state().owner_generation, 2)
+                guidance = json.loads(started_lead.stdout)['hookSpecificOutput']['additionalContext']
+                self.assertIn('SYMPHONY_ROLE: worker', guidance)
+                self.assertIn(_LEAD_VERIFICATION_CONTRACT, guidance)
+                self.assertIn(_LEAD_VERIFICATION_CONTRACT, BODIES['lead'])
+                self.assertNotIn('SYMPHONY_LEAD_SPAWN_PACKET:', guidance)
+                if provider == 'codex':
+                    self.assertIn('fork_turns="none"', guidance)
+                    self.assertIn('symphony_worker_<model>_<effort>', guidance)
+                    self.assertIn('symphony_consultant_<model>_<effort>', guidance)
+                    self.assertLess(len(guidance), 2048)
+                else:
+                    self.assertIn('symphony:symphony-worker-', guidance)
+                consultant_type = (f"symphony:symphony-consultant-{strongest}-high" if provider == 'claude'
+                    else f"symphony_consultant_{strongest.replace('-', '_').replace('.', '_')}_high")
+                started = self.hook(provider, 'SubagentStart', agent_id='consultant-1',
+                    parent_thread_id='lead-2', agent_type=consultant_type, model=strongest,
+                    model_reasoning_effort='high', task='SYMPHONY_ROLE: consultant\n'
+                    'SYMPHONY_DECISION: {"size":"small","complexity":"simple"}\nReview independently.')
+                context = json.loads(started.stdout)['hookSpecificOutput']['additionalContext']
+                self.assertIn(_CONSULTANT_CONTRACT, context)
+                self.assertIn(_CONSULTANT_CONTRACT, BODIES['consultant'])
+                self.assertEqual(_decision_markers(_CONSULTANT_CONTRACT),
+                                 ({'size': 'small', 'complexity': 'simple'},))
+                self.assertNotIn('SYMPHONY_LEAD_SPAWN_PACKET:', context)
 
     def test_unavailable_floor_uses_assessor_guidance_and_denies_fast_spawn(self):
         for provider in ("codex", "claude"):

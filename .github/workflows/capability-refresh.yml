@@ -1,11 +1,8 @@
 name: Capability refresh
 
-# Model lineups change over months, not days, so weekly is ample and keeps the
-# token cost of verification trivial. A scheduled workflow only runs from the
-# default branch, so this stays inert until it is merged.
+# Paused for the 1.7.0 release: validation uses local subscription logins.
+# Restoring API-backed refresh requires an explicit reviewed code change.
 on:
-  schedule:
-    - cron: "17 6 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -14,6 +11,7 @@ permissions:
 
 jobs:
   refresh:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

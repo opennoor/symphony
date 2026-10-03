@@ -4,25 +4,25 @@
 
 | Size / complexity | Lead | Execution | Consultation |
 |---|---|---|---|
-| small / simple | capable/medium | direct | none |
-| small / mixed | capable/high | direct | optional narrow |
-| small / complex | strongest/high | direct | optional independent check |
-| medium / simple | balanced/medium | direct plus mechanical delegation | none |
+| small / simple | capable/medium | delegated, one worker | none |
+| small / mixed | capable/high | delegated, one worker | optional narrow |
+| small / complex | strongest/high | delegated, one worker | required independent check |
+| medium / simple | balanced/medium | selective delegation | none |
 | medium / mixed | balanced/high | selective delegation | optional narrow |
 | medium / complex | capable/high | selective delegation | reserve one slot |
 | large / simple | economy/low | administrative delegation | none |
 | large / mixed | economy/medium | administrative delegation | reserve one slot |
 | large / complex | economy/medium | administrative delegation | strongest/high bounded decisions |
 
-Risk is `normal` or `high`. `high` raises a lead effort of `low` to `medium` and requires an independent check. Risk never changes the reported size or complexity. Reserved consultation means an available concurrency slot, not an idle agent.
+Risk is `normal` or `high`. `high` raises a lead effort of `low` to `medium` and requires an independent check. A different worker or consultant reviews completed substantive work and reports `SYMPHONY_REVIEW: passed` only after resolving findings. Risk never changes the reported size or complexity. Reserved consultation means an available concurrency slot, not an idle agent.
 
-The fixed matrix and these risk rules are authoritative for topology; an assessor's recommended topology is advisory input.
+The fixed matrix and these risk rules are authoritative for topology; an assessor's recommended topology is advisory input. Assessed substantive work goes to workers or consultants. Small tasks need one worker; medium tasks use bounded worker packets. The lead coordinates, integrates, and verifies results. `mixed` means worker execution with lead integration and verification.
 
 ## Capability resolution
 
-Before the matrix, the fast route may launch one lead at the current entitlement profile's `capable` model with `medium` effort. It is available only when that model and effort are shipped for the provider and the reviewed model policy ranks it at least 2. This excludes the economy floor without naming a particular provider model. An explicit assessor boost uses the assessor route directly. The fast lead checks the full task before writes; uncertainty escalates to an independent strongest/high assessor and the matrix below. The fast route does not change entitlement clamps on the later assessed route.
+Before the matrix, the fast route may launch one lead at the current entitlement profile's `capable` model with `medium` effort. It is available only when that model and effort are shipped for the provider and the reviewed model policy ranks it at least 2. This excludes the economy floor without naming a particular provider model. An explicit assessor boost uses the assessor route directly. Before any changes, the fast lead checks that the WHOLE objective consists only of predetermined mechanical steps with an expected result and passes the boundedness, clarity, low-risk, tool-availability, and verification checks. Implementation, diagnosis, design, substantive review, product judgment, mixed work, or uncertainty escalates to an independent strongest/high assessor before any changes, even for a tiny feature or a run-and-fix request. The fast route does not change entitlement clamps on the later assessed route.
 
-Resolve each cell through the selected shipped profile's model and effort choices. Profiles without cell choices fall back to the abstract tiers `economy`, `balanced`, `capable`, and `strongest`. Neither host gives a hook a model inventory, so there is no runtime discovery to attempt; the map is maintained at release time by a scheduled workflow that verifies every model against the provider before shipping it.
+Resolve each cell through the selected shipped profile's model and effort choices. Profiles without cell choices fall back to the abstract tiers `economy`, `balanced`, `capable`, and `strongest`. Runtime selects a shipped profile; it does not refresh the model map. For 1.7.0, maintainers run native validation locally through installed Codex and Claude clients with existing logins. Release CI checks the shipped profiles, reviewed policy, and generated agents offline. The API-backed capability-refresh workflow is disabled for this release; these offline checks do not establish live account access to every model.
 
 If no suitable assessor is available, disclose and use the conservative shipped route—the root does not improvise an assessment.
 

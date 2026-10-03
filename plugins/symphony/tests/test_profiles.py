@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -549,6 +550,11 @@ class AgentFileContractTests(unittest.TestCase):
         ]
         self.assertEqual(problems, [])
 
+    def test_claude_leads_request_direct_child_results(self):
+        generator = self.generator()
+        self.assertIn('`run_in_background: false`', generator.BODIES['lead'])
+        self.assertIn('An asynchronous launch acknowledgment is not a result', generator.BODIES['lead'])
+
     def test_the_floor_profile_can_spawn_an_assessor(self):
         # The assessor opens the run, so a floor-profile account that cannot
         # spawn one is an account Symphony can never govern at all.
@@ -560,6 +566,13 @@ class AgentFileContractTests(unittest.TestCase):
     def test_reference_refresh_detects_profile_meaning_changes(self):
         generator = self.generator()
         routing_module = sys.modules[generator.profiles_for.__module__]
+        packaged_agents = generator.AGENTS
+        original_write = Path.write_text
+        def fixture_write(path, *args, **kwargs):
+            # Rewriting even identical shipped bytes creates a truncate/read
+            # race with concurrent launcher digest checks.
+            self.assertNotEqual(path.parent, packaged_agents, 'test must not rewrite packaged agents')
+            return original_write(path, *args, **kwargs)
         original = generator.REFERENCE.read_text(encoding="utf-8")
         document = json.loads(routing_module.PROFILES_PATH.read_text(encoding="utf-8"))
         profiles = document["providers"]["codex"]["profiles"]
@@ -570,7 +583,12 @@ class AgentFileContractTests(unittest.TestCase):
             changed_profiles.write_text(json.dumps(document), encoding="utf-8")
             generated_reference = Path(directory) / "capability-routing.md"
             generated_reference.write_text(original, encoding="utf-8")
-            with patch.object(routing_module, "PROFILES_PATH", changed_profiles), patch.object(generator, "REFERENCE", generated_reference):
+            fixture_agents = Path(directory) / 'agents'
+            shutil.copytree(packaged_agents, fixture_agents)
+            with patch.object(routing_module, "PROFILES_PATH", changed_profiles), \
+                    patch.object(generator, "REFERENCE", generated_reference), \
+                    patch.object(generator, "AGENTS", fixture_agents), \
+                    patch.object(Path, 'write_text', fixture_write):
                 routing_module._profiles.cache_clear()
                 try:
                     with patch.object(sys, "argv", ["generate_agents.py", "--check"]), redirect_stdout(StringIO()):

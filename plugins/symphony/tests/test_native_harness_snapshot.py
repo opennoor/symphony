@@ -1,6 +1,7 @@
 """The native upgrade receipt accepts only the reviewed retained candidate."""
 
 import importlib.util
+from datetime import datetime
 import io
 import json
 import os
@@ -22,12 +23,642 @@ from plugins.symphony.symphony.store import _locked
 REPO = Path(__file__).resolve().parents[3]
 PLUGIN = REPO / "plugins" / "symphony"
 HARNESS = REPO / ".github" / "scripts" / "native_managed_concurrency.py"
+sys.path.insert(0, str(HARNESS.parent))
 SPEC = importlib.util.spec_from_file_location("native_managed_concurrency", HARNESS)
 native = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(native)
 
 
 class CandidateRetainedProfileTests(unittest.TestCase):
+    def test_claude_literal_worker_probe_exports_only_fixed_report_facts(self):
+        import native_routing_smoke as routing
+        rows = [{'type': 'assistant', 'uuid': 'terminal', 'timestamp': '2026-10-01T00:00:01Z',
+                 'message': {'role': 'assistant', 'stop_reason': None, 'content': [{'type': 'text', 'text': 'PRIVATE_SENTINEL\nGATE_RELEASED'}]}}]
+        launch = {'type': 'tool_use', 'id': 'bound-launch', 'name': 'Agent',
+                  'input': {'prompt': 'PRIVATE_PROMPT', 'run_in_background': True}}
+        lead_rows = [{'type': 'assistant', 'message': {'content': [launch]}},
+                     {'type': 'user', 'message': {'content': [{'type': 'tool_result',
+                       'tool_use_id': 'bound-launch', 'content': [{'type': 'text',
+                         'text': 'Async agent launched successfully PRIVATE_ACK'}]}]}}]
+        run = {'lead_identity': 'lead',
+               'assessment': {'_substantive_children': {'worker': {
+                   'launch_hash': native.sha256(b'bound-launch').hexdigest()}}},
+               'delegations': [{'identity': 'worker', 'role': 'worker', 'state': 'completed'}]}
+        with patch.object(routing, 'native_rows', side_effect=lambda provider, home, identity:
+                          lead_rows if identity == 'lead' else rows):
+            result = native.claude_literal_worker_probe(run, Path('private-home'))
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(result))
+        self.assertNotIn('PRIVATE_PROMPT', json.dumps(result))
+        self.assertNotIn('PRIVATE_ACK', json.dumps(result))
+        facts = result['workers'][0]
+        self.assertTrue(facts['native_reader_available'])
+        self.assertEqual(facts['native_bound_launch_count'], 1)
+        self.assertEqual(facts['native_bound_background_launch_count'], 1)
+        self.assertTrue(facts['native_bound_result_shapes'][0]['async_ack_present'])
+        self.assertFalse(facts['native_parent_completion_verified'])
+        self.assertTrue(facts['literal_line_present'])
+        self.assertFalse(facts['exact_literal_final'])
+        self.assertFalse(facts['terminal_is_end_turn'])
+
+    def test_failure_trace_uses_exact_gate_owner_when_cli_stdout_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = root / 'same-worktree'
+            project = case / 'primary'
+            project.mkdir(parents=True)
+            (case / 'native-gate').mkdir()
+            (case / 'native-gate/a.root.json').write_text('{"session_id":"own-root"}')
+            (case / 'native-gate/b.root.json').write_text('{"session_id":"foreign-root"}')
+            state = native.state_file(case / 'state', project)
+            state.parent.mkdir()
+            state.write_text(json.dumps({'recent_runs': [{'provider': 'claude', 'session_id': 'own-root',
+                'lead_identity': 'lead', 'run_id': 'run', 'status': 'completed'}]}))
+            with patch.object(native, 'claude_host_trace', return_value={'exact_owner': True}) as trace:
+                report = native.failure_state(root, 'claude')
+            self.assertEqual(report['cases'][0]['cli_session_ids'], {'a': 'own-root'})
+            self.assertEqual(report['native_host_trace']['same-worktree:a'], {'exact_owner': True})
+            trace.assert_called_once_with(root / 'claude-baseline-home', 'own-root', 'lead')
+
+    def test_nonupdate_wake_skips_only_exact_completed_original_owner(self):
+        run = {'provider': 'claude', 'session_id': 'root', 'run_id': 'original',
+               'lead_identity': 'lead', 'status': 'completed', 'outcome': {'status': 'completed'},
+               'delegations': [{'identity': 'lead', 'role': 'lead', 'state': 'completed'}]}
+        check = lambda document: native.claude_original_owner_archived(document, 'root', 'original', 'lead')
+        self.assertTrue(check({'recent_runs': [run]}))
+        for changes in ({'run_id': 'other'}, {'lead_identity': 'other'}, {'provider': 'codex'},
+                        {'session_id': 'foreign'}, {'status': 'completing'}, {'outcome': None},
+                        {'unreconciled': ['child']},
+                        {'delegations': [{'identity': 'child', 'state': 'working'}]}):
+            with self.subTest(changes=changes):
+                self.assertFalse(check({'recent_runs': [{**run, **changes}]}))
+        self.assertFalse(check({'recent_runs': [run, run]}))
+        self.assertFalse(check({'recent_runs': [run], 'active_runs': {'claude:root': run}}))
+
+    def test_cleanup_unblocks_missing_gates_without_overwriting_release_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ('release', 'a.stop-release'):
+                gate = Path(directory) / name
+                native.ensure_native_gate_release(gate)
+                self.assertTrue(gate.is_file())
+                boundary = 1_700_000_000_123_456_789
+                os.utime(gate, ns=(boundary, boundary))
+                recorded = gate.stat().st_mtime_ns
+                native.ensure_native_gate_release(gate)
+                self.assertEqual(gate.stat().st_mtime_ns, recorded)
+
+    def test_old_stop_hold_binds_released_160_fast_assessor_and_lead_native_history(self):
+        import copy
+        import native_routing_smoke as smoke
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            # Sanitized order from retained codex-0a188efdf511: fast 18--23,
+            # assessor 29--38, assessed lead 58--16:34:16, no root followup.
+            children = [
+                {'identity': 'fast', 'role': 'lead', 'requested_tier': 'gpt-6-sol', 'requested_effort': 'medium', 'state': 'completed'},
+                {'identity': 'assessor', 'role': 'assessor', 'requested_tier': 'gpt-6-astra', 'requested_effort': 'high', 'state': 'completed'},
+                {'identity': 'lead', 'role': 'lead', 'requested_tier': 'gpt-6-astra', 'requested_effort': 'high', 'state': 'completed'}]
+            run = {'session_id': 'root', 'lead_identity': 'lead', 'delegations': children,
+                   'assessment': {'_fast_route': {'model': 'gpt-6-sol', 'effort': 'medium'}}}
+            host = {'lead_turns': [{'completed': True, 'reported_outcome': 'blocked'}],
+                    'followup_calls': [], 'spawn_calls': [{}, {}, {}]}
+            rows = {'root': [{'type': 'session_meta', 'payload': {'id': 'root', 'source': 'exec', 'cwd': str(project)}}]}
+            for child, start, end in zip(children, ('16:33:18', '16:33:29', '16:33:58'), ('16:33:23', '16:33:38', '16:34:16')):
+                identity = child['identity']
+                role = 'lead_fast' if identity == 'fast' else child['role']
+                name = 'symphony_' + role + '_' + re.sub(r'\W', '_', child['requested_tier']) + '_' + child['requested_effort']
+                path = '/root/' + name
+                def timestamp(value):
+                    return '2026-10-01T' + value + '+00:00'
+                report = ('SYMPHONY_FAST_DECISION: escalate' if identity == 'fast'
+                          else 'SYMPHONY_ASSESSMENT: {}' if identity == 'assessor'
+                          else 'SYMPHONY_OUTCOME: {"status":"blocked"}')
+                rows[identity] = [
+                    {'type': 'session_meta', 'payload': {'id': identity, 'cwd': str(project), 'agent_path': path,
+                     'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}},
+                    {'type': 'turn_context', 'payload': {'turn_id': identity + '-turn', 'model': child['requested_tier'], 'effort': child['requested_effort']}},
+                    {'type': 'event_msg', 'timestamp': timestamp(start), 'payload': {'type': 'task_started', 'turn_id': identity + '-turn'}},
+                    {'type': 'event_msg', 'timestamp': timestamp(end), 'payload': {'type': 'task_complete', 'turn_id': identity + '-turn', 'last_agent_message': report}}]
+                rows['root'] += [
+                    {'type': 'response_item', 'timestamp': timestamp(start), 'payload': {'type': 'function_call', 'name': 'spawn_agent', 'call_id': identity + '-call',
+                     'arguments': json.dumps({'task_name': name, 'model': child['requested_tier'], 'reasoning_effort': child['requested_effort'], 'fork_turns': 'none'})}},
+                    {'type': 'response_item', 'timestamp': timestamp(start), 'payload': {'type': 'function_call_output', 'call_id': identity + '-call', 'output': json.dumps({'task_name': path})}}]
+            def check(values=run, native_rows=rows, host_values=host, version='1.6.0', alive=True):
+                with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: native_rows[identity]):
+                    native.require_old_stop_hold(host_values, alive, version, values, project, project, 'lead')
+            check()
+            archived = {**run, 'status': 'completed', 'outcome': {'status': 'completed'}}
+            with patch.object(smoke, 'native_rows', side_effect=lambda provider, home, identity: rows[identity]):
+                native.require_assessed_lead_set(archived, project, project, 'lead', released_old_version='1.6.0')
+                with self.assertRaises(RuntimeError):
+                    native.require_assessed_lead_set(archived, project, project, 'lead')
+            legacy = {**run, 'delegations': children[1:]}
+            without_fast = {key: copy.deepcopy(value) for key, value in rows.items() if key != 'fast'}
+            without_fast['root'] = without_fast['root'][:1] + without_fast['root'][3:]
+            check(legacy, without_fast, {**host, 'spawn_calls': [{}, {}]}, '1.5.1')
+            for flag in (False, None, 'true'):
+                with self.assertRaises(RuntimeError):
+                    check({**run, 'assessment': {**run['assessment'], '_fast_escalated': flag}})
+            for version in ('1.5.1', '1.7.0'):
+                with self.assertRaises(RuntimeError):
+                    check(version=version)
+            mutations = []
+            for variant in ('duplicate_call', 'missing_result', 'foreign_result', 'failed_result', 'model', 'fork', 'parent', 'failed', 'unfinished', 'misordered', 'replacement'):
+                altered = copy.deepcopy(rows)
+                if variant == 'duplicate_call': altered['root'].append(copy.deepcopy(altered['root'][1]))
+                elif variant == 'missing_result': altered['root'].pop(2)
+                elif variant == 'foreign_result': altered['root'][2]['payload']['output'] = '{"task_name":"foreign"}'
+                elif variant == 'failed_result':
+                    result = json.loads(altered['root'][2]['payload']['output'])
+                    result['isError'] = True
+                    altered['root'][2]['payload']['output'] = json.dumps(result)
+                elif variant in {'model', 'fork'}:
+                    arguments = json.loads(altered['root'][1]['payload']['arguments'])
+                    arguments['model' if variant == 'model' else 'fork_turns'] = 'foreign'
+                    altered['root'][1]['payload']['arguments'] = json.dumps(arguments)
+                elif variant == 'parent': altered['assessor'][0]['payload']['source']['subagent']['thread_spawn']['parent_thread_id'] = 'foreign'
+                elif variant == 'replacement': altered['lead'][0]['payload']['agent_path'] += '_replacement'
+                elif variant in {'failed', 'unfinished'}:
+                    altered['assessor'].append({'type': 'event_msg', 'payload': {'type': 'task_failed' if variant == 'failed' else 'task_started', 'turn_id': 'later'}})
+                elif variant == 'misordered': altered['fast'][-1]['timestamp'] = timestamp('16:33:31')
+                mutations.append((variant, altered))
+            for variant, altered in mutations:
+                with self.subTest(variant=variant), self.assertRaises(RuntimeError):
+                    check(native_rows=altered)
+            for altered, alive in (({**host, 'followup_calls': [{}]}, True), (host, False),
+                                   ({**host, 'lead_turns': [{'completed': True, 'reported_outcome': 'completed'}]}, True)):
+                with self.assertRaises(RuntimeError):
+                    check(host_values=altered, alive=alive)
+
+    def test_stop_hold_diagnostics_expose_each_predicate_without_acceptance(self):
+        host = {'lead_turns': [{'completed': True, 'reported_outcome': 'blocked'}],
+                'followup_calls': [], 'spawn_calls': [{}, {}, {}]}
+        result = native.old_stop_hold_conditions(host, True, '1.6.0')
+        self.assertEqual(result['native_lead_turn_count'], 1)
+        self.assertTrue(result['first_native_turn_completed'])
+        self.assertTrue(result['first_native_outcome_blocked'])
+        self.assertEqual(result['native_followup_count'], 0)
+        self.assertEqual(result['native_root_spawn_count'], 3)
+        self.assertFalse(result['native_root_has_two_spawns'])
+        self.assertTrue(result['old_cli_alive'])
+        missing = native.old_stop_hold_conditions(
+            {'lead_turns': [], 'followup_calls': [{}], 'spawn_calls': []}, False, '1.5.1')
+        self.assertFalse(missing['first_native_turn_completed'])
+        self.assertFalse(missing['first_native_outcome_blocked'])
+        self.assertFalse(missing['old_cli_alive'])
+
+    def test_private_native_failure_copy_excludes_credentials_config_and_arbitrary_home_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'scratch'
+            home = root / 'codex-live-update-home'
+            (home / 'sessions').mkdir(parents=True)
+            (home / 'sessions' / 'native.jsonl').write_text('PRIVATE_NATIVE_TRANSCRIPT', encoding='utf-8')
+            (home / 'sessions' / 'auth.json').write_text('PRIVATE_AUTH_SENTINEL', encoding='utf-8')
+            (home / 'auth.json').write_text('PRIVATE_AUTH_SENTINEL', encoding='utf-8')
+            (home / 'config.toml').write_text('PRIVATE_CONFIG_SENTINEL', encoding='utf-8')
+            logs = root / 'live-update' / 'logs'
+            logs.mkdir(parents=True)
+            (logs / 'a.errors').write_text('PRIVATE_NATIVE_OUTPUT', encoding='utf-8')
+            (root / 'live-update' / 'update_event_counts.json').write_text('{}', encoding='utf-8')
+            target = native.preserve_private_native_failure(root, Path(temporary) / 'private', 'codex')
+            self.assertTrue((target / 'codex-live-update-home/sessions/native.jsonl').is_file())
+            self.assertTrue((target / 'live-update/logs/a.errors').is_file())
+            self.assertTrue((target / 'live-update/update_event_counts.json').is_file())
+            copied = ''.join(path.read_text(encoding='utf-8') for path in target.rglob('*') if path.is_file())
+            self.assertNotIn('PRIVATE_AUTH_SENTINEL', copied)
+            self.assertNotIn('PRIVATE_CONFIG_SENTINEL', copied)
+            if os.name != 'nt':
+                self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((target / 'live-update/logs/a.errors').stat().st_mode & 0o777, 0o600)
+
+    def test_live_update_versions_keep_160_baseline_and_explicit_151_strict(self):
+        for old, candidate in (("1.5.1", "1.6.0"), ("1.5.1", "1.7.0"),
+                               ("1.6.0", "1.7.0")):
+            with self.subTest(old=old, candidate=candidate):
+                native.require_live_update_versions(old, candidate)
+
+        for old, candidate in (("1.5.1", "1.5.1"), ("1.5.1", "1.5.0"),
+                               ("1.6.0", "1.6.0"), ("1.6.0", "1.5.1"),
+                               ("1.7.0", "1.8.0"), ("1.5.0", "1.7.0"),
+                               (None, "1.7.0"), ([], "1.7.0"),
+                               ("1.6.0", "1.7"), ("1.6.0", "1.7.0-dev"),
+                               ("1.6.0", None)):
+            with self.subTest(old=old, candidate=candidate), self.assertRaises(RuntimeError):
+                native.require_live_update_versions(old, candidate)
+
+
+    def test_release_ci_preserves_offline_legacy_recovery_replay(self):
+        workflow = (PLUGIN.parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        self.assertIn('Replay released 1.5.1 recovering state', workflow)
+        self.assertIn('python -m unittest plugins.symphony.tests.test_host_evidence.'
+                      'HostEvidenceTests.test_released_151_recovering_state_reconciles_unique_native_followup', workflow)
+
+    def test_live_update_main_accepts_both_released_roots_with_default_candidate(self):
+        for old_version in ("1.5.1", "1.6.0"):
+            with self.subTest(old_version=old_version), tempfile.TemporaryDirectory() as temporary:
+                old_root = Path(temporary) / old_version
+                argv = [str(HARNESS), "--provider", "codex", "--live-update",
+                        "--only-live-update", "--old-plugin-root", str(old_root)]
+                update = {"home": Path(temporary) / "disposable-home"}
+                stdout = io.StringIO()
+                with patch.object(native, "package_version", side_effect=[old_version, "1.7.0"]) as versions, \
+                     patch.object(native, "prepare_live_update", return_value=update) as prepare, \
+                     patch.object(native, "prepare_baseline_capture") as baseline, \
+                     patch.object(native, "check_codex_mixed_live_update", return_value={"completed": ["a", "b"]}) as check, \
+                     patch.object(sys, "argv", argv), patch.object(sys, "stdout", stdout), \
+                     patch.dict(native.os.environ, {"OPENAI_API_KEY": "fixture-auth", "SYMPHONY_NATIVE_DIAGNOSTICS_DIR": ""}):
+                    self.assertEqual(native.main(), 0)
+                self.assertEqual([call.args[0] for call in versions.call_args_list], [old_root, PLUGIN])
+                self.assertEqual(prepare.call_args.args[2:], (old_root, PLUGIN))
+                baseline.assert_not_called()
+                self.assertIs(check.call_args.args[3], update)
+
+    def test_live_update_install_preflight_rejects_same_or_newer_old_before_mutation(self):
+        for old, candidate in (("1.5.1", "1.5.1"), ("1.6.0", "1.6.0"),
+                               ("1.6.0", "1.5.1"), ("1.7.0", "1.7.0")):
+            with self.subTest(old=old, candidate=candidate), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with patch.object(native, "package_version", side_effect=[old, candidate]), \
+                     patch.object(native, "marketplace") as market, \
+                     patch.object(native, "codex_command") as command, \
+                     self.assertRaises(RuntimeError):
+                    native.prepare_live_update("codex", root, root / "old", root / "candidate")
+                market.assert_not_called()
+                command.assert_not_called()
+                self.assertFalse((root / "codex-live-update-home").exists())
+
+    def test_literal_claude_worker_uses_actual_admitted_start_or_exact_legacy_clock(self):
+        from dataclasses import asdict
+        from plugins.symphony.tests.test_assessed_contract import AssessedContractTests
+        fixture = AssessedContractTests()
+        fixture.begin('claude')
+        self.addCleanup(fixture.doCleanups)
+        fixture.worker()
+        run = asdict(fixture.state.active_run)
+        worker = next(item for item in run['delegations'] if item['role'] == 'worker')
+        home = Path(fixture.environ['CLAUDE_CONFIG_DIR'])
+        directory = home / 'projects' / '-fixture' / 'root' / 'subagents'
+        parent = directory / 'agent-lead.jsonl'
+        rows = [json.loads(line) for line in parent.read_text(encoding='utf-8').splitlines()]
+        block = rows[0]['message']['content'][0]
+        block['input']['prompt'] = 'SYMPHONY_ROLE: worker\nReturn GATE_RELEASED.'
+        block['input']['run_in_background'] = True
+        rows.append({'type': 'user', 'sessionId': 'root', 'agentId': 'lead', 'isSidechain': True,
+                     'timestamp': '2026-10-01T14:00:04+00:00', 'message': {'content': [
+                     {'type': 'tool_result', 'tool_use_id': block['id'], 'content': 'worker', 'is_error': False}]}})
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        child = directory / 'agent-worker.jsonl'
+        child_rows = [json.loads(line) for line in child.read_text(encoding='utf-8').splitlines()]
+        child_rows[0]['message']['content'] = block['input']['prompt']
+        child.write_text(''.join(json.dumps(row) + '\n' for row in child_rows), encoding='utf-8')
+        with child.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps({'type': 'assistant', 'sessionId': 'root', 'agentId': 'worker', 'isSidechain': True,
+                'uuid': 'native-terminal', 'timestamp': '2026-10-01T14:00:04+00:00',
+                'effort': worker['requested_effort'],
+                'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'end_turn', 'content': [
+                {'type': 'text', 'text': 'GATE_RELEASED'}]}}) + '\n')
+        native.require_literal_worker('claude', run, home, fixture.project)
+        legacy = {**run, 'assessment': {}}
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', legacy, home, fixture.project)
+        stamp = int(datetime.fromisoformat(run['assessment']['_substantive_children']['worker']['admitted_at']).timestamp() * 1e9)
+        clock = {'event': 'SubagentStart', 'session_id': 'root', 'agent_id': 'worker', 'started_ns': stamp}
+        native.require_literal_worker('claude', legacy, home, fixture.project, [clock])
+        original = child.read_text(encoding='utf-8')
+        history = [json.loads(line) for line in original.splitlines()]
+        notification = {'type': 'user', 'sessionId': 'root', 'agentId': 'lead', 'isSidechain': True,
+            'uuid': 'native-notification', 'isMeta': True, 'timestamp': '2026-10-01T14:00:04.1+00:00',
+            'origin': {'kind': 'task-notification', 'producer': 'session-task'}, 'message': {'content':
+                '<task-notification><task-id>worker</task-id><status>completed</status><result>GATE_RELEASED</result></task-notification>'}}
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in [*rows, notification]), encoding='utf-8')
+        history[-1]['message']['stop_reason'] = None
+        child.write_text(''.join(json.dumps(row) + '\n' for row in history), encoding='utf-8')
+        native.require_literal_worker('claude', run, home, fixture.project)
+        for reason in (None, 'end_turn'):
+            history[-1]['message']['stop_reason'] = reason
+            error = {**history[-1], 'type': 'error', 'subtype': 'api_error', 'uuid': 'later-error',
+                     'timestamp': '2026-10-01T14:00:04.2+00:00'}
+            child.write_text(''.join(json.dumps(row) + '\n' for row in [*history, error]), encoding='utf-8')
+            with self.assertRaises(RuntimeError): native.require_literal_worker('claude', run, home, fixture.project)
+        history[-1]['message']['stop_reason'] = None
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        later = {**history[-1], 'uuid': 'later', 'timestamp': '2026-10-01T14:00:05+00:00',
+                 'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'different result'}]}}
+        child.write_text(''.join(json.dumps(row) + '\n' for row in [*history, later]), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', run, home, fixture.project)
+        child.write_text(original, encoding='utf-8')
+        prompt = json.loads(original.splitlines()[0])
+        handback = {**history[-1], 'uuid': 'handback', 'timestamp': '2026-10-01T14:00:04+00:00',
+                    'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'tool_use', 'content': [
+                    {'type': 'tool_use', 'id': 'handback-id', 'name': 'SubagentHandback', 'input': {'message': 'GATE_RELEASED'}}]}}
+        delivered = {**prompt, 'timestamp': '2026-10-01T14:00:05+00:00', 'message': {'content': [
+            {'type': 'tool_result', 'tool_use_id': 'handback-id', 'content': 'accepted', 'is_error': False}]}}
+        goodbye = {**later, 'timestamp': '2026-10-01T14:00:06+00:00',
+                   'message': {'role': 'assistant', 'model': worker['requested_tier'], 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Done.'}]}}
+        child.write_text(''.join(json.dumps(row) + '\n' for row in (prompt, handback, delivered, goodbye)), encoding='utf-8')
+        native.require_literal_worker('claude', run, home, fixture.project)
+        delivered['message']['content'][0]['is_error'] = True
+        child.write_text(''.join(json.dumps(row) + '\n' for row in (prompt, handback, delivered, goodbye)), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', run, home, fixture.project)
+        child.write_text(original, encoding='utf-8')
+        for captures in ([clock, clock], [{**clock, 'session_id': 'foreign'}]):
+            with self.assertRaises(RuntimeError):
+                native.require_literal_worker('claude', legacy, home, fixture.project, captures)
+        rows[0]['message']['content'][0]['input']['model'] = 'foreign'
+        parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            native.require_literal_worker('claude', run, home, fixture.project)
+
+    def test_literal_worker_acceptance_requires_exact_one_report_and_canonical_native_parent(self):
+        import native_routing_smoke as smoke
+        lead_path = '/root/symphony_lead_model_medium'
+        worker_path = lead_path + '/symphony_worker_model_medium'
+        worker = {'identity': 'worker', 'role': 'worker', 'state': 'completed',
+                  'requested_tier': 'model', 'requested_effort': 'medium'}
+        run = {'lead_identity': 'lead', 'delegations': [worker]}
+        lead_rows = [{'type': 'session_meta', 'payload': {'id': 'lead', 'agent_path': lead_path}},
+            {'type': 'response_item', 'payload': {'type': 'function_call', 'call_id': 'launch',
+             'name': 'spawn_agent', 'arguments': json.dumps({'task_name': 'symphony_worker_model_medium',
+             'model': 'model', 'reasoning_effort': 'medium', 'fork_turns': 'none', 'message': 'SYMPHONY_ROLE: worker\nfixture'})}},
+            {'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'launch',
+             'output': json.dumps({'task_name': worker_path})}}]
+        rows = [{'type': 'session_meta', 'payload': {'id': 'worker', 'agent_path': worker_path,
+                 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}},
+                {'type': 'turn_context', 'payload': {'turn_id': 'worker-turn', 'model': 'model', 'effort': 'medium'}},
+                {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:01+00:00', 'payload': {'type': 'task_started', 'turn_id': 'worker-turn'}},
+                {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:02+00:00', 'payload': {'type': 'task_complete', 'turn_id': 'worker-turn', 'last_agent_message': 'GATE_RELEASED'}}]
+
+        def check(values, child_rows):
+            with patch.object(smoke, 'native_rows', side_effect=[lead_rows, child_rows]):
+                native.require_literal_worker('codex', values, Path('/native'))
+
+        check(run, rows)
+        extra_report = [*rows[:-1], {**rows[-1], 'payload': {**rows[-1]['payload'],
+                        'last_agent_message': 'GATE_RELEASED\nSYMPHONY_OUTCOME: {"status":"completed"}\nPRIVATE_SENTINEL'}}]
+        with patch.object(smoke, 'native_rows', side_effect=[extra_report, lead_rows]):
+            diagnostic = native.codex_literal_worker_probe(run, Path('/native'))
+        self.assertEqual(diagnostic['worker_count'], 1)
+        facts = diagnostic['workers'][0]
+        self.assertTrue(facts['native_parent_matches_lead'])
+        self.assertTrue(facts['exact_native_launch_verified'])
+        self.assertTrue(facts['bound_nonempty_turn'])
+        self.assertFalse(facts['exact_literal_report'])
+        self.assertTrue(facts['literal_line_present'])
+        self.assertEqual(facts['outcome_marker_count'], 1)
+        self.assertEqual(facts['successful_parent_handback_count'], 0)
+        handback = [*extra_report[:-1],
+            {'type': 'response_item', 'payload': {'type': 'function_call', 'call_id': 'handback',
+             'name': 'collaboration.send_message', 'arguments': json.dumps({'target': lead_path, 'message': 'GATE_RELEASED'})}},
+            {'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'handback', 'output': '{}'}},
+            extra_report[-1]]
+        with patch.object(smoke, 'native_rows', side_effect=[handback, lead_rows]):
+            reported = native.codex_literal_worker_probe(run, Path('/native'))['workers'][0]
+        self.assertEqual(reported['successful_parent_handback_count'], 1)
+        self.assertEqual(reported['literal_parent_handback_count'], 1)
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(diagnostic))
+        self.assertNotIn(worker_path, json.dumps(diagnostic))
+        for values, child_rows in (({**run, 'delegations': [worker, worker]}, rows),
+                                  ({**run, 'delegations': [{**worker, 'state': 'failed'}]}, rows),
+                                  (run, [*rows[:-1], {'type': 'event_msg', 'payload': {'type': 'task_complete', 'last_agent_message': 'claimed'}}]),
+                                  (run, [{**rows[0], 'payload': {**rows[0]['payload'], 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}, *rows[1:]]),
+                                  (run, [rows[0], {**rows[1], 'payload': {**rows[1]['payload'], 'model': 'foreign'}}, *rows[2:]]),
+                                  (run, [*rows, {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'future'}}]),
+                                  (run, [*rows[:-1], {**rows[-1], 'timestamp': '2026-10-01T00:00:00+00:00'}]),
+                                  (run, [*rows, {'type': 'event_msg', 'payload': {'type': 'error', 'turn_id': 'worker-turn'}}])):
+            with self.assertRaises(RuntimeError):
+                check(values, child_rows)
+
+    def test_assessed_lead_set_excludes_only_exact_completed_native_fast_escalation(self):
+        import native_routing_smoke as smoke
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            lead = {'identity': 'lead', 'role': 'lead', 'state': 'completed', 'requested_tier': 'model', 'requested_effort': 'medium'}
+            fast = {**lead, 'identity': 'fast'}
+            run = {'lead_identity': 'lead', 'session_id': 'root', 'delegations': [lead, fast],
+                   'assessment': {'_fast_escalated': True, '_fast_route': {'model': 'model', 'effort': 'medium'}}}
+            def header(identity, name, parent='root'):
+                return {'type': 'session_meta', 'payload': {'id': identity, 'cwd': str(project),
+                    'agent_path': '/root/' + name, 'source': {'subagent': {'thread_spawn': {'parent_thread_id': parent}}}}}
+            canonical = [header('lead', 'symphony_lead_model_medium'), {'type': 'event_msg',
+                         'timestamp': '2026-10-01T00:00:03+00:00', 'payload': {'type': 'task_started', 'turn_id': 'assessed'}}]
+            rows = [header('fast', 'symphony_lead_fast_model_medium'),
+                    {'type': 'turn_context', 'payload': {'turn_id': 'turn', 'model': 'model', 'effort': 'medium'}},
+                    {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:01+00:00', 'payload': {'type': 'task_started', 'turn_id': 'turn'}},
+                    {'type': 'event_msg', 'timestamp': '2026-10-01T00:00:02+00:00', 'payload': {'type': 'task_complete', 'turn_id': 'turn',
+                     'last_agent_message': 'SYMPHONY_FAST_DECISION: escalate'}}]
+            def check(values, fast_rows):
+                with patch.object(smoke, 'native_rows', side_effect=[canonical, fast_rows]):
+                    native.require_assessed_lead_set(values, project, project, 'lead')
+            check(run, rows)
+            # Real lead admission consumes the intermediate escalation flag.
+            # The archived candidate must instead prove its scoped receipt.
+            from dataclasses import asdict
+            from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
+            from plugins.symphony.symphony.reducer import _lead_started
+            import copy
+            route = {'execution': 'delegated', 'lead_model': 'model', 'lead_effort': 'medium'}
+            contract = {'version': 1, 'epoch': 'accepted-source', 'accepted_at': '2026-10-01T00:00:02.500+00:00'}
+            result = 'd' * 64
+            assessment = {**run['assessment'], 'substantive_contract': contract, 'route': route,
+                '_terminal_turns': {'fast': ['turn_id:turn']}, '_terminal_event_ids': [result]}
+            before = RunState(run_id='current', task='fixture', status='assessed', started_at='2026-10-01T00:00:00+00:00',
+                updated_at='2026-10-01T00:00:02+00:00', lead_identity='fast', assessment=assessment,
+                delegations=tuple(Delegation(objective='', **child) for child in (lead, fast)),
+                session_id='root', provider='codex')
+            admitted, _ = _lead_started(ProjectState(active_run=before), Event('lead-start', 'lead_started',
+                '2026-10-01T00:00:03+00:00', {'identity': 'lead', 'owner_generation': 2, 'safe_boundary': True}))
+            candidate = asdict(admitted.active_run)
+            self.assertEqual(candidate['lead_identity'], 'lead')
+            self.assertNotIn('_fast_escalated', candidate['assessment'])
+            receipt = {'provider': 'codex', 'session': 'root', 'run_id': 'current', 'agent': 'fast', 'lead': 'fast',
+                       'parent': 'root', 'turn': 'turn_id:turn', 'result': result, 'status': 'completed'}
+            anchor = {'event_id': 'accepted-source:assessment:assessment_accepted', 'kind': 'assessment_accepted',
+                      'observed_at': contract['accepted_at'], 'payload': {'route': route}}
+            document = {'terminal_receipts': [receipt], 'event_history': [anchor]}
+            def check_candidate(values=candidate, proof=document):
+                with patch.object(smoke, 'native_rows', side_effect=[canonical, rows]):
+                    native.require_assessed_lead_set(values, project, project, 'lead', document=proof)
+            check_candidate()
+            version_two = copy.deepcopy(candidate)
+            version_two['assessment']['substantive_contract'].update(version=2, review_required=False)
+            check_candidate(version_two)
+            for key, value in (('version', True), ('version', 0), ('version', 3), ('version', '2'), ('version', None),
+                               ('epoch', ''), ('accepted_at', 'invalid'),
+                               ('accepted_at', '2026-10-01T00:00:01+00:00'), ('accepted_at', '2026-10-01T00:00:04+00:00')):
+                altered = copy.deepcopy(candidate)
+                altered['assessment']['substantive_contract'][key] = value
+                with self.subTest(contract_key=key, value=value), self.assertRaises(RuntimeError):
+                    check_candidate(altered)
+            for key, value in (('execution', 'direct'), ('lead_model', 'foreign'), ('lead_effort', 'high')):
+                altered = copy.deepcopy(candidate)
+                altered['assessment']['route'][key] = value
+                with self.subTest(route_key=key), self.assertRaises(RuntimeError):
+                    check_candidate(altered)
+            for field in ('provider', 'session', 'run_id', 'agent', 'lead', 'parent', 'turn', 'result', 'status'):
+                with self.subTest(receipt_key=field), self.assertRaises(RuntimeError):
+                    check_candidate(proof={**document, 'terminal_receipts': [{**receipt, field: 'foreign'}]})
+            for proof in (None, {}, {**document, 'terminal_receipts': [receipt, receipt]},
+                          {**document, 'event_history': []}, {**document, 'event_history': [anchor, anchor]},
+                          {**document, 'event_history': [{**anchor, 'observed_at': 'foreign'}]},
+                          {**document, 'event_history': [{**anchor, 'kind': 'foreign'}]}):
+                with self.subTest(document=proof), self.assertRaises(RuntimeError):
+                    check_candidate(proof=proof)
+            for key, value in (('_terminal_turns', {}), ('_terminal_event_ids', []), ('_fast_escalated', False),
+                               ('_fast_escalated', None), ('_fast_escalated', 'true'), ('substantive_contract', None)):
+                altered = copy.deepcopy(candidate)
+                altered['assessment'][key] = value
+                with self.subTest(assessment_key=key), self.assertRaises(RuntimeError):
+                    check_candidate(altered)
+            for values, other in (({**run, 'delegations': [lead, fast, {**fast, 'identity': 'extra'}]}, rows),
+                                  ({**run, 'delegations': [lead, {**fast, 'state': 'failed'}]}, rows),
+                                  (run, [header('fast', 'symphony_lead_model_medium'), *rows[1:]]),
+                                  (run, [header('fast', 'symphony_lead_fast_model_medium', 'foreign'), *rows[1:]]),
+                                  (run, rows + [{'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'future'}}]),
+                                  (run, [*rows[:-1], {**rows[-1], 'payload': {**rows[-1]['payload'], 'turn_id': 'foreign'}}]),
+                                  (run, [*rows[:-1], {**rows[-1], 'timestamp': '2026-10-01T00:00:04+00:00'}])):
+                with self.assertRaises(RuntimeError):
+                    check(values, other)
+
+    def test_second_child_schedule_requires_exact_native_canonical_lead_proof(self):
+        record = {'event': 'SubagentStart', 'native_gate_label': 'a', 'session_id': 'root',
+                  'agent_id': 'lead', 'native_metadata': {'own_header_identity_matches': True,
+                  'native_parent_matches_root': True, 'native_task_role': 'lead', 'declared_assessed_lead_matches': True}}
+        native.require_codex_gate_lead([record], 'a', 'root', 'lead')
+        for field, value in (('own_header_identity_matches', False),
+                             ('native_parent_matches_root', False), ('native_task_role', 'worker'),
+                             ('declared_assessed_lead_matches', False)):
+            with self.subTest(field=field):
+                bad = {**record, 'native_metadata': {**record['native_metadata'], field: value}}
+                with self.assertRaises(RuntimeError):
+                    native.require_codex_gate_lead([bad], 'a', 'root', 'lead')
+        for rows in ([], [record, record], [{**record, 'session_id': 'foreign'}],
+                     [{**record, 'agent_id': 'worker'}]):
+            with self.assertRaises(RuntimeError):
+                native.require_codex_gate_lead(rows, 'a', 'root', 'lead')
+
+    def test_released_original_fixture_versions_both_prompt_and_worker_expectation(self):
+        for version in ('1.5.1', '1.6.0'):
+            for provider in ('codex', 'claude'):
+                with self.subTest(version=version, provider=provider):
+                    root = native.prompt(provider, 'a', True, Path('/tmp/fixture'),
+                        codex_profile='full', defer_recovery=provider == 'codex', released_direct_version=version)
+                    if provider == 'codex':
+                        message = json.loads(re.search(r'^LEAD_SPAWN_PACKET: (.+)$', root, re.MULTILINE)[1])['message']
+                        self.assertIn('NATIVE_STATUS.txt', message)
+                        self.assertIn('only READY permits', message)
+                    else:
+                        message = json.loads(re.search(r'LEAD_TASK_TEXT: (.+)$', root, re.MULTILINE)[1])
+                    route = json.loads(re.search(r'^SYMPHONY_ROUTE: (.+)$', message, re.MULTILINE)[1])
+                    self.assertEqual(route['topology'], 'direct')
+                    self.assertIn('no worker report is required', message)
+                    self.assertNotIn('WORKER_SPAWN_PACKET', root)
+                    self.assertIn('SYMPHONY_OUTCOME: {"status":"blocked"}', message)
+                    released_run = {'assessment': {'size': 'small', 'route': {'execution': 'direct'}}}
+                    native.require_released_direct_fixture(released_run, version)
+                    with self.assertRaises(RuntimeError):
+                        native.require_literal_worker(provider, {**released_run, 'delegations': []}, Path('/tmp/home'))
+        candidate = native.prompt('codex', 'b', False, Path('/tmp/fixture'), codex_profile='latest')
+        self.assertIn('WORKER_SPAWN_PACKET', candidate)
+        self.assertIn('exactly one bounded', candidate)
+        with self.assertRaises(ValueError):
+            native.prompt('codex', 'a', True, Path('/tmp/fixture'), released_direct_version='1.7.0')
+        for version, assessment in (
+                ('1.7.0', {'size': 'small', 'route': {'execution': 'direct'}}),
+                ('1.6.0', {'size': 'small', 'route': {'execution': 'delegated'}}),
+                ('1.6.0', {'size': 'medium', 'route': {'execution': 'direct'}}),
+                ('1.6.0', {'size': 'small', 'route': {'execution': 'direct'}, 'substantive_contract': None}),
+                ('1.6.0', {'size': 'small', 'route': {'execution': 'direct'}, 'substantive_contract': {'version': 1}})):
+            with self.subTest(version=version, assessment=assessment), self.assertRaises(RuntimeError):
+                native.require_released_direct_fixture({'assessment': assessment}, version)
+
+    def test_assessed_fixture_lead_owns_one_literal_worker_and_keeps_recovery(self):
+        from plugins.symphony.symphony.routing import Assessment, route_for
+        profiles = json.loads((PLUGIN / 'profiles.json').read_text(encoding='utf-8'))['providers']
+        for provider, profile_id in (('codex', 'base'), ('codex', 'full'), ('codex', 'latest'),
+                                     ('claude', 'sonnet-5-5')):
+            for recover in (False, True):
+                with self.subTest(provider=provider, profile=profile_id, recover=recover):
+                    root = native.prompt(provider, 'a', recover, Path('/tmp/fixture'), codex_profile=profile_id)
+                    if provider == 'codex':
+                        lead = json.loads(re.search(r'^LEAD_SPAWN_PACKET: (.+)$', root, re.MULTILINE)[1])['message']
+                    else:
+                        lead = json.loads(re.search(r'LEAD_TASK_TEXT: (.+)$', root, re.MULTILINE)[1])
+                    route = json.loads(re.search(r'^SYMPHONY_ROUTE: (.+)$', lead, re.MULTILINE)[1])
+                    self.assertEqual(route['topology'], route_for(Assessment(
+                        route['size'], route['complexity'], risk=route['risk'])).execution)
+                    packet = json.loads(re.search(r'WORKER_SPAWN_PACKET: (.+)$', lead, re.MULTILINE)[1])
+                    profile = next(p for p in profiles[provider]['profiles'] if p['id'] == profile_id)
+                    selected = profile['matrix']['small/simple']
+                    if provider == 'codex':
+                        self.assertEqual((packet['model'], packet['reasoning_effort']),
+                                         (selected['model'], selected['effort']))
+                        self.assertEqual(packet['fork_turns'], 'none')
+                        self.assertEqual(packet['task_name'], 'symphony_worker_' +
+                                         re.sub(r'\W', '_', selected['model']) + '_' + selected['effort'] + '__substantive')
+                    else:
+                        self.assertEqual(packet['subagent_type'],
+                                         f"symphony:symphony-worker-{selected['model']}-{selected['effort']}")
+                        self.assertIs(packet['run_in_background'], False)
+                    message = packet.get('message', packet.get('prompt'))
+                    self.assertTrue(message.startswith('SYMPHONY_ROLE: worker\npurpose: substantive\n'))
+                    own = json.loads(message.split('\n', 2)[2])
+                    self.assertEqual((own['size'], own['complexity']), ('small', 'simple'))
+                    self.assertEqual(own['return_contract'], 'Return exactly GATE_RELEASED without Markdown.')
+                    self.assertIn('YOU as the canonical lead must spawn exactly one', lead)
+                    self.assertIn('Await its successful native result and verify', lead)
+                    self.assertIn('do not spawn duplicate work', lead)
+                    self.assertNotIn('Do not delegate or create a worktree.', lead)
+                    self.assertIn('the root never substitutes', lead)
+                    self.assertIn('Only the external harness releases', root)
+                    if recover:
+                        self.assertIn('SYMPHONY_OUTCOME: {"status":"blocked"}', lead)
+                        self.assertIn('SAME lead', root)
+
+    def test_assessor_capture_exports_metadata_and_admission_facts_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / 'project'
+            project.mkdir()
+            state = root / 'state'
+            state.mkdir()
+            script = root / 'capture.py'
+            script.write_text(native.CODEX_HOOK_CAPTURE, encoding='utf-8')
+            transcript = root / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'assessor-a',
+                'agent_path': '/root/symphony_assessor_gpt_6_luna_high',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root-a'}}}}}
+            turn = {'type': 'turn_context', 'payload': {'turn_id': 'turn-a',
+                                                     'model': 'gpt-6-luna', 'effort': 'high'}}
+            secret = {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                'content': [{'type': 'input_text', 'text': 'PRIVATE_AUTH_SENTINEL'}]}}
+            payload = {'cwd': str(project), 'session_id': 'root-a', 'agent_id': 'assessor-a',
+                       'agent_type': 'default', 'turn_id': 'turn-a', 'agent_transcript_path': str(transcript)}
+            path = native.state_file(state, project)
+            env = {**os.environ, 'SYMPHONY_STATE_DIR': str(state),
+                   'SYMPHONY_NATIVE_ASSESSOR_MODEL': 'gpt-6-luna', 'SYMPHONY_NATIVE_ASSESSOR_EFFORT': 'high'}
+            for admitted, rows in ((False, [header, turn, secret]), (True, [header, turn, secret]),
+                                    (False, [header, secret])):
+                transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+                run = {'delegations': [{'identity': 'assessor-a', 'role': 'assessor'}]}
+                event = {'kind': 'delegation_updated', 'payload': {'identity': 'assessor-a', 'state': 'working'}}
+                path.write_text(json.dumps({'active_runs': {'codex:root-a': run} if admitted else {},
+                                            'event_history': [event] if admitted else []}), encoding='utf-8')
+                result = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart',
+                                         str(root / 'codex-hook-capture'), 'codex'],
+                                        input=json.dumps(payload), env=env, capture_output=True,
+                                        text=True, encoding='utf-8', timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                records = native.codex_hook_capture_summary(root)['records']
+                capture = records[-1]
+                self.assertTrue(capture['native_metadata']['own_header_identity_matches'])
+                self.assertTrue(capture['native_metadata']['native_parent_matches_root'])
+                self.assertEqual(capture['native_metadata']['native_task_role'], 'assessor')
+                self.assertEqual(capture['native_metadata']['callback_turn_context_present'], len(rows) == 3)
+                self.assertEqual(capture['admission_at_capture']['owner_run_present'], admitted)
+                self.assertEqual(capture['admission_at_capture']['child_start_recorded'], admitted)
+                self.assertNotIn('PRIVATE_AUTH_SENTINEL', json.dumps(records))
+                self.assertNotIn('symphony_assessor_gpt_6_luna_high', json.dumps(capture['native_metadata']))
     def test_codex_native_spawn_packets_follow_packaged_base_matrix(self):
         base = next(item for item in json.loads((PLUGIN / "profiles.json").read_text())
                     ["providers"]["codex"]["profiles"] if item["id"] == "base")
@@ -57,6 +688,29 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         self.assertIn("WAIT", deferred_packet["message"])
         self.assertIn("only READY permits", deferred_packet["message"])
 
+    def test_current_native_child_packets_declare_supported_purpose(self):
+        from plugins.symphony.symphony.host_evidence import _codex_child_purpose, _packet_purpose
+        from plugins.symphony.symphony.model import Delegation
+        for provider, profile in (('codex', 'base'), ('codex', 'latest'), ('claude', 'base')):
+            with self.subTest(provider=provider, profile=profile):
+                prompt = native.prompt(provider, 'a', True, Path('/tmp/native-project'), codex_profile=profile)
+                if provider == 'codex':
+                    lead = json.loads(re.search(r'LEAD_SPAWN_PACKET: (\{[^\n]+\})', prompt).group(1))
+                    task = lead['message']
+                else:
+                    task = json.loads(re.search(r'LEAD_TASK_TEXT: (.+)$', prompt, re.MULTILINE).group(1))
+                expected = [('WORKER_SPAWN_PACKET', 'worker', 'substantive')]
+                if provider == 'codex' and profile != 'base':
+                    expected.append(('REVIEW_SPAWN_PACKET', 'consultant', 'independent_review'))
+                for marker, role, purpose in expected:
+                    packet = json.loads(re.search(marker + r': (\{[^\n]+\})', task).group(1))
+                    text = packet.get('message', packet.get('prompt'))
+                    self.assertEqual('SYMPHONY_ROLE: ' + role, text.splitlines()[0])
+                    self.assertEqual(purpose, _packet_purpose(text))
+                    if provider == 'codex':
+                        child = Delegation('child', role, '', 'working', packet['model'], packet['reasoning_effort'])
+                        self.assertEqual(purpose, _codex_child_purpose(packet['task_name'], child))
+
     def test_mixed_codex_upgrade_uses_packaged_full_route(self):
         profiles = json.loads((PLUGIN / "profiles.json").read_text())["providers"]["codex"]["profiles"]
         project = Path("/tmp/native-project")
@@ -79,6 +733,13 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertEqual((packet["task_name"], packet["model"],
                                       packet["reasoning_effort"]),
                                      (role["task_name"], role["model"], role["effort"]))
+                    if marker == "LEAD_SPAWN_PACKET":
+                        reviewer = json.loads(re.search(r"REVIEW_SPAWN_PACKET: (\{[^\n]+\})",
+                                                        packet["message"]).group(1))
+                        self.assertTrue(reviewer["task_name"].endswith("_review"))
+                        self.assertIn("SYMPHONY_ROLE: consultant", reviewer["message"])
+                        self.assertIn("SYMPHONY_DECISION:", reviewer["message"])
+                        self.assertIn("SYMPHONY_REVIEW: passed", reviewer["message"])
                 with tempfile.TemporaryDirectory() as temporary, \
                         patch.object(native.shutil, "which", return_value="codex"), \
                         patch.object(native.subprocess, "Popen") as popen:
@@ -102,12 +763,38 @@ class CandidateRetainedProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             native.observer_locked_read(Mock(side_effect=ValueError("invalid state")))
 
-    def test_codex_native_hook_gate_holds_second_distinct_default_agent(self):
+    def test_windows_observer_uses_the_writers_project_and_session_locks(self):
+        from contextlib import nullcontext
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'owner.v2.json'
+            session = root / '.session-owner.json'
+            session.write_text('{"pending": []}', encoding='utf-8')
+            # Preserve the native Path class when simulating Windows on Linux.
+            with patch.object(native.os, 'name', 'nt'), patch.object(native, 'Path', type(root)), \
+                 patch('plugins.symphony.symphony.store._read_owner_snapshot',
+                       return_value='{"active_runs": {}}') as read, \
+                 patch('plugins.symphony.symphony.store._locked', return_value=nullcontext()) as locked:
+                self.assertEqual(native.read_state_snapshot(project), {'active_runs': {}})
+                read.assert_called_once_with(project)
+                self.assertEqual(native.read_state_snapshot(session), {'pending': []})
+                locked.assert_called_once_with(session.with_suffix(''), timeout=.1)
+
+    def test_codex_native_hook_gate_holds_declared_assessed_task_not_fast_or_workers(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "capture.py"
             script.write_text(native.CODEX_HOOK_CAPTURE)
             gate, capture = root / "gate", root / "codex-hook-capture"
+            env = {**os.environ, 'SYMPHONY_NATIVE_GATE_DIR': str(gate),
+                   'SYMPHONY_NATIVE_GATE_LABEL': 'a', 'SYMPHONY_NATIVE_GATE_LEAD_NAME': 'symphony_lead_fixture'}
+
+            def payload(identity, task):
+                path = root / (identity + '.jsonl')
+                path.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': identity,
+                    'agent_path': '/root/' + task, 'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root-a'}}}}}) + '\n')
+                return {'session_id': 'root-a', 'agent_id': identity, 'agent_type': 'default',
+                        'agent_transcript_path': str(path)}
             root_start = subprocess.run(
                 [sys.executable, "-I", str(script), "SessionStart", str(capture), "codex"],
                 input=json.dumps({"session_id": "root-a"}),
@@ -116,12 +803,16 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 text=True, capture_output=True, timeout=5)
             self.assertEqual(root_start.returncode, 0)
             self.assertEqual(json.loads((gate / "a.root.json").read_text())["session_id"], "root-a")
+            for identity, task in (('fast', 'symphony_lead_fast_model_medium'), ('foreign', 'symphony_lead_other')):
+                result = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'codex'],
+                    input=json.dumps(payload(identity, task)), env=env, text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0)
+                self.assertFalse((gate / 'a.first.json').exists())
+                self.assertFalse((gate / 'a.ready').exists())
             first = subprocess.run(
                 [sys.executable, "-I", str(script), "SubagentStart", str(capture), "codex"],
-                input=json.dumps({"session_id": "root-a", "agent_id": "assessor-a",
-                                  "agent_type": "default"}),
-                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
-                     "SYMPHONY_NATIVE_GATE_LABEL": "a"},
+                input=json.dumps(payload('assessor-a', 'symphony_assessor_fixture')),
+                env=env,
                 text=True, capture_output=True, timeout=5)
             self.assertEqual(first.returncode, 0)
             self.assertFalse((gate / "a.ready").exists())
@@ -131,12 +822,9 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 [sys.executable, "-I", str(script), "SubagentStart", str(capture), "codex"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
-                env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
-                     "SYMPHONY_NATIVE_GATE_LABEL": "a"})
+                env=env)
             try:
-                process.stdin.write(json.dumps({
-                    "session_id": "root-a", "agent_id": "lead-a",
-                    "agent_type": "default"}))
+                process.stdin.write(json.dumps(payload('lead-a', 'symphony_lead_fixture')))
                 process.stdin.close()
                 deadline = time.monotonic() + 5
                 while not (gate / "a.ready").is_file():
@@ -144,6 +832,16 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     time.sleep(.01)
                 self.assertIsNone(process.poll())
                 self.assertEqual(json.loads((gate / "a.ready").read_text())["agent_id"], "lead-a")
+                frozen = (gate / 'a.ready').read_bytes()
+                for later in ('worker-a', 'lead-a'):
+                    replay = subprocess.run(
+                        [sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'codex'],
+                        input=json.dumps(payload(later, 'symphony_lead_fixture' if later == 'lead-a' else 'symphony_worker_fixture')),
+                        env=env, text=True, capture_output=True, timeout=5)
+                    self.assertEqual(replay.returncode, 0, replay.stderr)
+                    self.assertEqual((gate / 'a.ready').read_bytes(), frozen)
+                    self.assertEqual(json.loads((gate / 'a.lead.json').read_text())['agent_id'], 'lead-a')
+                self.assertIsNone(process.poll(), 'later callbacks must not release the original barrier')
                 (gate / "release").touch()
                 self.assertEqual(process.wait(timeout=5), 0)
             finally:
@@ -218,6 +916,15 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             script = root / "capture.py"
             script.write_text(native.CODEX_HOOK_CAPTURE)
             gate, capture = root / "gate", root / "capture"
+            project, state = root / 'project', root / 'state'
+            project.mkdir()
+            state.mkdir()
+            document = {'active_runs': {f'claude:root-{label}': {
+                'assessment': {'route': {'lead_model': 'claude-sonnet-5', 'lead_effort': 'low'}}}
+                for label in ('a', 'b')}}
+            native.state_file(state, project).write_text(json.dumps(document), encoding='utf-8')
+            native_env = {**os.environ, 'SYMPHONY_STATE_DIR': str(state),
+                          'SYMPHONY_NATIVE_GATE_DIR': str(gate)}
             assessor = subprocess.run(
                 [sys.executable, "-I", str(script), "SubagentStart", str(capture), "claude"],
                 input=json.dumps({"session_id": "root-a", "agent_id": "assessor",
@@ -231,7 +938,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                 started = subprocess.run(
                     [sys.executable, "-I", str(script), "SessionStart", str(capture), "claude"],
                     input=json.dumps({"session_id": f"root-{label}"}),
-                    env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                    env={**native_env,
                          "SYMPHONY_NATIVE_GATE_LABEL": label},
                     text=True, capture_output=True, timeout=5)
                 self.assertEqual(started.returncode, 0)
@@ -245,6 +952,17 @@ class CandidateRetainedProfileTests(unittest.TestCase):
             self.assertEqual(foreign.returncode, 0)
             self.assertFalse((gate / "a.ready").exists())
             self.assertFalse((gate / "b.ready").exists())
+            fast = {'active_runs': {'claude:root-a': {'assessment': {'_fast_pending': True,
+                'route': {'lead_model': 'claude-sonnet-5', 'lead_effort': 'low'}}}}}
+            native.state_file(state, project).write_text(json.dumps(fast), encoding='utf-8')
+            skipped = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'claude'],
+                input=json.dumps({'session_id': 'root-a', 'agent_id': 'fast-a', 'cwd': str(project),
+                                  'agent_type': 'symphony:symphony-lead-claude-sonnet-5-low'}),
+                env=native_env, text=True, capture_output=True, timeout=5)
+            self.assertEqual(skipped.returncode, 0, skipped.stderr)
+            self.assertFalse((gate / 'a.ready').exists())
+            self.assertFalse((gate / 'a.lead.json').exists())
+            native.state_file(state, project).write_text(json.dumps(document), encoding='utf-8')
             processes = {}
             try:
                 for label in ("a", "b"):
@@ -252,10 +970,11 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                         [sys.executable, "-I", str(script), "SubagentStart", str(capture), "claude"],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True,
-                        env={**os.environ, "SYMPHONY_NATIVE_GATE_DIR": str(gate),
+                        env={**native_env,
                              "SYMPHONY_NATIVE_GATE_LABEL": "b" if label == "a" else "a"})
                     processes[label].stdin.write(json.dumps({
                         "session_id": f"root-{label}", "agent_id": f"lead-{label}",
+                        "cwd": str(project),
                         "agent_type": "symphony:symphony-lead-claude-sonnet-5-low"}))
                     processes[label].stdin.close()
                 deadline = time.monotonic() + 5
@@ -266,6 +985,17 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     self.assertEqual(json.loads((gate / f"{label}.ready").read_text())
                                      ["session_id"], f"root-{label}")
+                    frozen = (gate / f'{label}.ready').read_bytes()
+                    for identity, agent_type in ((f'lead-{label}', 'symphony:symphony-lead-claude-sonnet-5-low'),
+                                                 ('different-lead', 'symphony:symphony-lead-claude-sonnet-5-low'),
+                                                 ('worker', 'symphony:symphony-worker-claude-sonnet-5-low')):
+                        later = subprocess.run([sys.executable, '-I', str(script), 'SubagentStart', str(capture), 'claude'],
+                            input=json.dumps({'session_id': f'root-{label}', 'agent_id': identity,
+                                              'cwd': str(project), 'agent_type': agent_type}),
+                            env=native_env, text=True, capture_output=True, timeout=5)
+                        self.assertEqual(later.returncode, 0, later.stderr)
+                        self.assertEqual((gate / f'{label}.ready').read_bytes(), frozen)
+                    self.assertIsNone(process.poll(), 'resumes cannot replace or release initial barrier')
                 starts = [json.loads(path.read_text()) for path in capture.glob("*-entry.json")]
                 self.assertEqual({(record["session_id"], record["native_gate_label"],
                                    record["native_gate_env_label"])
@@ -323,9 +1053,109 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                  patch.object(sys, "stderr", stderr), \
                  patch.dict(native.os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
                 self.assertEqual(native.main(), 1)
-            saved = json.loads((Path(temporary) / "native-managed-claude-failure.json").read_text())
-            self.assertEqual(len(saved["cases"][0]["native_trace"]), 100000)
+                report['cases'][0]['native_trace'] = 'second attempt'
+                self.assertEqual(native.main(), 1)
+            saved = [json.loads(path.read_text()) for path in Path(temporary).glob('native-managed-claude-failure-*.json')]
+            self.assertEqual(len(saved), 2)
+            self.assertEqual(sorted(len(item['cases'][0]['native_trace']) for item in saved), [14, 100000])
             self.assertLess(len(stderr.getvalue()), 1000)
+
+    def test_isolated_failure_keeps_artifact_and_handles_a_full_stderr_pipe(self):
+        import claude_isolated_worktree as isolated
+        for stderr in (io.StringIO(), Mock(write=Mock(side_effect=BlockingIOError("pipe full")))):
+            with self.subTest(stderr=type(stderr).__name__), tempfile.TemporaryDirectory() as temporary:
+                report = {"cases": [{"native_trace": "x" * 100000}]}
+                with patch.object(isolated, "run_case", side_effect=RuntimeError("native case failed")), \
+                     patch.object(isolated.native, "failure_state", return_value=report), \
+                     patch.object(sys, "argv", ["claude_isolated_worktree.py"]), \
+                     patch.object(sys, "stderr", stderr), \
+                     patch.dict(os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
+                    self.assertEqual(isolated.main(), 1)
+                saved = json.loads((Path(temporary) / "native-claude-isolated-worktree-failure.json").read_text())
+                self.assertEqual(saved["state"], report)
+                if isinstance(stderr, io.StringIO):
+                    self.assertLess(len(stderr.getvalue()), 1000)
+
+    def test_private_claude_snapshots_have_exact_ids_and_export_only_disposition_facts(self):
+        import native_routing_smoke as smoke
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for home_name in ('claude-baseline-home', 'claude-live-update-home'):
+                home = root / home_name
+                home.mkdir()
+                (home / 'settings.json').write_text('{}', encoding='utf-8')
+                native.install_hook_capture('claude', root, home, private_children=True)
+            source = {'provider': 'claude', 'cwd': str(root), 'session_id': 'root', 'agent_id': 'worker',
+                      'prompt_id': 'context', 'role': 'worker', 'status': 'completed',
+                      'hook_event_name': 'SubagentStop', 'last_assistant_message': 'PRIVATE_REPORT_SENTINEL'}
+            completed = subprocess.run([sys.executable, '-I', str(root / 'capture_claude_hook.py'),
+                'SubagentStop', str(root / 'claude-hook-capture'), 'claude'], input=json.dumps(source),
+                capture_output=True, text=True, encoding='utf-8', timeout=5)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, '')
+            captured_path = next((root / 'private-child-hooks').glob('*.json'))
+            captured = json.loads(captured_path.read_text(encoding='utf-8'))
+            event = smoke.event_from_payload('claude', source)
+            self.assertEqual(captured['raw'], source)
+            self.assertEqual(captured['canonical'], {'event_id': event.event_id, 'kind': event.kind, 'payload': event.payload})
+            run = {'session_id': 'root', 'run_id': 'run', 'delegations': [{'identity': 'worker'}],
+                   'assessment': {'_substantive_children': {'worker': {'role': 'worker', 'start_event_id': 'start'}},
+                                  '_start_event_ids': ['start'], '_terminal_event_ids': [], '_terminal_turns': {}}}
+            document = {'event_history': [], 'terminal_receipts': []}
+            pending = [{'pending': [{'event_id': event.event_id}]}]
+            facts = native.claude_callback_disposition_probe(root, run, document, pending)[0]
+            self.assertTrue(facts['immutable_start_proof_present'])
+            self.assertFalse(facts['canonical_id_equals_admitted_start'])
+            self.assertEqual(facts['pending_canonical_id_count'], 1)
+            self.assertEqual(facts['derived_terminal_history_count'], 0)
+            self.assertEqual(facts['exact_result_receipt_count'], 0)
+            result = smoke._terminal_result_id(event)
+            run['assessment']['_terminal_event_ids'] = [result]
+            run['assessment']['_terminal_turns']['worker'] = [smoke._child_turn_token(source)]
+            document['event_history'] = [{'event_id': event.event_id + ':delegation:delegation_updated',
+                'kind': 'delegation_updated', 'payload': {'state': 'completed'}}]
+            document['terminal_receipts'] = [{'provider': 'claude', 'session': 'root', 'run_id': 'run',
+                'agent': 'worker', 'turn': smoke._child_turn_token(source), 'result': result}]
+            matched = native.claude_callback_disposition_probe(root, run, document, [])[0]
+            self.assertTrue(matched['scoped_result_in_terminal_ids'])
+            self.assertTrue(matched['terminal_token_recorded'])
+            self.assertEqual(matched['derived_terminal_history_count'], 1)
+            self.assertEqual(matched['exact_result_receipt_count'], 1)
+            self.assertNotIn('PRIVATE_REPORT_SENTINEL', json.dumps(matched))
+            self.assertNotIn(str(root), json.dumps(matched))
+            self.assertNotIn(event.event_id, json.dumps(matched))
+            saved = native.preserve_private_native_failure(root, root / 'retained', 'claude')
+            self.assertTrue((saved / 'private-child-hooks' / captured_path.name).is_file())
+            captured['canonical']['event_id'] = 'mismatched'
+            captured_path.write_text(json.dumps(captured), encoding='utf-8')
+            self.assertEqual(native.claude_callback_disposition_probe(root, run, document, []), [])
+            if os.name != 'nt':
+                self.assertEqual(captured_path.stat().st_mode & 0o777, 0o600)
+
+    def test_private_claude_capture_uses_explicit_frozen_candidate_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / 'home'
+            home.mkdir()
+            (home / 'settings.json').write_text('{}', encoding='utf-8')
+            alternate = root / 'frozen candidate'
+            package = alternate / 'symphony'
+            package.mkdir(parents=True)
+            (package / '__init__.py').write_text('', encoding='utf-8')
+            (package / 'adapters.py').write_text(
+                "from types import SimpleNamespace\n"
+                "def event_from_payload(provider, payload):\n"
+                "    return SimpleNamespace(event_id='exact-frozen-adapter', kind='subagent_stopped', payload=payload)\n",
+                encoding='utf-8')
+            native.install_hook_capture('claude', root, home, private_children=True,
+                                        candidate_source=alternate)
+            result = subprocess.run([sys.executable, '-I', str(root / 'capture_claude_hook.py'),
+                'SubagentStop', str(root / 'claude-hook-capture'), 'claude'],
+                input=json.dumps({'hook_event_name': 'SubagentStop', 'session_id': 'root', 'agent_id': 'child'}),
+                capture_output=True, text=True, encoding='utf-8', timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = json.loads(next((root / 'private-child-hooks').glob('*.json')).read_text(encoding='utf-8'))
+            self.assertEqual(captured['canonical']['event_id'], 'exact-frozen-adapter')
 
     def test_success_keeps_full_hook_trace_in_artifact_without_flooding_ci_stdout(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -338,7 +1168,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                  patch.object(sys, "stdout", stdout), \
                  patch.dict(native.os.environ, {"SYMPHONY_NATIVE_DIAGNOSTICS_DIR": temporary}):
                 self.assertEqual(native.main(), 0)
-            saved = json.loads((Path(temporary) / "native-managed-claude-receipt.json").read_text())
+            saved = json.loads(next(Path(temporary).glob("native-managed-claude-receipt-*.json")).read_text())
             self.assertEqual(len(saved["native_managed"][0]["native_hook_capture"]["records"][0]),
                              100000)
             self.assertEqual(json.loads(stdout.getvalue())["native_managed"][0]["completed"],
@@ -959,7 +1789,7 @@ class CandidateRetainedProfileTests(unittest.TestCase):
                     self.assertIn("GATE_RELEASED\nSYMPHONY_OUTCOME", child_message)
                     self.assertIn("There is no gate command or file to find or run", child_message)
                     self.assertIn("GATE_RELEASED is a report line, not an operation", child_message)
-                    self.assertIn("Do not inspect files, run tools", child_message)
+                    self.assertIn("Do not inspect files, execute shell commands", child_message)
                     self.assertNotIn("gate.py", child_message)
                     self.assertEqual("none", packet["fork_turns"])
                     self.assertEqual(("gpt-6-luna", "low"),

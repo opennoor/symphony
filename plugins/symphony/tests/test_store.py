@@ -7,10 +7,11 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.store import StateStore, _locked, project_key
+from plugins.symphony.symphony.store import StateStore, _locked, _read_owner_snapshot, project_key
 
 
 class StateStoreTests(unittest.TestCase):
@@ -30,6 +31,27 @@ class StateStoreTests(unittest.TestCase):
 
     def legacy_path(self) -> Path:
         return self.data / f"{project_key(self.project)}.json"
+
+    def test_native_escalation_receipt_roundtrip_and_strict_optional_boolean(self):
+        from plugins.symphony.symphony.store import _receipt_from_dict
+        receipt = {key: key for key in ('provider', 'session', 'agent', 'run_id',
+                                       'turn', 'result', 'parent', 'lead')}
+        legacy = _receipt_from_dict(receipt)
+        self.assertNotIn('native_fast_escalation', legacy)
+        self.assertNotIn('native_followup_start_id', legacy)
+        for start in ('', 'a' * 64 + ':followup-start'):
+            self.assertEqual(_receipt_from_dict({**receipt, 'native_followup_start_id': start})[
+                'native_followup_start_id'], start)
+        for malformed in (None, False, 1, [], {}):
+            with self.assertRaises(ValueError):
+                _receipt_from_dict({**receipt, 'native_followup_start_id': malformed})
+        for flag in (False, True):
+            self.store.save(self.project, ProjectState(terminal_receipts=(
+                {**receipt, 'native_fast_escalation': flag},)))
+            self.assertIs(self.store.load(self.project).terminal_receipts[0]['native_fast_escalation'], flag)
+        for malformed in (None, 1, 0, 'true', {}, []):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                _receipt_from_dict({**receipt, 'native_fast_escalation': malformed})
 
     def test_round_trips_the_complete_domain_model_as_json(self):
         event = Event("event-1", "task_received", "2026-09-17T10:00:00+00:00", {"task": "ship"})
@@ -131,6 +153,34 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual([self.state_path()], matches)
         self.assertTrue(written.is_set())
 
+    def test_windows_owner_snapshot_waits_for_a_normal_parallel_transaction(self):
+        self.store.save(self.project, ProjectState(enabled=True))
+        path = self.state_path()
+        reading = threading.Event()
+        done = threading.Event()
+        snapshots = []
+        errors = []
+
+        def read():
+            reading.set()
+            try:
+                snapshots.append(_read_owner_snapshot(path))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        with patch("plugins.symphony.symphony.store.os", SimpleNamespace(name="nt")):
+            with _locked(path):
+                reader = threading.Thread(target=read)
+                reader.start()
+                self.assertTrue(reading.wait(5))
+                self.assertFalse(done.wait(0.25), "Snapshot abandoned a normal writer transaction")
+            reader.join(5)
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual([path.read_text(encoding="utf-8")], snapshots)
+
     def test_owner_scan_defers_on_busy_unrelated_windows_project(self):
         run = RunState("run", "task", session_id="root", provider="codex")
         self.store.save(self.project, ProjectState(active_run=run,
@@ -145,7 +195,7 @@ class StateStoreTests(unittest.TestCase):
         def hold_other():
             with _locked(other_path):
                 held.set()
-                release.wait(5)
+                release.wait(10)
 
         holder = threading.Thread(target=hold_other)
         holder.start()
@@ -168,6 +218,60 @@ class StateStoreTests(unittest.TestCase):
         self.store.save(other, state)
         self.assertEqual({self.state_path(), self.store._path(other)},
                          set(self.store.active_owner_paths("codex", "root")))
+
+    def test_owner_scan_shares_one_deadline_and_defers_incomplete_ownership(self):
+        run = RunState("run", "task", session_id="root", provider="codex")
+        state = ProjectState(active_run=run, active_runs={"codex:root": run})
+        self.store.save(self.project, state)
+        paths = [self.state_path()]
+        for name in ("unrelated", "duplicate"):
+            project = self.root / name
+            project.mkdir()
+            self.store.save(project, state if name == "duplicate" else ProjectState())
+            paths.append(self.store._path(project))
+        clock = [0.0]
+        budgets = []
+
+        def slow_snapshot(path, timeout=5):
+            budgets.append(timeout)
+            clock[0] += min(3, timeout)
+            if timeout < 3:
+                raise TimeoutError("snapshot budget exhausted")
+            return path.read_text(encoding="utf-8")
+
+        with patch.object(Path, "glob", return_value=iter(paths)), \
+                patch("plugins.symphony.symphony.store.time.monotonic", lambda: clock[0]), \
+                patch("plugins.symphony.symphony.store._read_owner_snapshot", slow_snapshot):
+            self.assertIsNone(self.store.active_owner_paths("codex", "root"))
+        self.assertEqual([5, 2], budgets)
+        self.assertEqual(5, clock[0])
+
+    def test_bounded_lock_shares_deadline_between_local_and_native_waits(self):
+        clock = [0.0]
+        released = []
+
+        def acquire(timeout):
+            clock[0] += 4
+            return True
+
+        def busy(*args):
+            raise OSError("native lock held")
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        local = SimpleNamespace(acquire=acquire, release=lambda: released.append(True))
+        native = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=0, locking=busy)
+        with patch("plugins.symphony.symphony.store._local_lock", return_value=local), \
+                patch("plugins.symphony.symphony.store.fcntl", None), \
+                patch("plugins.symphony.symphony.store.msvcrt", native), \
+                patch("plugins.symphony.symphony.store.time.monotonic", lambda: clock[0]), \
+                patch("plugins.symphony.symphony.store.time.sleep", sleep):
+            with self.assertRaises(TimeoutError):
+                with _locked(self.state_path(), timeout=5):
+                    self.fail("busy native lock acquired")
+        self.assertLess(clock[0], 5.01)
+        self.assertEqual([True], released)
 
     def test_snapshot_scan_and_atomic_replace_remain_compatible(self):
         run = RunState("run", "task", session_id="root", provider="codex")

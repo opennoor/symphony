@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 import json
 from pathlib import Path
+from typing import Mapping
 
 from .model import CapabilitySnapshot
 
@@ -34,9 +35,9 @@ class Route:
 
 
 MATRIX = {
-    ("small", "simple"): Route("capable", "medium", "direct", "none"),
-    ("small", "mixed"): Route("capable", "high", "direct", "optional"),
-    ("small", "complex"): Route("strongest", "high", "direct", "independent-check", True),
+    ("small", "simple"): Route("capable", "medium", "delegated", "none"),
+    ("small", "mixed"): Route("capable", "high", "delegated", "optional"),
+    ("small", "complex"): Route("strongest", "high", "delegated", "independent-check", True),
     ("medium", "simple"): Route("balanced", "medium", "mixed", "none"),
     ("medium", "mixed"): Route("balanced", "high", "mixed", "optional"),
     ("medium", "complex"): Route("capable", "high", "mixed", "reserved"),
@@ -103,6 +104,8 @@ def _profiles_generated_at() -> str:
 
 def route_for(assessment: Assessment) -> Route:
     """Return the literal matrix route, applying only risk safeguards."""
+    if not isinstance(assessment.risk, str) or assessment.risk not in {"normal", "high"}:
+        raise ValueError(f"unsupported assessment risk: {assessment.risk!r}")
     try:
         route = MATRIX[(assessment.size, assessment.complexity)]
     except KeyError as error:
@@ -111,6 +114,22 @@ def route_for(assessment: Assessment) -> Route:
         effort = "medium" if route.lead_effort == "low" else route.lead_effort
         route = replace(route, lead_effort=effort, independent_review=True)
     return replace(route, size=assessment.size, complexity=assessment.complexity, risk=assessment.risk)
+
+
+def route_for_recorded(recorded: Mapping[str, object]) -> Route:
+    """Re-resolve an accepted legacy route without rewriting its evidence.
+
+    Released assessments allowed freeform risk strings; only exact ``high``
+    enabled safeguards. New accepted assessments carry a substantive contract
+    and retain strict validation. This compatibility path is never ingress.
+    """
+    risk = recorded.get('risk', 'normal')
+    accepted = recorded.get('route')
+    legacy = ('substantive_contract' not in recorded and isinstance(accepted, Mapping)
+              and isinstance(accepted.get('lead_model'), str) and bool(accepted['lead_model'])
+              and accepted.get('lead_effort') in EFFORTS and isinstance(risk, str))
+    effective_risk = 'high' if risk == 'high' else 'normal' if legacy else risk
+    return route_for(Assessment(str(recorded['size']), str(recorded['complexity']), effective_risk))
 
 
 def resolve_tier(route: Route, snapshot: CapabilitySnapshot) -> dict[str, object]:
@@ -171,7 +190,7 @@ def assessor_selection(snapshot: CapabilitySnapshot, requested: str = "off") -> 
 
 
 def fast_lead_selection(snapshot: CapabilitySnapshot) -> dict[str, str]:
-    """A capable, medium-effort first lead, or no fast route for this profile."""
+    """A capable/medium lead to check mechanical eligibility, or no fast route."""
     model = snapshot.tiers.get("capable", "")
     try:
         rank = json.loads((PROFILES_PATH.parent / "model-policy.json").read_text(encoding="utf-8"))["models"][model]["capability_rank"]

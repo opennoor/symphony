@@ -56,10 +56,24 @@ PERSISTED_EVENT_KEYS = frozenset(
 )
 _BOUNDED_TEXT_KEYS = frozenset({"task", "objective", "rationale", "reason"})
 _LABEL_LIMIT = 120
+_UNMANAGED_DISPOSITION_KEYS = frozenset({
+    'disposition', 'provider', 'session', 'agent', 'turn', 'parent', 'generation', 'project',
+    'source_event_id', 'source_observed_at', 'result', 'native_call_id', 'native_path',
+    'native_started_at', 'native_completed_at', 'first_admission_id', 'first_admission_at',
+})
 
 
 def persistable(event: Event) -> Event:
     """Strip an event down to the facts Symphony is allowed to keep."""
+    if event.kind == 'unmanaged_terminal_disposed':
+        # Runtime constructs these fixed identity/hash/time facts only after
+        # native proof. No callback text, packet or transcript path is retained.
+        return Event(event.event_id, event.kind, event.observed_at, {
+            key: value for key, value in event.payload.items()
+            if key in _UNMANAGED_DISPOSITION_KEYS and (
+                key == 'generation' and type(value) is int and value > 0
+                or key != 'generation' and isinstance(value, str) and len(value) <= 512)
+        })
     kept: dict[str, Any] = {}
     for key, value in event.payload.items():
         if key not in PERSISTED_EVENT_KEYS:
@@ -133,6 +147,6 @@ class ProjectState:
     # long as this root can resume. Never trim these receipts silently: an old
     # callback could otherwise complete a newer run that reused its child ID.
     # Each receipt contains only identities and a result hash, not message text.
-    terminal_receipts: tuple[Mapping[str, str], ...] = ()
+    terminal_receipts: tuple[Mapping[str, object], ...] = ()
     event_history: tuple[Event, ...] = ()
     needs_reassessment: bool = False

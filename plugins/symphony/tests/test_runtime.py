@@ -33,6 +33,16 @@ def codex_agent_type(role, model, effort):
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
+        # Most runtime fixtures emit synthetic hooks without native transcripts.
+        # Native chronology itself is covered by file-backed host-evidence tests.
+        chronology = patch.object(runtime_module, "assessed_completion_chronology", return_value="valid")
+        chronology.start()
+        self.addCleanup(chronology.stop)
+        self.native_launches = {}
+        binding = patch.object(runtime_module, 'codex_substantive_launch',
+                               side_effect=lambda run, source, *args: self.native_launches.get(source.payload.get('agent_id')))
+        binding.start()
+        self.addCleanup(binding.stop)
         self.spawn_count = 0
         self.root = Path(self.temp.name)
         self.project = self.root / "project"
@@ -119,6 +129,33 @@ class RuntimeTests(unittest.TestCase):
             enabled=enabled, active_run=run, active_runs={f"{provider}:{session}": run},
         ))
         return run
+
+    def complete_substantive_worker(self, provider='codex', environ=None, *, review=False):
+        """Supply native child work for newly assessed completion fixtures."""
+        environ = environ or (self.claude_environ if provider == 'claude' else self.environ)
+        run = StateStore(self.state_root).load(self.project).active_run
+        choice = resolve_tier(route_for(Assessment('small', 'simple')),
+                              snapshot_for(provider, run.assessment['route']['profile']))
+        self.spawn_count += 1
+        identity = f'fixture-worker-{self.spawn_count}'
+        purpose = 'independent_review' if review else 'substantive'
+        self.native_launches[identity] = {'parent': run.lead_identity, 'purpose': purpose}
+        agent_type = (claude_agent_type('worker', {'model': choice['lead_model'], 'effort': choice['lead_effort']})
+                      if provider == 'claude' else codex_agent_type('worker', choice['lead_model'], choice['lead_effort']))
+        worker = {**self.payload('', provider), 'provider': provider, 'hook_event_name': 'SubagentStart', 'agent_id': identity,
+                  'agent_type': agent_type, 'parent_thread_id': run.lead_identity,
+                  'task': ('SYMPHONY_ROLE: worker\nReview the bounded fixture work' if review else
+                           'SYMPHONY_ROLE: worker\nComplete the bounded fixture work'),
+                  'model': choice['lead_model'], 'model_reasoning_effort': choice['lead_effort']}
+        if provider == 'claude':
+            from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
+            home = self.root / 'claude-native'
+            environ = {**environ, 'CLAUDE_CONFIG_DIR': str(home)}
+            write_claude_child_launch(home, self.project, run, identity, 'worker',
+                choice['lead_model'], choice['lead_effort'], f'worker-{self.spawn_count}', purpose=purpose)
+        handle(worker, environ)
+        handle({**worker, 'hook_event_name': 'SubagentStop', 'status': 'completed',
+                **({'last_assistant_message': 'SYMPHONY_REVIEW: passed'} if review else {})}, environ)
 
     def test_enable_persists_and_next_task_requests_bounded_assessment(self):
         enabled = handle(self.payload("$symphony:symphony enable"), self.environ)
@@ -408,6 +445,44 @@ class RuntimeTests(unittest.TestCase):
             "lead",
         )
 
+    def test_observed_role_uses_own_native_identity_before_quoted_roles(self):
+        for role in ('assessor', 'consultant', 'lead', 'worker'):
+            for separator in ('/', '\\'):
+                name = separator.join(('root', 'symphony_lead_gpt_6_sol_high',
+                                       f'symphony_{role}_gpt_6_luna_low'))
+                with self.subTest(role=role, separator=separator):
+                    self.assertEqual(runtime_module._observed_role({
+                        'task_name': name, 'task': 'Instructions for another agent:\nSYMPHONY_ROLE: worker'}), role)
+        self.assertEqual(runtime_module._observed_role({
+            'role': 'lead', 'task': 'Worker packet:\nSYMPHONY_ROLE: worker'}), 'lead')
+        self.assertEqual(runtime_module._observed_role({
+            'agent_type': 'symphony:symphony-lead-claude-sonnet-5-5-low',
+            'task': 'Worker packet:\nSYMPHONY_ROLE: worker'}), 'lead')
+        self.assertEqual(runtime_module._observed_role({
+            'task_name': '/root/symphony_lead_gpt_6_sol_high/unmanaged'}), '')
+        self.assertEqual(runtime_module._observed_role({'task': 'SYMPHONY_ROLE: consultant'}), 'consultant')
+
+    def test_corrected_native_role_keeps_preupgrade_terminal_fingerprints(self):
+        for report in ('Complete.', 'Quoted instructions:\nSYMPHONY_ROLE: lead'):
+            payload = {'provider': 'codex', 'session_id': 'original-root', 'agent_id': 'worker',
+                'task_name': '/root/symphony_lead_gpt_6_sol_high/symphony_worker_gpt_6_luna_low',
+                'prompt_id': 'original-turn', 'status': 'completed', 'last_assistant_message': report}
+            source = Event('retry', 'subagent_stopped', '2026-10-02T10:00:00Z', payload)
+            original_hash = runtime_module.hashlib.sha256(json.dumps(
+                {**payload, 'observed_role': 'lead'}, sort_keys=True).encode()).hexdigest()
+            state = ProjectState(terminal_receipts=({'provider': 'codex', 'session': 'original-root',
+                'agent': 'worker', 'run_id': 'original-run', 'parent': 'original-lead',
+                'lead': 'original-lead', 'turn': 'prompt_id:original-turn',
+                'result': original_hash, 'status': 'completed'},))
+            with self.subTest(report=report):
+                self.assertEqual(runtime_module._observed_role(payload), 'worker')
+                self.assertEqual(runtime_module._terminal_result_id(source), original_hash)
+                self.assertEqual(runtime_module._prior_child_terminal_disposition(
+                    state, source, 'codex', 'original-root', allow_active=False), 'replay')
+                changed = replace(source, payload={**payload, 'last_assistant_message': report + ' changed'})
+                self.assertEqual(runtime_module._prior_child_terminal_disposition(
+                    state, changed, 'codex', 'original-root', allow_active=False), 'conflict')
+
     def test_status_does_not_call_a_historical_heartbeat_current(self):
         handle(self.payload("$symphony:symphony status"), self.environ)
         state = StateStore(self.state_root).load(self.project)
@@ -516,6 +591,7 @@ class RuntimeTests(unittest.TestCase):
             }
         )
         handle(started, self.environ)
+        self.complete_substantive_worker()
         stopped = {**started, "hook_event_name": "SubagentStop", "status": "completed"}
         handle(stopped, self.environ)
 
@@ -631,6 +707,7 @@ class RuntimeTests(unittest.TestCase):
             "model_reasoning_effort": self.simple["effort"],
         }
         handle(replacement, self.environ)
+        self.complete_substantive_worker()
         replaced = StateStore(self.state_root).load(self.project).active_run
         self.assertEqual(replaced.lead_identity, "lead-2")
         self.assertEqual(replaced.owner_generation, 2)
@@ -706,6 +783,7 @@ class RuntimeTests(unittest.TestCase):
             "model": expected["lead_model"], "model_reasoning_effort": expected["lead_effort"],
         }
         handle(lead, self.environ)
+        self.complete_substantive_worker()
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Avalon task done"}, self.environ)
         self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "completing")
@@ -779,6 +857,10 @@ class RuntimeTests(unittest.TestCase):
                             self.assertEqual((recorded["lead_model"], recorded["lead_effort"]), (model, effort))
                             guidance = self.flush(provider)
                             self.assertIn(f"Selected {provider} lead ({profile_id} profile): {model}/{effort}", guidance)
+                            if provider == 'codex':
+                                packet = json.loads(guidance.split('SYMPHONY_LEAD_SPAWN_PACKET: ', 1)[1].splitlines()[0])
+                                self.assertEqual(packet['task_name'], codex_agent_type('lead', model, effort))
+                                self.assertEqual(packet['fork_turns'], 'none')
 
                             proceed = "/symphony:proceed" if provider == "claude" else "$symphony:symphony proceed"
                             handle(self.payload(proceed, provider), environ)
@@ -808,6 +890,9 @@ class RuntimeTests(unittest.TestCase):
                                 "model": model, "model_reasoning_effort": effort,
                             }
                             handle(lead, environ)
+                            self.complete_substantive_worker(provider, environ)
+                            if route.independent_review:
+                                self.complete_substantive_worker(provider, environ, review=True)
                             handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                                     "last_assistant_message": "Completed"}, environ)
                             completing = StateStore(self.state_root).load(self.project)
@@ -827,7 +912,7 @@ class RuntimeTests(unittest.TestCase):
                     json.dumps(
                         {
                             "type": "session_meta",
-                            "payload": {"agent_path": f"/root/{codex_agent_type('assessor', CODEX_STRONGEST, 'high')}"},
+                            "payload": {"id": "assessor-1", "agent_path": f"/root/{codex_agent_type('assessor', CODEX_STRONGEST, 'high')}"},
                         }
                     ),
                     json.dumps(
@@ -884,13 +969,13 @@ class RuntimeTests(unittest.TestCase):
                     json.dumps(
                         {
                             "type": "session_meta",
-                            "payload": {"agent_path": f"/root/symphony_lead_{self.simple['model'].replace('-', '_')}_{self.simple['effort']}"},
+                            "payload": {"id": "lead-1", "agent_path": f"/root/symphony_lead_{self.simple['model'].replace('-', '_')}_{self.simple['effort']}"},
                         }
                     ),
                     json.dumps(
                         {
                             "type": "turn_context",
-                            "payload": {"model": self.simple["model"], "effort": self.simple["effort"]},
+                            "payload": {"turn_id": "turn-1", "model": self.simple["model"], "effort": self.simple["effort"]},
                         }
                     ),
                 )
@@ -905,6 +990,7 @@ class RuntimeTests(unittest.TestCase):
             "transcript_path": str(lead_transcript),
         }
         handle(lead, self.environ)
+        self.complete_substantive_worker()
         handle(
             {
                 **lead,
@@ -2006,6 +2092,171 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(archived.active_run)
         self.assertEqual("completed", archived.recent_runs[-1].status)
 
+    def test_assessed_stop_requires_native_child_report_order(self):
+        for provider in ('codex', 'claude'):
+            for order in ('valid', 'early', 'unknown'):
+                with self.subTest(provider=provider, order=order):
+                    choice = route_choice(provider=provider)
+                    lead = Delegation('lead', 'lead', 'task', 'completed', choice['model'], choice['effort'])
+                    workers = tuple(Delegation(f'worker-{index}', 'worker', 'task', 'completed',
+                                               choice['model'], choice['effort']) for index in (1, 2))
+                    run = self.seed_run(RunState('run', 'task', lead_identity='lead',
+                        status='completing', outcome={'status': 'completed'},
+                        delegations=(lead, *workers), assessment={
+                            'substantive_contract': {'version': 1, 'epoch': 'e', 'accepted_at': '2026-10-01T00:00:00Z'},
+                            '_terminal_turns': {'lead': ('turn_id:lead-final',)},
+                            '_start_event_ids': ('start-worker-1', 'start-worker-2'),
+                            '_substantive_children': {worker.identity: {
+                                'successful': True, 'epoch': 'e', 'run_id': 'run',
+                                'lead': 'lead', 'parent': 'lead', 'role': 'worker',
+                                'start_event_id': 'start-' + worker.identity,
+                                'owner_generation': 1,
+                            } for worker in workers},
+                        }), provider=provider)
+                    environ = self.claude_environ if provider == 'claude' else self.environ
+                    stop = {**self.payload('', provider), 'hook_event_name': 'Stop'}
+                    with (patch.object(runtime_module, f'{provider}_recovered_lead_event', return_value=None),
+                          patch.object(runtime_module, f'{provider}_completing_lead_turn', return_value=('none', None)),
+                          patch.object(runtime_module, 'assessed_completion_chronology', return_value=order) as proof):
+                        result = handle(stop, environ)
+                    proof.assert_called_once()
+                    stored = StateStore(self.state_root).load(self.project)
+                    if order == 'valid':
+                        self.assertIsNone(stored.active_run)
+                        self.assertEqual('completed', stored.recent_runs[-1].status)
+                    else:
+                        self.assertEqual('block', self.output(result).get('decision'))
+                        self.assertEqual('recovering', stored.active_run.status)
+                        self.assertIsNone(stored.active_run.outcome)
+                        self.assertEqual(run.lead_identity, stored.active_run.assessment['_retryable_lead'])
+
+                    # A still-running worker keeps the normal background-wait path.
+                    working = replace(run, delegations=(lead, replace(workers[0], state='working'), workers[1]))
+                    self.seed_run(working, provider=provider)
+                    with (patch.object(runtime_module, f'{provider}_recovered_lead_event', return_value=None),
+                          patch.object(runtime_module, f'{provider}_completing_lead_turn', return_value=('none', None)),
+                          patch.object(runtime_module, 'assessed_completion_chronology') as proof):
+                        handle({**stop, 'turn_id': 'working-turn'}, environ)
+                    proof.assert_not_called()
+
+    def test_assessed_stop_checks_stored_success_aliases(self):
+        for provider in ('codex', 'claude'):
+            for status in ('done', 'success', 'succeeded', 'SUCCESS'):
+                for order in ('valid', 'early'):
+                    with self.subTest(provider=provider, status=status, order=order):
+                        choice = route_choice(provider=provider)
+                        lead = Delegation('lead', 'lead', 'task', 'completed', choice['model'], choice['effort'])
+                        worker = Delegation('worker', 'worker', 'task', 'completed', choice['model'], choice['effort'])
+                        self.seed_run(RunState('run', 'task', lead_identity='lead', status='completing',
+                            outcome={'status': status}, delegations=(lead, worker), assessment={
+                                'substantive_contract': {'version': 1, 'epoch': 'e', 'accepted_at': '2026-10-01T00:00:00Z'},
+                                '_terminal_turns': {'lead': ('turn_id:lead-final',)},
+                                '_start_event_ids': ('start-worker',),
+                                '_substantive_children': {'worker': {'successful': True, 'epoch': 'e',
+                                    'run_id': 'run', 'lead': 'lead', 'parent': 'lead', 'role': 'worker',
+                                    'start_event_id': 'start-worker', 'owner_generation': 1}},
+                            }), provider=provider)
+                        environ = self.claude_environ if provider == 'claude' else self.environ
+                        stop = {**self.payload('', provider), 'hook_event_name': 'Stop'}
+                        with (patch.object(runtime_module, f'{provider}_recovered_lead_event', return_value=None),
+                              patch.object(runtime_module, f'{provider}_completing_lead_turn', return_value=('none', None)),
+                              patch.object(runtime_module, 'assessed_completion_chronology', return_value=order) as proof):
+                            result = handle(stop, environ)
+                        proof.assert_called_once()
+                        self.assertEqual({'status': 'completed'}, proof.call_args.args[0].active_run.outcome)
+                        stored = StateStore(self.state_root).load(self.project)
+                        if order == 'valid':
+                            self.assertIsNone(stored.active_run)
+                            self.assertEqual('completed', stored.recent_runs[-1].status)
+                            self.assertEqual({'status': 'completed'}, stored.recent_runs[-1].outcome)
+                        else:
+                            self.assertEqual('block', self.output(result).get('decision'))
+                            self.assertEqual('recovering', stored.active_run.status)
+
+    def test_assessed_lead_start_repeats_admitted_acceptance_checks(self):
+        task = 'Make the change. Acceptance: run python -m unittest -q after every worker returns.'
+        run = self.seed_run(RunState('run', task, lead_identity='lead',
+            assessment={'size': 'small', 'complexity': 'simple'}))
+        state = StateStore(self.state_root).load(self.project)
+        guidance = runtime_module._lead_guidance(state, 'codex')
+        self.assertIn(task, guidance)
+        self.assertIn(runtime_module._LEAD_VERIFICATION_CONTRACT, guidance)
+        claude_guidance = runtime_module._lead_guidance(state, 'claude')
+        self.assertIn('`run_in_background: false`', claude_guidance)
+        self.assertIn('a native async launch acknowledgment is not the child result', claude_guidance)
+        for provider in ('codex', 'claude'):
+            self.assertIn('routing assessors belong to the root', runtime_module._lead_guidance(state, provider))
+            unassessed = replace(state, active_run=replace(state.active_run, assessment={}))
+            held = runtime_module._lead_guidance(unassessed, provider)
+            self.assertIn('Do not execute project work or spawn children', held)
+            self.assertNotIn('Symphony worker routes', held)
+
+    def test_codex_root_and_lead_wait_only_for_active_work(self):
+        self.seed_run(RunState('run', 'Implement and verify the feature', lead_identity='lead',
+            assessment={'size': 'small', 'complexity': 'simple'}))
+        state = StateStore(self.state_root).load(self.project)
+        for provider in ('codex', 'claude'):
+            root = runtime_module._assessment_guidance('Implement and verify the feature', provider, state)
+            lead = runtime_module._lead_guidance(state, provider)
+            for role, guidance in (('root', root), ('lead', lead)):
+                with self.subTest(provider=provider, role=role):
+                    for instruction in ('Reuse returned evidence', 'Wake idle children for work/evidence with followup_task',
+                                        'send_message only queues',
+                                        'wait_agent only for active work', 'timeout_ms<=60000'):
+                        if provider == 'codex':
+                            self.assertIn(instruction, guidance)
+                        else:
+                            self.assertNotIn(instruction, guidance)
+
+    def test_codex_required_context_survives_long_task_reminder_clipping(self):
+        task = 'Implement the feature and verify every acceptance check. ' + 'Acceptance detail. ' * 600
+        self.assertGreater(len(task), 10000)
+        manifest = json.loads((Path(__file__).resolve().parents[1] / 'hooks/codex.json').read_text())
+        limits = {event: manifest['hooks'][event][0]['hooks'][0]['additionalContextLimit']
+                  for event in ('UserPromptSubmit', 'SubagentStart')}
+        state = ProjectState(active_run=RunState('run', task, lead_identity='lead',
+            assessment={'size': 'small', 'complexity': 'simple'}))
+        for profile in profiles_for('codex'):
+            snapshot = snapshot_for('codex', profile['id'])
+            with patch.object(runtime_module, '_snapshot', return_value=snapshot):
+                contexts = (
+                    ('root', runtime_module._assessment_guidance(task, 'codex', state), 'UserPromptSubmit', 'original request'),
+                    ('root-assessed', runtime_module._assessed_guidance(task, 'codex', state, ''), 'UserPromptSubmit', 'original request'),
+                    ('lead', runtime_module._lead_guidance(state, 'codex'), 'SubagentStart', 'assigned packet'),
+                )
+            for role, guidance, event, source in contexts:
+                with self.subTest(profile=profile['id'], role=role):
+                    emitted = guidance[:limits[event]]
+                    reminder = f'\n\nTask reminder (full {source} governs if clipped):\n'
+                    contracts, separator, repeated_task = guidance.partition(reminder)
+                    self.assertEqual(reminder, separator)
+                    self.assertEqual(task, repeated_task)
+                    self.assertEqual(task, state.active_run.task)
+                    self.assertIn(contracts + reminder, emitted)
+                    self.assertNotIn(task, emitted)
+                    self.assertIn(runtime_module._ASSESSED_LEAD_CONTRACT, emitted)
+                    self.assertIn(runtime_module._LEAD_VERIFICATION_CONTRACT, emitted)
+                    self.assertIn(runtime_module._CODEX_LIFECYCLE_GUIDANCE, emitted)
+                    self.assertIn('SYMPHONY_ROLE: worker', emitted)
+                    if role == 'lead':
+                        self.assertIn("Symphony worker routes by the packet's own size/complexity:", emitted)
+                        self.assertIn('SYMPHONY_ROLE: consultant', emitted)
+                        self.assertIn('SYMPHONY_DECISION JSON in packet and own final report', emitted)
+                    else:
+                        self.assertIn('SYMPHONY_ROLE: assessor', emitted)
+                        self.assertIn('SYMPHONY_ROLE: lead', emitted)
+                        self.assertIn('SYMPHONY_ROUTE:', emitted)
+                        self.assertIn('SYMPHONY_ASSESSMENT:', emitted)
+                        self.assertIn('substantive tasks also need fresh assessment and fresh worker evidence', emitted)
+                    for size in ('small', 'medium', 'large'):
+                        for complexity in ('simple', 'mixed', 'complex'):
+                            normal, high = (resolve_tier(route_for(Assessment(size, complexity, risk)), snapshot)
+                                            for risk in ('normal', 'high'))
+                            expected = f"{size}/{complexity} `{normal['lead_model']}/{normal['lead_effort']}`"
+                            if (normal['lead_model'], normal['lead_effort']) != (high['lead_model'], high['lead_effort']):
+                                expected += f" (high risk: `{high['lead_model']}/{high['lead_effort']}`)"
+                            self.assertIn(expected, emitted)
+
     def test_completing_run_denies_new_lead_spawn_but_preserves_other_work(self):
         marker = ('SYMPHONY_ROUTE: {"size":"small","complexity":"simple",'
                   '"risk":"normal","rationale":"test","topology":"direct"}')
@@ -3046,7 +3297,9 @@ class RuntimeTests(unittest.TestCase):
             "hook_event_name": "SubagentStart",
             "agent_id": "consultant-1",
             "agent_type": "symphony_consultant_gpt_6_high",
+            "parent_thread_id": "lead-1",
         }
+        self.native_launches['consultant-1'] = {'parent': 'lead-1', 'purpose': 'substantive'}
         handle(lead, self.environ)
         handle(consultant, self.environ)
 
@@ -3065,7 +3318,7 @@ class RuntimeTests(unittest.TestCase):
                 **lead,
                 "hook_event_name": "SubagentStop",
                 "status": "completed",
-                "last_assistant_message": "Done",
+                "last_assistant_message": 'SYMPHONY_DECISION: {"size":"small","complexity":"simple"}\nDone',
             },
             self.environ,
         )
@@ -3142,6 +3395,7 @@ class RuntimeTests(unittest.TestCase):
             "agent_type": "consultant",
         }
         handle(lead, self.environ)
+        self.complete_substantive_worker()
         handle(consultant, self.environ)
         handle(
             {
@@ -3210,8 +3464,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("_pending_lead_completion", StateStore(self.state_root).load(self.project).active_run.assessment)
 
         transcript = self.root / "corrected-lead.jsonl"
-        transcript.write_text(json.dumps({
-            "type": "turn_context", "payload": {"model": "wrong-model", "effort": self.simple["effort"]},
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": "lead-1"}}) + "\n" + json.dumps({
+            "type": "turn_context", "payload": {"turn_id": "turn-1", "model": "wrong-model", "effort": self.simple["effort"]},
         }), encoding="utf-8")
         handle({**lead, "hook_event_name": "SubagentStop", "status": "completed",
                 "agent_transcript_path": str(transcript)}, self.environ)
@@ -3272,6 +3526,7 @@ class RuntimeTests(unittest.TestCase):
         handle({**self.payload(""), "hook_event_name": "Interrupt"}, self.environ)
         replacement = {**lead, "agent_id": "lead-2"}
         handle(replacement, self.environ)
+        self.complete_substantive_worker()
         self.assertNotIn(
             "_pending_lead_completion",
             StateStore(self.state_root).load(self.project).active_run.assessment,
@@ -3782,7 +4037,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_explicit_invalid_or_blocked_outcome_does_not_complete_native_lead(self):
         for provider in ("codex", "claude"):
-            for marker in ('SYMPHONY_OUTCOME: {broken', 'SYMPHONY_OUTCOME: {}',
+            for marker in ('SYMPHONY_OUTCOME: completed', 'SYMPHONY_OUTCOME: {broken', 'SYMPHONY_OUTCOME: {}',
                            'SYMPHONY_OUTCOME: {"status":"blocked"}'):
                 with self.subTest(provider=provider, marker=marker):
                     choice = route_choice(provider=provider)
@@ -3795,6 +4050,10 @@ class RuntimeTests(unittest.TestCase):
                     self.assertIsNotNone(state.active_run)
                     self.assertEqual(state.active_run.status, "recovering")
                     self.assertIsNone(state.active_run.outcome)
+                    guidance = runtime_module._recovery_guidance(state, provider)
+                    self.assertIn('SYMPHONY_OUTCOME: {"status":"completed"}', guidance)
+                    self.assertIn('blocked or failed', guidance)
+                    self.assertIn('followup_task' if provider == 'codex' else 'SendMessage', guidance)
 
     def test_single_word_codex_task_starts_a_one_shot_run(self):
         result = handle(self.payload("$symphony:symphony summarize"), self.environ)
@@ -3856,7 +4115,11 @@ class RuntimeTests(unittest.TestCase):
 
         released = handle({**stop, "stop_hook_active": True}, self.environ)
 
-        self.assertEqual(released.stdout, "", "a turn retry must render an empty Stop response")
+        notice = self.output(released)
+        self.assertEqual(set(notice), {'systemMessage'})
+        self.assertIsInstance(notice['systemMessage'], str)
+        self.assertIn('$symphony:symphony status', notice['systemMessage'])
+        self.assertIn('unfinished work remains open', notice['systemMessage'])
         state = StateStore(self.state_root).load(self.project)
         self.assertIsNotNone(state.active_run)
         self.assertEqual(state.recent_runs, ())

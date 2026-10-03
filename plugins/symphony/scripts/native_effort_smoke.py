@@ -25,7 +25,15 @@ def check(provider: str, plugin_root: Path) -> dict:
                 text=True, shell=False, timeout=remaining,
             )
             if result.returncode:
-                raise RuntimeError(f"{provider} command failed (exit {result.returncode})")
+                reason = f"{provider} command failed (exit {result.returncode})"
+                try:
+                    report = json.loads(result.stdout)
+                    subtype = report.get("subtype") if isinstance(report, dict) else None
+                    if subtype in {"error_max_budget_usd", "error_max_turns", "error_during_execution"}:
+                        reason += f"; {subtype}"
+                except ValueError:
+                    pass
+                raise RuntimeError(reason)
             return result
 
         version = run(["--version"]).stdout.strip()

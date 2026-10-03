@@ -10,6 +10,8 @@ Symphony is a Codex and Claude Code plugin that keeps the root agent thin, selec
 
 ### Codex
 
+Native routing with the `latest` profile (`gpt-6.1-sol`) is tested on Codex CLI 0.160.0. CLI 0.158.0 rejects `gpt-6.1-sol` in `spawn_agent`; the `latest` profile requires a host that can spawn that model. On CLI 0.158.0, set `SYMPHONY_PROFILE=full` in the environment of the Codex process to select `gpt-6-sol`, which that host supports. Verify the available spawn models before using another CLI version.
+
 ```bash
 codex plugin marketplace add opennoor/symphony
 codex plugin add symphony@symphony
@@ -85,7 +87,19 @@ When the heartbeat is absent, `status` reports pending verification and gives th
 
 Normal completion is blocked while host-observed tracked work remains active. A stop is blocked at most once per turn: when the host reports that the stop hook is already active, Symphony releases the turn and preserves unfinished work in durable `status`. Only an explicit force stop archives it as abandoned with unreconciled identities. A prompt that never spawned a managed agent opens no run and can never hold a session open.
 
-Version 1.6.5 lets a fresh fast lead open another task after archive. It also reconciles a fresh Start and matching terminal retained by 1.6.0 when the root, parent, invocation, generation, and unused child identity agree; a normal status, SessionStart, or Stop retries that evidence. Conflicting or incomplete evidence remains retained. Retrying after a crash also requires the committed run evidence to remain in active or recent history. Resuming an already archived child with a new native turn is outside this recovery: its terminal alone cannot establish a new task owner, even if it reports success. Start later tasks with a fresh child identity. Existing sessions keep their reviewed runtime until reload or restart.
+Version 1.7.0 lets a fresh fast lead open another task after archive. Normal status, SessionStart, and Stop hooks also reconcile a fresh Start and matching terminal retained by 1.6.0 when the root, parent, invocation, generation, and unused child identity agree.
+
+An explicit native followup to the latest completed lead continues that same run and owner generation.
+
+Recovery verifies the original spawn, successful root followup, exact child identity, pinned model and effort, and the new completed native turn. It processes a new Start before the new terminal, clearing the earlier outcome. Codex uses the native `followup_task` delivery and result.
+
+Claude accepts a verified native `Agent` resume or ordered root `SendMessage` deliveries to the literal original lead identity. For an archived assessed Claude lead, each SendMessage must have a unique successful result, matching fresh native prompt and completed turn; intermediate acknowledgments supply no outcome credit, and the final turn must report an explicit completed outcome. Within a fully proven ordered lead/worker sequence, a delivery to an already credited historical worker can supply acknowledgment only. Its resumed turn must perform no new tool work apart from a paired successful handback; it adds no child credit or outcome, and the final turn still belongs to the original lead.
+
+A new worker-only continuation remains held. Conflicting or incomplete evidence stays retained.
+
+A first-arriving late callback requires the full committed native sequence and its original transaction time. A late Start must be observed no later than its proven native terminal. An unseen terminal must supply the matching native `turn_id`; Claude's hook `prompt_id` identifies prompt context and cannot establish this authority. A context-only unseen terminal remains held, even if its report matches an older turn; repeated Stop does not resolve that ambiguity. Exact already-committed callback retries remain supported.
+
+A superseded former lead cannot reclaim ownership, including a weaker fast lead replaced by a high-effort owner; status asks for explicit reconciliation instead of another Stop retry. Recovery needs the original run in active or recent history; terminal receipts alone cannot establish a new owner. Existing sessions keep their reviewed runtime until reload or restart.
 
 User interruption and host-enforced overrides remain authoritative, so interrupted work is recovered from durable lifecycle state rather than described as uninterruptible. Neither host reports which agents are still alive. A new root session never takes over another session's run or declares its agents finished; each session resumes its own durable run.
 
@@ -93,13 +107,13 @@ User interruption and host-enforced overrides remain authoritative, so interrupt
 
 Assessment treats task size and complexity as separate axes. The fixed route is resolved against the capability map shipped with the installed version. Hooks are given no model inventory by either host, so the map is maintained at release time rather than discovered at runtime.
 
-For new tasks with an available capable/medium route, Symphony first sends the full request to one lead. That lead checks scope, clarity, risk, required tools, and verification before making changes. Bounded, clear, low-risk work runs directly; uncertainty or larger work is handed to an independent assessor. A missing or malformed lead decision cannot complete the run. An explicit assessor boost uses the assessor path directly. This before-write check is performed by the lead; current host hooks enforce the route and final disposition but cannot observe every tool action inside an agent.
+For predetermined mechanical tasks with an available capable/medium route, Symphony sends the full request to one fast lead to check mechanical eligibility. Substantive or uncertain tasks may instead go directly to an independent assessor; this conservative assessed-first path never authorizes root execution or supplies a fast decision. If a fast lead is attempted, its native escalation must complete before assessment; an unresolved, failed, or unclassified earlier child cannot be ignored. Direct execution requires the whole objective to consist of predetermined mechanical steps with an expected result, bounded scope, clear requirements, low risk, available tools, and concrete verification. Examples include a supplied bash/git command or reading a specified browser page through known steps. Implementation, diagnosis, design, substantive review, product judgment, mixed work, or uncertainty goes to an independent assessor before any changes, even for a tiny feature; a run-and-fix request escalates as a whole. A missing or malformed lead decision cannot complete the run. An explicit assessor boost uses the assessor path directly. This check is performed by the lead; current host hooks enforce the route and final disposition but cannot observe every tool action inside an agent.
 
 Symphony ships several profiles per provider and routes through the best one your plan is entitled to, falling back to a conservative floor when entitlement cannot be read. When your plan clamps a task to a weaker model, the lead spawn stops and waits for `proceed`, so quality never degrades silently; a reduced effort on the same model is announced and continues.
 
 | Size / complexity | Simple | Mixed | Complex |
 |---|---|---|---|
-| Small | capable/medium, direct | capable/high, direct with optional consultation | strongest/high, direct with independent review |
+| Small | capable/medium, delegated | capable/high, delegated with optional consultation | strongest/high, delegated with independent review |
 | Medium | balanced/medium, mixed | balanced/high, mixed with optional consultation | capable/high, mixed with reserved consultation |
 | Large | economy/low, delegated | economy/medium, delegated with reserved consultation | economy/medium, delegated with strongest consultation |
 
@@ -107,7 +121,7 @@ On Claude Code, the first substantive Symphony task checks Sonnet 5 and Opus 5.5
 
 Claude Code's Agent hook can reject an invalid spawn before launch. On Symphony's currently supported Codex collaboration path, a mis-routed spawn is detected after the child starts. Codex documents `PreToolUse` for ordinary `spawn_agent`, but Symphony has not verified pre-spawn enforcement on its exact collaboration path. Claude's packaged hooks match Agent calls, not Skill calls, so optional-capability practice is reported and checked by agents rather than host-enforced.
 
-The assessor is bounded, read-only, and separate from the assessed lead. The assessed lead route never inherits the assessor's expensive model or effort. Large-task leads administer dependency-aware work and reserve capacity for narrow consultant decisions. Small-task leads do straightforward work directly and delegate only genuinely independent or mechanical units.
+The assessor is bounded, read-only, and separate from the assessed lead. The assessed lead route never inherits the assessor's expensive model or effort. The matrix fixes execution topology, overriding an assessor's advisory recommendation. Assessed small substantive work uses one worker; medium work uses bounded worker packets. Leads coordinate, integrate, and verify results. Large-task leads administer dependency-aware work and reserve capacity for narrow consultant decisions.
 
 `reassess` updates subsequent work at a safe evidence boundary. It does not duplicate an active lead or rewrite completed work.
 
@@ -143,6 +157,8 @@ codex plugin add symphony@symphony
 
 Codex updates loaded outside the current process require a new session and renewed `/hooks` review when the hook hash changes. Claude updates require reload or restart. In both providers, the next prompt confirms the loaded version through its heartbeat.
 
+The native mixed-runtime release gate upgrades active 1.6.0 sessions to 1.7.0 while preserving the original run and owner after removal of the old source. Version 1.5.1 is an explicit legacy probe, not this release gate: its writer removes terminal receipts from shared v2 state. After that write, a committed callback whose owner has changed may remain held when exact acknowledgment proof is missing. Finish 1.5.1 work before upgrading; reloading alone cannot restore receipts already lost. Strict regression coverage retains those unresolved callbacks rather than treating them as completion evidence.
+
 Symphony 1.0 imports project enablement and user configuration only. Incompatible active-run state is archived and the next managed task receives a fresh assessment. Pre-1.0 state is located by hashing the repository's git toplevel, with the working directory as a fallback, so an import still succeeds from a subdirectory.
 
 Version 1.4.7 stores concurrent runs in a separate v2 state file. On first use it copies a readable v1 project state, including a live run, without changing the v1 file. Already-running 1.4.6 hooks may continue updating v1 while new hooks update v2; those two versions do not synchronize run completion. Let older sessions finish and reload the plugin before relying on migrated completion status. A new session cannot force-stop an older session's run.
@@ -171,7 +187,9 @@ The package smoke supports `activation`, `managed-run`, `unmarked-spawn`, `inter
 
 ### Receiving capability updates
 
-Symphony ships its tier-to-model map inside the release, and a scheduled workflow republishes that map whenever a provider retires a model. Installing does not subscribe you to those releases: both hosts leave a third-party plugin at the version you installed until you ask for a newer one.
+Symphony ships its tier-to-model map inside the release. For final release validation, maintainers review and test a frozen candidate branch locally, using installed Codex and Claude clients with existing logins for native checks. They dispatch Symphony CI on that branch with its full `tested_sha`; CI repeats deterministic Linux and Windows checks without installing provider clients or calling AI APIs. Candidate branches cannot publish. Merge only after these gates pass and the proposed merge preserves the tested tree: marketplace updates can expose the new plugin as soon as it reaches `main`. After reviewing and testing the merged `main` commit locally, dispatch its exact `tested_sha` to repeat the gates and publish that commit. The API-backed Capability refresh workflow is disabled for this release.
+
+Installing does not subscribe you to those releases: both hosts leave a third-party plugin at the version you installed until you ask for a newer one.
 
 ```bash
 claude plugin update symphony

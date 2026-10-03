@@ -64,6 +64,8 @@ class ClaudeCompatTests(unittest.TestCase):
         ]["additionalContext"]
         self.assertIn("`symphony:symphony-lead-claude-opus-5-5-medium`", text)
         self.assertIn("SYMPHONY_FAST_DECISION: escalate", text)
+        self.assertIn("even for a tiny feature", text)
+        self.assertIn("requires escalation before any changes", text)
         self.assertIn("end your turn", text)
 
     def test_assessment_marker_is_read_from_the_handback_report(self):
@@ -81,7 +83,9 @@ class ClaudeCompatTests(unittest.TestCase):
                 ]
             },
         }
-        transcript.write_text(json.dumps(handback) + "\n", encoding="utf-8")
+        final = {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Assessment delivered."}]}}
+        transcript.write_text(json.dumps(handback) + "\n" + json.dumps(final) + "\n", encoding="utf-8")
         self.hook(
             "SubagentStop",
             agent_id="assessor-1",

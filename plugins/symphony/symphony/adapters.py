@@ -66,22 +66,58 @@ def event_from_payload(provider: str, payload: dict[str, Any]) -> Event:
 
 def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
     transcript = payload.get("agent_transcript_path") or payload.get("transcript_path")
-    if not transcript:
+    callback_identity = payload.get("agent_id")
+    if not transcript or not isinstance(callback_identity, str) or not callback_identity:
+        return {}
+    callback_turn = payload.get("turn_id", "")
+    if "turn_id" in payload and (not isinstance(callback_turn, str) or not callback_turn):
         return {}
     found: dict[str, str] = {}
+    header_seen = False
+    forked = False
+    own_turn = True
+    native_contexts = 0
+    matching_contexts = 0
+    contexts_ambiguous = False
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
-            for index, line in enumerate(handle):
-                if index >= 64:
-                    break
+            # A partial stream cannot prove uniqueness, even with a turn token.
+            for line in handle:
                 try:
                     record = json.loads(line)
                 except ValueError:
+                    if header_seen:
+                        contexts_ambiguous = True
                     continue
-                if not isinstance(record, dict) or not isinstance(record.get("payload", {}), dict):
+                if not isinstance(record, dict):
+                    if header_seen:
+                        contexts_ambiguous = True
+                    continue
+                if not isinstance(record.get("payload", {}), dict):
+                    if record.get("type") == "session_meta":
+                        return {}
+                    if header_seen:
+                        contexts_ambiguous = True
                     continue
                 record_payload = record.get("payload", {})
+                if record.get("type") != "session_meta" and not header_seen:
+                    continue
                 if record.get("type") == "session_meta":
+                    identity = record_payload.get("id")
+                    if not isinstance(identity, str) or not identity:
+                        return {}
+                    # A fork contains copied ancestor headers and turns after
+                    # its own first header. They are not this child's evidence.
+                    if header_seen:
+                        forked = True
+                        own_turn = False
+                        contexts_ambiguous |= not callback_turn
+                        continue
+                    header_seen = True
+                    if identity != callback_identity:
+                        return {}
+                    forked = bool(record_payload.get("forked_from_id"))
+                    own_turn = not forked and not callback_turn
                     spawn = record_payload
                     for key in ("source", "subagent", "thread_spawn"):
                         spawn = spawn.get(key, {}) if isinstance(spawn, dict) else {}
@@ -94,18 +130,29 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                     if parent_thread_id:
                         found["parent_thread_id"] = str(parent_thread_id)
                 elif record.get("type") == "turn_context":
+                    native_contexts += 1
+                    if not callback_turn and native_contexts > 1:
+                        contexts_ambiguous = True
+                        own_turn = False
+                    if forked:
+                        own_turn = bool(callback_turn and record_payload.get("turn_id") == callback_turn)
+                    elif callback_turn:
+                        own_turn = record_payload.get("turn_id") == callback_turn
+                    if not own_turn:
+                        continue
+                    matching_contexts += 1
                     if record_payload.get("model"):
                         found["model"] = str(record_payload["model"])
                     if record_payload.get("effort"):
                         found["model_reasoning_effort"] = str(record_payload["effort"])
                 elif (record.get("type") == "event_msg"
-                      and record_payload.get("type") == "user_message"):
+                      and record_payload.get("type") == "user_message" and own_turn):
                     message = record_payload.get("message")
                     if isinstance(message, str) and "SYMPHONY_FAST_ROUTE: lead" in message:
                         found["task"] = message
                 elif (record.get("type") == "response_item"
                       and record_payload.get("type") == "message"
-                      and record_payload.get("role") == "user"):
+                      and record_payload.get("role") == "user" and own_turn):
                     content = record_payload.get("content")
                     if isinstance(content, list):
                         message = "\n".join(str(item.get("text")) for item in content
@@ -113,11 +160,11 @@ def _codex_subagent_metadata(payload: dict[str, Any]) -> dict[str, str]:
                                             and isinstance(item.get("text"), str))
                         if "SYMPHONY_FAST_ROUTE: lead" in message:
                             found["task"] = message
-                if {"task_name", "model_reasoning_effort", "task"} <= found.keys():
-                    break
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return found
-    return found
+        contexts_ambiguous = True
+    ambiguous = contexts_ambiguous or bool(callback_turn and matching_contexts != 1)
+    return {key: value for key, value in found.items()
+            if not ambiguous or key in {'task_name', 'parent_thread_id'}}
 
 
 def _claude_handback_report(payload: dict[str, Any]) -> str:
@@ -126,28 +173,76 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
     if not transcript:
         return ""
     report = ""
+    final = ""
+    prompt_id = ""
+    handbacks = 0
+    turns = []
     try:
         with Path(str(transcript)).open(encoding="utf-8") as handle:
             for line in handle:
-                if "SubagentHandback" not in line:
-                    continue
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    continue
-                message = record.get("message") if isinstance(record, dict) else None
+                    return ""
+                if not isinstance(record, dict):
+                    return ""
+                message = record.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
-                for item in content if isinstance(content, list) else ():
+                if record.get("type") == "user":
+                    if not isinstance(content, (str, list)) or isinstance(content, list) and any(
+                            not isinstance(item, dict) or not isinstance(item.get("type"), str) for item in content):
+                        return ""
+                    tool_result = isinstance(content, list) and any(
+                        item["type"] == "tool_result" for item in content)
+                    if tool_result and any(item["type"] != "tool_result" and (
+                            item["type"] != "text" or not isinstance(item.get("text"), str)) for item in content):
+                        return ""
+                    if not tool_result:
+                        # requestJournal context can be reused across native child
+                        # turns. A report belongs only to its own prompt.
+                        if report or final:
+                            turns.append((prompt_id, report, final))
+                        prompt_id = record.get("uuid")
+                        report, final = "", ""
+                        handbacks = 0
+                    continue
+                if record.get("type") != "assistant":
+                    continue
+                if not isinstance(content, list) or any(
+                        not isinstance(item, dict) or not isinstance(item.get("type"), str)
+                        or (item["type"] == "text" and not isinstance(item.get("text"), str))
+                        for item in content):
+                    return ""
+                final = "\n".join(item.get("text", "") for item in content if item["type"] == "text")
+                for item in content:
                     if (
                         isinstance(item, dict)
                         and item.get("type") == "tool_use"
                         and item.get("name") == "SubagentHandback"
                     ):
                         values = item.get("input")
-                        if isinstance(values, dict):
-                            report = str(values.get("message") or report)
+                        if (handbacks or not isinstance(values, dict)
+                                or not isinstance(values.get("message"), str)):
+                            return ""
+                        handbacks = 1
+                        report = values["message"]
     except (OSError, TypeError, ValueError, AttributeError):
-        return report
+        return ""
+    turns.append((prompt_id, report, final))
+    callback = payload.get("last_assistant_message")
+    if "last_assistant_message" in payload and not isinstance(callback, str):
+        return ""
+    if 'turn_id' in payload:
+        matching = [turn for turn in turns if isinstance(payload['turn_id'], str)
+                    and payload['turn_id'] and turn[0] == payload['turn_id'] and callback == turn[2]]
+        return matching[0][1] if len(matching) == 1 else ""
+    if callback:
+        matching = [turn for turn in turns if turn[2] == callback]
+        # Identical goodbyes in separate turns cannot identify a delayed Stop.
+        if len(matching) != 1 or matching[0] != turns[-1]:
+            return ""
+    elif len(turns) != 1:
+        return ""
     return report
 
 
@@ -177,6 +272,13 @@ def render(
                 )
             )
         return HookResult(json.dumps({"decision": "block", "reason": reason}))
+    if provider in {'claude', 'codex'} and hook_event_name == 'Stop':
+        notice = next((action.payload.get('reason') for action in actions
+                       if action.kind == 'permit_stop' and action.payload.get('reason')), None)
+        if notice:
+            # additionalContext would continue Claude's Stop loop. The common
+            # systemMessage field displays a warning without requesting a turn.
+            return HookResult(json.dumps({'systemMessage': notice}))
     if context:
         return HookResult(
             json.dumps(

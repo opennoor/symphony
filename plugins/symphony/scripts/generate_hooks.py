@@ -4,8 +4,11 @@
 import argparse
 import ast
 import base64
+import gzip
+import io
 import hashlib
 import json
+import shlex
 from pathlib import Path
 import zlib
 
@@ -34,18 +37,46 @@ def generated(root=PLUGIN):
     # The reviewed Windows command embeds this source; execution policy never
     # needs to permit an unsigned file or a script from a disappeared cache.
     relay = (root / "scripts/codex_hook.ps1").read_text()
-    relay = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", "$b = '" + code.replace("'", "''") + "'")
-    windows = "cmd.exe /c powershell.exe -NoProfile -NonInteractive -EncodedCommand " + base64.b64encode(relay.encode("utf-16le")).decode()
-    if len(windows) > 8170:
-        raise ValueError("Windows hook launcher exceeds cmd.exe's 8191-character limit")
     documents = {}
     for provider, filename, variable in (("codex", "codex.json", "PLUGIN_ROOT"),
                                           ("claude", "hooks.json", "CLAUDE_PLUGIN_ROOT")):
         path = root / "hooks" / filename
         document = json.loads(path.read_text())
+        if provider == 'claude':
+            # Root execution before admission must be observed as well as
+            # Agent launches. Discovery and control tools remain available.
+            for group in document['hooks']['PreToolUse']:
+                group['matcher'] = 'Agent|SendMessage|Bash|PowerShell|Write|Edit|NotebookEdit'
+        # Capture bootstrap once outside the encoded relay on both hosts.
+        # Base64-expanding it again wastes the native Windows command budget.
+        binding = "$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
+        source = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", binding)
+        buffer = io.BytesIO()
+        # Stored DEFLATE avoids differing zlib/zlib-ng compression heuristics.
+        # The complete relay still fits cmd.exe's bounded command length.
+        with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0, compresslevel=0) as archive:
+            archive.write(source.replace('__SYMPHONY_PROVIDER__', provider).encode())
+        payload = base64.b64encode(buffer.getvalue()).decode()
+        # Codex can parse this command through an outer PowerShell before CMD.
+        # Inline the stream so its double-quoted argument has no $ variables
+        # for that outer shell to expand before the inner PowerShell starts.
+        wrapper = ("iex ([IO.StreamReader]::new([IO.Compression.GZipStream]::new("
+                   "[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "')),"
+                   "[IO.Compression.CompressionMode]::Decompress))).ReadToEnd()")
+        prefix = 'powershell.exe -NoProfile -NonInteractive -Command '
+        capture = "[Environment]::SetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP','" + code.replace("'", "''") + "');"
+        windows = 'cmd.exe /c ' + prefix + '"' + capture + wrapper + '"'
+        if len(windows) > 8170:
+            raise ValueError("Windows hook launcher exceeds cmd.exe's 8191-character limit")
         command = 'python3 -I -c "' + code + '" "${' + variable + '}" ' + provider
         if provider == "claude":
-            command = 'if [ "${OS:-}" = Windows_NT ]; then python -I -c "' + code + '" "${' + variable + '}" claude; else ' + command + '; fi'
+            command = ('(export SYMPHONY_CAPTURED_BOOTSTRAP=' + shlex.quote(code)
+                       + '; if [ "${OS:-}" = Windows_NT ]; then ' + prefix + shlex.quote(wrapper)
+                       + '; else python3 -I -c "$SYMPHONY_CAPTURED_BOOTSTRAP" "${'
+                       + variable + '}" ' + provider + '; fi)')
+            # Reserve room for Bash's native invocation and escaped quotes.
+            if len(command) + 256 > 8170:
+                raise ValueError("Claude hook launcher exceeds the Windows native command limit")
         for groups in document["hooks"].values():
             for group in groups:
                 for hook in group["hooks"]:

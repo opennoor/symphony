@@ -36,6 +36,7 @@ class AdapterContractTests(unittest.TestCase):
                             {
                                 "type": "session_meta",
                                 "payload": {
+                                    "id": "agent-1",
                                     "agent_path": "/root/symphony_assessor_gpt_6_astra_high",
                                     "source": {"subagent": {"thread_spawn": {
                                         "parent_thread_id": "root-session",
@@ -70,10 +71,11 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(event.payload["model"], "gpt-6-astra")
         self.assertEqual(event.payload["model_reasoning_effort"], "high")
 
-    def test_malformed_transcript_rows_do_not_hide_child_metadata_or_handback(self):
+    def test_malformed_transcript_rows_preserve_only_verified_native_header(self):
         with TemporaryDirectory() as temp:
             transcript = Path(temp) / "child.jsonl"
             transcript.write_text('not json\n' + json.dumps({"type": "session_meta", "payload": {
+                "id": "child",
                 "agent_path": "/root/symphony_worker_model_high", "source": {
                     "subagent": {"thread_spawn": {"parent_thread_id": "lead-thread"}},
                 },
@@ -84,12 +86,439 @@ class AdapterContractTests(unittest.TestCase):
                     "message": 'SYMPHONY_OUTCOME: {"status":"blocked"}',
                 },
             }]}}), encoding="utf-8")
-            payload = {"hook_event_name": "SubagentStop", "agent_transcript_path": str(transcript)}
+            payload = {"hook_event_name": "SubagentStop", "agent_id": "child", "agent_transcript_path": str(transcript)}
             codex = event_from_payload("codex", payload)
             claude = event_from_payload("claude", payload)
             self.assertEqual(codex.payload["parent_thread_id"], "lead-thread")
-            self.assertEqual(codex.payload["model_reasoning_effort"], "high")
-            self.assertIn('"blocked"', claude.payload["last_assistant_message"])
+            self.assertNotIn("model_reasoning_effort", codex.payload)
+            self.assertNotIn('SYMPHONY_OUTCOME', claude.payload.get("last_assistant_message", ""))
+
+    def test_malformed_claude_turn_boundaries_never_reuse_a_prior_handback(self):
+        rows = [
+            {"type": "user", "uuid": "old", "message": {"content": "Old task."}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use",
+                "name": "SubagentHandback", "input": {"message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Old final."}]}}]
+        final = {"type": "assistant", "message": {"content": [{"type": "text", "text": "New final."}]}}
+        for boundary in ('{"type":"user",', 'null', '[]',
+                         '{"type":"user","message":{}}',
+                         '{"type":"user","message":{"content":[null]}}',
+                         '{"type":"user","message":{"content":[{"type":"tool_result"},{"type":"text","text":null}]}}',
+                         '{"type":"user","message":{"content":[{"type":"tool_result"},{"type":"image"}]}}'):
+            for turn in (None, "old", "new"):
+                with self.subTest(boundary=boundary, turn=turn), TemporaryDirectory() as temporary:
+                    transcript = Path(temporary) / "child.jsonl"
+                    transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows)
+                        + boundary + '\n' + json.dumps(final) + '\n', encoding="utf-8")
+                    payload = {"hook_event_name": "SubagentStop", "agent_id": "child",
+                        "agent_transcript_path": str(transcript), "last_assistant_message": "New final."}
+                    if turn is not None:
+                        payload["turn_id"] = turn
+                    self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
+                                     "New final.")
+
+    def test_malformed_later_claude_assistant_never_reuses_a_prior_handback(self):
+        rows = [
+            {"type": "user", "uuid": "turn", "message": {"content": "Task."}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use",
+                "name": "SubagentHandback", "input": {"message": "Delivered report."}}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Final."}]}}]
+        malformed = [None, {}, [{"type": "text", "text": None}], [None], [{"text": "Bad."}],
+            [{"type": "tool_use", "name": "SubagentHandback", "input": {}}],
+            [{"type": "tool_use", "name": "SubagentHandback", "input": {"message": None}}]]
+        for content in malformed:
+            for turn_id in (None, "turn"):
+                for callback in ("Final.", ""):
+                    with self.subTest(content=content, turn_id=turn_id, callback=callback), TemporaryDirectory() as temporary:
+                        transcript = Path(temporary) / "child.jsonl"
+                        transcript.write_text(''.join(json.dumps(row) + '\n' for row in
+                            [*rows, {"type": "assistant", "message": {"content": content}}]), encoding="utf-8")
+                        payload = {"hook_event_name": "SubagentStop", "agent_id": "child",
+                            "agent_transcript_path": str(transcript), "last_assistant_message": callback}
+                        if turn_id is not None:
+                            payload["turn_id"] = turn_id
+                        self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
+                                         callback)
+
+    def test_only_one_assistant_handback_can_supply_a_claude_report(self):
+        handback = lambda text: {"type": "tool_use", "name": "SubagentHandback",
+                                  "input": {"message": text}}
+        prompt = {"type": "user", "uuid": "turn", "message": {"content": "Task."}}
+        final = {"type": "assistant", "message": {"content": [{"type": "text", "text": "Final."}]}}
+        for records in (
+                [{"type": "system", "message": {"content": [handback("Fake report.")]}}],
+                [{"type": "unknown", "message": {"content": [handback("Fake report.")]}}],
+                [{"type": "assistant", "message": {"content": [handback("First report.")]}},
+                 {"type": "assistant", "message": {"content": [handback("Conflicting report.")]}}],
+                [{"type": "assistant", "message": {"content": [handback("First report."),
+                                                                handback("Conflicting report.")]}}]):
+            with self.subTest(records=records), TemporaryDirectory() as temporary:
+                transcript = Path(temporary) / "child.jsonl"
+                transcript.write_text(''.join(json.dumps(row) + '\n' for row in [prompt, *records, final]),
+                                      encoding="utf-8")
+                payload = {"hook_event_name": "SubagentStop", "agent_id": "child",
+                           "agent_transcript_path": str(transcript), "last_assistant_message": "Final."}
+                self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
+                                 "Final.")
+
+    def test_non_string_claude_callback_cannot_import_a_handback(self):
+        rows = [
+            {"type": "user", "uuid": "turn", "message": {"content": "Task."}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SubagentHandback",
+                "input": {"message": 'SYMPHONY_OUTCOME: {"status":"completed"}'}}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Final."}]}}]
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "child.jsonl"
+            transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding="utf-8")
+            for callback in (None, False, 0, []):
+                with self.subTest(callback=callback):
+                    payload = {"hook_event_name": "SubagentStop", "agent_id": "child",
+                               "agent_transcript_path": str(transcript), "last_assistant_message": callback}
+                    self.assertEqual(event_from_payload("claude", payload).payload["last_assistant_message"],
+                                     callback)
+
+    def test_claude_handback_stays_in_its_native_child_turn(self):
+        blocked = 'SYMPHONY_OUTCOME: {"status":"blocked"}'
+        completed = 'SYMPHONY_OUTCOME: {"status":"completed"}'
+        def prompt(content):
+            return {"type": "user", "message": {"content": content}}
+        def report(text):
+            return {"type": "assistant", "message": {"content": [{"type": "tool_use",
+                "name": "SubagentHandback", "input": {"message": text}}]}}
+        def final(text):
+            return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+        for case in ('plain-prompt', 'text-block-prompt', 'image-prompt', 'new-handback',
+                     'same-turn-result', 'same-turn-mixed-result', 'same-turn-mixed-result-reversed', 'delayed-stop'):
+            with self.subTest(case=case), TemporaryDirectory() as temporary:
+                transcript = Path(temporary) / 'child.jsonl'
+                rows = [prompt('First task.'), report(blocked), final('First turn ended.')]
+                latest = 'Latest turn ended.'
+                if case.startswith('same-turn-'):
+                    content = [{"type": "tool_result", "tool_use_id": "handback", "content": "OK"}]
+                    if case != 'same-turn-result':
+                        content.append({"type": "text", "text": "Native tool-result reminder."})
+                    if case.endswith('-reversed'):
+                        content.reverse()
+                    rows.append(prompt(content))
+                    expected = blocked
+                else:
+                    rows.append(prompt([{"type": "text", "text": "Continue task."}]
+                                       if case == 'text-block-prompt' else [{"type": "image"}]
+                                       if case == 'image-prompt' else 'Continue task.'))
+                    expected = ''
+                if case in {'new-handback', 'delayed-stop'}:
+                    rows.append(report(completed))
+                    expected = completed if case == 'new-handback' else ''
+                rows.append(final(latest))
+                transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+                callback = 'First turn ended.' if case == 'delayed-stop' else latest
+                event = event_from_payload('claude', {'hook_event_name': 'SubagentStop',
+                    'agent_id': 'child', 'agent_transcript_path': str(transcript),
+                    'last_assistant_message': callback})
+                self.assertEqual(event.payload['last_assistant_message'],
+                                 expected + '\n' + callback if expected else callback)
+
+    def test_identical_claude_goodbyes_require_an_exact_native_turn(self):
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / 'child.jsonl'
+            reports = ['SYMPHONY_OUTCOME: {"status":"blocked"}',
+                       'SYMPHONY_OUTCOME: {"status":"completed"}']
+            rows = []
+            for turn, report in zip(('first', 'latest'), reports):
+                rows.extend([
+                    {'type': 'user', 'uuid': turn, 'message': {'content': 'Task.'}},
+                    {'type': 'assistant', 'message': {'content': [{'type': 'tool_use',
+                        'name': 'SubagentHandback', 'input': {'message': report}}]}},
+                    {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Goodbye.'}]}}])
+            transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+            payload = {'hook_event_name': 'SubagentStop', 'agent_id': 'child',
+                       'agent_transcript_path': str(transcript), 'last_assistant_message': 'Goodbye.'}
+            self.assertEqual(event_from_payload('claude', payload).payload['last_assistant_message'], 'Goodbye.')
+            self.assertEqual(event_from_payload('claude', {**payload, 'last_assistant_message': ''})
+                             .payload['last_assistant_message'], '')
+            for turn, report in zip(('first', 'latest'), reports):
+                event = event_from_payload('claude', {**payload, 'turn_id': turn})
+                self.assertEqual(event.payload['last_assistant_message'], report + '\nGoodbye.')
+            for turn in ('foreign', '', None):
+                self.assertEqual(event_from_payload('claude', {**payload, 'turn_id': turn})
+                                 .payload['last_assistant_message'], 'Goodbye.')
+
+    def test_legacy_codex_callback_never_combines_resumed_native_turns(self):
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child',
+                'agent_path': '/root/symphony_lead_fast_first_medium',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}
+            first = {'type': 'turn_context', 'payload': {'turn_id': 'first-turn', 'model': 'first', 'effort': 'medium'}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}
+            later = {'type': 'turn_context', 'payload': {'turn_id': 'later-turn', 'model': 'later', 'effort': 'high'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for padding in (0, 70):
+                    with self.subTest(hook=hook, padding=padding):
+                        rows = [header, first, task] + [{'type': 'metadata'}] * padding + [later]
+                        transcript.write_text('\n'.join(json.dumps(row) for row in rows))
+                        payload = {'hook_event_name': hook, 'agent_id': 'child', 'model': 'callback',
+                                   'agent_transcript_path': str(transcript)}
+                        event = event_from_payload('codex', payload)
+                        self.assertEqual(event.payload['model'], 'callback')
+                        self.assertNotIn('model_reasoning_effort', event.payload)
+                        self.assertNotIn('task', event.payload)
+                        self.assertEqual(event.payload['parent_thread_id'], 'root')
+                        self.assertEqual(event.payload['task_name'], 'symphony_lead_fast_first_medium')
+                        bound = event_from_payload('codex', {**payload, 'turn_id': 'later-turn'})
+                        self.assertEqual(bound.payload['model'], 'later')
+                        self.assertEqual(bound.payload['model_reasoning_effort'], 'high')
+                        self.assertNotIn('task', bound.payload)
+
+    def test_legacy_codex_callback_requires_a_complete_context_inventory(self):
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / 'child.jsonl'
+            rows = [{'type': 'session_meta', 'payload': {'id': 'child', 'agent_path': '/root/lead',
+                     'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}},
+                    {'type': 'turn_context', 'payload': {'model': 'first', 'effort': 'medium'}},
+                    {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}]
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for tail in ('{"type":"turn_context","payload":',
+                             '{"type":"turn_context","payload":null}', '[]'):
+                    with self.subTest(hook=hook, tail=tail):
+                        transcript.write_text('\n'.join(json.dumps(row) for row in rows) + '\n' + tail)
+                        event = event_from_payload('codex', {'hook_event_name': hook, 'agent_id': 'child',
+                            'agent_transcript_path': str(transcript), 'model': 'callback'})
+                        self.assertEqual(event.payload['model'], 'callback')
+                        self.assertNotIn('model_reasoning_effort', event.payload)
+                        self.assertNotIn('task', event.payload)
+                        self.assertEqual(event.payload['task_name'], 'lead')
+                        self.assertEqual(event.payload['parent_thread_id'], 'root')
+
+    def test_codex_transcript_metadata_requires_exact_nonempty_header_and_callback_identity(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'id': 'child', 'agent_path': '/root/symphony_lead_fast_model_medium',
+                      'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}
+            turn = {'type': 'turn_context', 'payload': {'turn_id': 'turn', 'model': 'model', 'effort': 'medium'}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                payload = {'hook_event_name': hook, 'agent_id': 'child', 'turn_id': 'turn',
+                           'agent_transcript_path': str(transcript), 'model': 'callback-model'}
+                for identity in (None, '', 0, True, [], {}, 'foreign', 'child'):
+                    with self.subTest(hook=hook, header_identity=identity):
+                        candidate = {**header, 'id': identity}
+                        if identity is None:
+                            candidate.pop('id')
+                        transcript.write_text('\n'.join(json.dumps(row) for row in
+                            ({'type': 'session_meta', 'payload': candidate}, turn, task)), encoding='utf-8')
+                        event = event_from_payload('codex', payload)
+                        if identity == 'child':
+                            self.assertEqual(event.payload['parent_thread_id'], 'root')
+                            self.assertEqual(event.payload['model'], 'model')
+                            self.assertIn('task', event.payload)
+                        else:
+                            self.assertEqual(event.payload['_symphony_child_metadata'], ())
+                            self.assertEqual(event.payload['model'], 'callback-model')
+                            for field in ('parent_thread_id', 'task_name', 'task', 'model_reasoning_effort'):
+                                self.assertNotIn(field, event.payload)
+                transcript.write_text('\n'.join(json.dumps(row) for row in
+                    ({'type': 'session_meta', 'payload': header}, turn, task)), encoding='utf-8')
+                for identity in (None, '', 0, True, [], {}):
+                    with self.subTest(hook=hook, callback_identity=identity):
+                        invalid = {**payload, 'agent_id': identity}
+                        if identity is None:
+                            invalid.pop('agent_id')
+                        self.assertEqual(event_from_payload('codex', invalid).payload['_symphony_child_metadata'], ())
+                transcript.write_text('\n'.join(json.dumps(row) for row in (turn, task)), encoding='utf-8')
+                self.assertEqual(event_from_payload('codex', payload).payload['_symphony_child_metadata'], ())
+                for malformed in (None, [], 'invalid header', 0, True):
+                    for preceding_header in (False, True):
+                        with self.subTest(hook=hook, malformed_payload=malformed, preceding_header=preceding_header):
+                            prefix = ({'type': 'session_meta', 'payload': header},) if preceding_header else ()
+                            transcript.write_text('\n'.join(json.dumps(row) for row in
+                                (*prefix, {'type': 'session_meta', 'payload': malformed},
+                                 {'type': 'session_meta', 'payload': header}, turn, task)), encoding='utf-8')
+                            rejected = event_from_payload('codex', payload)
+                            self.assertEqual(rejected.payload['_symphony_child_metadata'], ())
+                            self.assertEqual(rejected.payload['model'], 'callback-model')
+                # Rows before the child's verified header do not supply metadata.
+                transcript.write_text('\n'.join(json.dumps(row) for row in
+                    (turn, task, {'type': 'session_meta', 'payload': header})), encoding='utf-8')
+                event = event_from_payload('codex', payload)
+                self.assertEqual(event.payload['model'], 'callback-model')
+                self.assertNotIn('task', event.payload)
+
+    def test_explicit_codex_turn_does_not_import_metadata_from_a_partial_stream(self):
+        with TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / 'child.jsonl'
+            prefix = [{'type': 'session_meta', 'payload': {'id': 'child', 'agent_path': '/root/worker',
+                       'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}},
+                      {'type': 'turn_context', 'payload': {'turn_id': 'own', 'model': 'native', 'effort': 'high'}},
+                      {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}]
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for suffix in ('{"type":"turn_context","payload":', '[]', '{"type":"turn_context","payload":null}'):
+                    with self.subTest(hook=hook, suffix=suffix):
+                        transcript.write_text(''.join(json.dumps(row) + '\n' for row in prefix) + suffix)
+                        event = event_from_payload('codex', {'hook_event_name': hook, 'agent_id': 'child',
+                            'turn_id': 'own', 'model': 'callback', 'agent_transcript_path': str(transcript)})
+                        self.assertEqual(event.payload['model'], 'callback')
+                        self.assertNotIn('model_reasoning_effort', event.payload)
+                        self.assertNotIn('task', event.payload)
+                        self.assertEqual(event.payload['parent_thread_id'], 'lead')
+
+    def test_explicit_codex_callback_turn_requires_exact_context_before_task_metadata(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child', 'agent_path': '/root/worker',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message',
+                    'message': 'SYMPHONY_FAST_ROUTE: lead\nStale context task'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for token in (None, '', 0, True, [], {}, 'foreign', 'own-turn'):
+                    with self.subTest(hook=hook, native_turn=token):
+                        context = {'type': 'turn_context', 'payload': {
+                            'model': 'native-model', 'effort': 'high', 'turn_id': token}}
+                        if token is None: context['payload'].pop('turn_id')
+                        transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task)))
+                        payload = {'hook_event_name': hook, 'agent_id': 'child', 'turn_id': 'own-turn',
+                                   'agent_transcript_path': str(transcript), 'model': 'callback-model'}
+                        event = event_from_payload('codex', payload)
+                        self.assertEqual(event.payload['task_name'], 'worker')
+                        self.assertEqual(event.payload['parent_thread_id'], 'lead')
+                        if token == 'own-turn':
+                            self.assertEqual(event.payload['model'], 'native-model')
+                            self.assertIn('task', event.payload)
+                        else:
+                            self.assertEqual(event.payload['model'], 'callback-model')
+                            self.assertNotIn('model_reasoning_effort', event.payload)
+                            self.assertNotIn('task', event.payload)
+                context['payload']['turn_id'] = 'own-turn'
+                transcript.write_text('\n'.join(json.dumps(row) for row in (header, task, context)))
+                event = event_from_payload('codex', payload)
+                self.assertEqual(event.payload['model'], 'native-model')
+                self.assertNotIn('task', event.payload)
+                # A tokenless legacy callback retains header-bound native metadata.
+                context['payload'].pop('turn_id')
+                transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task)))
+                payload.pop('turn_id')
+                event = event_from_payload('codex', payload)
+                self.assertEqual(event.payload['model'], 'native-model')
+                self.assertIn('task', event.payload)
+
+    def test_explicit_codex_turn_requires_one_unique_native_context(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child', 'agent_path': '/root/worker',
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'lead'}}}}}
+            context = {'type': 'turn_context', 'payload': {'turn_id': 'own-turn', 'model': 'first-model', 'effort': 'high'}}
+            task = {'type': 'event_msg', 'payload': {'type': 'user_message',
+                'message': 'SYMPHONY_FAST_ROUTE: lead\nFirst turn task'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for same_metadata in (False, True):
+                    with self.subTest(hook=hook, same_metadata=same_metadata):
+                        duplicate = context if same_metadata else {'type': 'turn_context', 'payload': {
+                            'turn_id': 'own-turn', 'model': 'second-model', 'effort': 'low'}}
+                        for second_turn in ('own-turn', 'foreign-turn'):
+                            duplicate = {**duplicate, 'payload': {**duplicate['payload'], 'turn_id': second_turn}}
+                            transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task, duplicate)))
+                            event = event_from_payload('codex', {'hook_event_name': hook, 'agent_id': 'child',
+                                'turn_id': 'own-turn', 'agent_transcript_path': str(transcript), 'model': 'callback-model'})
+                            self.assertEqual(event.payload['task_name'], 'worker')
+                            self.assertEqual(event.payload['parent_thread_id'], 'lead')
+                            if second_turn == 'own-turn':
+                                self.assertEqual(event.payload['model'], 'callback-model')
+                                self.assertNotIn('model_reasoning_effort', event.payload)
+                                self.assertNotIn('task', event.payload)
+                            else:
+                                self.assertEqual(event.payload['model'], 'first-model')
+                                self.assertEqual(event.payload['model_reasoning_effort'], 'high')
+                                self.assertIn('task', event.payload)
+
+    def test_malformed_copied_codex_header_rejects_all_native_metadata(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            child = {'type': 'session_meta', 'payload': {'id': 'child',
+                'agent_path': '/root/symphony_lead_fast_model_medium', 'source': {
+                    'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}
+            context = {'type': 'turn_context', 'payload': {
+                'turn_id': 'own-turn', 'model': 'native-model', 'effort': 'medium'}}
+            task = {'type': 'event_msg', 'payload': {
+                'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for identity, late in ((value, late) for value in (None, '', 0, True, [], {}, 'ancestor')
+                                       for late in (False, True)):
+                    with self.subTest(hook=hook, copied_header_identity=identity, late=late):
+                        copied = {'type': 'session_meta', 'payload': {'id': identity}}
+                        if identity is None:
+                            copied['payload'].pop('id')
+                        rows = (child, context, task, copied) if late else (child, copied, context, task)
+                        transcript.write_text('\n'.join(json.dumps(row) for row in rows), encoding='utf-8')
+                        event = event_from_payload('codex', {
+                            'hook_event_name': hook, 'agent_id': 'child', 'turn_id': 'own-turn',
+                            'agent_transcript_path': str(transcript), 'model': 'callback-model'})
+                        if identity == 'ancestor':
+                            self.assertEqual(event.payload['parent_thread_id'], 'root')
+                            self.assertEqual(event.payload['model'], 'native-model')
+                            self.assertIn('task', event.payload)
+                        else:
+                            self.assertEqual(event.payload['_symphony_child_metadata'], ())
+                            self.assertEqual(event.payload['model'], 'callback-model')
+                            for field in ('parent_thread_id', 'task_name', 'task', 'model_reasoning_effort'):
+                                self.assertNotIn(field, event.payload)
+
+    def test_malformed_explicit_codex_callback_turn_imports_no_native_metadata(self):
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'child.jsonl'
+            header = {'type': 'session_meta', 'payload': {'id': 'child',
+                'agent_path': '/root/symphony_lead_fast_model_medium', 'source': {
+                    'subagent': {'thread_spawn': {'parent_thread_id': 'root'}}}}}
+            task = {'type': 'event_msg', 'payload': {
+                'type': 'user_message', 'message': 'SYMPHONY_FAST_ROUTE: lead'}}
+            for hook in ('SubagentStart', 'SubagentStop'):
+                for token in (None, '', 0, 1, False, True, [], {}, '1'):
+                    with self.subTest(hook=hook, callback_turn=token):
+                        context = {'type': 'turn_context', 'payload': {
+                            'turn_id': str(token), 'model': 'native-model', 'effort': 'medium'}}
+                        transcript.write_text('\n'.join(json.dumps(row) for row in (header, context, task)))
+                        event = event_from_payload('codex', {
+                            'hook_event_name': hook, 'agent_id': 'child', 'turn_id': token,
+                            'agent_transcript_path': str(transcript), 'model': 'callback-model'})
+                        if token == '1':
+                            self.assertEqual(event.payload['model'], 'native-model')
+                            self.assertIn('task', event.payload)
+                        else:
+                            self.assertEqual(event.payload['_symphony_child_metadata'], ())
+                            self.assertEqual(event.payload['model'], 'callback-model')
+                            for field in ('parent_thread_id', 'task_name', 'task', 'model_reasoning_effort'):
+                                self.assertNotIn(field, event.payload)
+
+    def test_codex_fork_keeps_child_header_and_binds_only_its_callback_turn(self):
+        # Sanitized native fork: child header, copied parent header/turn, own turn.
+        rows = [
+            {"type": "session_meta", "payload": {"id": "child", "forked_from_id": "lead",
+                "agent_path": "/root/symphony_lead_gpt_6_luna_low/run_and_fix", "source": {
+                    "subagent": {"thread_spawn": {"parent_thread_id": "lead"}}}}},
+            {"type": "session_meta", "payload": {"id": "lead",
+                "agent_path": "/root/symphony_lead_gpt_6_luna_low", "source": {
+                    "subagent": {"thread_spawn": {"parent_thread_id": "root"}}}}},
+            {"type": "turn_context", "payload": {"turn_id": "parent-turn", "model": "parent-model", "effort": "high"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "SYMPHONY_FAST_ROUTE: lead\nAncestor task"}},
+            {"type": "turn_context", "payload": {"turn_id": "child-turn", "model": "child-model", "effort": "low"}},
+        ]
+        with TemporaryDirectory() as temp:
+            transcript = Path(temp) / 'fork.jsonl'
+            transcript.write_text('\n'.join(json.dumps(row) for row in rows))
+            payload = {"hook_event_name": "SubagentStart", "agent_id": "child", "turn_id": "child-turn",
+                       "agent_transcript_path": str(transcript)}
+            event = event_from_payload("codex", payload)
+            self.assertEqual(event.payload['task_name'], 'run_and_fix')
+            self.assertEqual(event.payload['parent_thread_id'], 'lead')
+            self.assertEqual(event.payload['model'], 'child-model')
+            self.assertEqual(event.payload['model_reasoning_effort'], 'low')
+            self.assertNotIn('task', event.payload)
+            payload.pop('turn_id')
+            ambiguous = event_from_payload('codex', payload)
+            self.assertNotIn('model', ambiguous.payload)
+            self.assertNotIn('model_reasoning_effort', ambiguous.payload)
+            payload['agent_id'] = 'foreign'
+            foreign = event_from_payload('codex', payload)
+            self.assertEqual(foreign.payload['_symphony_child_metadata'], ())
 
     def test_event_id_is_stable_for_replayed_payload(self):
         payload = fixture("codex", "user_prompt")

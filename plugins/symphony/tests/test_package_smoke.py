@@ -6,7 +6,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from plugins.symphony.scripts.package_smoke import run_smoke
+from plugins.symphony.scripts.package_smoke import _payload, run_smoke
+from plugins.symphony.symphony.host_evidence import _packet_purpose
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -14,6 +15,16 @@ SCRIPT = ROOT / "plugins" / "symphony" / "scripts" / "package_smoke.py"
 
 
 class PackageSmokeTests(unittest.TestCase):
+    def test_child_spawn_packets_declare_substantive_purpose(self):
+        plugin = ROOT / "plugins" / "symphony"
+        for event in ("PreToolUse", "PostToolUse"):
+            for role in ("worker", "consultant", "lead", "assessor"):
+                with self.subTest(event=event, role=role):
+                    packet = _payload(plugin, "claude", event, ROOT, "session", role)["tool_input"]["prompt"]
+                    self.assertTrue(packet.startswith(f"SYMPHONY_ROLE: {role}\n"))
+                    self.assertEqual(_packet_purpose(packet),
+                                     "substantive" if role in {"worker", "consultant"} else "")
+
     def make_candidate(
         self,
         root: Path,
@@ -156,6 +167,8 @@ class PackageSmokeTests(unittest.TestCase):
             "Stop",
             "Stop",
             "Stop",
+            "SubagentStart",
+            "SubagentStop",
             "SubagentStop",
             "Stop",
         ]

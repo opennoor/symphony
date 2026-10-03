@@ -2,16 +2,19 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from uuid import NAMESPACE_URL, uuid5
 
 from plugins.symphony.scripts.generate_hooks import bootstrap, generated
-from plugins.symphony.scripts.package_smoke import _payload
+from plugins.symphony.scripts.package_smoke import _payload, _role_model, _write_claude_child_launch
 
 
 PLUGIN = Path(__file__).resolve().parents[1]
@@ -32,16 +35,22 @@ class RuntimeRetentionTests(unittest.TestCase):
             command = context.split("Check activation through the verified launcher: ", 1)[1]
             self.assertLess(len(command), 1200)
             self.assertNotIn("base64", command)
+            executable = shlex.split(command)[1 if os.name == 'nt' else 0]
+            self.assertTrue(Path(executable).is_absolute())
+            self.assertTrue(os.path.samefile(sys.executable, executable))
             shutil.rmtree(root)
             env["CODEX_SESSION_ID"] = "original-session"
             def check():
-                invocation = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
-                              if os.name == "nt" else ["bash", "-c", command])
+                invocation = ([str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'), "-NoProfile", "-NonInteractive", "-Command", command]
+                              if os.name == "nt" else [shutil.which("bash"), "-c", command])
                 return subprocess.run(invocation, cwd=directory, env=env,
                                       capture_output=True, text=True, timeout=20)
             accepted = check()
             self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
             self.assertIn("guarded: matching current-session heartbeat", accepted.stdout)
+            env['PATH'] = ''
+            accepted = check()
+            self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
             env["CODEX_SESSION_ID"] = "foreign-session"
             self.assertNotEqual(0, check().returncode)
             env["CODEX_SESSION_ID"] = "original-session"
@@ -72,19 +81,67 @@ class RuntimeRetentionTests(unittest.TestCase):
                "SYMPHONY_RUNTIME_DIR": str(directory / "retained runtimes"),
                "SYMPHONY_STATE_DIR": str(directory / "state"), "SYMPHONY_PROFILE": profile,
                "PYTHONPATH": str(directory),
+               "SYMPHONY_CAPTURED_BOOTSTRAP": "raise RuntimeError('inherited bootstrap executed')",
                "CODEX_HOME": str(directory / "empty codex home")}
+        env['CLAUDE_CONFIG_DIR'] = str(directory / 'claude-native')
+        if (provider == 'claude' and payload.get('hook_event_name') == 'SubagentStart'
+                and payload.get('agent_id') == 'fake-worker'):
+            documents = [json.loads(path.read_text(encoding='utf-8'))
+                         for path in (directory / 'state').glob('*.v2.json')]
+            run = next(document['active_runs'][f"claude:{payload['session_id']}"]
+                       for document in documents
+                       if f"claude:{payload['session_id']}" in document.get('active_runs', {}))
+            model, effort = _role_model(PLUGIN, provider, 'worker')
+            _write_claude_child_launch(env['CLAUDE_CONFIG_DIR'], directory, run,
+                                       'fake-worker', 'worker', model, effort, 'worker')
         if (directory / "pin barrier" / "barrier.py").is_file():
             env["SYMPHONY_TEST_PIN_BARRIER"] = str(directory / "pin barrier" / "barrier.py")
-        if os.name == "nt":
-            # The VM invokes Python by absolute path and does not install it
-            # globally; provide that same interpreter to the captured hook.
-            env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+        # Give the hook this fixture's selected interpreter on every platform,
+        # including alternate Python/backend runs and the Windows VM.
+        env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
         result = subprocess.run(command, input=json.dumps(payload), capture_output=True,
                                 text=True, env=env, cwd=directory, timeout=20, check=False)
         return result, env
 
-    def test_captured_hooks_and_checker_survive_removed_cache_without_losing_outcome(self):
+    def test_captured_hooks_and_checker_survive_removed_cache_and_require_native_proof(self):
         self.exercise_removed_cache()
+
+    def write_codex_worker_launch(self, directory, run, worker):
+        """Supply native worker ownership, without inventing lead completion."""
+        home = directory / 'empty codex home' / 'sessions' / '2026' / '10' / '03'
+        home.mkdir(parents=True, exist_ok=True)
+        lead = next(item for item in run['delegations'] if item['identity'] == run['lead_identity'])
+        model, effort = worker['model'], worker['model_reasoning_effort']
+        lead_name = f"symphony_lead_{lead['requested_tier'].replace('-', '_').replace('.', '_')}_{lead['requested_effort']}"
+        parent_path = '/root/' + lead_name
+        child_path = parent_path + '/' + worker['agent_type']
+        launched = datetime.now(timezone.utc) - timedelta(milliseconds=3)
+        self.assertGreater(launched, datetime.fromisoformat(run['assessment']['substantive_contract']['accepted_at']))
+
+        def row(kind, payload, offset):
+            return {'type': kind, 'payload': payload,
+                    'timestamp': (launched + timedelta(milliseconds=offset)).isoformat()}
+
+        def header(identity, path, parent):
+            return row('session_meta', {'id': identity, 'cwd': str(directory), 'agent_path': path,
+                'source': {'subagent': {'thread_spawn': {'parent_thread_id': parent, 'agent_path': path}}}}, 0)
+
+        parent = [header(run['lead_identity'], parent_path, run['session_id']),
+            row('response_item', {'type': 'function_call', 'name': 'spawn_agent', 'call_id': 'worker-launch',
+                'arguments': json.dumps({'task_name': worker['agent_type'], 'model': model,
+                    'reasoning_effort': effort, 'fork_turns': 'none', 'message': 'gAAAAopaque-native-packet'})}, 0),
+            row('event_msg', {'type': 'item_completed', 'thread_id': run['lead_identity'], 'item': {
+                'type': 'SubAgentActivity', 'kind': 'started', 'id': 'worker-launch',
+                'agent_thread_id': worker['agent_id'], 'agent_path': child_path}}, 1),
+            row('response_item', {'type': 'function_call_output', 'call_id': 'worker-launch',
+                'output': json.dumps({'task_name': child_path})}, 3)]
+        child = [header(worker['agent_id'], child_path, run['lead_identity']),
+            row('event_msg', {'type': 'task_started', 'turn_id': worker['turn_id']}, 2),
+            row('turn_context', {'turn_id': worker['turn_id'], 'model': model, 'effort': effort}, 2)]
+        for identity, records in ((run['lead_identity'], parent), (worker['agent_id'], child)):
+            (home / f'rollout-{identity}.jsonl').write_text(
+                ''.join(json.dumps(record) + '\n' for record in records), encoding='utf-8')
+        return home / f"rollout-{worker['agent_id']}.jsonl"
 
     def test_new_checker_accepts_only_verified_old_session(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -149,7 +206,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             (retained / "symphony" / "runtime.py").write_text("raise RuntimeError('tampered')\n")
             self.assertNotEqual(check().returncode, 0)
 
-    def test_two_active_sessions_finish_from_old_runtime_after_update(self):
+    def test_two_active_sessions_keep_their_owner_after_update_without_native_proof(self):
         for provider in ("codex", "claude"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
@@ -189,6 +246,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                             cwd=directory, env={**env, "CODEX_SESSION_ID": session},
                             capture_output=True, text=True, check=False)
                         self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
+                    for event in ('SubagentStart', 'SubagentStop'):
+                        payload = _payload(new_root, provider, event, directory, session, 'worker')
+                        result, _ = self.run_hook(commands[event], root, provider, directory, payload)
+                        self.assertEqual(0, result.returncode, result.stderr)
                     payload = _payload(new_root, provider, "SubagentStop", directory, session, "lead")
                     payload["last_assistant_message"] = 'SYMPHONY_OUTCOME: {"status":"completed"}'
                     result, _ = self.run_hook(commands["SubagentStop"], root, provider, directory, payload)
@@ -197,12 +258,13 @@ class RuntimeRetentionTests(unittest.TestCase):
                                               _payload(new_root, provider, "Stop", directory, session))
                     self.assertEqual(0, result.returncode, result.stderr)
                 document = json.loads(state_file.read_text())
-                self.assertFalse(document["active_runs"])
-                recent = {run["session_id"]: run for run in document["recent_runs"]
-                          if run["session_id"] in {"old-a", "old-b"}}
-                self.assertEqual({"old-a", "old-b"}, set(recent))
-                self.assertTrue(all(run["status"] == "completed" and
-                                    run["outcome"] == {"status": "completed"} for run in recent.values()))
+                # These fake agent IDs have no native transcript. The retained
+                # runtime must keep each owner recoverable instead of archiving it.
+                self.assertEqual({f"{provider}:old-a", f"{provider}:old-b"},
+                                 set(document["active_runs"]))
+                self.assertTrue(all(run["status"] == "recovering" and run["outcome"] is None
+                                    and run["assessment"]["_retryable_lead"] == "fake-lead"
+                                    for run in document["active_runs"].values()))
 
     def exercise_removed_cache(self, providers=("codex", "claude")):
         for provider in providers:
@@ -210,6 +272,22 @@ class RuntimeRetentionTests(unittest.TestCase):
                 directory = Path(temporary)
                 (directory / "base64.py").write_text("raise RuntimeError('untrusted project import')\n")
                 root = self.materialize(directory, "Reviewed Old Plugin With Spaces")
+                session = str(uuid5(NAMESPACE_URL, 'retention-old-session')) if provider == 'codex' else 'old-session'
+                identities = {f'fake-{role}': str(uuid5(NAMESPACE_URL, f'retention-{role}'))
+                              for role in ('assessor', 'lead', 'worker')} if provider == 'codex' else {}
+
+                def payload_for(package, event, role='lead'):
+                    payload = _payload(package, provider, event, directory, session, role)
+                    if provider == 'codex':
+                        for key in ('agent_id', 'parent_thread_id'):
+                            if key in payload:
+                                payload[key] = identities[payload[key]]
+                        turn_role = role if event in ('SubagentStart', 'SubagentStop') else 'root'
+                        payload['turn_id'] = str(uuid5(NAMESPACE_URL, f'retention-{turn_role}-turn'))
+                        if role == 'worker' and 'agent_type' in payload:
+                            payload['agent_type'] += '__substantive'
+                    return payload
+
                 commands = {event: self.command(root, provider, event) for event in
                             ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop")}
                 checker_code = bootstrap(root)
@@ -217,16 +295,16 @@ class RuntimeRetentionTests(unittest.TestCase):
                 for event, role in (("SessionStart", "assessor"), ("UserPromptSubmit", "assessor"),
                                     ("SubagentStart", "assessor"), ("SubagentStop", "assessor"),
                                     ("SubagentStart", "lead")):
-                    payload = _payload(root, provider, event, directory, "old-session", role)
+                    payload = payload_for(root, event, role)
                     result, env = self.run_hook(commands[event], root, provider, directory, payload)
                     self.assertEqual(result.returncode, 0, result.stderr)
                 # Prepare captured payloads before removing all the old files.
                 for event in ("SubagentStop", "UserPromptSubmit", "Stop"):
-                    payloads[event] = _payload(root, provider, event, directory, "old-session", "lead")
+                    payloads[event] = payload_for(root, event)
                 payloads["UserPromptSubmit"]["prompt"] = "$symphony:symphony status" if provider == "codex" else "/symphony:status"
                 state_file = next((directory / "state").glob("*.v2.json"))
                 document = json.loads(state_file.read_text())
-                self.assertIn(f"{provider}:old-session", document["active_runs"])
+                self.assertIn(f"{provider}:{session}", document["active_runs"])
                 retained = Path(document["activation"][provider]["runtime_root"])
                 # A newer session uses its separately reviewed package; the old
                 # captured command must never resolve to this version.
@@ -243,21 +321,43 @@ class RuntimeRetentionTests(unittest.TestCase):
                 shutil.rmtree(root)
                 if provider == "codex":
                     checked = subprocess.run([sys.executable, "-I", str(new_root / "scripts/check_activation.py")],
-                                             cwd=directory, env={**env, "CODEX_SESSION_ID": "old-session"},
+                                             cwd=directory, env={**env, "CODEX_SESSION_ID": session},
                                              capture_output=True, text=True, check=False)
                     self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+                worker_transcript = None
+                for event in ('SubagentStart', 'SubagentStop'):
+                    worker = payload_for(new_root, event, 'worker')
+                    if provider == 'codex':
+                        if event == 'SubagentStart':
+                            run = json.loads(state_file.read_text())['active_runs'][f'codex:{session}']
+                            self.assertEqual(2, run['assessment']['substantive_contract']['version'])
+                            worker_transcript = self.write_codex_worker_launch(directory, run, worker)
+                        else:
+                            terminal = {'type': 'event_msg', 'timestamp': datetime.now(timezone.utc).isoformat(),
+                                'payload': {'type': 'task_complete', 'turn_id': worker['turn_id'],
+                                            'last_agent_message': worker['last_assistant_message']}}
+                            with worker_transcript.open('a', encoding='utf-8') as stream:
+                                stream.write(json.dumps(terminal) + '\n')
+                        worker['agent_transcript_path'] = str(worker_transcript)
+                    result, _ = self.run_hook(commands[event], root, provider, directory, worker)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                if provider == 'codex':
+                    run = json.loads(state_file.read_text())['active_runs'][f'codex:{session}']
+                    proof = run['assessment']['_substantive_children'][identities['fake-worker']]
+                    self.assertEqual('substantive', proof['purpose'])
+                    self.assertTrue(proof['successful'])
                 for event in ("SubagentStop", "UserPromptSubmit"):
                     result, env = self.run_hook(commands[event], root, provider, directory, payloads[event])
                     self.assertEqual(result.returncode, 0, result.stderr)
                 document = json.loads(state_file.read_text())
                 self.assertEqual(document["activation"][provider]["plugin_version"], old_version)
                 self.assertEqual(document["activation"][provider]["runtime_root"], str(retained))
-                outcome_run = document["active_runs"].get(f"{provider}:old-session") or document["recent_runs"][-1]
+                outcome_run = document["active_runs"].get(f"{provider}:{session}") or document["recent_runs"][-1]
                 self.assertIsNotNone(outcome_run["outcome"])
                 if provider == "codex":
                     checked = subprocess.run([sys.executable, "-I", "-c", checker_code,
                                               str(root), "codex", "--check-activation"], cwd=directory,
-                                             env={**env, "CODEX_SESSION_ID": "old-session"}, capture_output=True,
+                                             env={**env, "CODEX_SESSION_ID": session}, capture_output=True,
                                              text=True, check=False)
                     self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr + json.dumps({
                         "expected_source": str(root.resolve()), "expected_runtime": str(retained.resolve()),
@@ -265,8 +365,19 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result, _ = self.run_hook(commands["Stop"], root, provider, directory, payloads["Stop"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 document = json.loads(state_file.read_text())
-                self.assertNotIn(f"{provider}:old-session", document["active_runs"])
-                self.assertEqual(document["recent_runs"][-1]["status"], "completed")
+                pending = document["active_runs"][f"{provider}:{session}"]
+                if provider == "codex":
+                    # The native parent launch proves the worker's purpose but
+                    # contains no lead turn/result. The earlier freshness guard
+                    # must block before completion-order recovery can run.
+                    stopped = json.loads(result.stdout)
+                    self.assertEqual("block", stopped["decision"])
+                    self.assertIn("could not verify the tracked lead's latest native turn", stopped["reason"])
+                    self.assertEqual("completing", pending["status"])
+                    self.assertFalse(any(run["run_id"] == pending["run_id"] for run in document["recent_runs"]))
+                else:
+                    self.assertEqual("recovering", pending["status"])
+                    self.assertEqual("fake-lead", pending["assessment"]["_retryable_lead"])
 
     def test_retained_or_source_tampering_fails_closed(self):
         for changed_path in ("symphony/runtime.py", "json.py", "scripts/check_activation.py"):

@@ -31,6 +31,7 @@ from symphony.routing import (  # noqa: E402
     route_for,
     snapshot_for,
 )
+from symphony.runtime import _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 REFERENCE = Path(__file__).resolve().parents[1] / "skills/symphony/references/capability-routing.md"
@@ -50,8 +51,10 @@ DESCRIPTIONS = {
 }
 
 WAITING = (
-    "Agents you spawn run in the background: after spawning, end your turn and you are woken with "
-    "each result. Never wait by polling output files with Bash, sleep, or Monitor."
+    "Pass `run_in_background: false` on every child Agent call so its result returns to you before "
+    "you finish. In sessions where Claude forces background execution, end your turn and wait for "
+    "the native completion notification. An asynchronous launch acknowledgment is not a result. "
+    "Never poll output files with Bash, sleep, or Monitor."
 )
 
 PRACTICES = (
@@ -69,35 +72,49 @@ PRACTICES = (
 
 BODIES = {
     "lead": (
-        "If the packet has `SYMPHONY_FAST_ROUTE: lead`, decide before any writes whether the "
-        "entire task is bounded, clear, low risk, required tools (including browser or computer "
-        "control when needed) are available, and has a concrete verification check. If "
-        "uncertain or ineligible, make no changes and end with `SYMPHONY_FAST_DECISION: escalate`; "
+        "If the packet has `SYMPHONY_FAST_ROUTE: lead`, decide before any changes whether the "
+        "WHOLE objective consists only of predetermined mechanical steps with an expected result, "
+        "scope bounded, requirements clear, risk low, required tools (including browser or computer "
+        "control when needed) available, and verification concrete. Eligible examples: run a supplied "
+        "bash/git command and report its result, or read a specified browser page through known steps. "
+        "Implementation, diagnosis, design, substantive review, product judgment, mixed work, or uncertainty "
+        "requires escalation before any changes, even for a tiny feature. A run-and-fix request escalates "
+        "as a whole. A tool name, short task, or supplied command alone does not establish eligibility. "
+        "If ineligible, make no changes and end with `SYMPHONY_FAST_DECISION: escalate`; "
         "the root will hand the original task to an independent assessor. Do not spawn children "
         "on this route. If eligible, work directly and end with `SYMPHONY_FAST_DECISION: eligible` "
         "and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`.\n\n"
-        "Own execution, integration, verification, and communication for the supplied route. "
-        "For assessed packets, the `SYMPHONY_ROUTE` line fixes your topology; follow it rather than doing everything "
-        "yourself.\n\n"
-        "- small: do the work directly; delegate only long-running mechanical units.\n"
-        "- medium: split independent implementation units into worker packets, do quick glue work "
-        "yourself, and integrate and verify the results.\n"
+        "For assessed packets, the matrix fixes your topology. Assign substantive implementation, diagnosis, "
+        "design, review tasks, and product judgment to workers or consultants. Delegate implementation before editing; "
+        "your edits integrate returned worker changes. After workers return, run your own native "
+        "acceptance check on the integrated result and report its fresh evidence. Coordinate, review integration, "
+        "and communicate the results.\n\n"
+        "- small: assign the substantive work to one worker; integrate and verify its result.\n"
+        "- medium: assign substantive work to bounded worker packets; integrate and verify the results.\n"
         "- large: administer. Delegate all project work to workers and keep only planning, "
         "integration, and verification.\n"
-        "- When the route calls for an independent check (high risk, or small/complex), a separate "
-        "consultant or worker performs the review. Never review your own work.\n\n"
+        "- When the route calls for an independent check (high risk, or small/complex), a different "
+        "consultant or worker reviews the completed substantive work. Give that child a review-only packet "
+        "with `purpose: independent_review`. Task work, including a requested review deliverable, uses "
+        "`purpose: substantive`. Purpose stays with the original launch; use a fresh child to change it. "
+        "Its own final report must contain exactly one `SYMPHONY_REVIEW: passed` line only when "
+        "all findings are resolved; an implementation child's self-review cannot count.\n\n"
         "Spawn each child as `symphony:symphony-<role>-<model>-<effort>`, choosing the type for the "
         "packet's own size/complexity from the table Symphony gives you at start. Put "
-        "`SYMPHONY_ROLE: <role>` on the first line, then objective, ownership, evidence, constraints, "
+        "`SYMPHONY_ROLE: <role>` on the first line, then purpose, objective, ownership, evidence, constraints, "
         "acceptance_check, return_contract, size, and complexity. A consultant packet also needs one "
         "`SYMPHONY_DECISION: {\"size\":\"...\",\"complexity\":\"...\"}` line. Name the "
-        "applicable capability and evidence check in each child packet. " + WAITING + "\n\n"
+        "applicable capability and evidence check in each child packet. " + WAITING + " "
+        + _LEAD_VERIFICATION_CONTRACT + "\n\n"
         "For planning use compatible `ce-plan` or bounded steps. For implementation use compatible "
         "`ce-work`, behavior checks (Superpowers TDD when usable), and Ponytail's reuse/native "
         "check. For independent review use compatible `ce-code-review` or a requirement-and-diff "
         "review; verify the final tree before success claims. Shipping skills apply only when "
         "authorized. " + PRACTICES + " Verify the integrated "
-        "result before you report.\n\n"
+        "result before you report. Once verified and all children have returned, native successful assessed "
+        'completion is sufficient. If reporting an outcome, use one JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; '
+        "use blocked or failed when work remains. Archived followup only reconciles the same bounded task; "
+        "a new or substantive objective starts a fresh assessment and delegation scope.\n\n"
         "You cannot ask the user questions: record open decisions and assumptions in your result."
     ),
     "worker": (
@@ -107,24 +124,21 @@ BODIES = {
         "Superpowers TDD or the smallest meaningful native check; for bugs use a compatible "
         "diagnosing-bugs skill or reproduce and fix the cause. Use Ponytail's reuse/native check. "
         "Use any compatible skill the packet names, and verify your result before you report.\n\n"
+        "For `purpose: independent_review`, review only and return exactly one "
+        "`SYMPHONY_REVIEW: passed` line only when all findings are resolved; otherwise report findings without it.\n\n"
         + PRACTICES
     ),
     "assessor": (
-        "Assess only. Return size, complexity, risk, rationale, topology, and abstract role "
-        "routes. End with exactly one `SYMPHONY_ASSESSMENT: "
-        '{"size":"small|medium|large","complexity":"simple|mixed|complex","risk":"...",'
-        '"rationale":"...","topology":"..."}` line. Do not become the lead. '
+        _ASSESSOR_CONTRACT +
         "Identify applicable phase practices, their current availability, native fallbacks, and "
         "evidence needed in the lead packet; do not execute them. " + PRACTICES
     ),
     "consultant": (
-        "Decide only the supplied question. Return recommendation, evidence, uncertainty, and "
-        "consequences. Include one `SYMPHONY_DECISION: "
-        '{"size":"small|medium|large","complexity":"simple|mixed|complex"}` line per actionable '
-        "decision. For an independent review use compatible `ce-code-review` or Matt Pocock "
+        _CONSULTANT_CONTRACT + "For an independent review use compatible `ce-code-review` or Matt Pocock "
         "`code-review`, or compare the exact diff with requirements and affected callers. "
-        "For external facts use Context7 or dated official sources. When asked for a review, "
-        "review independently and do not fix the code.\n\n" + PRACTICES
+        "For external facts use Context7 or dated official sources. For `purpose: independent_review`, "
+        "review independently and do not fix the code. Return exactly one `SYMPHONY_REVIEW: passed` "
+        "line only when all findings are resolved; otherwise report findings without it.\n\n" + PRACTICES
     ),
 }
 

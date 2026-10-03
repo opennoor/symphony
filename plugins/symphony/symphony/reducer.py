@@ -3,12 +3,23 @@
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import datetime
 
 from .model import Action, Delegation, Event, ProjectState, RunState, persistable
 
 
 _ACTIVE_STATES = {"active", "created", "pending", "running", "waiting", "working"}
 _EVENT_HISTORY_LIMIT = 200
+
+
+def _proof_instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return instant if instant.tzinfo is not None else None
+    except ValueError:
+        return None
 
 
 def _active_identities(run: RunState) -> list[str]:
@@ -346,6 +357,59 @@ def _valid_outcome(outcome) -> bool:
     return isinstance(status, str) and status.lower() in {"completed", "done", "success", "succeeded"}
 
 
+def _substantive_child_completed(run: RunState) -> bool:
+    """Legacy routes have no contract; present contracts require scoped proof."""
+    if 'substantive_contract' not in run.assessment:
+        return True
+    contract = run.assessment['substantive_contract']
+    if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int
+            or contract['version'] not in {1, 2}
+            or not isinstance(contract.get('epoch'), str) or not contract['epoch']
+            or not isinstance(contract.get('accepted_at'), str) or not contract['accepted_at']
+            or ('review_required' in contract and type(contract['review_required']) is not bool)
+            or contract['version'] == 2 and type(contract.get('review_required')) is not bool):
+        return False
+    proofs = run.assessment.get('_substantive_children', {})
+    if not isinstance(proofs, Mapping):
+        return False
+    completed = []
+    for child in run.delegations:
+        proof = proofs.get(child.identity)
+        if (child.role in {'worker', 'consultant'}
+                and child.state.lower() in {'completed', 'done', 'success', 'succeeded'}
+                and isinstance(proof, Mapping) and proof.get('successful') is True
+                and proof.get('epoch') == contract['epoch']
+                and proof.get('run_id') == run.run_id
+                and proof.get('lead') == run.lead_identity
+                and proof.get('parent') == run.lead_identity
+                and proof.get('role') == child.role
+                and isinstance(proof.get('start_event_id'), str)
+                and proof['start_event_id'] in run.assessment.get('_start_event_ids', ())
+                    and proof.get('owner_generation') == run.owner_generation
+                    and (contract['version'] == 1 or isinstance(proof.get('purpose'), str)
+                         and proof['purpose'] in {'substantive', 'independent_review'})
+                  and (child.role != 'consultant' or child.identity not in run.assessment.get('_invalid_consultants', ()))):
+            completed.append(proof)
+    # Version 1 never admitted purpose; keep its accepted completion rules.
+    work = [proof for proof in completed if (proof.get('purpose') == 'substantive'
+            if contract['version'] == 2 else proof.get('reviewed') is not True)]
+    if contract.get('review_required') is True:
+        completed_work = [_proof_instant(proof.get('completed_at')) for proof in work]
+        if not completed_work or any(instant is None for instant in completed_work):
+            return False
+        for proof in completed:
+            if (proof.get('reviewed') is True
+                    and (contract['version'] == 1 or proof.get('purpose') == 'independent_review')):
+                start = _proof_instant(proof.get('admitted_at'))
+                end = _proof_instant(proof.get('completed_at'))
+                if start and end and end > start > max(completed_work):
+                    return True
+        return False
+    if contract.get('review_required') is False:
+        return bool(work)
+    return bool(completed)
+
+
 def _lead_completed(state: ProjectState, event: Event):
     run = state.active_run
     if not run:
@@ -358,8 +422,18 @@ def _lead_completed(state: ProjectState, event: Event):
     if run.status == "recovering":
         return state, (Action("block_completion", {"reason": "lead_recovery_required"}),)
     outcome = event.payload.get("outcome")
-    if not _valid_outcome(outcome):
+    if (not _valid_outcome(outcome)
+            or "substantive_contract" in run.assessment and "status" not in outcome):
         return state, (Action("block_completion", {"reason": "outcome_missing"}),)
+    if "substantive_contract" in run.assessment:
+        outcome = {"status": "completed"}
+    if not _substantive_child_completed(run):
+        assessment = {**run.assessment, '_substantive_child_missing': True}
+        token = event.payload.get('turn_token') or run.assessment.get('_active_turns', {}).get(identity)
+        return _lead_failed(replace(state, active_run=replace(run, assessment=assessment)),
+                            replace(event, kind='lead_failed', payload={"identity": identity,
+                                    "reason": "substantive_child_missing",
+                                    **({'turn_token': token} if isinstance(token, str) and token else {})}))
     active = [item for item in _active_identities(run) if item != identity]
     unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
                   and (item.role != "lead" or item.identity == run.lead_identity)]
@@ -400,6 +474,8 @@ def _lead_failed(state: ProjectState, event: Event):
         assessment["_retryable_lead"] = ""
         assessment.pop("_retryable_lead_turn", None)
     recovering = replace(run, status="recovering", outcome=None, assessment=assessment, updated_at=event.observed_at)
+    if event.payload.get('reason') == 'substantive_child_missing':
+        return replace(state, active_run=recovering), (Action('request_substantive_work', {}),)
     return replace(state, active_run=recovering), (
         Action("replace_lead", {"owner_generation": run.owner_generation + 1}),
     )
@@ -482,6 +558,10 @@ def _stop_block_reason(run: RunState) -> dict | None:
     mismatch = run.assessment.get("_lead_route_mismatch")
     if mismatch:
         return {"reason": mismatch}
+    if not run.lead_identity and not _valid_outcome(run.outcome):
+        return {"reason": "lead_not_started"}
+    if not _substantive_child_completed(run):
+        return {"reason": "substantive_child_missing"}
     if not _valid_outcome(run.outcome):
         return {"reason": "lead_outcome_missing" if run.lead_identity else "lead_not_started"}
     return None
@@ -519,10 +599,12 @@ def _stop_requested(state: ProjectState, event: Event):
             Action("archive_run", {"run_id": run.run_id}),
             Action("permit_stop"),
         )
-    if event.payload.get("stop_hook_active"):
+    if (event.payload.get('provider') in {'claude', 'codex'}
+            and event.payload.get('hook_event_name') == 'Stop'
+            and event.payload.get('stop_hook_active') is True):
         # Ending a host turn is not evidence that its children died. Release
         # the retry while keeping the run available for later host events.
-        return state, (Action("permit_stop"),)
+        return state, (Action("permit_stop", {"reason": reason}),)
     return state, (Action("block_stop", reason),)
 
 
@@ -540,6 +622,8 @@ def _force_stop(state: ProjectState, event: Event):
 
 _Handler = Callable[[ProjectState, Event], tuple[ProjectState, tuple[Action, ...]]]
 _HANDLERS: dict[str, _Handler] = {
+    # A proven pre-run callback is an observation only, never child/task credit.
+    "unmanaged_terminal_disposed": lambda state, event: (state, ()),
     "session_heartbeat": _heartbeat,
     "enable": _enable,
     "route_accepted": _route_accepted,
@@ -572,7 +656,7 @@ def reduce(state: ProjectState, event: Event) -> tuple[ProjectState, tuple[Actio
         return state, ()
 
     next_state, actions = handler(state, event)
-    if next_state == state and not actions:
+    if next_state == state and not actions and event.kind != "unmanaged_terminal_disposed":
         return state, ()
     history = tuple(
         deque((*next_state.event_history, persistable(event)), maxlen=_EVENT_HISTORY_LIMIT)

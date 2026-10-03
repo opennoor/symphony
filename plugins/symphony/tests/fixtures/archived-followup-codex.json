@@ -1,0 +1,154 @@
+{
+  "source": "Sanitized native Codex archived-lead followup captured 2026-10-01: the child header records CLI 0.159.3, while the long-lived VS Code root header records its original 0.156.1 build. Identities, cwd and messages replaced.",
+  "root": [
+    {
+      "type": "session_meta",
+      "timestamp": "2026-09-24T12:43:17.178Z",
+      "payload": {
+        "id": "01a0ec79-988a-7903-ba2e-b003394a341b",
+        "cwd": "FIXTURE_PROJECT",
+        "cli_version": "0.156.1",
+        "source": "vscode"
+      }
+    },
+    {
+      "type": "response_item",
+      "timestamp": "2026-10-01T09:06:16.963Z",
+      "payload": {
+        "type": "function_call",
+        "name": "spawn_agent",
+        "namespace": "collaboration",
+        "arguments": "{\"task_name\": \"symphony_lead_fast_gpt_6_1_sol_medium\", \"agent_type\": \"default\", \"model\": \"gpt-6.1-sol\", \"reasoning_effort\": \"medium\", \"fork_turns\": \"none\", \"message\": \"Complete the original task.\"}",
+        "call_id": "spawn"
+      }
+    },
+    {
+      "type": "event_msg",
+      "timestamp": "2026-10-01T09:06:17.140Z",
+      "payload": {
+        "type": "item_completed",
+        "thread_id": "01a0ec79-988a-7903-ba2e-b003394a341b",
+        "item": {
+          "type": "SubAgentActivity",
+          "id": "spawn",
+          "kind": "started",
+          "agent_thread_id": "01a0ec7a-bc3b-73a2-97ad-cb75564f6899",
+          "agent_path": "/root/symphony_lead_fast_gpt_6_1_sol_medium"
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "timestamp": "2026-10-01T09:06:17.334Z",
+      "payload": {
+        "type": "function_call_output",
+        "output": "{\"task_name\":\"/root/symphony_lead_fast_gpt_6_1_sol_medium\"}",
+        "call_id": "spawn"
+      }
+    },
+    {
+      "type": "response_item",
+      "timestamp": "2026-10-01T09:50:31.941Z",
+      "payload": {
+        "type": "function_call",
+        "name": "followup_task",
+        "namespace": "collaboration",
+        "arguments": "{\"target\": \"symphony_lead_fast_gpt_6_1_sol_medium\", \"message\": \"Continue the original task.\"}",
+        "call_id": "followup"
+      }
+    },
+    {
+      "type": "event_msg",
+      "timestamp": "2026-10-01T09:50:32.144Z",
+      "payload": {
+        "type": "item_completed",
+        "thread_id": "01a0ec79-988a-7903-ba2e-b003394a341b",
+        "item": {
+          "type": "SubAgentActivity",
+          "id": "followup",
+          "kind": "interacted",
+          "agent_thread_id": "01a0ec7a-bc3b-73a2-97ad-cb75564f6899",
+          "agent_path": "/root/symphony_lead_fast_gpt_6_1_sol_medium"
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "timestamp": "2026-10-01T09:50:32.418Z",
+      "payload": {
+        "type": "function_call_output",
+        "output": "",
+        "call_id": "followup"
+      }
+    }
+  ],
+  "child": [
+    {
+      "type": "session_meta",
+      "timestamp": "2026-10-01T09:06:17.172Z",
+      "payload": {
+        "id": "01a0ec7a-bc3b-73a2-97ad-cb75564f6899",
+        "source": {
+          "subagent": {
+            "thread_spawn": {
+              "parent_thread_id": "01a0ec79-988a-7903-ba2e-b003394a341b"
+            }
+          }
+        },
+        "cli_version": "0.159.3"
+      }
+    },
+    {
+      "type": "event_msg",
+      "timestamp": "2026-10-01T09:06:17.172Z",
+      "payload": {
+        "type": "task_started",
+        "turn_id": "01a0ec7a-bc5f-7eb2-bc52-7b149e655887"
+      }
+    },
+    {
+      "type": "turn_context",
+      "timestamp": "2026-10-01T09:06:18.546Z",
+      "payload": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium",
+        "turn_id": "01a0ec7a-bc5f-7eb2-bc52-7b149e655887"
+      }
+    },
+    {
+      "type": "event_msg",
+      "timestamp": "2026-10-01T09:08:20.207Z",
+      "payload": {
+        "type": "task_complete",
+        "turn_id": "01a0ec7a-bc5f-7eb2-bc52-7b149e655887",
+        "last_agent_message": "SYMPHONY_OUTCOME: {\"status\": \"completed\", \"summary\": \"old\"}"
+      }
+    },
+    {
+      "type": "event_msg",
+      "timestamp": "2026-10-01T09:50:32.157Z",
+      "payload": {
+        "type": "task_started",
+        "turn_id": "01a0ec7b-15e6-7993-9445-c7046df07f19"
+      }
+    },
+    {
+      "type": "turn_context",
+      "timestamp": "2026-10-01T09:50:34.112Z",
+      "payload": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium",
+        "turn_id": "01a0ec7b-15e6-7993-9445-c7046df07f19"
+      }
+    },
+    {
+      "type": "event_msg",
+      "timestamp": "2026-10-01T09:50:54.759Z",
+      "payload": {
+        "type": "task_complete",
+        "turn_id": "01a0ec7b-15e6-7993-9445-c7046df07f19",
+        "last_agent_message": "SYMPHONY_OUTCOME: {\"status\": \"completed\", \"summary\": \"new\"}"
+      }
+    }
+  ]
+}

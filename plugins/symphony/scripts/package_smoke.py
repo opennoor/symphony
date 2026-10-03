@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,38 @@ SCENARIOS = ("activation", "managed-run", "unmarked-spawn", "interrupt-resume", 
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+def _write_claude_child_launch(home, project, run, identity, role, model, effort, turn, *, purpose='substantive'):
+    """Model the host's exact lead→Agent link for deterministic package fixtures."""
+    directory = Path(home) / 'projects' / '-fixture' / run['session_id'] / 'subagents'
+    directory.mkdir(parents=True, exist_ok=True)
+    child = directory / f'agent-{identity}.jsonl'
+    parent = directory / f"agent-{run['lead_identity']}.jsonl"
+    lead = next(item for item in run['delegations'] if item['identity'] == run['lead_identity'])
+    child_type = f'symphony:symphony-{role}-{model}-{effort}'
+    launch_id = f'toolu_{identity}_{turn}'.replace(':', '_')
+    packet = f'purpose: {purpose}\nComplete the assigned bounded work.'
+    accepted = datetime.fromisoformat(run['assessment']['substantive_contract']['accepted_at'])
+    launched = accepted + timedelta(milliseconds=1)
+    child.with_suffix('.meta.json').write_text(json.dumps({
+        'agentType': child_type, 'toolUseId': launch_id, 'spawnDepth': 2}), encoding='utf-8')
+    parent.with_suffix('.meta.json').write_text(json.dumps({
+        'agentType': f"symphony:symphony-lead-{lead['requested_tier']}-{lead['requested_effort']}",
+        'toolUseId': 'toolu_lead', 'spawnDepth': 1}), encoding='utf-8')
+    rows = [json.loads(line) for line in parent.read_text(encoding='utf-8').splitlines()] if parent.exists() else []
+    rows.append({'type': 'assistant', 'sessionId': run['session_id'], 'agentId': run['lead_identity'],
+                 'isSidechain': True, 'cwd': str(project), 'timestamp': launched.isoformat(),
+                 'message': {'content': [{'type': 'tool_use', 'name': 'Agent', 'id': launch_id,
+                                         'input': {'subagent_type': child_type, 'prompt': packet}}]}})
+    parent.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+    child_rows = [json.loads(line) for line in child.read_text(encoding='utf-8').splitlines()] if child.exists() else []
+    child_rows.append({'type': 'user', 'sessionId': run['session_id'], 'agentId': identity,
+        'isSidechain': True, 'uuid': f'child-prompt-{turn}',
+        'timestamp': (launched + timedelta(milliseconds=1)).isoformat(),
+        'message': {'content': packet}})
+    child.write_text(''.join(json.dumps(row) + '\n' for row in child_rows), encoding='utf-8')
+    return parent, child
 
 
 def _plugin_source(candidate: Path) -> Path:
@@ -185,12 +218,15 @@ def _payload(
     elif event in ("PreToolUse", "PostToolUse"):
         # Claude reports a spawn before launch; Codex registers no such hook.
         payload["tool_name"] = "Agent"
+        purpose = "purpose: substantive\n" if agent_role in {"worker", "consultant"} else ""
         payload["tool_input"] = {
             "subagent_type": f"symphony-{agent_role}-{model}-{effort}",
-            "prompt": f"SYMPHONY_ROLE: {agent_role}\nexercise the package lifecycle",
+            "prompt": f"SYMPHONY_ROLE: {agent_role}\n{purpose}exercise the package lifecycle",
         }
     elif event in ("SubagentStart", "SubagentStop"):
         payload["agent_id"] = f"fake-{agent_role}"
+        if agent_role == 'worker':
+            payload['parent_thread_id'] = 'fake-lead'
         if provider == "codex":
             # Codex exposes the child's own model and effort on the event.
             payload.update(
@@ -239,8 +275,17 @@ def _run_event(
             "CLAUDE_PLUGIN_ROOT": str(root),
             "SYMPHONY_RUNTIME_DIR": str(state_dir.parent / "runtimes"),
             "SYMPHONY_PROFILE": _first_profile(root, provider)["id"],
+            "CLAUDE_CONFIG_DIR": str(state_dir.parent / 'claude-native'),
         }
     )
+    if provider == 'claude' and event == 'SubagentStart' and agent_role == 'worker':
+        run = next((document['active_runs'][f'claude:{session}']
+                   for document in _state_documents(state_dir)
+                   if f'claude:{session}' in document.get('active_runs', {})), None)
+        if run is not None and 'substantive_contract' in run.get('assessment', {}):
+            model, effort = _role_model(root, provider, agent_role)
+            _write_claude_child_launch(env['CLAUDE_CONFIG_DIR'], project, run,
+                                       'fake-worker', 'worker', model, effort, 'worker')
     completed = subprocess.run(
         argv,
         input=json.dumps(
@@ -429,11 +474,21 @@ def _exercise(
             raise SmokeFailure("a repeated Stop must release the session, never loop")
         if not any(_has_active_run(document) for document in _state_documents(state_dir)):
             raise SmokeFailure("the released turn lost its unfinished durable run")
+        send('SubagentStart', agent_role='worker')
+        send('SubagentStop', agent_role='worker')
         send("SubagentStop")
-        if _blocks_stop(send("Stop")):
-            raise SmokeFailure("a returned native lead still blocked Stop")
-        if any(_has_active_run(document) for document in _state_documents(state_dir)):
-            raise SmokeFailure("the returned lead was not reconciled")
+        blocked = _blocks_stop(send("Stop"))
+        captured = 'base64.b64decode(' in _event_command(_hook_config(root, provider), 'SubagentStop')['command']
+        if captured:
+            # Fake agent IDs have no native transcript. The reviewed runtime
+            # must retain the owner instead of archiving a fabricated result.
+            recovering = [document.get('active_runs', {}).get(f'{provider}:fake-session')
+                          for document in _state_documents(state_dir)]
+            if not blocked or not any(run and run['status'] == 'recovering' and run['outcome'] is None
+                    and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in recovering):
+                raise SmokeFailure("unproved native lead was not retained for same-owner recovery")
+        elif blocked or any(_has_active_run(document) for document in _state_documents(state_dir)):
+            raise SmokeFailure("the synthetic lead was not reconciled")
         activation.append("guarded")
     elif scenario == "unmarked-spawn":
         if provider != "claude":
@@ -504,6 +559,8 @@ def _exercise(
             send("SubagentStart", "old-session", agent_role="assessor")
             send("SubagentStop", "old-session", agent_role="assessor")
             send("SubagentStart", "old-session")
+            send('SubagentStart', 'old-session', agent_role='worker')
+            send('SubagentStop', 'old-session', agent_role='worker')
         stale_argv = _command_argv(
             _event_command(_hook_config(old_root, provider), "SubagentStop"), old_root, provider
         )
@@ -525,12 +582,13 @@ def _exercise(
                 raise SmokeFailure(f"retained old hook failed after cache removal: {stale.stderr}")
             stopped = subprocess.run(stale_stop, input=json.dumps({"hook_event_name": "Stop", "session_id": "old-session",
                                      "cwd": str(project)}), capture_output=True, text=True, env=stale_env, timeout=15)
-            if stopped.returncode or _blocks_stop(json.loads(stopped.stdout) if stopped.stdout.strip() else None):
-                raise SmokeFailure("retained Stop failed to reconcile the returned lead")
-            if not any(run.get("session_id") == "old-session" and run.get("status") == "completed"
-                       and run.get("outcome") for doc in _state_documents(state_dir)
-                       for run in doc.get("recent_runs", [])):
-                raise SmokeFailure("old session lost its durable lead outcome after cache removal")
+            if stopped.returncode or not _blocks_stop(json.loads(stopped.stdout) if stopped.stdout.strip() else None):
+                raise SmokeFailure("retained Stop bypassed missing native proof after cache removal")
+            recovering = [doc.get('active_runs', {}).get(f'{provider}:old-session')
+                          for doc in _state_documents(state_dir)]
+            if not any(run and run['status'] == 'recovering' and run['outcome'] is None
+                       and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in recovering):
+                raise SmokeFailure("old session lost its recoverable owner after cache removal")
         else:
             # Pre-retention captured commands cannot be repaired retroactively.
             if stale.returncode == 0 or str(old_root / "scripts" / "symphony_hook.py") not in stale.stderr:
