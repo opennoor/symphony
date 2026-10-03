@@ -144,6 +144,7 @@ class PackageContractTests(unittest.TestCase):
                 self.assertEqual(tokens.count('SYMPHONY_CAPTURED_BOOTSTRAP=' + bootstrap() + ';'), 1)
                 command = next(token for token in tokens if token.startswith('iex '))
                 provider = 'claude'
+            self.assertIn('[IO.Compression.CompressionMode]0', command)
             payload = base64.b64decode(re.search(r"FromBase64String\('([^']+)'", command)[1])
             binding = "$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
             expected = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", binding).replace('__SYMPHONY_PROVIDER__', provider).encode()

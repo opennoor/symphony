@@ -106,7 +106,7 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 - Provider manifests, marketplace and package constant agree on 1.7.5. Reviewed
   hook snapshots include the diagnostic module, consent reference and command.
 - Windows smoke execution selects native Git Bash. The compressed PowerShell
-  relay keeps its stable stored encoding and uses the numeric Decompress enum
+  relay keeps its stable stored encoding and uses the explicitly typed numeric Decompress enum
   to retain native command length headroom, including the parallel-pin barrier.
 - New public hook and reporting tests are included in Restricted PowerShell and
   standard-user Windows release acceptance. GitHub publication is mocked in
@@ -116,8 +116,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 ## Validation evidence
 
 The frozen candidate passed 889 deterministic tests (seven platform skips) in
-141.203 seconds, the 178-test local Windows acceptance selection (six Windows-only
-skips) in 74.386 seconds, and all 10 installed-package scenarios. Native captured
+154.047 seconds, the 178-test local Windows acceptance selection (six Windows-only
+skips) in 91.983 seconds, and all 10 installed-package scenarios. Both local suites
+include 20 parallel first-pin rounds. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
 one private-clock fixture from read-only home to temporary storage; assertions
@@ -165,3 +166,11 @@ in the field name. Only nonnegative integer count metadata has an exemption;
 string or container values under credential count names remain redacted.
 The new regression is also selected for Restricted PowerShell and standard-user
 Windows release acceptance.
+
+The first updated candidate release gate exposed an overload ambiguity in
+Windows PowerShell 5.1: a bare integer zero did not reliably select the
+GZipStream Decompress constructor. Both Windows jobs failed before execution of
+the Python runtime; Linux verification passed. The launcher now uses an explicit
+CompressionMode cast, and both provider command tests require it. Native command
+length checks and 20 parallel first-pin rounds pass locally. The failed candidate
+is not merged or published; all release gates must rerun on the corrected SHA.
