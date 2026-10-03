@@ -44,15 +44,15 @@ unresolved managed results continue to require their native ownership evidence.
 - Replayed the full attached project state and both original pending callbacks
   in temporary storage: Stop permitted, both callbacks preserved exactly, zero
   managed runs and zero terminal receipts. Original user state was not edited.
-- Added a sanitized captured regression and 18 test methods covering ordinary
+- Added a sanitized captured regression and 19 test methods covering ordinary
   native/default reviews, follow-ups, both provider formats, managed exemptions,
   independent roots in a shared checkout, separate child worktrees, generation
   and retirement guards, archive errors, large results, and crash/retry behavior.
 - Real generated, installed hook commands passed the new regression for both
   providers. Codex parent/name/model metadata came from a native child fixture;
   the fixture was unchanged afterward.
-- Final unit suite after the Copilot fixes: 829 tests passed, seven
-  platform-dependent skips, 104.698 seconds.
+- Final unit suite after the Copilot fixes: 830 tests passed, seven
+  platform-dependent skips, 106.503 seconds.
   A temporary runner used the installed PowerShell binary directly because Snap
   confinement was unavailable, and relocated one private-clock fixture from the
   read-only home directory to `/tmp`. Assertions were unchanged. The runner used
@@ -83,3 +83,11 @@ observation time from identity; it still binds the full callback payload and
 owning scope. A changed report with the same event ID remains unresolved.
 Also verified retry after a crash between the full archive write and the hash
 fact commit: the original report and observation time remain unchanged.
+
+The third review found that the managed inbox field projection omitted ordinary
+and future provider fields from unmanaged evidence. The unmanaged archive now
+preserves the complete normalized payload, with the existing secret redaction,
+excluding only the runtime's synthetic owner-conflict and verified-alias flags.
+Both providers' regressions preserve hook name, cwd, stop flags, an arbitrary
+nested provider field, and verified native metadata; live retries after enable
+continue to match the same complete representation.

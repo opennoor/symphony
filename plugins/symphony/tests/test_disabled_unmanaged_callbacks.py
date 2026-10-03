@@ -222,6 +222,27 @@ class DisabledUnmanagedCallbackTests(unittest.TestCase):
                 self.queue((altered,), provider)
                 self.assertIn('"decision": "block"', self.hook(provider=provider).stdout)
 
+    def test_live_provider_payload_is_complete_and_retries_after_enable(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.bind(provider=provider)
+                payload = {**self.events[0].payload, 'hook_event_name': 'SubagentStop',
+                    'session_id': self.session, 'provider': provider, 'cwd': str(self.project),
+                    'stop_hook_active': False, 'future_provider_field': {'values': [1, 'review']},
+                    'agent_type': 'default' if provider == 'codex' else 'general-purpose'}
+                original = event_from_payload(provider, payload)
+                self.hook('SubagentStop', original, provider)
+                archived = next(item for item in self.archives() if item['provider'] == provider)
+                expected = json.loads(json.dumps(original.payload))
+                self.assertEqual(archived['event']['payload'], expected)
+                self.assertNotIn('_symphony_owner_conflict', archived['event']['payload'])
+                self.assertNotIn('_symphony_verified_alias', archived['event']['payload'])
+                self.store.save(self.project, replace(self.store.load(self.project), enabled=True))
+                self.assertNotIn('"decision": "block"',
+                                 self.hook('SubagentStop', original, provider).stdout)
+                self.assertNotIn('"decision": "block"', self.hook(provider=provider).stdout)
+                self.assertEqual(self.store.session_record(provider, self.session)['pending'], [])
+
     def test_ack_write_failure_protects_full_reports_even_after_facts_commit(self):
         self.bind()
         self.queue()
