@@ -300,6 +300,19 @@ class PackageContractTests(unittest.TestCase):
                         else:
                             self.assertEqual(before['timeout'], hook['timeout'])
 
+    def test_binary_assets_preserve_their_bytes_under_both_line_ending_modes(self):
+        repository = PLUGIN.parents[1]
+        relative = 'plugins/symphony/assets/logo.png'
+        data = (repository / relative).read_bytes()
+        self.assertTrue(data.startswith(b'\x89PNG\r\n\x1a\n'))
+        for mode in ('false', 'true'):
+            with self.subTest(autocrlf=mode):
+                git = ['git', '-c', 'safe.directory=' + str(repository),
+                       '-c', 'core.autocrlf=' + mode, '-C', str(repository), 'hash-object']
+                raw = subprocess.check_output([*git, '--stdin'], input=data)
+                staged = subprocess.check_output([*git, '--path=' + relative, '--stdin'], input=data)
+                self.assertEqual(raw, staged, 'Git must never normalize binary image bytes')
+
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries(self):
         ps = self._relay_powershell()

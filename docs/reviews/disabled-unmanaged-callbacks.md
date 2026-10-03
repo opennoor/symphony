@@ -114,9 +114,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 900 deterministic tests (seven platform skips) in
-152.805 seconds, the 189-test local Windows acceptance selection (six Windows-only
-skips) in 89.730 seconds, and all 10 installed-package scenarios. Both local suites
+The frozen candidate passed 901 deterministic tests (seven platform skips) in
+153.604 seconds, the 190-test local Windows acceptance selection (six Windows-only
+skips) in 90.154 seconds, and all 10 installed-package scenarios. Both local suites
 include 20 parallel first-pin rounds. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
@@ -226,3 +226,11 @@ a configuration name followed by a colon), prose and quoted inline examples;
 all actual protocol lines, including malformed empty values, remain guarded.
 The positive regression failed in all eight cases before the correction. Existing
 reserved-role, ownership, admission and historical receipt guards are unchanged.
+
+The fresh exact-main checkout exposed a packaging rule that forced the PNG logo
+through text conversion. The checked-out image still equaled the committed blob,
+but staging changed its hash. PNG assets now have
+Git's binary attribute; Python/text files retain LF normalization. The regression
+failed under both core.autocrlf modes before the correction and now verifies that
+staging preserves every image byte. Both native Windows acceptance modes select
+the regression. The original image bytes and all runtime behavior stay unchanged.
