@@ -115,9 +115,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 891 deterministic tests (seven platform skips) in
-157.307 seconds, the 180-test local Windows acceptance selection (six Windows-only
-skips) in 92.198 seconds, and all 10 installed-package scenarios. Both local suites
+The frozen candidate passed 893 deterministic tests (seven platform skips) in
+153.923 seconds, the 182-test local Windows acceptance selection (six Windows-only
+skips) in 91.317 seconds, and all 10 installed-package scenarios. Both local suites
 include 20 parallel first-pin rounds. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
@@ -188,3 +188,11 @@ integer count fields are exempt. The regression covers singular/plural/provider
 token names with string, object, array, null, boolean, negative and floating-point
 values, plus valid zero/positive counts. All 28 previously failing cases now pass;
 the regression is also in both Windows release acceptance modes.
+
+The next review identified that separate GitHub processes could resolve different
+default accounts after the identity preflight. Probe/publication attempts now
+snapshot one local credential in memory, verify its identity and use GH_TOKEN
+precedence for every subsequent network call. The account-switch regression failed
+before the fix and now proves verification/search/create retain the consented
+account after the default login changes. Fake credentials are used in all unit
+tests, including invalid-output cases; no local token is read or persisted.

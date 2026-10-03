@@ -29,6 +29,11 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.launch_patch = patch.object(d, 'launch_worker')
         self.launch = self.launch_patch.start()
         self.addCleanup(self.launch_patch.stop)
+        # Unit publication never reads an actual local GitHub credential.
+        self.credential_patch = patch.object(d, '_credential_environ',
+            side_effect=lambda environ: {**environ, 'GH_TOKEN': 'test-only-token'})
+        self.credential_patch.start()
+        self.addCleanup(self.credential_patch.stop)
 
     def offered(self, provider='codex', session='root'):
         self.assertEqual('', d.notice(self.store, provider, session, self.env))
@@ -212,6 +217,49 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.assertEqual(1, gh.call_count)
         self.assertEqual('checking', d._read(self.store)['phase'])
         self.assertNotIn('reports', d._read(self.store))
+
+    def test_switch_after_identity_check_cannot_change_the_publication_account(self):
+        self.approved()
+        self.credential_patch.stop()
+        active = ['fake-token-a']
+        calls = []
+        def gh(arguments, environ):
+            calls.append((arguments, dict(environ)))
+            if arguments[:2] == ['auth', 'token']:
+                return active[0]
+            token = environ.get('GH_TOKEN') or active[0]
+            if arguments[-1] == '.login':
+                active[0] = 'fake-token-b'  # Simulate gh auth switch now.
+                return 'User' if token == 'fake-token-a' else 'DifferentUser'
+            if 'search/issues' in arguments:
+                self.assertEqual('fake-token-a', token)
+                return '[]'
+            if arguments[:2] == ['issue', 'create']:
+                self.assertEqual('fake-token-a', token)
+                return 'https://github.com/opennoor/symphony/issues/123'
+            self.fail('unexpected GitHub operation')
+        with patch.object(d, '_gh', side_effect=gh):
+            d.worker(str(self.store.root), 'publish')
+        self.assertEqual('published', d._read(self.store)['phase'])
+        self.assertEqual(1, sum(args[:2] == ['auth', 'token'] for args, _ in calls))
+        for _, environ in calls[1:]:
+            self.assertEqual('fake-token-a', environ['GH_TOKEN'])
+        for path in self.store.root.rglob('*'):
+            if path.is_file():
+                self.assertNotIn('fake-token-', path.read_text())
+
+    def test_credential_snapshot_uses_mocked_local_token_and_rejects_invalid_output(self):
+        self.credential_patch.stop()
+        original = {'GH_TOKEN': 'fake-original', 'GITHUB_TOKEN': 'fake-other', 'GH_HOST': 'github.com'}
+        with patch.object(d, '_gh', return_value='fake-pinned') as gh:
+            pinned = d._credential_environ(original)
+        gh.assert_called_once_with(['auth', 'token', '--hostname', 'github.com'], original)
+        self.assertEqual('fake-pinned', pinned['GH_TOKEN'])
+        self.assertEqual('fake-original', original['GH_TOKEN'])
+        for invalid in ('', 'unexpected output\nmore', 'x' * 4097, None):
+            with patch.object(d, '_gh', return_value=invalid):
+                with self.assertRaisesRegex(ValueError, 'GitHub credential unavailable'):
+                    d._credential_environ(original)
 
     def test_tampered_approved_report_cannot_publish_raw_text_or_destination(self):
         record = self.approved()

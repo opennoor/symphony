@@ -294,6 +294,16 @@ def _account(environ: Mapping[str, str]) -> str:
     return account
 
 
+def _credential_environ(environ: Mapping[str, str]) -> dict[str, str]:
+    """Freeze one credential in memory so gh auth switch cannot change it."""
+    token = _gh(['auth', 'token', '--hostname', 'github.com'], environ)
+    if not isinstance(token, str) or len(token) > 4096 or not re.fullmatch(r'[A-Za-z0-9_-]+', token):
+        raise ValueError('GitHub credential unavailable')
+    # GH_TOKEN takes precedence over the CLI's current account/keyring. Never
+    # put this snapshot in argv, files, diagnostics or hook output.
+    return {**environ, 'GH_TOKEN': token}
+
+
 def issue_body(record: dict) -> str:
     # Revalidate persisted approved data too: edits cannot smuggle private text.
     reports = record['reports']
@@ -317,9 +327,10 @@ def worker(root: str, mode: str) -> None:
             with _locked(_path(store), timeout=0.05):
                 record = _read(store)
             if mode == 'probe' and record.get('phase') == 'checking':
-                account = _account(os.environ)
+                environ = _credential_environ(os.environ)
+                account = _account(environ)
                 available = _gh(['api', '--hostname', 'github.com', f'repos/{REPOSITORY}',
-                                 '--jq', '.has_issues'], os.environ)
+                                 '--jq', '.has_issues'], environ)
                 with _locked(_path(store), timeout=0.05):
                     latest = _read(store)
                     if latest.get('id') == record['id'] and latest.get('phase') == 'checking':
@@ -328,7 +339,8 @@ def worker(root: str, mode: str) -> None:
                 return
             if mode != 'publish' or record.get('phase') != 'approved' or record.get('repository') != REPOSITORY:
                 return
-            if _account(os.environ).lower() != record['account'].lower():
+            environ = _credential_environ(os.environ)
+            if _account(environ).lower() != record['account'].lower():
                 # Approval names the account. A changed login needs a new offer.
                 with _locked(_path(store), timeout=0.05):
                     store._write_json(_path(store), {'id': secrets.token_hex(16), 'phase': 'checking', 'started': 0})
@@ -339,7 +351,7 @@ def worker(root: str, mode: str) -> None:
             # lost. Search failure must never be treated as 'no matching issue'.
             matches = json.loads(_gh(['api', '--hostname', 'github.com', 'search/issues', '--method', 'GET',
                 '-f', f'q=repo:{REPOSITORY} is:issue author:{record["account"]} "{marker}" in:body',
-                '--jq', '[.items[] | {url:.html_url,body:.body}]'], os.environ))
+                '--jq', '[.items[] | {url:.html_url,body:.body}]'], environ))
             urls = {item['url'] for item in matches if f'<!-- {marker} -->' in item.get('body', '')}
             if len(urls) > 1:
                 raise ValueError('ambiguous diagnostic issue')
@@ -362,7 +374,7 @@ def worker(root: str, mode: str) -> None:
                     record['create_attempted'] = True
                     store._write_json(_path(store), record)
                 url = _gh(['issue', 'create', '--repo', REPOSITORY, '--title', 'Symphony lifecycle recovery diagnostics',
-                           '--body-file', str(path)], os.environ)
+                           '--body-file', str(path)], environ)
             if not re.fullmatch(r'https://github\.com/opennoor/symphony/issues/[1-9][0-9]*', url):
                 raise ValueError('invalid diagnostic issue URL')
             with _locked(_path(store), timeout=0.05):

@@ -42,6 +42,10 @@ documents, child reports, or a report command written inside an assistant turn.
 After approval, a background worker freezes the accumulated sanitized snapshot
 and includes it as JSON in the issue body. No separate GitHub upload API or raw
 log attachment is used. A changed GitHub account requires a new approval offer.
+Each worker attempt freezes one local credential in memory and verifies its
+identity; every network call uses that same credential. Switching the CLI's
+default account mid-attempt cannot change the issue author. Credentials never
+enter files, command arguments, diagnostic reports or hook output.
 Submission failure leaves the approved snapshot local. A lost create response
 is checked by its random issue marker; an uncertain prior create is not retried
 as a new issue. When publication succeeds, the approving chat receives the issue
