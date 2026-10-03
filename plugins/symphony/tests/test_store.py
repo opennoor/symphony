@@ -595,6 +595,24 @@ with Path(sys.argv[1]).open('a+b') as handle:
         self.assertNotIn('never-persist-this-value', self.state_path().read_text())
         self.assertEqual({key: '[REDACTED]' for key in fields}, self.store.load(self.project).configuration)
 
+    def test_credential_value_and_container_suffixes_are_redacted_but_numeric_counts_survive(self):
+        names = ['apiKeyValue', 'providerAPIKeyBundle', 'apiKeysByAccount', 'privateKeyPem',
+                 'encryptionKeyBytes', 'cookieJar', 'cookiesByDomain', 'cookieValues',
+                 'keyPassphraseValue', 'passphrasesByKey', 'accessTokenHeader', 'refreshTokenValue']
+        values = {name: {'nested': ['opaque-credential-' + str(index)]} for index, name in enumerate(names)}
+        counts = {'tokenCount': 42, 'apiKeyCount': 2, 'cookieJarCount': 3, 'passphraseCount': 4}
+        self.store.save(self.project, ProjectState(configuration={**values, **counts,
+            'apiKeyCountText': 'opaque-string-count', 'privateKeyCount': 'opaque-string-key',
+            'monkeyValue': 'harmless-provider-value'}))
+        contents = self.state_path().read_text()
+        self.assertNotIn('opaque-', contents)
+        saved = self.store.load(self.project).configuration
+        for name in names:
+            self.assertEqual('[REDACTED]', saved[name], name)
+        for name, count in counts.items():
+            self.assertEqual(count, saved[name], name)
+        self.assertEqual('harmless-provider-value', saved['monkeyValue'])
+
 
 if __name__ == "__main__":
     unittest.main()

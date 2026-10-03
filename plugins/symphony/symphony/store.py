@@ -352,10 +352,15 @@ def _redact(value: Any, key: str = "") -> Any:
     normalized = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', normalized)
     normalized = re.sub(r'[^a-z0-9]+', '_', normalized.lower()).strip('_')
     words = set(normalized.split('_'))
+    # A numeric count is metadata, never a credential container or value.
+    if normalized.endswith(('_count', '_counts')) and type(value) is int and value >= 0:
+        return value
     if (any(normalized == secret or normalized.endswith('_' + secret) for secret in _SECRET_KEYS)
-            or words & {'password', 'passwords', 'passwd', 'secret', 'secrets', 'authorization', 'credential', 'credentials'}
-            or ('keys' in words and bool(words & {'api', 'private', 'encryption'}))
-            or ('tokens' in words and bool(words & {'auth', 'access', 'refresh'}))
+            or words & {'password', 'passwords', 'passwd', 'secret', 'secrets', 'authorization',
+                        'credential', 'credentials', 'cookie', 'cookies', 'passphrase', 'passphrases',
+                        'apikey', 'apikeys', 'pwd'}
+            or (words & {'key', 'keys'} and bool(words & {'api', 'private', 'encryption'}))
+            or (words & {'token', 'tokens'} and bool(words & {'auth', 'access', 'refresh'}))
             or normalized in {'auth', 'authentication'}
             or ('token' in words and 'value' in words)):
         return "[REDACTED]"

@@ -115,9 +115,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 888 deterministic tests (seven platform skips) in
-138.121 seconds, the 177-test local Windows acceptance selection (six Windows-only
-skips) in 79.592 seconds, and all 10 installed-package scenarios. Native captured
+The frozen candidate passed 889 deterministic tests (seven platform skips) in
+141.203 seconds, the 178-test local Windows acceptance selection (six Windows-only
+skips) in 74.386 seconds, and all 10 installed-package scenarios. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
 one private-clock fixture from read-only home to temporary storage; assertions
@@ -156,3 +156,12 @@ hook-captured host location. Actual isolated relay tests cover both providers;
 forged stdin and tool/assistant/document/child/old-message sources are rejected.
 Stop resets and report controls share the root-origin and durable alias check.
 Both providers reject child metadata and bound aliases without re-arming Stop.
+
+The next review confirmed those fixes and found recognizable credential names
+with value/container suffixes could escape redaction. A new failing regression
+reproduced API/private/encryption key, cookie/passphrase and access-token suffixes.
+The shared persistence redactor now recognizes their normalized words anywhere
+in the field name. Only nonnegative integer count metadata has an exemption;
+string or container values under credential count names remain redacted.
+The new regression is also selected for Restricted PowerShell and standard-user
+Windows release acceptance.
