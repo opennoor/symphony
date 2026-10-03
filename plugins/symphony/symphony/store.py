@@ -488,7 +488,7 @@ class StateStore:
         with _locked(path.parent / '.aggregate', timeout=0.05):
             previous = json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else {}
             count = previous.get('occurrences', 0)
-            count = count if type(count) is int and 0 <= count < 1_000_000 else 0
+            count = count if type(count) is int and 0 <= count <= 1_000_000 else 0
             self._write_json(path, {**report, 'day': day, 'occurrences': min(count + 1, 1_000_000)})
             # One directory lock avoids accumulating a lock file per daily
             # aggregate and serializes retention against concurrent writers.

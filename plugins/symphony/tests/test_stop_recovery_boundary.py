@@ -86,6 +86,19 @@ class StopRecoveryBoundaryTests(unittest.TestCase):
                 self.assertFalse(state.recent_runs)
                 self.assertIsNone(state.active_runs[f'{provider}:private-session'].outcome)
 
+    def test_automatic_hook_and_agent_notifications_cannot_rearm_stop_loop(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                _, payload, env = self.fixture(provider)
+                self.assertEqual('block', json.loads(handle(payload, env).stdout)['decision'])
+                for prompt in ('<hook_prompt hook_run_id="stop:1">retry</hook_prompt>',
+                               '<task-notification>agent result</task-notification>',
+                               '<subagent_notification>agent result</subagent_notification>'):
+                    handle({**payload, 'hook_event_name': 'UserPromptSubmit', 'prompt': prompt}, env)
+                    self.assertEqual('', handle(payload, env).stdout)
+                handle({**payload, 'hook_event_name': 'UserPromptSubmit', 'prompt': '$symphony:symphony status'}, env)
+                self.assertEqual('block', json.loads(handle(payload, env).stdout)['decision'])
+
     def test_foreign_pending_result_cannot_hold_an_already_proven_current_completion(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):
@@ -179,6 +192,21 @@ class StopRecoveryBoundaryTests(unittest.TestCase):
             self.assertEqual(before, self.store._path(self.project).read_bytes())
             with self.assertRaises(TypeError):
                 handle({**payload, 'cwd': 123, 'hook_event_name': 'PreToolUse'}, env)
+
+    def test_diagnostic_counter_stays_saturated_and_invalid_counts_reset(self):
+        report = dict(schema=1, plugin_version=PLUGIN_VERSION, provider='codex', platform='linux',
+                      category='bookkeeping', outcome='deferred')
+        self.store.record_recovery_diagnostic(report)
+        path = next((self.store.root / 'diagnostics').glob('*.json'))
+        item = json.loads(path.read_text())
+        self.store._write_json(path, {**item, 'occurrences': 1_000_000})
+        for _ in range(3):
+            self.store.record_recovery_diagnostic(report)
+            self.assertEqual(1_000_000, json.loads(path.read_text())['occurrences'])
+        for invalid in (True, -1, 1_000_001, '1000000'):
+            self.store._write_json(path, {**item, 'occurrences': invalid})
+            self.store.record_recovery_diagnostic(report)
+            self.assertEqual(1, json.loads(path.read_text())['occurrences'])
 
     def test_non_stop_faults_and_explicit_stop_controls_are_not_silently_accepted(self):
         _, payload, env = self.fixture('codex')

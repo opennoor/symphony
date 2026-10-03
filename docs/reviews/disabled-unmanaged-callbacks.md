@@ -110,9 +110,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 882 deterministic tests (seven platform skips) in
-142.057 seconds, the 171-test local Windows acceptance selection (six Windows-only
-skips) in 79.897 seconds, and all 10 installed-package scenarios. Native captured
+The frozen candidate passed 884 deterministic tests (seven platform skips) in
+144.579 seconds, the 173-test local Windows acceptance selection (six Windows-only
+skips) in 81.394 seconds, and all 10 installed-package scenarios. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
 one private-clock fixture from read-only home to temporary storage; assertions
@@ -129,3 +129,17 @@ Original state and native files are unchanged; replay writes are temporary.
 No remaining actionable findings in the author's source review. Copilot review,
 exact candidate/main release gates and publication remain required and are
 tracked in PR #17. No 1.7.5 version has been published at this review stage.
+
+## Final review corrections
+
+Copilot reproduced two reporting defects before release: the Claude command
+expansion dropped arguments and its prose prevented control parsing; a saturated
+counter reset to one. The report wrapper now contains only the two supported
+control/argument lines. Actual installed-hook regression uses that expanded
+Claude body. Counters accept their inclusive cap; a failing saturation regression
+now verifies repeated updates and invalid prior values. Re-reviewed both fixes.
+Automatic hook/agent notifications also cannot reset the actual-user-turn Stop
+budget; both providers have a regression preventing that loop. Final reruns
+passed the updated counts above. Workers run from private state directories,
+leaving user repositories untouched even when GitHub client state variables
+are absent. Final exact-head review and release gates remain required.

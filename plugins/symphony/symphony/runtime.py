@@ -316,7 +316,9 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             # No usable scope exists for a write, ACK or completion claim.
             return HookResult()
         raise
-    if hook == 'UserPromptSubmit' and session:
+    automatic_prompt = str(payload.get('prompt') or '').lstrip().startswith(
+        ('<hook_prompt', '<task-notification', '<subagent_notification'))
+    if hook == 'UserPromptSubmit' and session and not automatic_prompt:
         try:
             store.stop_turn_budget(provider, session, project, reset=True)
         except (OSError, ValueError, TypeError):

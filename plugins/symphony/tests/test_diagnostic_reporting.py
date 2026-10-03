@@ -289,6 +289,11 @@ class DiagnosticReportingTests(unittest.TestCase):
                 store._write_json(d._path(store), proposal)
                 prompt = ('$symphony:symphony report submit ' if provider == 'codex' else
                           '/symphony:report submit ') + proposal['id']
+                if provider == 'claude':
+                    # Exercise the real slash-command expansion, not just a
+                    # literal native prompt that bypasses the wrapper template.
+                    prompt = (installed / 'commands/report.md').read_text().split('---', 2)[-1].strip()
+                    prompt = prompt.replace('$ARGUMENTS', 'submit ' + proposal['id'])
                 payload = {'hook_event_name': 'UserPromptSubmit', 'session_id': 'root',
                            'cwd': str(self.project), 'prompt': prompt}
                 result = _send_raw(installed, provider, 'UserPromptSubmit', store.root, payload)
