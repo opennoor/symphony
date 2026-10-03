@@ -51,8 +51,8 @@ unresolved managed results continue to require their native ownership evidence.
 - Real generated, installed hook commands passed the new regression for both
   providers. Codex parent/name/model metadata came from a native child fixture;
   the fixture was unchanged afterward.
-- Final unit suite after the Copilot fixes: 831 tests passed, seven
-  platform-dependent skips, 119.334 seconds.
+- Final unit suite for the bumped 1.7.5 candidate: 831 tests passed, seven
+  platform-dependent skips, 128.673 seconds.
   A temporary runner used the installed PowerShell binary directly because Snap
   confinement was unavailable, and relocated one private-clock fixture from the
   read-only home directory to `/tmp`. Assertions were unchanged. The runner used
@@ -64,6 +64,33 @@ No AI API calls, native AI inference, or CI tests were used. These are local
 Linux tests with real PowerShell and synthetic provider lifecycle fixtures plus
 the captured macOS replay; they are not live macOS or Windows client tests.
 No new version has been published.
+
+## Manual pre-release review for 1.7.5
+
+Reviewed the final runtime/store diff against the 1.7.0 release and the reported
+incident, then reviewed the regression tests and release entry points. This was
+the author's manual review requested by the user, not an independent human sign-off.
+
+- Classification remains conditional on disabled governance, exact root scope,
+  provider, generation, parent, ordinary role, and the absence of managed admission
+  or tracked identity evidence. Other roots' runs are not acknowledged or completed.
+- Replay hashes bind the full normalized payload and owning scope. The mutable
+  local observation time is retained as evidence but cannot invalidate a retry.
+  Changed reports with reused event IDs remain guarded.
+- Atomic private writes precede acknowledgment. Archive and ACK fault tests preserve
+  recoverable evidence; retention follows successful ACK and protects pending IDs.
+  Acknowledgment never creates managed completion credit.
+- Complete provider fields survive queueing. Existing inbox limits and secret
+  redaction remain in place. Full unmanaged evidence bypasses the bounded managed
+  queue only after the disabled-governance classification is established.
+- Found and fixed a release coverage gap: include all new callback tests in the
+  Windows acceptance suite used under Restricted PowerShell and as a standard user.
+  Generated hook manifests are refreshed for the 1.7.5 runtime and both provider
+  manifests, the marketplace manifest, and the package constant agree.
+
+No remaining actionable source findings from this manual review. Final candidate
+test results, exact-head Copilot review, Windows release checks, and publication
+are recorded in PR #17 and its release workflow.
 
 ## Copilot feedback
 

@@ -561,9 +561,9 @@ class StateStore:
         value = _redact({"schema": 1, "disposition": "outside_disabled_governance",
                         "provider": provider, "session": session,
                         "project": project_key(project), "generation": generation,
-                          "event": {"event_id": event.event_id, "kind": event.kind,
-                                    "observed_at": event.observed_at,
-                                    "payload": _child_callback_payload(event)}})
+                        "event": {"event_id": event.event_id, "kind": event.kind,
+                                  "observed_at": event.observed_at,
+                                  "payload": _child_callback_payload(event)}})
         # Normalize tuple-valued native metadata to its durable JSON shape.
         value = json.loads(json.dumps(value, sort_keys=True))
         # Provider retries keep their callback ID and payload but acquire a new

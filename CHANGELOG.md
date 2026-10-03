@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.5 — prepared 2026-10-03
+
+- Keep ordinary untracked child callbacks outside disabled Symphony governance on Codex and Claude. Preserve their evidence before acknowledgment without opening a run, granting completion credit, or blocking Stop. Live managed work, known identities, reserved roles, admission intents, foreign ownership, generation, and retirement checks remain guarded.
+- Preserve full normalized provider payloads at inbox entry and archival, including future provider fields, with existing secret redaction and without synthetic replay flags. Bind replay to the provider, root project, session, generation, event identity, and payload; record the original observation time without using changing retry timestamps as identity.
+- Recover failed primary archive writes through a separate private recovery directory without overflowing the managed inbox. Limit acknowledged report copies to 100 files and 16 MiB per root scope, protect pending evidence, and retain small hash facts for retries after pruning or re-enabling.
+- Cover the captured macOS incident, both provider hook formats, shared-checkout roots, child worktrees, large reports, archive and acknowledgment failures, retention, and native retries. Include the callback regression suite in Restricted PowerShell and standard-user Windows release acceptance. Release CI remains offline with no AI API tests.
+
 ## 1.7.0 — prepared 2026-10-02
 
 - Validate the exact locally tested candidate before merge can expose a marketplace update; publish only through a manual release dispatch for the exact locally reviewed and tested `main` commit. Release CI runs deterministic Linux and Windows checks without provider installs or AI API calls; native testing uses local clients and existing logins. The separate API-backed capability refresh workflow is disabled for this release.

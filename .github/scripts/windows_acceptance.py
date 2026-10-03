@@ -26,6 +26,7 @@ TESTS = (
     "plugins.symphony.tests.test_store.StateStoreTests.test_new_duplicate_owner_after_prior_lookup_is_not_hidden",
     "plugins.symphony.tests.test_store.StateStoreTests.test_snapshot_scan_and_atomic_replace_remain_compatible",
     "plugins.symphony.tests.test_concurrent_sessions",
+    "plugins.symphony.tests.test_disabled_unmanaged_callbacks",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_same_lead_followup_recovers_without_another_start_hook",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_same_text_result_after_a_new_start_is_a_new_lifecycle",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_identical_no_id_restart_keeps_outcome_unreconciled",
