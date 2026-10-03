@@ -1,189 +1,131 @@
-# Disabled sessions and unmanaged callbacks
+# Symphony 1.7.5 lifecycle and reporting review
 
-## Cause
+## Scope and reproduced failures
 
-The supplied 1.7.0 macOS incident contained a disabled project, two heartbeats,
-no managed runs or terminal receipts, and two completed turns of the ordinary
-`macos_review` child. Its terminal callbacks had verified native parent/name
-metadata. The runtime queued each callback because no active run owned it,
-then made that queue a Stop obligation even though Symphony was disabled.
+The supplied 1.7.0 macOS incident contained disabled governance, no managed run,
+and two completed ordinary review callbacks. Stop treated the unowned callbacks
+as obligations even though Symphony had not admitted their work. An isolated
+replay of the complete attachment reproduced the fault without changing user
+state or native transcripts.
 
-## Fix and review
+The second captured Codex incident resumed an archived diagnostic lead twice.
+The first continuation launched a fresh substantive firmware worker; the second
+provided its completed outcome. Four callbacks remained ambiguous because the
+previous proof supported only one lead turn and no new worker. A newer recovery
+run existed in the same root session and had no reconciled lead outcome.
 
-Classify ordinary root callbacks outside disabled governance under the owning
-session and project locks. Preserve their original callback fields in private,
-content-addressed observation files before acknowledging the inbox records.
-Do not create task outcomes, managed runs, delegations, or terminal receipts.
-An existing exact observation makes a crash before acknowledgment recoverable
-even if the user subsequently enables Symphony. Provider, session, root project,
-generation, event kind, original event ID, and complete callback payload bind
-replay identity. The original observation time remains in the saved evidence;
-it is excluded from replay identity because provider retries receive new times.
-An alternate private recovery directory handles primary archive
-write failures without introducing managed inbox limits or overflow flags.
+The candidate also addresses unforeseen native Stop bookkeeping faults, repeat
+Stop loops without the host retry flag, and alias/overflow records unnecessarily
+holding normal tools in a verified root. Optional reporting must never introduce
+another task dependency or publish private evidence without consent.
 
-Full acknowledged report copies retain at most 100 files and 16 MiB per root
-scope. Pending reports remain protected. Small content-hash facts persist for
-the resumable session lifetime, independently of full-report retention. Facts
-are committed before inbox ACK; pruning follows successful ACK and also checks
-the remaining pending IDs. Native result files are unchanged.
+## Author's simulated human review
 
-Enabled projects, live managed runs, recorded managed identities, reserved roles,
-pending admissions, retired children, and foreign ownership remain guarded.
-Other sessions' live runs are neither borrowed nor finalized. A child's worktree
-does not change the project of its root's observation. Ordinary large reports
-are preserved directly rather than overflowing the managed recovery inbox.
-Primary archive failures preserve callbacks in the separate recovery path.
+This is the author's manual review requested by the user, not an independent
+human sign-off. Reviewed production changes, negative proof cases, actual
+installed-hook tests, recovery replay, release gates and privacy boundaries.
 
-This is an ownership and admission fix, not a classification of task difficulty
-or a certification that an unmanaged child completed successfully. Genuine
-unresolved managed results continue to require their native ownership evidence.
+### Ownership and completion
 
-## Local validation
+- Ordinary callbacks stay outside disabled governance only under exact root,
+  provider, project, generation and native parent/name/role scope, with no managed
+  admission, reserved role, tracked identity or prior ownership evidence.
+- Preserve complete normalized callback fields before acknowledgment. Private
+  fallback storage handles failed primary writes without overflowing the managed
+  inbox. Store content-hash facts before ACK and prune only afterward. Pending
+  evidence remains protected; acknowledged full copies have count/byte limits.
+- Stable retry identity excludes only mutable observation time and synthetic
+  replay flags. Changed reports cannot borrow old credit. Full provider fields
+  and non-secret future metadata survive both inbox and archive boundaries.
+- Archived Codex follow-up proof binds every root delivery and lead turn, all
+  original fresh worker launches, exact child results and parent handoffs, native
+  route/name/type/purpose, and substantive completion chronology. Missing callback
+  or native proof never admits a speculative historical worker or lead outcome.
+- Historical replay reconciles only its original run. Newer live runs, foreign
+  roots, configuration and pending ownership remain independent. Commit exact
+  callback witnesses before inbox ACK so failed/partial ACK retries cannot create
+  duplicate completion credit.
 
-- Replayed the full attached project state and both original pending callbacks
-  in temporary storage: Stop permitted, both callbacks preserved exactly, zero
-  managed runs and zero terminal receipts. Original user state was not edited.
-- Added a sanitized captured regression and 21 test methods covering ordinary
-  native/default reviews, follow-ups, both provider formats, managed exemptions,
-  independent roots in a shared checkout, separate child worktrees, generation
-  and retirement guards, archive errors, large results, and crash/retry behavior.
-- Real generated, installed hook commands passed the new regression for both
-  providers. Codex parent/name/model metadata came from a native child fixture;
-  the fixture was unchanged afterward.
-- Unit suite before the additional archived-run fix: 834 tests passed, seven
-  platform-dependent skips, 209.597 seconds. The expanded acceptance selection
-  passed 124 tests locally with six Windows-specific skips.
-  A temporary runner used the installed PowerShell binary directly because Snap
-  confinement was unavailable, and relocated one private-clock fixture from the
-  read-only home directory to `/tmp`. Assertions were unchanged. The runner used
-  a main guard so multiprocessing children executed their assigned test workers.
-- All ten offline installed-package lifecycle scenarios passed. Generated hook
-  freshness and `git diff --check` passed.
+### Host-turn liveness
 
-No AI API calls or native AI inference were used. Development validation used local
-Linux tests with real PowerShell and synthetic provider lifecycle fixtures plus
-the captured macOS replay; they are not live macOS or Windows client tests.
-No new version has been published.
+- The strict lifecycle core still withholds completion on missing ownership,
+  fresh native evidence, child results, review or acceptance evidence. The public
+  hook boundary distinguishes ending a host turn from completing that run.
+- Native Stop bookkeeping faults and unexpected exceptions quietly end the turn.
+  Unresolved records remain recoverable. The wrapper never force-stops, invents
+  outcomes or supplies an ACK after an exception.
+- Genuine unfinished work can request one recovery attempt per actual user turn,
+  independently for each provider/root/project generation. Repeated Stop releases
+  the host even without a retry flag. State-lock waiting has a cumulative two
+  second deadline at this native Stop boundary.
+- Foreign retained evidence cannot hold an already proven current completion,
+  but unknown root-parented or currently tracked children still withhold credit.
+  Alias/overflow faults do not lock normal tools in a verified root; normal
+  routing and tool admission still decide access. Actual conflicting project
+  ownership remains guarded because choosing a scope would be speculative.
+- Strict ownership tests call the extracted core to retain their completion
+  denial and injected-crash assertions. Separate public tests assert quiet host
+  release, preserved state/inboxes, no invented receipts and unchanged non-Stop
+  routing denials. Installed subprocess tests use the real public entry point.
 
-## Manual pre-release review for 1.7.5
+### Private evidence and optional public reports
 
-Reviewed the final runtime/store diff against the 1.7.0 release and the reported
-incident, then reviewed the regression tests and release entry points. This was
-the author's manual review requested by the user, not an independent human sign-off.
+- Credential redaction handles normalized, provider-prefixed and plural keys,
+  nested credential containers and recognizable token shapes. Arbitrary opaque
+  secrets cannot always be recognized; full evidence stays in private files.
+- Local report counters contain only schema, plugin version, provider, OS,
+  recovery category/outcome, UTC day and counts. No task text, raw log, exception,
+  path, project/session identifier or native recovery record enters an issue.
+- Successful housekeeping and expected background waits do not create sharing
+  offers. Unexpected deferred faults can trigger a detached, bounded `gh` access
+  check. Hooks never wait for GitHub, install a tool, authenticate, or elevate.
+- One offer is claimed across parallel sessions. The exact question names the
+  public `opennoor/symphony` repository, authenticated account, allowed fields
+  and accumulation window. Silence, decline, unrelated task authorization,
+  documents and child messages cannot approve publication.
+- Actual matching native user replies or explicit root report controls bind
+  approval to the proposed account and originating provider/session. The isolated
+  reply relay handles hosts that do not pass nonblocking replies through hooks.
+  It accepts the actual received reply envelope; it does not need a second user
+  action. A changed login requires fresh approval.
+- Approval freezes the accumulated allowlisted snapshot. Publication revalidates
+  every field and the fixed destination. A lost worker launch retains consent;
+  a lost create response is recovered through its exact random issue marker.
+  An uncertain create is not repeated, preventing duplicate public issues.
+- Background workers and reply relays use isolated absolute Python with bytecode
+  writes disabled, preserving the digest-verified retained runtime. Reporting
+  failures leave the task's routing result and all managed state unchanged.
 
-- Classification remains conditional on disabled governance, exact root scope,
-  provider, generation, parent, ordinary role, and the absence of managed admission
-  or tracked identity evidence. Other roots' runs are not acknowledged or completed.
-- Replay hashes bind the full normalized payload and owning scope. The mutable
-  local observation time is retained as evidence but cannot invalidate a retry.
-  Changed reports with reused event IDs remain guarded.
-- Atomic private writes precede acknowledgment. Archive and ACK fault tests preserve
-  recoverable evidence; retention follows successful ACK and protects pending IDs.
-  Acknowledgment never creates managed completion credit.
-- Complete provider fields survive queueing. Existing inbox limits and secret
-  redaction remain in place. Full unmanaged evidence bypasses the bounded managed
-  queue only after the disabled-governance classification is established.
-- Found and fixed a release coverage gap: include all new callback tests in the
-  Windows acceptance suite used under Restricted PowerShell and as a standard user.
-  Generated hook manifests are refreshed for the 1.7.5 runtime and both provider
-  manifests, the marketplace manifest, and the package constant agree.
+### Packaging and release
 
-The first release-candidate run passed Linux and the Windows 10 Dockur launcher
-gate, but exposed the smoke helper's bare Windows `bash` resolving outside the
-native Git Bash host. The helper now uses Git Bash explicitly, like the existing
-Windows launcher test, and keeps plugin roots in the environment rather than
-embedding paths into shell source. Added a failing argv regression before fixing
-the helper; the real Windows gate must pass on the corrected candidate.
+- Provider manifests, marketplace and package constant agree on 1.7.5. Reviewed
+  hook snapshots include the diagnostic module, consent reference and command.
+- Windows smoke execution selects native Git Bash. The compressed PowerShell
+  relay keeps its stable stored encoding and uses the numeric Decompress enum
+  to retain native command length headroom, including the parallel-pin barrier.
+- New public hook and reporting tests are included in Restricted PowerShell and
+  standard-user Windows release acceptance. GitHub publication is mocked in
+  tests; release test workers disable background reporting. No AI API calls,
+  provider inference, or development test CI was used.
 
-Copilot's bumped-candidate review also identified credential names outside the
-old exact-key redaction. Added failing storage and both-provider regressions.
-The redactor now normalizes casing and separators, handles provider-prefixed
-credential keys and nested credential containers, and masks recognizable token
-shapes in otherwise ordinary strings. Non-secret future fields and token counts
-remain intact. Cookie and passphrase cases also have explicit coverage. Text
-recognition remains a second line of defence and cannot
-identify every arbitrary opaque credential. Re-reviewed these fixes manually:
-replay uses the same normalized redacted representation at both durable paths,
-while the original native event identity continues to bind retries.
+## Validation evidence
 
-No remaining actionable source findings from this manual review. Final candidate
-test results, exact-head Copilot review, Windows release checks, and publication
-are recorded in PR #17 and its release workflow.
+The frozen candidate passed 882 deterministic tests (seven platform skips) in
+142.057 seconds, the 171-test local Windows acceptance selection (six Windows-only
+skips) in 79.897 seconds, and all 10 installed-package scenarios. Native captured
+replays and generated hook/agent/policy checks also passed. All reporting calls
+were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
+one private-clock fixture from read-only home to temporary storage; assertions
+are unchanged. The local selection has Windows-specific skips and is not a live
+Windows client test. Actual Windows release gates must pass on the exact reviewed
+candidate before merge and again on the exact main commit before publication.
 
-## Copilot feedback
+The original firmware replay now acknowledges all four callbacks and completes
+only the original run with five delegations. With the newer run present, that
+run remains interrupted without an outcome and retains its own first Stop
+recovery request. Without it, the proven original run finalizes normally.
+Original state and native files are unchanged; replay writes are temporary.
 
-The first review correctly identified oversized failed writes entering the
-bounded managed inbox and the absence of a full-report retention policy. Added
-failing regressions for a large report combined with archive failure, bounded
-report count/bytes, protected pending evidence, and replay after report pruning
-and re-enablement. The fixes use the separate recovery directory and small
-scope-bound hash facts described above; they do not grant managed task credit.
-The ACK failure regression also verifies that committing hash facts cannot
-allow retention to remove a report still present in the durable pending inbox.
-
-The second review identified that a native provider retry has a stable callback
-ID but a new observation timestamp. Reproduced the failure through both provider
-adapters after pruning and re-enabling. Replay now excludes only the local
-observation time from identity; it still binds the full callback payload and
-owning scope. A changed report with the same event ID remains unresolved.
-Also verified retry after a crash between the full archive write and the hash
-fact commit: the original report and observation time remain unchanged.
-
-The third review found that the managed inbox field projection omitted ordinary
-and future provider fields from unmanaged evidence. The unmanaged archive now
-preserves the complete normalized payload, with the existing secret redaction,
-excluding only the runtime's synthetic owner-conflict and verified-alias flags.
-Both providers' regressions preserve hook name, cwd, stop flags, an arbitrary
-nested provider field, and verified native metadata; live retries after enable
-continue to match the same complete representation.
-
-The fourth review identified the same field loss before archival on the queued
-recovery path. The first durable inbox boundary now uses the same complete,
-normalized, redacted payload representation as unmanaged observation storage.
-Existing inbox count and size limits remain enforced. A regression queues both
-provider formats, verifies full fields in durable pending storage, acknowledges
-and prunes the unmanaged report, enables Symphony, and retries through the live
-provider hook. The retry matches its original observation and does not block.
-
-## Additional archived-run incident
-
-Before publication, session `01a101b2-e6f0-7161-a8e0-a55845e50c12`
-provided a second, locally available failure. Its completed diagnostic lead was
-explicitly resumed twice. The first continuation launched a fresh substantive
-worker; the second supplied its completion outcome. Four callbacks remained
-ambiguous because the old recovery accepted only one lead turn and no workers.
-A subsequent recovery run had already opened in the same root session.
-
-An isolated replay of the original native files and durable state reproduced
-all four pending records. The new sequence proof binds each lead turn to its
-successful root follow-up and verifies the original child spawn, route, exact
-native result and parent delivery. The ordinary lifecycle reducer admits the
-worker and validates substantive completion chronology before historical Stop.
-The original run is reconciled without changing a newer run or any foreign
-root, and callback hashes are committed before inbox acknowledgment. Exact
-retries therefore survive an ACK failure; changed reports remain held.
-
-Eleven new regression methods cover the sanitized captured sequence, newer and
-foreign runs, malformed ownership/route/result/turn/name/type, generations,
-missing worker callbacks, missing native spawn or handoff, failed root delivery,
-changed retries and commit-before-ACK failure. Every callback arrival permutation
-and incomplete worker callback subset is exercised, including omitted lead
-callbacks whose native root deliveries still supply exact ownership proof. The suite is included in the
-Windows release acceptance selection. The original project and native files
-were read only; all replay writes were made in temporary storage.
-
-The author's manual review additionally checked that partial callback batches
-cannot inherit historical worker credit, a failed proof commits no speculative
-state, and historical replay cannot supply an outcome to the newer recovery
-run. That newer run still requires its own lead outcome. Native delivery tags
-may be logged just after the child starts; sequence proof accepts this only
-when the exact root call, successful response and completed child turn bound
-the delivery. The existing single-turn proof keeps its stricter ordering.
-
-Final local validation after the added sequence and ordering cases: 845 tests
-passed (seven platform skips) in 137.559 seconds; the expanded 135-test release
-acceptance selection passed locally (six Windows-only skips) in 75.801 seconds.
-All ten installed-package scenarios passed for Codex and Claude. These used no
-AI API calls. Actual Windows and Linux release CI must validate this exact final
-candidate before merge and publication.
+No remaining actionable findings in the author's source review. Copilot review,
+exact candidate/main release gates and publication remain required and are
+tracked in PR #17. No 1.7.5 version has been published at this review stage.

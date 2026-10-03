@@ -13,7 +13,7 @@ from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony.reducer import reduce
-from plugins.symphony.symphony.runtime import handle
+from plugins.symphony.symphony.runtime import _handle_core as handle
 from plugins.symphony.symphony.store import StateStore
 
 
@@ -585,9 +585,12 @@ class HostEvidenceTests(unittest.TestCase):
         for event in ("Stop", "UserPromptSubmit"):
             result = handle({"session_id": ROOT_ID, "cwd": str(self.project), "hook_event_name": event,
                              "prompt": "$symphony:symphony status"}, self.environ)
-            self.assertIn("superseded lead", result.stdout)
-            self.assertIn("Do not resume", result.stdout)
-            self.assertIn("or repeat Stop", result.stdout)
+            if event == 'Stop':
+                self.assertIn("superseded lead", result.stdout)
+                self.assertIn("Do not resume", result.stdout)
+                self.assertIn("or repeat Stop", result.stdout)
+            else:
+                self.assertIn("no completion credit", result.stdout)
         self.assertIsNone(self.store.load(self.project).active_run)
         self.assertEqual((stronger,), self.store.load(self.project).recent_runs)
         self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
@@ -624,7 +627,7 @@ class HostEvidenceTests(unittest.TestCase):
         for event, prompt in (("Stop", ""), ("UserPromptSubmit", "$symphony:symphony status")):
             result = handle({"session_id": ROOT_ID, "cwd": str(self.project),
                              "hook_event_name": event, "prompt": prompt}, self.environ)
-            self.assertIn("unresolved child result", result.stdout)
+            self.assertIn("unresolved child result" if event == 'Stop' else "no completion credit", result.stdout)
         self.assertIsNone(self.store.load(self.project).active_run)
         self.assertEqual((archived,), self.store.load(self.project).recent_runs)
         self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))

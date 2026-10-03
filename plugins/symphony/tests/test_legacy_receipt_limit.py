@@ -11,7 +11,8 @@ from unittest.mock import patch
 from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.model import Event, ProjectState
 from plugins.symphony.symphony.routing import Assessment
-from plugins.symphony.symphony.runtime import _accept_assessment, handle
+# Strict ownership/credit reducer; public host-turn liveness has separate tests.
+from plugins.symphony.symphony.runtime import _accept_assessment, _handle_core as handle
 from plugins.symphony.symphony.store import StateStore
 
 
@@ -99,8 +100,9 @@ class Released151ReceiptLimitTests(unittest.TestCase):
                             result = handle(request, fixture.environ)
                             self.assertTrue(json.loads(result.stdout).get('decision') == 'block')
                             state = fixture.store.load(fixture.project)
-                            self.assertEqual(state.active_run, replace(after.active_run,
-                                assessment={**after.active_run.assessment, '_batch_pending': True}))
+                            # Preserve the unproved historical record without
+                            # adding a batch hold to the independent new lead.
+                            self.assertEqual(state.active_run, after.active_run)
                             self.assertEqual(state.recent_runs, after.recent_runs)
                             self.assertEqual(fixture.store.session_record(provider, session)['pending'], pending_before)
                     finally:

@@ -14,7 +14,7 @@ from plugins.symphony.scripts.package_smoke import _materialize, _send_raw
 from plugins.symphony.symphony import PLUGIN_VERSION
 from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.runtime import _root_admission_key, handle
+from plugins.symphony.symphony.runtime import _root_admission_key, _handle_core as handle
 from plugins.symphony.symphony.store import StateStore
 
 

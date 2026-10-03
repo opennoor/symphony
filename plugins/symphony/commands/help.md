@@ -15,6 +15,7 @@ description: Show Claude Code commands for Symphony
 - `/symphony:boost [xhigh|max|off]` — boost subsequent assessors in this session; status shows requested and effective effort.
 - `/symphony:stop [--force]` — request a safe stop; `--force` acknowledges interruption of active work.
 - `/symphony:version` — show which Symphony build is running this session, and whether a newer one is installed.
+- `/symphony:report submit|decline <approval-code>` — approve or decline a pending public sanitized diagnostic issue without pausing work.
 - `/symphony:help` — show this help.
 
 SYMPHONY_CONTROL: help

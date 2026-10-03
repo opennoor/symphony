@@ -28,6 +28,8 @@ TESTS = (
     "plugins.symphony.tests.test_concurrent_sessions",
     "plugins.symphony.tests.test_disabled_unmanaged_callbacks",
     "plugins.symphony.tests.test_archived_followup_workers",
+    "plugins.symphony.tests.test_stop_recovery_boundary",
+    "plugins.symphony.tests.test_diagnostic_reporting",
     "plugins.symphony.tests.test_package_smoke.PackageSmokeTests.test_windows_claude_smoke_uses_git_bash_and_environment_root",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_same_lead_followup_recovers_without_another_start_hook",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_same_text_result_after_a_new_start_is_a_new_lifecycle",

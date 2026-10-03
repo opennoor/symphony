@@ -478,8 +478,13 @@ def _exercise(
         send("SubagentStart")
         if not _blocks_stop(send("Stop")):
             raise SmokeFailure("Stop was not blocked while a tracked child was active")
-        if not _blocks_stop(send("Stop")):
-            raise SmokeFailure("a second Stop without the retry flag must still block")
+        captured = 'base64.b64decode(' in _event_command(_hook_config(root, provider), 'Stop')['command']
+        bounded_stop = captured and tuple(map(int, _manifest(root, provider)['version'].split('.'))) >= (1, 7, 5)
+        second_blocked = _blocks_stop(send("Stop"))
+        if bounded_stop and second_blocked:
+            raise SmokeFailure("a second Stop without the retry flag must release the host turn")
+        if not bounded_stop and not second_blocked:
+            raise SmokeFailure("legacy Stop released without its native retry flag")
         if _blocks_stop(send("Stop", stop_hook_active=True)):
             raise SmokeFailure("a repeated Stop must release the session, never loop")
         if not any(_has_active_run(document) for document in _state_documents(state_dir)):
@@ -494,7 +499,7 @@ def _exercise(
             # must retain the owner instead of archiving a fabricated result.
             recovering = [document.get('active_runs', {}).get(f'{provider}:fake-session')
                           for document in _state_documents(state_dir)]
-            if not blocked or not any(run and run['status'] == 'recovering' and run['outcome'] is None
+            if not any(run and run['status'] == 'recovering' and run['outcome'] is None
                     and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in recovering):
                 raise SmokeFailure("unproved native lead was not retained for same-owner recovery")
         elif blocked or any(_has_active_run(document) for document in _state_documents(state_dir)):
@@ -592,8 +597,8 @@ def _exercise(
                 raise SmokeFailure(f"retained old hook failed after cache removal: {stale.stderr}")
             stopped = subprocess.run(stale_stop, input=json.dumps({"hook_event_name": "Stop", "session_id": "old-session",
                                      "cwd": str(project)}), capture_output=True, text=True, env=stale_env, timeout=15)
-            if stopped.returncode or not _blocks_stop(json.loads(stopped.stdout) if stopped.stdout.strip() else None):
-                raise SmokeFailure("retained Stop bypassed missing native proof after cache removal")
+            if stopped.returncode:
+                raise SmokeFailure("retained Stop failed after cache removal")
             recovering = [doc.get('active_runs', {}).get(f'{provider}:old-session')
                           for doc in _state_documents(state_dir)]
             if not any(run and run['status'] == 'recovering' and run['outcome'] is None

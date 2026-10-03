@@ -588,6 +588,13 @@ with Path(sys.argv[1]).open('a+b') as handle:
         self.assertEqual(saved['future']['ordinary'][-1], 'harmless-provider-value')
         self.assertEqual(saved['tokenCount'], 42)
 
+    def test_plural_credential_containers_do_not_persist_opaque_values(self):
+        fields = ['clientSecrets', 'passwords', 'provider.apiKeys', 'accessTokens', 'privateKeys']
+        self.store.save(self.project, ProjectState(configuration={
+            key: {'opaque': 'never-persist-this-value'} for key in fields}))
+        self.assertNotIn('never-persist-this-value', self.state_path().read_text())
+        self.assertEqual({key: '[REDACTED]' for key in fields}, self.store.load(self.project).configuration)
+
 
 if __name__ == "__main__":
     unittest.main()

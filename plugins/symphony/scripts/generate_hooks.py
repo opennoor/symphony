@@ -62,7 +62,7 @@ def generated(root=PLUGIN):
         # for that outer shell to expand before the inner PowerShell starts.
         wrapper = ("iex ([IO.StreamReader]::new([IO.Compression.GZipStream]::new("
                    "[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "')),"
-                   "[IO.Compression.CompressionMode]::Decompress))).ReadToEnd()")
+                   "0))).ReadToEnd()")  # CompressionMode.Decompress = 0.
         prefix = 'powershell.exe -NoProfile -NonInteractive -Command '
         capture = "[Environment]::SetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP','" + code.replace("'", "''") + "');"
         windows = 'cmd.exe /c ' + prefix + '"' + capture + wrapper + '"'

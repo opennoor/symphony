@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from plugins.symphony.symphony.model import Event, ProjectState, RunState
-from plugins.symphony.symphony.runtime import handle
+from plugins.symphony.symphony.runtime import _handle_core as handle
 from plugins.symphony.symphony.store import StateStore, _state_from_dict
 
 

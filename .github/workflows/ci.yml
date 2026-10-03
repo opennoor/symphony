@@ -1,5 +1,9 @@
 name: Symphony CI
 
+# Release tests mock reporting and never contact GitHub from product hooks.
+env:
+  SYMPHONY_REPORT_WORKER: '0'
+
 on:
   workflow_dispatch:
     inputs:

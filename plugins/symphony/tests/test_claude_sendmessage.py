@@ -9,7 +9,8 @@ from unittest.mock import patch
 from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.host_evidence import claude_archived_sendmessage_sequence, _claude_native_lead_event
 from plugins.symphony.symphony.model import ProjectState
-from plugins.symphony.symphony.runtime import handle, _root_admission_key, _terminal_result_id
+# Strict ownership/credit reducer; public host-turn liveness has separate tests.
+from plugins.symphony.symphony.runtime import _handle_core as handle, _root_admission_key, _terminal_result_id
 from plugins.symphony.symphony.store import StateStore
 from plugins.symphony.tests import test_claude_host_evidence as fixture
 from plugins.symphony.tests.test_claude_host_evidence import SESSION, LEAD, TYPE, REPORT

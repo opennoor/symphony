@@ -369,10 +369,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                 if provider == "codex":
                     # The native parent launch proves the worker's purpose but
                     # contains no lead turn/result. The earlier freshness guard
-                    # must block before completion-order recovery can run.
-                    stopped = json.loads(result.stdout)
-                    self.assertEqual("block", stopped["decision"])
-                    self.assertIn("could not verify the tracked lead's latest native turn", stopped["reason"])
+                    # must withhold completion before chronology recovery.
+                    # The public hook quietly ends the host turn, retaining
+                    # this completing run without success credit.
+                    self.assertEqual('', result.stdout)
                     self.assertEqual("completing", pending["status"])
                     self.assertFalse(any(run["run_id"] == pending["run_id"] for run in document["recent_runs"]))
                 else:

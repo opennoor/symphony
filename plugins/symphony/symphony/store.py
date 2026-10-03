@@ -11,6 +11,7 @@ import time
 import tempfile
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,19 @@ except ImportError:  # pragma: no cover - exercised outside Windows
 
 
 SCHEMA_VERSION = 2
+_LOCK_DEADLINE: ContextVar[float | None] = ContextVar('symphony_lock_deadline', default=None)
+
+
+@contextmanager
+def state_lock_budget(seconds: float) -> Iterator[None]:
+    """Bound cumulative state-lock waiting for a native Stop recovery attempt."""
+    deadline = time.monotonic() + seconds
+    previous = _LOCK_DEADLINE.get()
+    token = _LOCK_DEADLINE.set(min(previous, deadline) if previous is not None else deadline)
+    try:
+        yield
+    finally:
+        _LOCK_DEADLINE.reset(token)
 _UNMANAGED_REPORT_COUNT = 100
 _UNMANAGED_REPORT_BYTES = 16 * 1024 * 1024
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
@@ -339,7 +353,9 @@ def _redact(value: Any, key: str = "") -> Any:
     normalized = re.sub(r'[^a-z0-9]+', '_', normalized.lower()).strip('_')
     words = set(normalized.split('_'))
     if (any(normalized == secret or normalized.endswith('_' + secret) for secret in _SECRET_KEYS)
-            or words & {'password', 'passwd', 'secret', 'authorization', 'credential', 'credentials'}
+            or words & {'password', 'passwords', 'passwd', 'secret', 'secrets', 'authorization', 'credential', 'credentials'}
+            or ('keys' in words and bool(words & {'api', 'private', 'encryption'}))
+            or ('tokens' in words and bool(words & {'auth', 'access', 'refresh'}))
             or normalized in {'auth', 'authentication'}
             or ('token' in words and 'value' in words)):
         return "[REDACTED]"
@@ -365,6 +381,10 @@ def _local_lock(path: Path) -> threading.Lock:
 
 @contextmanager
 def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
+    budget = _LOCK_DEADLINE.get()
+    if budget is not None:
+        remaining = max(0, budget - time.monotonic())
+        timeout = min(timeout, remaining) if timeout is not None else remaining
     path.parent.mkdir(parents=True, exist_ok=True)
     local = _local_lock(path)
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -433,6 +453,48 @@ class StateStore:
     def _session_path(self, provider: str, session: str) -> Path:
         digest = hashlib.sha256(f"{provider}\0{session}".encode()).hexdigest()
         return self.root / f".session-{digest}.json"
+
+    def stop_turn_budget(self, provider: str, session: str, project: Path, *, reset: bool = False) -> bool:
+        """Allow at most one native Stop block per root user turn.
+
+        This sidecar is not an outcome or an acknowledgment. It never changes
+        project state, inbox entries, receipts, ownership or generation.
+        """
+        digest = hashlib.sha256(f'{provider}\0{session}'.encode()).hexdigest()
+        path = self.root / f'.stop-budget-{digest}.json'
+        with _locked(path, timeout=0.05):
+            record = self.session_record(provider, session)
+            scope = {'provider': provider, 'session': session,
+                     'project': (record or {}).get('state_name') or self._path(project).name,
+                     'generation': (record or {}).get('generation', 1)}
+            previous = json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else {}
+            spent = previous.get('scope') == scope and previous.get('blocked') is True
+            self._write_json(path, {'schema': 1, 'scope': scope, 'blocked': not reset})
+            return not spent
+
+    def record_recovery_diagnostic(self, report: dict[str, Any]) -> None:
+        """Aggregate allowlisted anonymous facts locally; never transmit them."""
+        allowed = {'schema', 'plugin_version', 'provider', 'platform', 'category', 'outcome'}
+        if (set(report) != allowed or type(report['schema']) is not int or report['schema'] != 1
+                or report['provider'] not in {'codex', 'claude'}
+                or report['platform'] not in {'windows', 'linux', 'macos', 'other'}
+                or report['category'] not in {'bookkeeping', 'incomplete_work', 'state_io', 'state_shape', 'runtime_fault', 'native_recovery'}
+                or report['outcome'] not in {'deferred', 'recovered'}
+                or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', str(report['plugin_version']))):
+            raise ValueError('invalid anonymous diagnostic')
+        day = datetime.now(timezone.utc).date().isoformat()
+        identity = json.dumps({**report, 'day': day}, sort_keys=True).encode()
+        path = self.root / 'diagnostics' / (hashlib.sha256(identity).hexdigest() + '.json')
+        with _locked(path.parent / '.aggregate', timeout=0.05):
+            previous = json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else {}
+            count = previous.get('occurrences', 0)
+            count = count if type(count) is int and 0 <= count < 1_000_000 else 0
+            self._write_json(path, {**report, 'day': day, 'occurrences': min(count + 1, 1_000_000)})
+            # One directory lock avoids accumulating a lock file per daily
+            # aggregate and serializes retention against concurrent writers.
+            files = sorted(path.parent.glob('*.json'), key=lambda entry: entry.stat().st_mtime, reverse=True)
+            for expired in files[100:]:
+                expired.unlink(missing_ok=True)
 
     def _alias_path(self, provider: str, owner: str, child: str) -> Path:
         root_digest = hashlib.sha256(f"{provider}\0{owner}".encode()).hexdigest()

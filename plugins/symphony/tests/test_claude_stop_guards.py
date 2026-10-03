@@ -9,7 +9,8 @@ from unittest.mock import patch
 from plugins.symphony.symphony.adapters import event_from_payload, render
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony.reducer import reduce
-from plugins.symphony.symphony.runtime import handle, _render_actions
+# Strict ownership/credit reducer; public host-turn liveness has separate tests.
+from plugins.symphony.symphony.runtime import _handle_core as handle, _render_actions
 from plugins.symphony.symphony.store import StateStore
 
 
@@ -39,7 +40,7 @@ class ClaudeStopGuardTests(unittest.TestCase):
         self.assertIn('$symphony:symphony status', output['systemMessage'])
         self.assertEqual(released.active_run, state.active_run)
 
-    def test_every_pre_reducer_guard_preserves_state_and_releases_only_native_claude_retry(self):
+    def test_every_pre_reducer_guard_preserves_state_and_releases_native_retry_on_both_providers(self):
         for provider in ('claude', 'codex'):
             for scenario in ('queued-conflict', 'owner-unavailable', 'multiple-owners',
                              'alias-unavailable', 'overflow', 'alias-overflow', 'missing-state'):
@@ -70,7 +71,7 @@ class ClaudeStopGuardTests(unittest.TestCase):
                                                False, project, 'root')
                         event = event_from_payload(provider, {
                             'session_id': inbox_session, 'hook_event_name': 'SubagentStop',
-                            'agent_id': 'unowned', 'parent_thread_id': 'foreign',
+                            'agent_id': 'unowned', 'parent_thread_id': 'root',
                             'last_assistant_message': 'x' * (140_000 if 'overflow' in scenario else 1),
                         })
                         store.queue_session_event(provider, inbox_session, event, ambiguous_owner=True)
@@ -98,7 +99,7 @@ class ClaudeStopGuardTests(unittest.TestCase):
                     with guard():
                         result = handle(dict(request, stop_hook_active=True), environ)
                     output = json.loads(result.stdout)
-                    if provider == 'claude':
+                    if provider in {'claude', 'codex'}:
                         self.assertEqual(set(output), {'systemMessage'})
                         self.assertIn('host turn only', output['systemMessage'])
                     else:

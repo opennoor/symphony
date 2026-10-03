@@ -45,6 +45,7 @@ $symphony:symphony boost [xhigh|max|ultra|off]
 $symphony:symphony stop [--force]
 $symphony:symphony disable
 $symphony:symphony version
+$symphony:symphony report submit|decline <approval-code>
 $symphony:symphony help
 ```
 
@@ -62,12 +63,17 @@ Claude Code exposes native slash commands:
 /symphony:stop [--force]
 /symphony:disable
 /symphony:version
+/symphony:report submit|decline <approval-code>
 /symphony:help
 ```
 
 Do not use `/symphony:*` in Codex. `$symphony:symphony start <task>` and `/symphony:start <task>` each run one managed task without changing project enablement. A leading control word counts as a control only when nothing but a documented flag follows it, so `$symphony:symphony help me fix the login bug` is treated as a task.
 
 `boost` raises only subsequent assessor effort in this project/provider/session. Codex accepts native `xhigh`, `max`, or `ultra`; Claude accepts native `xhigh` or `max`. With no argument it requests the provider’s highest level. Unsupported provider or account/model levels are rejected without changing the preference. Status reports the requested and effective native model/effort. `boost off` (or `reset`) restores normal high assessment; worker/lead routes, account restrictions, consent, and Fable opt-in remain unchanged.
+
+Native Stop bookkeeping faults end the host turn quietly while preserving unresolved evidence and withholding completion credit. Actual unfinished work can request one recovery attempt per user turn; repeated Stop cannot trap the session in a loop. Routing, tool admission, native ownership and completion proof remain guarded. Ending a chat turn never means an unfinished Symphony run completed or was abandoned.
+
+Optional diagnostic sharing collects only version/provider/OS, recovery category/outcome, UTC day and counts locally. When `gh` has access, the plugin offers one nonblocking confirmation to open a **public issue in `opennoor/symphony` using your named GitHub account**. Counters accumulate while you decide. Only actual approval submits the sanitized snapshot as JSON in the issue body; raw logs, task text, paths and project/session IDs stay private. Missing access, silence, decline and submission failure do not pause work. See [diagnostic sharing](plugins/symphony/skills/symphony/references/diagnostic-sharing.md).
 
 Symphony assumes the session root runs at the economy tier: it exists to route work to a right-sized lead, so a root that is already the strongest model pays for an assessor and a lead on top of itself. Set the root model to the cheapest capable option before enabling.
 
