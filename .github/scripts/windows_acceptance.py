@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 TESTS = (
+    "plugins.symphony.tests.test_package.PackageContractTests.test_generated_codex_interrupt_timeout_respects_host_limit_without_changing_other_events",
     "plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_relay_accepts_a_slow_working_interpreter_probe",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries",
@@ -25,7 +26,15 @@ TESTS = (
     "plugins.symphony.tests.test_store.StateStoreTests.test_owner_scan_defers_on_busy_unrelated_windows_project",
     "plugins.symphony.tests.test_store.StateStoreTests.test_new_duplicate_owner_after_prior_lookup_is_not_hidden",
     "plugins.symphony.tests.test_store.StateStoreTests.test_snapshot_scan_and_atomic_replace_remain_compatible",
+    "plugins.symphony.tests.test_store.StateStoreTests.test_credential_value_and_container_suffixes_are_redacted_but_numeric_counts_survive",
+    "plugins.symphony.tests.test_store.StateStoreTests.test_generic_token_fields_redact_every_non_count_value",
     "plugins.symphony.tests.test_concurrent_sessions",
+    "plugins.symphony.tests.test_disabled_unmanaged_callbacks",
+    "plugins.symphony.tests.test_archived_followup_workers",
+    "plugins.symphony.tests.test_claude_host_evidence.ClaudeHostEvidenceTests.test_archived_claude_redacted_callback_matches_only_the_same_native_report",
+    "plugins.symphony.tests.test_stop_recovery_boundary",
+    "plugins.symphony.tests.test_diagnostic_reporting",
+    "plugins.symphony.tests.test_package_smoke.PackageSmokeTests.test_windows_claude_smoke_uses_git_bash_and_environment_root",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_same_lead_followup_recovers_without_another_start_hook",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_same_text_result_after_a_new_start_is_a_new_lifecycle",
     "plugins.symphony.tests.test_runtime.RuntimeTests.test_identical_no_id_restart_keeps_outcome_unreconciled",

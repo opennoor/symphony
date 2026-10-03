@@ -13,15 +13,19 @@ _SECRET_PATTERNS = (
         re.DOTALL,
     ),
     re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+               r"|glpat-[A-Za-z0-9_-]{20,}|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"
+               r"|xox[baprs]-[A-Za-z0-9-]{10,})\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
 )
 
 
 def redact_secrets(text: str) -> str:
     """Redact credential-shaped text before durable storage.
 
-    A second line of defence only: the persistence allowlist in `model.py` is
-    what keeps free text out of the store, because no pattern set can recognise
-    every credential someone might paste into a prompt.
+    Structured storage also masks credential-keyed fields, including provider
+    naming variants. These text patterns are a second line of defence; no
+    pattern set can recognise every credential pasted into arbitrary text.
     """
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)

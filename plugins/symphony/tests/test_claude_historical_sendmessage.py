@@ -12,7 +12,8 @@ from plugins.symphony.symphony.host_evidence import (
     claude_native_parent_completion,
 )
 from plugins.symphony.symphony.model import Event, ProjectState
-from plugins.symphony.symphony.runtime import _observe_delegation, _sendmessage_sequence_digest, event_from_payload, handle
+# Strict ownership/credit reducer; public host-turn liveness has separate tests.
+from plugins.symphony.symphony.runtime import _observe_delegation, _sendmessage_sequence_digest, event_from_payload, _handle_core as handle
 from plugins.symphony.symphony.store import StateStore
 from unittest.mock import patch
 from plugins.symphony.tests import test_claude_sendmessage as fixture

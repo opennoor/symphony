@@ -45,6 +45,7 @@ $symphony:symphony boost [xhigh|max|ultra|off]
 $symphony:symphony stop [--force]
 $symphony:symphony disable
 $symphony:symphony version
+$symphony:symphony report submit|decline <approval-code>
 $symphony:symphony help
 ```
 
@@ -62,12 +63,17 @@ Claude Code exposes native slash commands:
 /symphony:stop [--force]
 /symphony:disable
 /symphony:version
+/symphony:report submit|decline <approval-code>
 /symphony:help
 ```
 
 Do not use `/symphony:*` in Codex. `$symphony:symphony start <task>` and `/symphony:start <task>` each run one managed task without changing project enablement. A leading control word counts as a control only when nothing but a documented flag follows it, so `$symphony:symphony help me fix the login bug` is treated as a task.
 
 `boost` raises only subsequent assessor effort in this project/provider/session. Codex accepts native `xhigh`, `max`, or `ultra`; Claude accepts native `xhigh` or `max`. With no argument it requests the provider’s highest level. Unsupported provider or account/model levels are rejected without changing the preference. Status reports the requested and effective native model/effort. `boost off` (or `reset`) restores normal high assessment; worker/lead routes, account restrictions, consent, and Fable opt-in remain unchanged.
+
+Native Stop bookkeeping faults end the host turn quietly while preserving unresolved evidence and withholding completion credit. Actual unfinished work can request one recovery attempt per user turn; repeated Stop cannot trap the session in a loop. Routing, tool admission, native ownership and completion proof remain guarded. Ending a chat turn never means an unfinished Symphony run completed or was abandoned.
+
+Optional diagnostic sharing collects only version/provider/OS, recovery category/outcome, UTC day and counts locally. When `gh` has access, the plugin offers one nonblocking confirmation to open a **public issue in `opennoor/symphony` using your named GitHub account**. Counters accumulate while you decide. Only actual approval submits the sanitized snapshot as JSON in the issue body; raw logs, task text, paths and project/session IDs stay private. Missing access, silence, decline and submission failure do not pause work. See [diagnostic sharing](plugins/symphony/skills/symphony/references/diagnostic-sharing.md).
 
 Symphony assumes the session root runs at the economy tier: it exists to route work to a right-sized lead, so a root that is already the strongest model pays for an assessor and a lead on top of itself. Set the root model to the cheapest capable option before enabling.
 
@@ -76,6 +82,10 @@ Symphony assumes the session root runs at the economy tier: it exists to route w
 `enable` governs future substantive prompts in the current project, including new sessions and resumes, until `disable` is used. In Codex, a prompt containing only `enable` also invokes this control. Independent root sessions in the same project keep separate runs and agents. Controls and deterministic trivial tasks do not trigger assessment. `bypass` runs one task outside Symphony without changing enablement or mutating an active run.
 
 `stop` ends only the current root session's run and keeps project enablement. `stop --force` records an explicit interruption of that run when a safe stop cannot be completed. `disable` turns off future automatic governance project-wide and gracefully stops the current session's run; other sessions' live runs continue. Uninstalling removes plugin execution but does not rewrite the project or silently finish active work; disable first when possible.
+
+While disabled, ordinary untracked root agents run outside Symphony. Their callbacks are preserved privately under `~/.symphony/state/unmanaged-callbacks/` and do not create a managed run or block Stop. If that archive cannot be written, `unmanaged-recovery/` retains the callback without using the managed inbox or its report-size limit. This records an observation, not successful completion. Live managed runs, tracked children, reserved Symphony roles, pending admissions, and unresolved foreign ownership remain guarded.
+
+Acknowledged full callback copies are limited to the newest reports that fit within 100 files and 16 MiB per provider, root project, session, and generation. Pending evidence is never pruned. Small content-hash observation facts remain for the session's resumable lifetime, so retention cannot make an old callback complete a later run or block a retry after re-enabling. Native transcripts are not changed.
 
 ## Guarded execution
 
@@ -163,7 +173,7 @@ Symphony 1.0 imports project enablement and user configuration only. Incompatibl
 
 Version 1.4.7 stores concurrent runs in a separate v2 state file. On first use it copies a readable v1 project state, including a live run, without changing the v1 file. Already-running 1.4.6 hooks may continue updating v1 while new hooks update v2; those two versions do not synchronize run completion. Let older sessions finish and reload the plugin before relying on migrated completion status. A new session cannot force-stop an older session's run.
 
-Symphony stores only lifecycle facts: identities, roles, requested tier and effort, classification, status and timestamps, plus a short objective label. Prompts, agent messages, spawn packets and transcript paths are never written to disk.
+Managed run records store lifecycle facts: identities, roles, requested tier and effort, classification, status, timestamps, and short objective labels. Recovery inboxes and private unmanaged-callback archives also preserve normalized provider payloads, which can include agent reports, transcript paths, and future provider fields. Credential keys and recognizable secret strings are redacted before storage; arbitrary opaque secrets cannot always be recognized. Callback archives use the retention limits described above. Native transcripts remain in their provider's own storage and are not copied into document memory.
 
 ## Develop and verify
 

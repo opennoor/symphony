@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from plugins.symphony.symphony.adapters import HookResult, event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony import runtime as runtime_module
-from plugins.symphony.symphony.runtime import compact_delegations, format_delegation, handle
+from plugins.symphony.symphony.runtime import compact_delegations, format_delegation, _handle_core as handle
 from plugins.symphony.symphony.routing import Assessment, MATRIX, profiles_for, resolve_tier, route_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore, project_key
 

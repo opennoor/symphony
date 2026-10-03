@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from plugins.symphony.symphony.host_evidence import codex_unmanaged_pre_run_terminal
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState, persistable
-from plugins.symphony.symphony.runtime import _dispose_unmanaged_pre_run_terminal, _terminal_result_id, handle
+# Strict ownership/credit reducer; public host-turn liveness has separate tests.
+from plugins.symphony.symphony.runtime import _dispose_unmanaged_pre_run_terminal, _terminal_result_id, _handle_core as handle
 from plugins.symphony.symphony.store import StateStore
 
 

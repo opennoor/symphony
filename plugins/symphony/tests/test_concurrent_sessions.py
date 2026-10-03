@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 from plugins.symphony.symphony import runtime as runtime_module
 from plugins.symphony.symphony.model import Action, Delegation, ProjectState, RunState
-from plugins.symphony.symphony.runtime import handle
+from plugins.symphony.symphony.runtime import _handle_core as handle
 from plugins.symphony.symphony.routing import profiles_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
 

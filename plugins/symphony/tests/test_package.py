@@ -144,6 +144,7 @@ class PackageContractTests(unittest.TestCase):
                 self.assertEqual(tokens.count('SYMPHONY_CAPTURED_BOOTSTRAP=' + bootstrap() + ';'), 1)
                 command = next(token for token in tokens if token.startswith('iex '))
                 provider = 'claude'
+            self.assertIn('[IO.Compression.CompressionMode]0', command)
             payload = base64.b64decode(re.search(r"FromBase64String\('([^']+)'", command)[1])
             binding = "$b = [Environment]::GetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP')"
             expected = relay.replace("$b = '__SYMPHONY_BOOTSTRAP__'", binding).replace('__SYMPHONY_PROVIDER__', provider).encode()
@@ -277,10 +278,27 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn('$end=[DateTime]::UtcNow.AddSeconds(4)', source)
         self.assertEqual(source.count('-I -X utf8 -c'), 2)
         for manifest in ('hooks/codex.json', 'hooks/hooks.json'):
-            for groups in load_json(manifest)['hooks'].values():
+            for event, groups in load_json(manifest)['hooks'].items():
                 for group in groups:
                     for hook in group['hooks']:
-                        self.assertGreaterEqual(hook['timeout'], 20, manifest)
+                        if manifest == 'hooks/codex.json' and event == 'Interrupt':
+                            self.assertEqual(3, hook['timeout'])
+                        else:
+                            self.assertGreaterEqual(hook['timeout'], 20, manifest)
+
+    def test_generated_codex_interrupt_timeout_respects_host_limit_without_changing_other_events(self):
+        from plugins.symphony.scripts.generate_hooks import generated
+        for path, text in generated().items():
+            original = json.loads(path.read_text())
+            result = json.loads(text)
+            for event, groups in result['hooks'].items():
+                for group_index, group in enumerate(groups):
+                    for hook_index, hook in enumerate(group['hooks']):
+                        before = original['hooks'][event][group_index]['hooks'][hook_index]
+                        if path.name == 'codex.json' and event == 'Interrupt':
+                            self.assertEqual(3, hook['timeout'])
+                        else:
+                            self.assertEqual(before['timeout'], hook['timeout'])
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries(self):

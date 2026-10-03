@@ -14,7 +14,7 @@ from plugins.symphony.symphony.host_evidence import (
 )
 from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.runtime import _observe_delegation, handle
+from plugins.symphony.symphony.runtime import _observe_delegation, _handle_core as handle
 from plugins.symphony.symphony.store import StateStore
 
 
@@ -188,7 +188,7 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                          "message": {"content": "Do more work."}})
         self.child.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    def prepare_archived_followup(self, *, with_start=False, promptless=False):
+    def prepare_archived_followup(self, *, with_start=False, promptless=False, report_suffix=''):
         self.environ["SYMPHONY_PROVIDER"] = "claude"
         self.write_root_prompt()
         archived = replace(self.run, status="completed", owner_generation=7,
@@ -211,7 +211,7 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                                       "content": "Agent completed", "is_error": False}]}},
         ])
         self.parent.write_text("".join(json.dumps(row) + "\n" for row in parent))
-        report = REPORT + "\nNew result."
+        report = REPORT + "\nNew result." + report_suffix
         child = [json.loads(line) for line in self.child.read_text().splitlines()]
         child.extend([
             {"type": "user", "uuid": "prompt-two", "sessionId": SESSION, "agentId": LEAD,
@@ -234,6 +234,33 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                     "last_assistant_message": report}
         self.store.queue_session_event("claude", SESSION, event_from_payload("claude", terminal), ambiguous_owner=True)
         return archived, terminal
+
+    def test_archived_claude_redacted_callback_matches_only_the_same_native_report(self):
+        for mismatch in (False, True):
+            with self.subTest(mismatch=mismatch):
+                self.setUp()
+                credential = 'ghp_' + 'b' * 36
+                archived, _ = self.prepare_archived_followup(
+                    report_suffix='\nDiagnostic credential: ' + credential)
+                record = self.store.session_record('claude', SESSION)
+                self.assertNotIn(credential, json.dumps(record['pending']))
+                self.assertIn('[REDACTED]', json.dumps(record['pending']))
+                if mismatch:
+                    report = record['pending'][0]['payload']['last_assistant_message']
+                    record['pending'][0]['payload']['last_assistant_message'] = report.replace(
+                        'New result.', 'Changed result.')
+                    self.store._write_json(self.store._session_path('claude', SESSION), record)
+                result = handle({'cwd': str(self.project), 'session_id': SESSION,
+                                 'hook_event_name': 'Stop'}, self.environ)
+                state = self.store.load(self.project)
+                if mismatch:
+                    self.assertIn('"decision": "block"', result.stdout)
+                    self.assertEqual((archived,), state.recent_runs)
+                    self.assertEqual(1, len(self.store.session_record('claude', SESSION)['pending']))
+                else:
+                    self.assertNotIn('"decision": "block"', result.stdout)
+                    self.assertEqual([], self.store.session_record('claude', SESSION)['pending'])
+                    self.assertIn('prompt_id:prompt-two', state.recent_runs[0].assessment['_terminal_turns'][LEAD])
 
     def test_archived_claude_resume_reconciles_through_root_hooks_and_replays(self):
         for event, promptless in ((event, promptless) for event in
