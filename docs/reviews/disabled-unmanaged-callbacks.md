@@ -85,19 +85,18 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
   public `opennoor/symphony` repository, authenticated account, allowed fields
   and accumulation window. Silence, decline, unrelated task authorization,
   documents and child messages cannot approve publication.
-- Actual matching native user replies or explicit root report controls bind
-  approval to the proposed account and originating provider/session. The isolated
-  reply relay handles hosts that do not pass nonblocking replies through hooks.
-  It verifies the exact reply against a native root user-message row after the
-  offer, using the host location captured by the trusted hook. Fabricated stdin,
-  tool/assistant/document text and sidechain rows cannot approve sharing. Missing
-  proof leaves the optional explicit user command available. A changed login
-  requires fresh approval.
+- Matching replies delivered through trusted native user-prompt hooks or explicit
+  user-entered root report controls bind approval to the proposed account and
+  originating provider/session. Writable transcripts cannot authenticate consent;
+  the tool relay was removed. Hosts that omit the hook for a nonblocking reply
+  keep reports local and leave the optional explicit user command available.
+  Forged transcripts and tool/assistant/document/child text cannot approve sharing.
+  A changed login requires fresh approval.
 - Approval freezes the accumulated allowlisted snapshot. Publication revalidates
   every field and the fixed destination. A lost worker launch retains consent;
   a lost create response is recovered through its exact random issue marker.
   An uncertain create is not repeated, preventing duplicate public issues.
-- Background workers and reply relays use isolated absolute Python with bytecode
+- Background workers use isolated absolute Python with bytecode
   writes disabled, preserving the digest-verified retained runtime. Reporting
   failures leave the task's routing result and all managed state unchanged.
 
@@ -115,9 +114,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 893 deterministic tests (seven platform skips) in
-153.923 seconds, the 182-test local Windows acceptance selection (six Windows-only
-skips) in 91.317 seconds, and all 10 installed-package scenarios. Both local suites
+The frozen candidate passed 898 deterministic tests (seven platform skips) in
+154.964 seconds, the 187-test local Windows acceptance selection (six Windows-only
+skips) in 92.996 seconds, and all 10 installed-package scenarios. Both local suites
 include 20 parallel first-pin rounds. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
@@ -151,10 +150,10 @@ leaving user repositories untouched even when GitHub client state variables
 are absent. Final exact-head review and release gates remain required.
 
 The subsequent exact-head review found that tool stdin alone could fabricate
-consent and that child prompts reset the root Stop allowance. The relay now
-requires the exact native root user row, a timestamp after the offer and the
-hook-captured host location. Actual isolated relay tests cover both providers;
-forged stdin and tool/assistant/document/child/old-message sources are rejected.
+consent and that child prompts reset the root Stop allowance. An intermediate
+relay required the native root user row and hook-captured host location; later
+review rejected that proof because the transcript is writable. The relay was
+removed rather than treating writable files as authenticated consent.
 Stop resets and report controls share the root-origin and durable alias check.
 Both providers reject child metadata and bound aliases without re-arming Stop.
 
@@ -196,3 +195,20 @@ precedence for every subsequent network call. The account-switch regression fail
 before the fix and now proves verification/search/create retain the consented
 account after the default login changes. Fake credentials are used in all unit
 tests, including invalid-output cases; no local token is read or persisted.
+
+The latest review identified two more lifecycle boundaries. Persisted callbacks
+are credential-redacted while native transcripts retain the original report;
+comparison now applies the same redaction to both sides. Native launch, identity,
+route and native-to-native handoff proof remain exact. Codex fresh-worker and
+Claude archived-lead regressions cover token-bearing reports and retain denial
+for changed ordinary report text. Disabled Claude governance now recognizes
+Explore, Plan and custom nonreserved agent types as ordinary work under the same
+strict scope and no-ownership checks. Reserved Symphony agents remain pending.
+
+The colleague's latest report exposed Codex's invalid Interrupt timeout of 20
+seconds. [Official hook documentation](https://learn.chatgpt.com/docs/hooks#config-shape)
+sets the maximum at three. The generator now enforces three for Codex Interrupt
+only. A failing-before/passing-after regression checks that all other event and
+provider timeouts stay unchanged. Both Windows acceptance modes select that
+regression; native Restricted PowerShell checks also time repeated Interrupt
+execution against the three-second limit.

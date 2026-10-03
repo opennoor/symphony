@@ -95,6 +95,27 @@ class DisabledUnmanagedCallbackTests(unittest.TestCase):
         self.assertEqual(len(self.store.session_record('codex', self.session)['pending']), 2)
         self.assertEqual(self.archives(), [])
 
+    def test_disabled_claude_builtin_and_custom_types_remain_unmanaged(self):
+        for agent_type in ('Explore', 'Plan', 'custom-security-review'):
+            with self.subTest(agent_type=agent_type):
+                self.bind(provider='claude')
+                terminal = replace(self.events[0], event_id='ordinary-' + agent_type,
+                    payload={**self.events[0].payload, 'provider': 'claude', 'agent_type': agent_type})
+                self.queue((terminal,), 'claude')
+                self.assertNotIn('"decision": "block"', self.hook(provider='claude').stdout)
+                self.assertEqual([], self.store.session_record('claude', self.session)['pending'])
+                self.assertFalse(self.store.load(self.project).terminal_receipts)
+                self.assertTrue(any(item['event']['event_id'] == terminal.event_id for item in self.archives()))
+
+    def test_disabled_claude_reserved_type_keeps_original_evidence_pending(self):
+        self.bind(provider='claude')
+        terminal = replace(self.events[0], payload={**self.events[0].payload,
+            'provider': 'claude', 'agent_type': 'symphony:symphony-worker'})
+        self.queue((terminal,), 'claude')
+        self.assertIn('"decision": "block"', self.hook(provider='claude').stdout)
+        self.assertEqual(1, len(self.store.session_record('claude', self.session)['pending']))
+        self.assertEqual([], self.archives())
+
     def test_managed_role_or_identity_or_live_run_is_never_exempted(self):
         identity = self.events[0].payload['agent_id']
         run = RunState('run', 'managed task', 'working', session_id=self.session,

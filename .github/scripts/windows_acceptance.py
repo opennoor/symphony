@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 TESTS = (
+    "plugins.symphony.tests.test_package.PackageContractTests.test_generated_codex_interrupt_timeout_respects_host_limit_without_changing_other_events",
     "plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_relay_accepts_a_slow_working_interpreter_probe",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries",
@@ -30,6 +31,7 @@ TESTS = (
     "plugins.symphony.tests.test_concurrent_sessions",
     "plugins.symphony.tests.test_disabled_unmanaged_callbacks",
     "plugins.symphony.tests.test_archived_followup_workers",
+    "plugins.symphony.tests.test_claude_host_evidence.ClaudeHostEvidenceTests.test_archived_claude_redacted_callback_matches_only_the_same_native_report",
     "plugins.symphony.tests.test_stop_recovery_boundary",
     "plugins.symphony.tests.test_diagnostic_reporting",
     "plugins.symphony.tests.test_package_smoke.PackageSmokeTests.test_windows_claude_smoke_uses_git_bash_and_environment_root",

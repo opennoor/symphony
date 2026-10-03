@@ -79,12 +79,15 @@ def generated(root=PLUGIN):
             # Reserve room for Bash's native invocation and escaped quotes.
             if len(command) + 256 > 8170:
                 raise ValueError("Claude hook launcher exceeds the Windows native command limit")
-        for groups in document["hooks"].values():
+        for event, groups in document["hooks"].items():
             for group in groups:
                 for hook in group["hooks"]:
                     hook["command"] = command
                     if provider == "codex":
                         hook["commandWindows"] = windows
+                        if event == 'Interrupt':
+                            # Codex caps shutdown hooks at three seconds.
+                            hook['timeout'] = 3
         documents[path] = json.dumps(document, indent=2) + "\n"
     return documents
 

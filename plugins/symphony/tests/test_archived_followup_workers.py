@@ -78,6 +78,33 @@ class ArchivedFollowupWorkerTests(unittest.TestCase):
                 self.assertEqual(self.state.recent_runs[0].run_id, run.run_id)
                 self.assertEqual(5, len(run.delegations))
 
+    def test_redacted_worker_callback_matches_its_complete_native_report(self):
+        original = self.events[1].payload['last_assistant_message']
+        credential = 'ghp_' + 'a' * 36
+        report = original + '\nDiagnostic credential: ' + credential
+        def substitute(value):
+            if isinstance(value, dict):
+                return {key: substitute(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [substitute(item) for item in value]
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (ValueError, TypeError):
+                    return value.replace(original, report)
+                return json.dumps(substitute(parsed)) if isinstance(parsed, (dict, list)) else value.replace(original, report)
+            return value
+        for path in self.paths.values():
+            rows = substitute([json.loads(line) for line in path.read_text().splitlines()])
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.queue(tuple(replace(event, payload=substitute(event.payload)) for event in self.events))
+        pending = self.store.session_record('codex', self.root)['pending']
+        self.assertNotIn(credential, json.dumps(pending))
+        self.assertIn('[REDACTED]', json.dumps(pending))
+        self.assertNotIn('"decision": "block"', self.stop().stdout)
+        self.assertEqual([], self.store.session_record('codex', self.root)['pending'])
+        self.assertEqual('completed', self.store.load(self.project).recent_runs[0].status)
+
     def test_missing_lead_callbacks_use_native_root_delivery_without_inventing_worker_results(self):
         self.queue(self.events[:2])
         self.assertNotIn('"decision": "block"', self.stop().stdout)

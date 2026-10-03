@@ -2,6 +2,7 @@
 
 ## 1.7.5 — prepared 2026-10-03
 
+- Correct Codex's generated Interrupt timeout to its supported three-second limit while preserving every other provider/event timeout.
 - End native Stop bookkeeping faults quietly without acknowledging unresolved callbacks or granting completion credit. Bound storage-lock waits and incomplete-work Stop retries per actual user turn. Keep independent retained records from holding a proven current completion; retain native ownership, routing and admission guards.
 - Add optional background GitHub diagnostic issues after local access checks and scoped user confirmation. Accumulate allowlisted version/provider/OS/recovery counters while awaiting consent, publish only the approved snapshot, and recover lost submission responses without duplicate issues. Missing access or consent never blocks work; raw evidence remains private.
 - Reconcile completed Codex follow-up sequences after an archived diagnostic run, including fresh substantive workers and multiple lead turns. Require each root delivery, original child launch, exact native result, and lead handoff; preserve newer runs and foreign roots. Commit source witnesses before inbox acknowledgment so crashes and delayed retries cannot duplicate credit.

@@ -1201,8 +1201,8 @@ def _outside_disabled_governance(
             or not isinstance(identity, str) or not identity or identity == session
             or parent not in ({session} if provider == 'codex' else {None, '', session})
             or _observed_role(payload) or _fast_spawn(payload)
-            or payload.get('agent_type') not in ({'default'} if provider == 'codex'
-                                               else {'general-purpose'})
+            or not isinstance(payload.get('agent_type'), str) or not payload['agent_type'].strip()
+            or provider == 'codex' and payload['agent_type'] != 'default'
             or any(isinstance(payload.get(key), str) and 'SYMPHONY_' in payload[key]
                    for key in ('task_name', 'task', 'objective', 'last_assistant_message'))):
         return False
