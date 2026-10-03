@@ -245,6 +245,7 @@ class DiagnosticReportingTests(unittest.TestCase):
             d.launch_worker(self.store, 'probe', {})
         self.assertEqual(d.sys.executable, launch.call_args.args[0][0])
         self.assertIn('-B', launch.call_args.args[0])
+        self.assertEqual(self.store.root.resolve(), launch.call_args.kwargs['cwd'])
         self.assertNotIn('shell', launch.call_args.kwargs)
         self.assertEqual(subprocess.DEVNULL, launch.call_args.kwargs['stdout'])
         self.assertEqual(subprocess.DEVNULL, launch.call_args.kwargs['stderr'])

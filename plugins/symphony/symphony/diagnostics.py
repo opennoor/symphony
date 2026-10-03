@@ -88,7 +88,8 @@ def launch_worker(store: StateStore, mode: str, environ: Mapping[str, str]) -> N
     options = {'start_new_session': True} if os.name != 'nt' else {
         'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
     subprocess.Popen([sys.executable, '-I', '-B', '-c', code, str(Path(__file__).resolve().parents[1]),
-                      str(store.root), mode], env=dict(environ), stdin=subprocess.DEVNULL,
+                      str(store.root.resolve()), mode], cwd=store.root.resolve(),
+                     env=dict(environ), stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **options)
 
 
@@ -102,7 +103,7 @@ def question(record: dict) -> str:
 
 def _relay_command(store: StateStore, provider: str, session: str) -> str:
     arguments = [sys.executable, '-I', '-B', str(Path(__file__).resolve()), '--relay-reply',
-                 '--provider', provider, '--session', session, '--state-dir', str(store.root)]
+                 '--provider', provider, '--session', session, '--state-dir', str(store.root.resolve())]
     if os.name == 'nt':
         return '& ' + ' '.join("'" + value.replace("'", "''") + "'" for value in arguments)
     return shlex.join(arguments)
