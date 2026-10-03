@@ -32,9 +32,7 @@ if($c.Name -eq 'py.exe') {$a='-3 '+$a}
 $q=[Diagnostics.ProcessStartInfo]::new($c.Source,$a)
 $q.UseShellExecute=$false
 $q.StandardOutputEncoding=[Text.Encoding]::UTF8
-$q.RedirectStandardInput=$true
-$q.RedirectStandardOutput=$true
-$q.RedirectStandardError=$true
+$q.RedirectStandardInput=$q.RedirectStandardOutput=$q.RedirectStandardError=$true
 $p=[Diagnostics.Process]::Start($q)
 $p.StandardInput.Close()
 if(-not $p.WaitForExit([Math]::Min(2500,$ms))) {$w=$c.Source+': probe timed out';try {$p.Kill()} catch {};continue}
@@ -46,9 +44,7 @@ $w=$c.Source+': probe exit '+$p.ExitCode
 if(-not $py) {[Console]::Error.WriteLine('Symphony pending activation: no working Python 3.10+ on PATH;'+$w);exit 1}
 $i=[Diagnostics.ProcessStartInfo]::new($py,'-I -X utf8 -c "'+$b+'" "'+$root+'" '+$v)
 $i.UseShellExecute=$false
-$i.RedirectStandardInput=$true
-$i.RedirectStandardOutput=$true
-$i.RedirectStandardError=$true
+$i.RedirectStandardInput=$i.RedirectStandardOutput=$i.RedirectStandardError=$true
 try {
 $p=[Diagnostics.Process]::Start($i)
 } catch {
