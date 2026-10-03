@@ -26,6 +26,7 @@ TESTS = (
     "plugins.symphony.tests.test_store.StateStoreTests.test_new_duplicate_owner_after_prior_lookup_is_not_hidden",
     "plugins.symphony.tests.test_store.StateStoreTests.test_snapshot_scan_and_atomic_replace_remain_compatible",
     "plugins.symphony.tests.test_store.StateStoreTests.test_credential_value_and_container_suffixes_are_redacted_but_numeric_counts_survive",
+    "plugins.symphony.tests.test_store.StateStoreTests.test_generic_token_fields_redact_every_non_count_value",
     "plugins.symphony.tests.test_concurrent_sessions",
     "plugins.symphony.tests.test_disabled_unmanaged_callbacks",
     "plugins.symphony.tests.test_archived_followup_workers",

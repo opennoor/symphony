@@ -115,9 +115,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 890 deterministic tests (seven platform skips) in
-154.236 seconds, the 179-test local Windows acceptance selection (six Windows-only
-skips) in 93.052 seconds, and all 10 installed-package scenarios. Both local suites
+The frozen candidate passed 891 deterministic tests (seven platform skips) in
+157.307 seconds, the 180-test local Windows acceptance selection (six Windows-only
+skips) in 92.198 seconds, and all 10 installed-package scenarios. Both local suites
 include 20 parallel first-pin rounds. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
@@ -180,3 +180,11 @@ aggregate pruning could remove a file between listing and metadata inspection.
 The existing per-record OSError guard now covers metadata checks as well as
 reading. A failing-before/passing-after regression verifies approval is retained
 and other valid counters are frozen when one selected aggregate disappears.
+
+The following review found generic token containers and nonnumeric token counts
+still escaped that rule. The redactor now recognizes every normalized token word
+and every existing credential-key phrase regardless of position. Only nonnegative
+integer count fields are exempt. The regression covers singular/plural/provider
+token names with string, object, array, null, boolean, negative and floating-point
+values, plus valid zero/positive counts. All 28 previously failing cases now pass;
+the regression is also in both Windows release acceptance modes.

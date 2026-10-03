@@ -613,6 +613,19 @@ with Path(sys.argv[1]).open('a+b') as handle:
             self.assertEqual(count, saved[name], name)
         self.assertEqual('harmless-provider-value', saved['monkeyValue'])
 
+    def test_generic_token_fields_redact_every_non_count_value(self):
+        for name in ('tokenCount', 'tokenBundle', 'tokensByAccount', 'vendorTokenMaterial'):
+            for value in ('opaque-token-credential', {'opaque': 'opaque-token-credential'},
+                          ['opaque-token-credential'], None, True, -1, 1.5):
+                with self.subTest(name=name, value=value):
+                    self.store.save(self.project, ProjectState(configuration={name: value,
+                        'token_count': 0, 'tokens_count': 42, 'ordinary': 'safe'}))
+                    saved = self.store.load(self.project).configuration
+                    self.assertEqual('[REDACTED]', saved[name])
+                    self.assertEqual(0, saved['token_count'])
+                    self.assertEqual(42, saved['tokens_count'])
+                    self.assertEqual('safe', saved['ordinary'])
+
 
 if __name__ == "__main__":
     unittest.main()

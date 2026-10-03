@@ -355,14 +355,12 @@ def _redact(value: Any, key: str = "") -> Any:
     # A numeric count is metadata, never a credential container or value.
     if normalized.endswith(('_count', '_counts')) and type(value) is int and value >= 0:
         return value
-    if (any(normalized == secret or normalized.endswith('_' + secret) for secret in _SECRET_KEYS)
+    phrased = '_' + normalized + '_'
+    if (any('_' + secret + '_' in phrased for secret in _SECRET_KEYS)
             or words & {'password', 'passwords', 'passwd', 'secret', 'secrets', 'authorization',
                         'credential', 'credentials', 'cookie', 'cookies', 'passphrase', 'passphrases',
-                        'apikey', 'apikeys', 'pwd'}
-            or (words & {'key', 'keys'} and bool(words & {'api', 'private', 'encryption'}))
-            or (words & {'token', 'tokens'} and bool(words & {'auth', 'access', 'refresh'}))
-            or normalized in {'auth', 'authentication'}
-            or ('token' in words and 'value' in words)):
+                        'apikey', 'apikeys', 'pwd', 'token', 'tokens', 'auth', 'authentication'}
+            or (words & {'key', 'keys'} and bool(words & {'api', 'private', 'encryption'}))):
         return "[REDACTED]"
     if isinstance(value, str):
         return redact_secrets(value)
