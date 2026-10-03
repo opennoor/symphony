@@ -123,6 +123,23 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.store.record_recovery_diagnostic(self.report)
         self.assertEqual(3, sum(item['occurrences'] for item in d._read(self.store)['reports']))
 
+    def test_concurrent_counter_pruning_does_not_lose_approval_or_other_reports(self):
+        record = self.offered()
+        self.store.record_recovery_diagnostic({**self.report, 'provider': 'claude', 'platform': 'windows'})
+        pruned = next(path for path in (self.store.root / 'diagnostics').glob('*.json')
+                      if json.loads(path.read_text())['provider'] == 'codex')
+        original_stat = Path.stat
+        def stat(path, *args, **kwargs):
+            if path == pruned:
+                raise FileNotFoundError('concurrently pruned')
+            return original_stat(path, *args, **kwargs)
+        with patch.object(Path, 'stat', stat):
+            result = d.control(self.store, 'submit ' + record['id'], 'codex', 'root', self.env)
+        self.assertIn('Sharing approved', result)
+        approved = d._read(self.store)
+        self.assertEqual('approved', approved['phase'])
+        self.assertEqual(['claude'], [item['provider'] for item in approved['reports']])
+
     def test_decline_or_other_session_cannot_publish(self):
         record = self.offered()
         self.assertIn('does not belong', d.control(self.store, 'submit ' + record['id'], 'codex', 'other', self.env))

@@ -51,9 +51,9 @@ def snapshot(store: StateStore) -> list[dict]:
     """Revalidate every field before it can enter a public issue."""
     reports = []
     for path in sorted((store.root / 'diagnostics').glob('*.json'))[:100]:
-        if path.is_symlink() or path.stat().st_size > 2048:
-            continue
         try:
+            if path.is_symlink() or path.stat().st_size > 2048:
+                continue
             item = json.loads(path.read_text())
             if not _valid_report(item):
                 continue

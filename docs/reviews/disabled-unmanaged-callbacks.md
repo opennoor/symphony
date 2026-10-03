@@ -115,9 +115,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 889 deterministic tests (seven platform skips) in
-154.047 seconds, the 178-test local Windows acceptance selection (six Windows-only
-skips) in 91.983 seconds, and all 10 installed-package scenarios. Both local suites
+The frozen candidate passed 890 deterministic tests (seven platform skips) in
+154.236 seconds, the 179-test local Windows acceptance selection (six Windows-only
+skips) in 93.052 seconds, and all 10 installed-package scenarios. Both local suites
 include 20 parallel first-pin rounds. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
@@ -174,3 +174,9 @@ the Python runtime; Linux verification passed. The launcher now uses an explicit
 CompressionMode cast, and both provider command tests require it. Native command
 length checks and 20 parallel first-pin rounds pass locally. The failed candidate
 is not merged or published; all release gates must rerun on the corrected SHA.
+
+Copilot confirmed the credential fix and identified a reporting snapshot race:
+aggregate pruning could remove a file between listing and metadata inspection.
+The existing per-record OSError guard now covers metadata checks as well as
+reading. A failing-before/passing-after regression verifies approval is retained
+and other valid counters are frozen when one selected aggregate disappears.
