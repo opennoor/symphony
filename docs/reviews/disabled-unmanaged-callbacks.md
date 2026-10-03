@@ -51,7 +51,7 @@ unresolved managed results continue to require their native ownership evidence.
 - Real generated, installed hook commands passed the new regression for both
   providers. Codex parent/name/model metadata came from a native child fixture;
   the fixture was unchanged afterward.
-- Final unit suite for the corrected 1.7.5 candidate: 834 tests passed, seven
+- Unit suite before the additional archived-run fix: 834 tests passed, seven
   platform-dependent skips, 209.597 seconds. The expanded acceptance selection
   passed 124 tests locally with six Windows-specific skips.
   A temporary runner used the installed PowerShell binary directly because Snap
@@ -61,7 +61,7 @@ unresolved managed results continue to require their native ownership evidence.
 - All ten offline installed-package lifecycle scenarios passed. Generated hook
   freshness and `git diff --check` passed.
 
-No AI API calls, native AI inference, or CI tests were used. These are local
+No AI API calls or native AI inference were used. Development validation used local
 Linux tests with real PowerShell and synthetic provider lifecycle fixtures plus
 the captured macOS replay; they are not live macOS or Windows client tests.
 No new version has been published.
@@ -145,3 +145,45 @@ Existing inbox count and size limits remain enforced. A regression queues both
 provider formats, verifies full fields in durable pending storage, acknowledges
 and prunes the unmanaged report, enables Symphony, and retries through the live
 provider hook. The retry matches its original observation and does not block.
+
+## Additional archived-run incident
+
+Before publication, session `01a101b2-e6f0-7161-a8e0-a55845e50c12`
+provided a second, locally available failure. Its completed diagnostic lead was
+explicitly resumed twice. The first continuation launched a fresh substantive
+worker; the second supplied its completion outcome. Four callbacks remained
+ambiguous because the old recovery accepted only one lead turn and no workers.
+A subsequent recovery run had already opened in the same root session.
+
+An isolated replay of the original native files and durable state reproduced
+all four pending records. The new sequence proof binds each lead turn to its
+successful root follow-up and verifies the original child spawn, route, exact
+native result and parent delivery. The ordinary lifecycle reducer admits the
+worker and validates substantive completion chronology before historical Stop.
+The original run is reconciled without changing a newer run or any foreign
+root, and callback hashes are committed before inbox acknowledgment. Exact
+retries therefore survive an ACK failure; changed reports remain held.
+
+Eleven new regression methods cover the sanitized captured sequence, newer and
+foreign runs, malformed ownership/route/result/turn/name/type, generations,
+missing worker callbacks, missing native spawn or handoff, failed root delivery,
+changed retries and commit-before-ACK failure. Every callback arrival permutation
+and incomplete worker callback subset is exercised, including omitted lead
+callbacks whose native root deliveries still supply exact ownership proof. The suite is included in the
+Windows release acceptance selection. The original project and native files
+were read only; all replay writes were made in temporary storage.
+
+The author's manual review additionally checked that partial callback batches
+cannot inherit historical worker credit, a failed proof commits no speculative
+state, and historical replay cannot supply an outcome to the newer recovery
+run. That newer run still requires its own lead outcome. Native delivery tags
+may be logged just after the child starts; sequence proof accepts this only
+when the exact root call, successful response and completed child turn bound
+the delivery. The existing single-turn proof keeps its stricter ordering.
+
+Final local validation after the added sequence and ordering cases: 845 tests
+passed (seven platform skips) in 137.559 seconds; the expanded 135-test release
+acceptance selection passed locally (six Windows-only skips) in 75.801 seconds.
+All ten installed-package scenarios passed for Codex and Claude. These used no
+AI API calls. Actual Windows and Linux release CI must validate this exact final
+candidate before merge and publication.

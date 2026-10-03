@@ -167,7 +167,7 @@ Symphony 1.0 imports project enablement and user configuration only. Incompatibl
 
 Version 1.4.7 stores concurrent runs in a separate v2 state file. On first use it copies a readable v1 project state, including a live run, without changing the v1 file. Already-running 1.4.6 hooks may continue updating v1 while new hooks update v2; those two versions do not synchronize run completion. Let older sessions finish and reload the plugin before relying on migrated completion status. A new session cannot force-stop an older session's run.
 
-Symphony stores only lifecycle facts: identities, roles, requested tier and effort, classification, status and timestamps, plus a short objective label. Prompts, agent messages, spawn packets and transcript paths are never written to disk.
+Managed run records store lifecycle facts: identities, roles, requested tier and effort, classification, status, timestamps, and short objective labels. Recovery inboxes and private unmanaged-callback archives also preserve normalized provider payloads, which can include agent reports, transcript paths, and future provider fields. Credential keys and recognizable secret strings are redacted before storage; arbitrary opaque secrets cannot always be recognized. Callback archives use the retention limits described above. Native transcripts remain in their provider's own storage and are not copied into document memory.
 
 ## Develop and verify
 

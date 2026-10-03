@@ -26,6 +26,7 @@ from .host_evidence import (
     claude_current_native_lead_event, claude_recovered_lead_event,
     claude_substantive_launch,
     codex_substantive_launch,
+    codex_archived_followup_sequence,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
     codex_unmanaged_pre_run_terminal,
@@ -345,6 +346,34 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         batch = [(event, event_generation, False) for event, event_generation in pending]
         if lifecycle_source:
             batch.append((source, generation, True))
+        if provider == 'codex' and session:
+            retained = []
+            for event, epoch, current in batch:
+                if (epoch == generation and event.payload.get('agent_id') not in retired
+                        and _committed_codex_followup_source(state, event, session, generation)):
+                    if not current:
+                        acknowledged.add(event.event_id)
+                else:
+                    retained.append((event, epoch, current))
+            batch = retained
+        if provider == 'codex' and session and batch and all(
+                epoch == generation and (event.payload.get('agent_id') or event.payload.get('subagent_id'))
+                not in retired for event, epoch, _ in batch):
+            try:
+                historical = codex_archived_followup_sequence(
+                    state, tuple(event for event, _, _ in batch), session, generation,
+                    Path(record['project'] or project) if record else project, environ)
+                if historical is not None:
+                    committed = _commit_codex_followup_sequence(
+                        state, historical, session, dispatch,
+                        Path(record['project'] or project) if record else project, environ,
+                        source.observed_at, tuple(event for event, _, _ in batch), generation)
+                    if committed is not None:
+                        state = committed
+                        acknowledged.update(event.event_id for event, _, current in batch if not current)
+                        batch = []
+            except (OSError, TypeError, ValueError, AttributeError, KeyError):
+                pass
         if provider == 'claude' and session:
             retained = []
             for event, epoch, current in batch:
@@ -2406,6 +2435,78 @@ def _commit_late_sendmessage_sources(state: ProjectState, sources: tuple[Event, 
                for source in sources):
         return None
     return candidate
+
+
+def _codex_followup_source_hash(source: Event) -> str:
+    payload = {key: value for key, value in source.payload.items()
+               if key not in {'_symphony_owner_conflict', '_symphony_verified_alias'}}
+    return hashlib.sha256(json.dumps({'kind': source.kind, 'payload': payload},
+                                     sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _committed_codex_followup_source(state: ProjectState, source: Event, session: str,
+                                     generation: int) -> bool:
+    if source.payload.get('provider') != 'codex' or source.payload.get('session_id') != session:
+        return False
+    digest = _codex_followup_source_hash(source)
+    return any(run.provider == 'codex' and run.session_id == session
+               and run.owner_generation == generation and any(
+                   isinstance(item, Mapping) and item.get('generation') == generation
+                   and item.get('hash') == digest
+                   for item in run.assessment.get('_codex_archived_followup_sources', ()))
+               for run in (*state.recent_runs, *state.active_runs.values()))
+
+
+def _commit_codex_followup_sequence(state: ProjectState, sequence: tuple, session: str, dispatch,
+                                   project: Path, environ: Mapping[str, str], committed_at: str,
+                                   sources: tuple[Event, ...], generation: int
+                                   ) -> ProjectState | None:
+    """Reduce proven historical work without transferring it to a newer run."""
+    archived, natives = sequence
+    boundary = _instant(committed_at)
+    if boundary is None or any(_instant(event.observed_at) is None
+                              or _instant(event.observed_at) > boundary
+                              for event in (*natives, *sources)):
+        return None
+    original = state
+    key = f'codex:{session}'
+    resumed = replace(archived, status='completing', outcome=None,
+                      assessment={**archived.assessment, '_batch_pending': True})
+    state = replace(state, active_run=resumed, active_runs={**state.active_runs, key: resumed},
+                    recent_runs=tuple(run for run in state.recent_runs if run != archived))
+    for event in natives:
+        state, _ = dispatch(state, replace(event, payload={**event.payload,
+                                                          '_symphony_owner_conflict': False}))
+        run = state.active_runs.get(key)
+        if not run or run.run_id != archived.run_id:
+            return None
+    run = state.active_runs[key]
+    if assessed_completion_chronology(replace(state, active_run=run), session, project, environ) != 'valid':
+        return None
+    run = replace(run, assessment={name: value for name, value in run.assessment.items()
+                                  if name != '_batch_pending'})
+    state = replace(state, active_run=run, active_runs={**state.active_runs, key: run})
+    # Historical work has all native results now; use the normal reducer to
+    # archive it. A later run, its admission and every foreign root stay intact.
+    state, _ = dispatch(state, Event(natives[-1].event_id + ':historical-stop', 'stop_requested',
+                                    committed_at, {'provider': 'codex', 'session_id': session,
+                                                   'cwd': str(project)}))
+    matches = [item for item in state.recent_runs if item.run_id == archived.run_id]
+    if key in state.active_runs or len(matches) != 1 or matches[0].status != 'completed':
+        return None
+    witnesses = tuple({'event_id': event.event_id, 'kind': event.kind,
+                       'generation': generation, 'hash': _codex_followup_source_hash(event)}
+                      for event in sources)
+    completed = replace(matches[0], assessment={**matches[0].assessment,
+        '_codex_archived_followup_sources': (*matches[0].assessment.get(
+            '_codex_archived_followup_sources', ()), *witnesses)})
+    state = replace(state, recent_runs=tuple(completed if run.run_id == completed.run_id else run
+                                            for run in state.recent_runs))
+    active = dict(state.active_runs)
+    if key in original.active_runs:
+        active[key] = original.active_runs[key]
+    return replace(state, active_run=original.active_run, active_runs=active,
+                   configuration=original.configuration)
 
 
 def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: tuple[Event, ...],

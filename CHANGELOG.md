@@ -2,6 +2,7 @@
 
 ## 1.7.5 — prepared 2026-10-03
 
+- Reconcile completed Codex follow-up sequences after an archived diagnostic run, including fresh substantive workers and multiple lead turns. Require each root delivery, original child launch, exact native result, and lead handoff; preserve newer runs and foreign roots. Commit source witnesses before inbox acknowledgment so crashes and delayed retries cannot duplicate credit.
 - Keep ordinary untracked child callbacks outside disabled Symphony governance on Codex and Claude. Preserve their evidence before acknowledgment without opening a run, granting completion credit, or blocking Stop. Live managed work, known identities, reserved roles, admission intents, foreign ownership, generation, and retirement checks remain guarded.
 - Preserve full normalized provider payloads at inbox entry and archival, including future provider fields, with existing secret redaction and without synthetic replay flags. Bind replay to the provider, root project, session, generation, event identity, and payload; record the original observation time without using changing retry timestamps as identity.
 - Recover failed primary archive writes through a separate private recovery directory without overflowing the managed inbox. Limit acknowledged report copies to 100 files and 16 MiB per root scope, protect pending evidence, and retain small hash facts for retries after pruning or re-enabling.
