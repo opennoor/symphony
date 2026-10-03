@@ -116,6 +116,44 @@ class DisabledUnmanagedCallbackTests(unittest.TestCase):
         self.assertEqual(1, len(self.store.session_record('claude', self.session)['pending']))
         self.assertEqual([], self.archives())
 
+    def test_ordinary_disabled_reports_can_discuss_symphony_settings_and_protocol(self):
+        reports = (
+            'Reviewed SYMPHONY_STATE_DIR and SYMPHONY_PROFILE settings.',
+            'SYMPHONY_STATE_DIR: private state location',
+            'The documentation mentions SYMPHONY_OUTCOME: as a protocol marker.',
+            '`SYMPHONY_ROLE: worker` appears in the code example.',
+        )
+        for provider in ('codex', 'claude'):
+            for report in reports:
+                with self.subTest(provider=provider, report=report):
+                    self.setUp()
+                    self.bind(provider=provider)
+                    event = replace(self.events[0], payload={**self.events[0].payload,
+                        'provider': provider, 'agent_type': 'default' if provider == 'codex' else 'Explore',
+                        'task_name': report, 'task': report, 'objective': report,
+                        'last_assistant_message': report})
+                    self.queue((event,), provider)
+                    self.assertNotIn('"decision": "block"', self.hook(provider=provider).stdout)
+                    self.assertEqual([], self.store.session_record(provider, self.session)['pending'])
+                    self.assertFalse(self.store.load(self.project).terminal_receipts)
+                    self.assertEqual(report, self.archives()[0]['event']['payload']['last_assistant_message'])
+
+    def test_actual_protocol_lines_remain_guarded_on_both_providers(self):
+        markers = ('ROLE', 'ROUTE', 'ASSESSMENT', 'DECISION', 'OUTCOME', 'REVIEW',
+                   'FAST_ROUTE', 'FAST_DECISION', 'LEAD_SPAWN_PACKET', 'CONTROL')
+        for provider in ('codex', 'claude'):
+            for marker in markers:
+                with self.subTest(provider=provider, marker=marker):
+                    self.setUp()
+                    self.bind(provider=provider)
+                    event = replace(self.events[0], payload={**self.events[0].payload,
+                        'provider': provider, 'agent_type': 'default' if provider == 'codex' else 'Explore',
+                        'last_assistant_message': 'Reviewed.\n  SYMPHONY_' + marker + ':'})
+                    self.queue((event,), provider)
+                    self.assertIn('"decision": "block"', self.hook(provider=provider).stdout)
+                    self.assertEqual(1, len(self.store.session_record(provider, self.session)['pending']))
+                    self.assertEqual([], self.archives())
+
     def test_managed_role_or_identity_or_live_run_is_never_exempted(self):
         identity = self.events[0].payload['agent_id']
         run = RunState('run', 'managed task', 'working', session_id=self.session,

@@ -1203,8 +1203,13 @@ def _outside_disabled_governance(
             or _observed_role(payload) or _fast_spawn(payload)
             or not isinstance(payload.get('agent_type'), str) or not payload['agent_type'].strip()
             or provider == 'codex' and payload['agent_type'] != 'default'
-            or any(isinstance(payload.get(key), str) and 'SYMPHONY_' in payload[key]
-                   for key in ('task_name', 'task', 'objective', 'last_assistant_message'))):
+            or any(line.strip().startswith((
+                       'SYMPHONY_ROLE:', 'SYMPHONY_ROUTE:', 'SYMPHONY_ASSESSMENT:',
+                       'SYMPHONY_DECISION:', 'SYMPHONY_OUTCOME:', 'SYMPHONY_REVIEW:',
+                       'SYMPHONY_FAST_ROUTE:', 'SYMPHONY_FAST_DECISION:',
+                       'SYMPHONY_LEAD_SPAWN_PACKET:', 'SYMPHONY_CONTROL:'))
+                   for key in ('task_name', 'task', 'objective', 'last_assistant_message')
+                   if isinstance(payload.get(key), str) for line in payload[key].splitlines())):
         return False
     intents = state.configuration.get('root_admission_intents', {})
     admission_key = _root_admission_key(provider, {'session_id': session})

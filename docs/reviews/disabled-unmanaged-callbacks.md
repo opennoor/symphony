@@ -114,9 +114,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 898 deterministic tests (seven platform skips) in
-154.964 seconds, the 187-test local Windows acceptance selection (six Windows-only
-skips) in 92.996 seconds, and all 10 installed-package scenarios. Both local suites
+The frozen candidate passed 900 deterministic tests (seven platform skips) in
+152.805 seconds, the 189-test local Windows acceptance selection (six Windows-only
+skips) in 89.730 seconds, and all 10 installed-package scenarios. Both local suites
 include 20 parallel first-pin rounds. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
@@ -212,3 +212,17 @@ only. A failing-before/passing-after regression checks that all other event and
 provider timeouts stay unchanged. Both Windows acceptance modes select that
 regression; native Restricted PowerShell checks also time repeated Interrupt
 execution against the three-second limit.
+
+Claude was checked against its own hook reference and installed 2.1.284 manifest
+validator. Symphony registers neither Interrupt nor SessionEnd for Claude; its
+20/30/45-second command-hook timeouts are supported. Actual installed Claude
+hook scenarios pass, including interruption/resume and cache replacement.
+
+The next review reproduced ordinary disabled reports being retained merely
+because they mentioned SYMPHONY_STATE_DIR or quoted a protocol example. The
+classifier now detects only known protocol markers at the beginning of a line,
+matching the protocol parser. Both providers allow configuration names (including
+a configuration name followed by a colon), prose and quoted inline examples;
+all actual protocol lines, including malformed empty values, remain guarded.
+The positive regression failed in all eight cases before the correction. Existing
+reserved-role, ownership, admission and historical receipt guards are unchanged.
