@@ -16,8 +16,10 @@ content-addressed observation files before acknowledging the inbox records.
 Do not create task outcomes, managed runs, delegations, or terminal receipts.
 An existing exact observation makes a crash before acknowledgment recoverable
 even if the user subsequently enables Symphony. Provider, session, root project,
-generation, event kind, original event ID, time, and callback payload all bind
-that observation. An alternate private recovery directory handles primary archive
+generation, event kind, original event ID, and complete callback payload bind
+replay identity. The original observation time remains in the saved evidence;
+it is excluded from replay identity because provider retries receive new times.
+An alternate private recovery directory handles primary archive
 write failures without introducing managed inbox limits or overflow flags.
 
 Full acknowledged report copies retain at most 100 files and 16 MiB per root
@@ -42,15 +44,15 @@ unresolved managed results continue to require their native ownership evidence.
 - Replayed the full attached project state and both original pending callbacks
   in temporary storage: Stop permitted, both callbacks preserved exactly, zero
   managed runs and zero terminal receipts. Original user state was not edited.
-- Added a sanitized captured regression and 17 test methods covering ordinary
+- Added a sanitized captured regression and 18 test methods covering ordinary
   native/default reviews, follow-ups, both provider formats, managed exemptions,
   independent roots in a shared checkout, separate child worktrees, generation
   and retirement guards, archive errors, large results, and crash/retry behavior.
 - Real generated, installed hook commands passed the new regression for both
   providers. Codex parent/name/model metadata came from a native child fixture;
   the fixture was unchanged afterward.
-- Final unit suite after the Copilot fixes: 828 tests passed, seven
-  platform-dependent skips, 106.084 seconds.
+- Final unit suite after the Copilot fixes: 829 tests passed, seven
+  platform-dependent skips, 104.698 seconds.
   A temporary runner used the installed PowerShell binary directly because Snap
   confinement was unavailable, and relocated one private-clock fixture from the
   read-only home directory to `/tmp`. Assertions were unchanged. The runner used
@@ -73,3 +75,11 @@ and re-enablement. The fixes use the separate recovery directory and small
 scope-bound hash facts described above; they do not grant managed task credit.
 The ACK failure regression also verifies that committing hash facts cannot
 allow retention to remove a report still present in the durable pending inbox.
+
+The second review identified that a native provider retry has a stable callback
+ID but a new observation timestamp. Reproduced the failure through both provider
+adapters after pruning and re-enabling. Replay now excludes only the local
+observation time from identity; it still binds the full callback payload and
+owning scope. A changed report with the same event ID remains unresolved.
+Also verified retry after a crash between the full archive write and the hash
+fact commit: the original report and observation time remain unchanged.

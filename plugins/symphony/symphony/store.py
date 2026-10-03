@@ -569,7 +569,12 @@ class StateStore:
                                   "payload": _child_callback_payload(event)}})
         # Normalize tuple-valued native metadata to its durable JSON shape.
         value = json.loads(json.dumps(value, sort_keys=True))
-        digest = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        # Provider retries keep their callback ID and payload but acquire a new
+        # local observation time. Retain that time in the original evidence;
+        # bind replay to the stable identity, including the complete payload.
+        identity = {**value, 'event': {key: item for key, item in value['event'].items()
+                                     if key != 'observed_at'}}
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         index_path, index = self._unmanaged_observations(provider, session, value['project'], generation)
         fact = index['entries'].get(digest)
         if fact and fact['event_id'] != event.event_id:
@@ -579,8 +584,14 @@ class StateStore:
         paths = [self.root / folder / (digest + '.json')
                  for folder in ('unmanaged-callbacks', 'unmanaged-recovery')]
         existing = next((path for path in paths if path.exists()), None)
-        if existing is not None and json.loads(existing.read_text(encoding='utf-8')) != value:
-            raise ValueError('unmanaged callback evidence differs from its content hash')
+        if existing is not None:
+            saved = json.loads(existing.read_text(encoding='utf-8'))
+            if not isinstance(saved, dict) or not isinstance(saved.get('event'), dict):
+                raise ValueError('invalid unmanaged callback evidence')
+            saved_identity = {**saved, 'event': {key: item for key, item in saved['event'].items()
+                                               if key != 'observed_at'}}
+            if saved_identity != identity:
+                raise ValueError('unmanaged callback evidence differs from its identity hash')
         if existing is None:
             if not create:
                 return False

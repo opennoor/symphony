@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from plugins.symphony.scripts.package_smoke import _materialize, _send_raw
 from plugins.symphony.symphony import PLUGIN_VERSION
+from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
 from plugins.symphony.symphony.runtime import _root_admission_key, handle
 from plugins.symphony.symphony.store import StateStore
@@ -195,6 +196,31 @@ class DisabledUnmanagedCallbackTests(unittest.TestCase):
         self.assertEqual(len(self.archives()), 1)
         self.assertEqual(self.archives()[0]['event']['event_id'], self.events[1].event_id)
         self.assertEqual(len(self.store.session_record('codex', self.session)['pending']), 1)
+
+    def test_native_retry_after_pruning_matches_identity_with_new_observed_time(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.bind(provider=provider)
+                payload = {**self.events[0].payload, 'hook_event_name': 'SubagentStop',
+                    'provider': provider, 'cwd': str(self.project),
+                    'agent_type': 'default' if provider == 'codex' else 'general-purpose'}
+                original = event_from_payload(provider, payload)
+                self.queue((original,), provider)
+                with patch('plugins.symphony.symphony.store._UNMANAGED_REPORT_COUNT', 0):
+                    self.hook(provider=provider)
+                self.assertEqual(self.archives(), [])
+                self.store.save(self.project, replace(self.store.load(self.project), enabled=True))
+                retry = event_from_payload(provider, payload)
+                self.assertEqual(retry.event_id, original.event_id)
+                self.assertNotEqual(retry.observed_at, original.observed_at)
+                self.queue((retry,), provider)
+                self.assertNotIn('"decision": "block"', self.hook(provider=provider).stdout)
+                self.assertEqual(self.store.session_record(provider, self.session)['pending'], [])
+                self.assertEqual(self.store.load(self.project).terminal_receipts, ())
+                altered = replace(retry, payload={**retry.payload,
+                    'last_assistant_message': 'A different report must not inherit the observation.'})
+                self.queue((altered,), provider)
+                self.assertIn('"decision": "block"', self.hook(provider=provider).stdout)
 
     def test_ack_write_failure_protects_full_reports_even_after_facts_commit(self):
         self.bind()
