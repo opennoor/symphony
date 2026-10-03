@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 TESTS = (
+    "plugins.symphony.tests.test_package.PackageContractTests.test_binary_assets_preserve_their_bytes_under_both_line_ending_modes",
     "plugins.symphony.tests.test_package.PackageContractTests.test_generated_codex_interrupt_timeout_respects_host_limit_without_changing_other_events",
     "plugins.symphony.tests.test_package.PackageContractTests.test_codex_windows_hooks_run_without_a_working_py_launcher",
     "plugins.symphony.tests.test_package.PackageContractTests.test_windows_relay_accepts_a_slow_working_interpreter_probe",

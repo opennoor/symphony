@@ -1,2 +1,3 @@
 # Captured launchers verify package bytes; checkout must preserve reviewed hashes.
 plugins/symphony/** text eol=lf
+plugins/symphony/assets/*.png binary
