@@ -30,6 +30,8 @@ except ImportError:  # pragma: no cover - exercised outside Windows
 
 
 SCHEMA_VERSION = 2
+_UNMANAGED_REPORT_COUNT = 100
+_UNMANAGED_REPORT_BYTES = 16 * 1024 * 1024
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
 _UpdateResult = TypeVar("_UpdateResult")
@@ -568,21 +570,110 @@ class StateStore:
         # Normalize tuple-valued native metadata to its durable JSON shape.
         value = json.loads(json.dumps(value, sort_keys=True))
         digest = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
-        path = self.root / "unmanaged-callbacks" / (digest + ".json")
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8")) == value
-        if not create:
-            return False
-        self._write_json(path, value)
+        index_path, index = self._unmanaged_observations(provider, session, value['project'], generation)
+        fact = index['entries'].get(digest)
+        if fact and fact['event_id'] != event.event_id:
+            raise ValueError('unmanaged observation event identity differs')
+        if fact and (not create or fact['acknowledged']):
+            return True
+        paths = [self.root / folder / (digest + '.json')
+                 for folder in ('unmanaged-callbacks', 'unmanaged-recovery')]
+        existing = next((path for path in paths if path.exists()), None)
+        if existing is not None and json.loads(existing.read_text(encoding='utf-8')) != value:
+            raise ValueError('unmanaged callback evidence differs from its content hash')
+        if existing is None:
+            if not create:
+                return False
+            try:
+                self._write_json(paths[0], value)
+            except OSError:
+                # Separate from the managed inbox: no report-size limit, no
+                # overflow flag, and no invented obligation for disabled work.
+                self._write_json(paths[1], value)
+        elif not create:
+            return True
+        if fact is None:
+            index['entries'][digest] = {'event_id': event.event_id, 'acknowledged': False}
+            self._write_json(index_path, index)
         return True
+
+    def _unmanaged_observations(
+        self, provider: str, session: str, project: str, generation: int,
+    ) -> tuple[Path, dict[str, Any]]:
+        scope = {'schema': 1, 'provider': provider, 'session': session,
+                 'project': project, 'generation': generation}
+        digest = hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
+        path = self.root / 'unmanaged-observations' / (digest + '.json')
+        if not path.exists():
+            return path, {**scope, 'entries': {}}
+        value = json.loads(path.read_text(encoding='utf-8'))
+        if (not isinstance(value, dict) or set(value) != {*scope, 'entries'}
+                or any(value[key] != expected for key, expected in scope.items())
+                or type(value['schema']) is not int or type(value['generation']) is not int
+                or not isinstance(value['entries'], dict)
+                or any(not re.fullmatch(r'[0-9a-f]{64}', key)
+                       or not isinstance(fact, dict) or set(fact) != {'event_id', 'acknowledged'}
+                       or not isinstance(fact['event_id'], str)
+                       or not fact['event_id'] or len(fact['event_id']) > 512
+                       or type(fact['acknowledged']) is not bool
+                       for key, fact in value['entries'].items())):
+            raise ValueError('invalid unmanaged observation facts')
+        return path, value
+
+    def _prune_unmanaged_reports(self, index: dict[str, Any], pending: set[str]) -> None:
+        """Bound acknowledged full reports; pending evidence is never pruned.
+
+        Small content hashes survive for this root's resumable lifetime, like
+        managed terminal receipts. They carry no report text or task credit.
+        """
+        candidates = []
+        for digest, fact in index['entries'].items():
+            if not fact['acknowledged'] or fact['event_id'] in pending:
+                continue
+            for folder in ('unmanaged-callbacks', 'unmanaged-recovery'):
+                path = self.root / folder / (digest + '.json')
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    continue
+                candidates.append((info.st_mtime_ns, path, info.st_size))
+        retained_bytes, retained_count = 0, 0
+        for _, path, size in sorted(candidates, reverse=True):
+            if (retained_count >= _UNMANAGED_REPORT_COUNT
+                    or retained_bytes + size > _UNMANAGED_REPORT_BYTES):
+                path.unlink(missing_ok=True)
+            else:
+                retained_bytes += size
+                retained_count += 1
 
     def finish_session_events(self, record: dict[str, Any], event_ids: set[str]) -> None:
         """Acknowledge only after the project transaction has committed."""
         if not event_ids:
             return
+        index = None
+        if record['project']:
+            index_path, index = self._unmanaged_observations(
+                record['provider'], record['session'], project_key(Path(record['project'])),
+                record['generation'])
+            changed = False
+            for fact in index['entries'].values():
+                if fact['event_id'] in event_ids and not fact['acknowledged']:
+                    fact['acknowledged'] = True
+                    changed = True
+            # Commit the tiny replay facts first. If ACK fails, the unchanged
+            # inbox still protects every pending full report from retention.
+            if changed:
+                self._write_json(index_path, index)
         record["pending"] = [item for item in record["pending"]
                              if item.get("event_id") not in event_ids]
         self._write_json(self._session_path(record["provider"], record["session"]), record)
+        if index is not None:
+            try:
+                self._prune_unmanaged_reports(index, {item['event_id'] for item in record['pending']})
+            except OSError:
+                # Cleanup failure must preserve data, not turn an ordinary
+                # completed observation into a new managed Stop obligation.
+                pass
 
     def rebind_session(self, record: dict[str, Any], project: Path, retired: set[str]) -> dict[str, Any]:
         """Move a settled native session to a new root project at a task boundary."""

@@ -426,13 +426,8 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 # the original callback privately, then ACK only this inbox ID.
                 # Do not first send ordinary reports through the bounded managed
                 # queue: a large report would set its overflow flag permanently.
-                try:
-                    preserved = store.preserve_unmanaged_callback(
-                        provider, session, callback_project, generation, event)
-                except (OSError, ValueError):
-                    if current:
-                        store.queue_session_event(provider, session, event, ambiguous_owner=True)
-                    raise
+                preserved = store.preserve_unmanaged_callback(
+                    provider, session, callback_project, generation, event)
                 if preserved:
                     acknowledged.add(event.event_id)
                     continue

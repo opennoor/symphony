@@ -77,7 +77,9 @@ Symphony assumes the session root runs at the economy tier: it exists to route w
 
 `stop` ends only the current root session's run and keeps project enablement. `stop --force` records an explicit interruption of that run when a safe stop cannot be completed. `disable` turns off future automatic governance project-wide and gracefully stops the current session's run; other sessions' live runs continue. Uninstalling removes plugin execution but does not rewrite the project or silently finish active work; disable first when possible.
 
-While disabled, ordinary untracked root agents run outside Symphony. Their callbacks are preserved privately under `~/.symphony/state/unmanaged-callbacks/` and do not create a managed run or block Stop. This records an observation, not successful completion. Live managed runs, tracked children, reserved Symphony roles, pending admissions, and unresolved foreign ownership remain guarded.
+While disabled, ordinary untracked root agents run outside Symphony. Their callbacks are preserved privately under `~/.symphony/state/unmanaged-callbacks/` and do not create a managed run or block Stop. If that archive cannot be written, `unmanaged-recovery/` retains the callback without using the managed inbox or its report-size limit. This records an observation, not successful completion. Live managed runs, tracked children, reserved Symphony roles, pending admissions, and unresolved foreign ownership remain guarded.
+
+Acknowledged full callback copies are limited to the newest reports that fit within 100 files and 16 MiB per provider, root project, session, and generation. Pending evidence is never pruned. Small content-hash observation facts remain for the session's resumable lifetime, so retention cannot make an old callback complete a later run or block a retry after re-enabling. Native transcripts are not changed.
 
 ## Guarded execution
 

@@ -149,21 +149,78 @@ class DisabledUnmanagedCallbackTests(unittest.TestCase):
         self.assertIn('"decision": "block"', self.hook(provider='claude').stdout)
         self.assertEqual(self.archives(), [])
 
-    def test_archive_failure_keeps_live_source_in_inbox(self):
+    def test_archive_failure_keeps_large_live_source_outside_managed_inbox(self):
         self.bind()
+        event = replace(self.events[0], payload={**self.events[0].payload,
+            'last_assistant_message': 'Ordinary review finding.\n' * 8000})
         write = StateStore._write_json
         def fail_archive(path, value):
             if path.parent.name == 'unmanaged-callbacks':
                 raise OSError('archive unavailable')
             return write(path, value)
         with patch.object(StateStore, '_write_json', side_effect=fail_archive):
-            with self.assertRaises(OSError):
-                self.hook('SubagentStop', self.events[0])
-        pending = self.store.session_record('codex', self.session)['pending']
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]['payload']['last_assistant_message'],
-                         self.events[0].payload['last_assistant_message'])
+            self.hook('SubagentStop', event)
+        record = self.store.session_record('codex', self.session)
+        self.assertEqual(record['pending'], [])
+        self.assertFalse(record['overflow'])
+        recovered = list((self.store.root / 'unmanaged-recovery').glob('*.json'))
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(json.loads(recovered[0].read_text())['event']['payload']['last_assistant_message'],
+                         event.payload['last_assistant_message'])
         self.assertEqual(self.archives(), [])
+        self.assertNotIn('"decision": "block"', self.hook().stdout)
+
+    def test_retention_limits_full_reports_but_keeps_replay_facts_after_enable(self):
+        self.bind()
+        self.queue()
+        with patch('plugins.symphony.symphony.store._UNMANAGED_REPORT_COUNT', 1):
+            self.hook()
+        self.assertEqual(len(self.archives()), 1)
+        pruned = next(event for event in self.events if event.event_id !=
+                      self.archives()[0]['event']['event_id'])
+        self.store.save(self.project, replace(self.store.load(self.project), enabled=True))
+        self.queue((pruned,))
+        self.assertNotIn('"decision": "block"', self.hook().stdout)
+        self.assertEqual(self.store.session_record('codex', self.session)['pending'], [])
+        self.assertEqual(self.store.load(self.project).terminal_receipts, ())
+
+    def test_retention_byte_budget_preserves_unacknowledged_reports(self):
+        self.bind()
+        self.queue()
+        for event in self.events:
+            self.store.preserve_unmanaged_callback('codex', self.session, self.project, 1, event)
+        record = self.store.session_record('codex', self.session)
+        with patch('plugins.symphony.symphony.store._UNMANAGED_REPORT_BYTES', 1):
+            self.store.finish_session_events(record, {self.events[0].event_id})
+        self.assertEqual(len(self.archives()), 1)
+        self.assertEqual(self.archives()[0]['event']['event_id'], self.events[1].event_id)
+        self.assertEqual(len(self.store.session_record('codex', self.session)['pending']), 1)
+
+    def test_ack_write_failure_protects_full_reports_even_after_facts_commit(self):
+        self.bind()
+        self.queue()
+        session_path = self.store._session_path('codex', self.session)
+        write = StateStore._write_json
+        def fail_ack(path, value):
+            if path == session_path:
+                raise OSError('ACK unavailable')
+            return write(path, value)
+        with patch('plugins.symphony.symphony.store._UNMANAGED_REPORT_COUNT', 0):
+            with patch.object(StateStore, '_write_json', side_effect=fail_ack):
+                with self.assertRaises(OSError):
+                    self.hook()
+            self.assertEqual(len(self.archives()), 2)
+            record = self.store.session_record('codex', self.session)
+            _, index = self.store._unmanaged_observations(
+                'codex', self.session, hashlib.sha256(
+                    os.path.normcase(str(self.project.resolve())).encode()).hexdigest(), 1)
+            self.assertTrue(all(fact['acknowledged'] for fact in index['entries'].values()))
+            self.store._prune_unmanaged_reports(index, {item['event_id'] for item in record['pending']})
+            self.assertEqual(len(self.archives()), 2)
+            self.store.save(self.project, replace(self.store.load(self.project), enabled=True))
+            self.assertNotIn('"decision": "block"', self.hook().stdout)
+            self.assertEqual(self.archives(), [])
+            self.assertEqual(self.store.load(self.project).terminal_receipts, ())
 
     def test_large_ordinary_result_does_not_overflow_the_managed_queue(self):
         self.bind()
