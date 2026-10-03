@@ -58,6 +58,8 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
   independently for each provider/root/project generation. Repeated Stop releases
   the host even without a retry flag. State-lock waiting has a cumulative two
   second deadline at this native Stop boundary.
+- Only root user prompts reset that allowance. Child metadata, bound child
+  aliases and automatic hook/agent notifications cannot re-arm a Stop loop.
 - Foreign retained evidence cannot hold an already proven current completion,
   but unknown root-parented or currently tracked children still withhold credit.
   Alias/overflow faults do not lock normal tools in a verified root; normal
@@ -86,8 +88,11 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 - Actual matching native user replies or explicit root report controls bind
   approval to the proposed account and originating provider/session. The isolated
   reply relay handles hosts that do not pass nonblocking replies through hooks.
-  It accepts the actual received reply envelope; it does not need a second user
-  action. A changed login requires fresh approval.
+  It verifies the exact reply against a native root user-message row after the
+  offer, using the host location captured by the trusted hook. Fabricated stdin,
+  tool/assistant/document text and sidechain rows cannot approve sharing. Missing
+  proof leaves the optional explicit user command available. A changed login
+  requires fresh approval.
 - Approval freezes the accumulated allowlisted snapshot. Publication revalidates
   every field and the fixed destination. A lost worker launch retains consent;
   a lost create response is recovered through its exact random issue marker.
@@ -110,9 +115,9 @@ installed-hook tests, recovery replay, release gates and privacy boundaries.
 
 ## Validation evidence
 
-The frozen candidate passed 884 deterministic tests (seven platform skips) in
-144.579 seconds, the 173-test local Windows acceptance selection (six Windows-only
-skips) in 81.394 seconds, and all 10 installed-package scenarios. Native captured
+The frozen candidate passed 888 deterministic tests (seven platform skips) in
+138.121 seconds, the 177-test local Windows acceptance selection (six Windows-only
+skips) in 79.592 seconds, and all 10 installed-package scenarios. Native captured
 replays and generated hook/agent/policy checks also passed. All reporting calls
 were mocked; no test issue was created. Linux tests execute the installed PowerShell binary directly and move
 one private-clock fixture from read-only home to temporary storage; assertions
@@ -143,3 +148,11 @@ budget; both providers have a regression preventing that loop. Final reruns
 passed the updated counts above. Workers run from private state directories,
 leaving user repositories untouched even when GitHub client state variables
 are absent. Final exact-head review and release gates remain required.
+
+The subsequent exact-head review found that tool stdin alone could fabricate
+consent and that child prompts reset the root Stop allowance. The relay now
+requires the exact native root user row, a timestamp after the offer and the
+hook-captured host location. Actual isolated relay tests cover both providers;
+forged stdin and tool/assistant/document/child/old-message sources are rejected.
+Stop resets and report controls share the root-origin and durable alias check.
+Both providers reject child metadata and bound aliases without re-arming Stop.

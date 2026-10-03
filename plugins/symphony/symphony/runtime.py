@@ -318,7 +318,17 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         raise
     automatic_prompt = str(payload.get('prompt') or '').lstrip().startswith(
         ('<hook_prompt', '<task-notification', '<subagent_notification'))
-    if hook == 'UserPromptSubmit' and session and not automatic_prompt:
+    root_entry = (hook in {'UserPromptSubmit', 'SessionStart'} and session
+                  and not any(payload.get(field) for field in
+                              ('agent_id', 'subagent_id', 'parent_thread_id', 'agent_transcript_path')))
+    if root_entry:
+        try:
+            record = store.session_record(provider, session)
+            root_entry = not record or record.get('owner_session') in {None, '', session}
+        except (OSError, ValueError, TypeError):
+            # An unreadable alias cannot authorize root-only controls or resets.
+            root_entry = False
+    if hook == 'UserPromptSubmit' and root_entry and not automatic_prompt:
         try:
             store.stop_turn_budget(provider, session, project, reset=True)
         except (OSError, ValueError, TypeError):
@@ -326,9 +336,6 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
     if hook != 'Stop':
         # Reporting is a root-only optional control, independent of managed
         # ownership/Stop recovery. It never creates a task or grants credit.
-        root_entry = (hook in {'UserPromptSubmit', 'SessionStart'} and session
-                      and not any(payload.get(field) for field in
-                                  ('agent_id', 'subagent_id', 'parent_thread_id', 'agent_transcript_path')))
         if root_entry and hook == 'UserPromptSubmit':
             try:
                 prompt = str(payload.get('prompt') or '')

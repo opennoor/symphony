@@ -99,6 +99,31 @@ class StopRecoveryBoundaryTests(unittest.TestCase):
                 handle({**payload, 'hook_event_name': 'UserPromptSubmit', 'prompt': '$symphony:symphony status'}, env)
                 self.assertEqual('block', json.loads(handle(payload, env).stdout)['decision'])
 
+    def test_child_prompts_cannot_reset_root_stop_budget_on_either_provider(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                _, payload, env = self.fixture(provider)
+                self.assertEqual('block', json.loads(handle(payload, env).stdout)['decision'])
+                for field in ('agent_id', 'subagent_id', 'parent_thread_id', 'agent_transcript_path'):
+                    with patch('plugins.symphony.symphony.runtime._handle_core', return_value=HookResult()):
+                        handle({**payload, 'hook_event_name': 'UserPromptSubmit', 'prompt': 'child task',
+                                field: 'child-origin'}, env)
+                    self.assertEqual('', handle(payload, env).stdout)
+                handle({**payload, 'hook_event_name': 'UserPromptSubmit', 'prompt': '$symphony:symphony status'}, env)
+                self.assertEqual('block', json.loads(handle(payload, env).stdout)['decision'])
+
+    def test_bound_child_alias_cannot_rearm_its_stop_budget(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                _, payload, env = self.fixture(provider)
+                self.store.bind_session(provider, 'child', self.store._path(self.project), False, self.project,
+                                        payload['session_id'])
+                self.assertTrue(self.store.stop_turn_budget(provider, 'child', self.project))
+                with patch('plugins.symphony.symphony.runtime._handle_core', return_value=HookResult()):
+                    handle({**payload, 'session_id': 'child', 'hook_event_name': 'UserPromptSubmit',
+                            'prompt': 'child task'}, env)
+                self.assertFalse(self.store.stop_turn_budget(provider, 'child', self.project))
+
     def test_foreign_pending_result_cannot_hold_an_already_proven_current_completion(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):

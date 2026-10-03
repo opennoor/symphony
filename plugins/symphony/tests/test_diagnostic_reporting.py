@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -22,7 +23,9 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.report = dict(schema=1, plugin_version='1.7.5', provider='codex', platform='linux',
                            category='bookkeeping', outcome='deferred')
         self.store.record_recovery_diagnostic(self.report)
-        self.env = {'SYMPHONY_STATE_DIR': str(self.store.root), 'SYMPHONY_REPORT_WORKER': '0'}
+        self.env = {'SYMPHONY_STATE_DIR': str(self.store.root), 'SYMPHONY_REPORT_WORKER': '0',
+                    'CODEX_HOME': str(Path(self.temp.name) / 'codex'),
+                    'CLAUDE_CONFIG_DIR': str(Path(self.temp.name) / 'claude')}
         self.launch_patch = patch.object(d, 'launch_worker')
         self.launch = self.launch_patch.start()
         self.addCleanup(self.launch_patch.stop)
@@ -43,6 +46,21 @@ class DiagnosticReportingTests(unittest.TestCase):
         result = d.control(self.store, 'submit ' + record['id'], 'codex', 'root', self.env)
         self.assertIn('background', result)
         return d._read(self.store)
+
+    def native_reply(self, provider, prompt):
+        now = datetime.now(timezone.utc).isoformat()
+        if provider == 'codex':
+            path = Path(self.env['CODEX_HOME']) / 'sessions/2026/10/03/rollout-root.jsonl'
+            rows = [{'timestamp': now, 'type': 'session_meta', 'payload': {'id': 'root', 'source': 'cli'}},
+                    {'timestamp': now, 'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                     'content': [{'type': 'input_text', 'text': prompt}]}}]
+        else:
+            path = Path(self.env['CLAUDE_CONFIG_DIR']) / 'projects/project/root.jsonl'
+            rows = [{'timestamp': now, 'type': 'user', 'sessionId': 'root', 'isSidechain': False,
+                     'message': {'role': 'user', 'content': [{'type': 'text', 'text': prompt}]}}]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        return path, rows
 
     def test_probe_reads_access_without_creating_issue_and_offer_is_once_across_roots(self):
         self.offered()
@@ -259,21 +277,78 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.assertEqual('github.com', run.call_args.kwargs['env']['GH_HOST'])
         self.assertEqual('', run.call_args.kwargs['env']['GH_DEBUG'])
 
-    def test_real_isolated_reply_relay_records_only_matching_user_consent_without_bytecode(self):
-        record = self.offered()
-        reply = '<send_user_message_question_reply>' + json.dumps([
-            {'question': d.question(record), 'answer': d.SHARE}]) + '</send_user_message_question_reply>'
+    def test_real_isolated_reply_relay_requires_native_user_consent_without_bytecode(self):
         before = set(Path(d.__file__).parent.rglob('*'))
-        command = [d.sys.executable, '-I', '-B', str(Path(d.__file__)), '--relay-reply',
-                   '--provider', 'codex', '--session', 'root', '--state-dir', str(self.store.root)]
-        for prompt, expected in [('not a user approval', 'No matching'), (reply, 'Sharing approved'),
-                                 (reply, 'Sharing approved')]:
-            result = subprocess.run(command, input=prompt, text=True, capture_output=True,
-                                    env={**os.environ, 'SYMPHONY_REPORT_WORKER': '0'}, timeout=5)
-            self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn(expected, result.stdout)
-        self.assertEqual('approved', d._read(self.store)['phase'])
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                if provider == 'claude':
+                    d._path(self.store).unlink()
+                    self.launch.reset_mock()
+                record = self.offered(provider)
+                reply = '<send_user_message_question_reply>' + json.dumps([
+                    {'question': d.question(record), 'answer': d.SHARE}]) + '</send_user_message_question_reply>'
+                command = [d.sys.executable, '-I', '-B', str(Path(d.__file__)), '--relay-reply',
+                           '--provider', provider, '--session', 'root', '--state-dir', str(self.store.root)]
+                env = {**os.environ, 'SYMPHONY_REPORT_WORKER': '0',
+                       'CODEX_HOME': str(Path(self.temp.name) / 'untrusted-tool-home'),
+                       'CLAUDE_CONFIG_DIR': str(Path(self.temp.name) / 'untrusted-tool-home')}
+                for prompt in ('not a user approval', reply):
+                    result = subprocess.run(command, input=prompt, text=True, capture_output=True, env=env, timeout=5)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn('No matching', result.stdout)
+                self.assertEqual('offered', d._read(self.store)['phase'])
+                self.native_reply(provider, reply)
+                for _ in range(2):
+                    result = subprocess.run(command, input=reply, text=True, capture_output=True, env=env, timeout=5)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn('Sharing approved', result.stdout)
+                self.assertEqual('approved', d._read(self.store)['phase'])
         self.assertEqual(before, set(Path(d.__file__).parent.rglob('*')))
+
+    def test_native_reply_proof_rejects_documents_tools_assistants_children_and_old_messages(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                if provider == 'claude':
+                    d._path(self.store).unlink()
+                    self.launch.reset_mock()
+                record = self.offered(provider)
+                reply = '<send_user_message_question_reply>' + json.dumps([
+                    {'question': d.question(record), 'answer': d.SHARE}]) + '</send_user_message_question_reply>'
+                path, rows = self.native_reply(provider, reply)
+                self.assertTrue(d.native_reply_verified(self.store, reply, provider, 'root'))
+                variants = []
+                if provider == 'codex':
+                    variants.extend([
+                        [{**rows[0], 'payload': {**rows[0]['payload'], 'id': 'foreign'}}, rows[1]],
+                        [{**rows[0], 'payload': {**rows[0]['payload'], 'source': {'subagent': {'thread_spawn': {}}}}}, rows[1]],
+                        [rows[0], {**rows[1], 'payload': {**rows[1]['payload'], 'role': 'assistant'}}],
+                        [rows[0], {**rows[1], 'payload': {'type': 'function_call_output', 'output': reply}}],
+                        [rows[0], {**rows[1], 'payload': {**rows[1]['payload'],
+                         'content': [{'type': 'input_text', 'text': 'Attached document:\n' + reply}]}}],
+                    ])
+                else:
+                    variants.extend([[{**rows[0], field: value}] for field, value in (
+                        ('sessionId', 'foreign'), ('isSidechain', True), ('agentId', 'child'),
+                        ('isMeta', True), ('parentToolUseID', 'child-launch'))])
+                    variants.extend([
+                        [{**rows[0], 'type': 'assistant', 'message': {**rows[0]['message'], 'role': 'assistant'}}],
+                        [{**rows[0], 'message': {'role': 'user', 'content': [{'type': 'tool_result', 'content': reply}]}}],
+                        [{**rows[0], 'message': {'role': 'user', 'content': 'Attached document:\n' + reply}}],
+                    ])
+                variants.append([*rows[:-1], {**rows[-1], 'timestamp': '2000-01-01T00:00:00+00:00'}])
+                for damaged in variants:
+                    path.write_text(''.join(json.dumps(row) + '\n' for row in damaged))
+                    self.assertFalse(d.native_reply_verified(self.store, reply, provider, 'root'))
+                self.assertEqual('offered', d._read(self.store)['phase'])
+
+    def test_bound_child_alias_cannot_approve_root_report_control(self):
+        record = self.offered(session='child')
+        self.store.bind_session('codex', 'child', self.store._path(self.project), False, self.project, 'root')
+        with patch('plugins.symphony.symphony.runtime._handle_core', return_value=dummy_result()):
+            handle({'hook_event_name': 'UserPromptSubmit', 'session_id': 'child', 'cwd': str(self.project),
+                    'prompt': '$symphony:symphony report submit ' + record['id']},
+                   {**self.env, 'SYMPHONY_PROVIDER': 'codex'})
+        self.assertEqual('offered', d._read(self.store)['phase'])
 
     def test_actual_installed_hooks_accept_root_report_control_on_both_providers_without_a_run(self):
         from plugins.symphony.scripts.package_smoke import _materialize, _send_raw
