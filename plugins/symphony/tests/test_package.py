@@ -245,9 +245,12 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn('[Text.Encoding]::Unicode', source)
         self.assertIn('$q.StandardOutputEncoding=[Text.Encoding]::UTF8', source)
         self.assertNotIn('Get-Command', source)
-        self.assertIn('foreach($n in 0,1)', source)
+        self.assertIn(':probe for($n=0;$n -lt $all.Count;$n++)', source)
         self.assertIn("foreach($name in 'python.exe','python3.exe','py.exe')", source)
-        self.assertIn('Select-Object -Skip $n -First 1', source)
+        self.assertIn('$cs=$all|Group-Object Name -AsHashTable', source)
+        self.assertNotIn('Select-Object -Skip $n -First 1', source)
+        self.assertLess(source.index('$end=[DateTime]::UtcNow.AddSeconds(4)'),
+                        source.index('$cs=$all|Group-Object Name -AsHashTable'))
         self.assertIn('$p.WaitForExit([Math]::Min(2500,$ms))', source)
         self.assertIn('$end=[DateTime]::UtcNow.AddSeconds(4)', source)
         self.assertEqual(source.count('-I -X utf8 -c'), 2)
@@ -260,22 +263,26 @@ class PackageContractTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries(self):
         ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            directories = [root / ('broken' + str(n)) for n in range(6)] + [root / 'working']
-            for directory in directories:
-                directory.mkdir()
-            probe = self._probe_executable(directories[-1])
-            records = [str(directory / 'python.exe') for directory in directories[:-1]] + [str(probe)]
-            code = 'import sys;sys.stdout.buffer.write(' + repr(''.join('"' + path + '"\n' for path in records)) + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
-            relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
-                        .replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)'), code)
-            for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
-                result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
-                    relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
-                    text=True, timeout=15, env={**os.environ, 'PATH': os.pathsep.join(map(str, directories)), variable: temporary})
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), '123')
+        for working_name, broken_count in (('python3.exe', 6), ('python.exe', 2), ('python.exe', 6), ('py.exe', 6)):
+            with self.subTest(working_name=working_name, broken_count=broken_count), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                directories = [root / ('broken' + str(n)) for n in range(broken_count)] + [root / 'working']
+                for directory in directories:
+                    directory.mkdir()
+                for directory in directories[:-1]:
+                    (directory / 'python.exe').write_bytes(b'not an interpreter')
+                probe = self._probe_executable(directories[-1], name=working_name)
+                records = [str(directory / 'python.exe') for directory in directories[:-1]] + [str(probe)]
+                code = 'import sys;sys.stdout.buffer.write(' + repr(''.join('"' + path + '"\n' for path in records)) + ".encode('utf-16-le'));sys.stdout.buffer.flush()"
+                relay = self._mock_windows_discovery((PLUGIN / 'scripts/codex_hook.ps1').read_text()
+                            .replace('__SYMPHONY_BOOTSTRAP__', 'import sys;sys.stdin.buffer.read();print(123)'), code)
+                for provider, variable in (('codex', 'PLUGIN_ROOT'), ('claude', 'CLAUDE_PLUGIN_ROOT')):
+                    with self.subTest(provider=provider):
+                        result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command',
+                            relay.replace('__SYMPHONY_PROVIDER__', provider)], input='{}', capture_output=True,
+                            text=True, timeout=15, env={**os.environ, 'PATH': os.pathsep.join(map(str, directories)), variable: temporary})
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), '123')
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_deduplicates_repeated_path_candidates(self):
