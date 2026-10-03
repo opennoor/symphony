@@ -265,6 +265,33 @@ class DisabledUnmanagedCallbackTests(unittest.TestCase):
                 self.assertNotIn('"decision": "block"', self.hook(provider=provider).stdout)
                 self.assertEqual(self.store.session_record(provider, self.session)['pending'], [])
 
+    def test_credentials_are_redacted_at_queue_and_archive_without_breaking_retry(self):
+        secrets = ['provider-credential-one', 'provider-credential-two', 'ghp_' + 'a' * 36]
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.bind(provider=provider)
+                payload = {**self.events[0].payload, 'hook_event_name': 'SubagentStop',
+                    'session_id': self.session, 'provider': provider, 'cwd': str(self.project),
+                    'stop_hook_active': False, 'authToken': secrets[0],
+                    'future_provider_field': {'vendorPassword': secrets[1],
+                                              'ordinary': [secrets[2], 'harmless']},
+                    'agent_type': 'default' if provider == 'codex' else 'general-purpose'}
+                original = event_from_payload(provider, payload)
+                self.queue((original,), provider)
+                inbox = self.store.session_record(provider, self.session)['pending'][0]['payload']
+                self.assertEqual(inbox['authToken'], '[REDACTED]')
+                self.assertEqual(inbox['future_provider_field']['vendorPassword'], '[REDACTED]')
+                self.assertNotIn('"decision": "block"', self.hook(provider=provider).stdout)
+                archived = next(item for item in self.archives() if item['provider'] == provider)
+                self.assertEqual(archived['event']['payload'], inbox)
+                for path in self.store.root.rglob('*.json'):
+                    contents = path.read_text(encoding='utf-8')
+                    for secret in secrets:
+                        self.assertNotIn(secret, contents)
+                self.store.save(self.project, replace(self.store.load(self.project), enabled=True))
+                self.assertNotIn('"decision": "block"',
+                                 self.hook('SubagentStop', original, provider).stdout)
+
     def test_ack_write_failure_protects_full_reports_even_after_facts_commit(self):
         self.bind()
         self.queue()

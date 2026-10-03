@@ -47,6 +47,11 @@ _SECRET_KEYS = {
     "client_secret",
     "private_key",
     "token",
+    "cookie",
+    "cookies",
+    "set_cookie",
+    "passphrase",
+    "pwd",
 }
 
 
@@ -329,7 +334,14 @@ def _text(value: Any, name: str) -> str:
 
 
 def _redact(value: Any, key: str = "") -> Any:
-    if key.lower().replace("-", "_") in _SECRET_KEYS:
+    normalized = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', key)
+    normalized = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', normalized)
+    normalized = re.sub(r'[^a-z0-9]+', '_', normalized.lower()).strip('_')
+    words = set(normalized.split('_'))
+    if (any(normalized == secret or normalized.endswith('_' + secret) for secret in _SECRET_KEYS)
+            or words & {'password', 'passwd', 'secret', 'authorization', 'credential', 'credentials'}
+            or normalized in {'auth', 'authentication'}
+            or ('token' in words and 'value' in words)):
         return "[REDACTED]"
     if isinstance(value, str):
         return redact_secrets(value)

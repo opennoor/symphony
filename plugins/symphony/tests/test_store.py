@@ -567,6 +567,27 @@ with Path(sys.argv[1]).open('a+b') as handle:
         self.assertNotIn("abcdefghijklmnop", contents)
         self.assertIn("[REDACTED]", contents)
 
+    def test_persistence_redacts_provider_credential_names_and_token_shapes(self):
+        secrets = ['credential-one', 'credential-two', 'credential-three',
+                   'ghp_' + 'a' * 36, 'github_pat_' + 'b' * 40,
+                   'sk-ant-api03-' + 'c' * 32, 'cookie-credential', 'passphrase-credential']
+        self.store.save(self.project, ProjectState(configuration={
+            'authToken': secrets[0], 'providerAPIKey': secrets[1],
+            'future': {'vendor.credentials': {'opaque': secrets[2]},
+                       'ordinary': [*secrets[3:6], 'harmless-provider-value'],
+                       'headers': {'Cookie': secrets[6]}, 'keyPassphrase': secrets[7]},
+            'tokenCount': 42,
+        }))
+        contents = self.state_path().read_text(encoding='utf-8')
+        for secret in secrets:
+            self.assertNotIn(secret, contents)
+        saved = self.store.load(self.project).configuration
+        self.assertEqual(saved['authToken'], '[REDACTED]')
+        self.assertEqual(saved['providerAPIKey'], '[REDACTED]')
+        self.assertEqual(saved['future']['vendor.credentials'], '[REDACTED]')
+        self.assertEqual(saved['future']['ordinary'][-1], 'harmless-provider-value')
+        self.assertEqual(saved['tokenCount'], 42)
+
 
 if __name__ == "__main__":
     unittest.main()

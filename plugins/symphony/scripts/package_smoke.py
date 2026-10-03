@@ -134,7 +134,17 @@ def _command_argv(hook: dict[str, Any], root: Path, provider: str) -> list[str]:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";")
         lexer.whitespace_split = True
         parts = list(lexer)
-        argv = ["bash", "-c", command]
+        bash = 'bash'
+        if os.name == 'nt':
+            # Claude Code's Windows host is Git Bash; bare bash may resolve to
+            # the unrelated WSL launcher and fail before the hook executes.
+            git_bash = Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'Git/bin/bash.exe'
+            if not git_bash.is_file():
+                raise SmokeFailure(f'Claude smoke requires native Git Bash: {git_bash}')
+            bash = str(git_bash)
+        # Keep plugin roots in the environment, as the host does. Baking a
+        # path into shell source would interpret its dollar signs or backticks.
+        argv = [bash, "-c", hook['command']]
     else:
         argv = shlex.split(command)
         parts = argv[1:]

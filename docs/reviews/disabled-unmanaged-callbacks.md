@@ -44,15 +44,16 @@ unresolved managed results continue to require their native ownership evidence.
 - Replayed the full attached project state and both original pending callbacks
   in temporary storage: Stop permitted, both callbacks preserved exactly, zero
   managed runs and zero terminal receipts. Original user state was not edited.
-- Added a sanitized captured regression and 20 test methods covering ordinary
+- Added a sanitized captured regression and 21 test methods covering ordinary
   native/default reviews, follow-ups, both provider formats, managed exemptions,
   independent roots in a shared checkout, separate child worktrees, generation
   and retirement guards, archive errors, large results, and crash/retry behavior.
 - Real generated, installed hook commands passed the new regression for both
   providers. Codex parent/name/model metadata came from a native child fixture;
   the fixture was unchanged afterward.
-- Final unit suite for the bumped 1.7.5 candidate: 831 tests passed, seven
-  platform-dependent skips, 128.673 seconds.
+- Final unit suite for the corrected 1.7.5 candidate: 834 tests passed, seven
+  platform-dependent skips, 209.597 seconds. The expanded acceptance selection
+  passed 124 tests locally with six Windows-specific skips.
   A temporary runner used the installed PowerShell binary directly because Snap
   confinement was unavailable, and relocated one private-clock fixture from the
   read-only home directory to `/tmp`. Assertions were unchanged. The runner used
@@ -87,6 +88,24 @@ the author's manual review requested by the user, not an independent human sign-
   Windows acceptance suite used under Restricted PowerShell and as a standard user.
   Generated hook manifests are refreshed for the 1.7.5 runtime and both provider
   manifests, the marketplace manifest, and the package constant agree.
+
+The first release-candidate run passed Linux and the Windows 10 Dockur launcher
+gate, but exposed the smoke helper's bare Windows `bash` resolving outside the
+native Git Bash host. The helper now uses Git Bash explicitly, like the existing
+Windows launcher test, and keeps plugin roots in the environment rather than
+embedding paths into shell source. Added a failing argv regression before fixing
+the helper; the real Windows gate must pass on the corrected candidate.
+
+Copilot's bumped-candidate review also identified credential names outside the
+old exact-key redaction. Added failing storage and both-provider regressions.
+The redactor now normalizes casing and separators, handles provider-prefixed
+credential keys and nested credential containers, and masks recognizable token
+shapes in otherwise ordinary strings. Non-secret future fields and token counts
+remain intact. Cookie and passphrase cases also have explicit coverage. Text
+recognition remains a second line of defence and cannot
+identify every arbitrary opaque credential. Re-reviewed these fixes manually:
+replay uses the same normalized redacted representation at both durable paths,
+while the original native event identity continues to bind retries.
 
 No remaining actionable source findings from this manual review. Final candidate
 test results, exact-head Copilot review, Windows release checks, and publication
