@@ -48,6 +48,16 @@ _SECRET_KEYS = {
 }
 
 
+def _child_callback_payload(event: Event) -> dict[str, Any]:
+    return {key: event.payload[key] for key in (
+        "provider", "session_id", "parent_thread_id", "agent_id", "subagent_id",
+        "turn_id", "prompt_id", "status", "last_assistant_message",
+        "agent_transcript_path", "transcript_path", "agent_type", "task_name",
+        "role", "model", "model_reasoning_effort", "task", "objective",
+        "_symphony_child_metadata",
+    ) if key in event.payload}
+
+
 def project_key(project: Path) -> str:
     canonical = os.path.normcase(str(Path(project).resolve()))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -522,15 +532,7 @@ class StateStore:
             # session record and event under its own lock before replay.
             self._register_alias(provider, parent, session)
         pending = list(record["pending"])
-        event_payload = {
-            key: event.payload[key] for key in (
-                "provider", "session_id", "parent_thread_id", "agent_id", "subagent_id",
-                "turn_id", "prompt_id", "status", "last_assistant_message",
-                "agent_transcript_path", "transcript_path", "agent_type", "task_name",
-                "role", "model", "model_reasoning_effort", "task", "objective",
-                "_symphony_child_metadata",
-            ) if key in event.payload
-        }
+        event_payload = _child_callback_payload(event)
         entry = {"event_id": event.event_id, "kind": event.kind,
                  "observed_at": event.observed_at, "payload": _redact(event_payload),
                  "generation": record["generation"], "ambiguous_owner": ambiguous_owner}
@@ -546,6 +548,33 @@ class StateStore:
             else:
                 record["overflow"] = True
             self._write_json(self._session_path(record["provider"], record["session"]), record)
+
+    def preserve_unmanaged_callback(
+        self, provider: str, session: str, project: Path, generation: int,
+        event: Event, *, create: bool = True,
+    ) -> bool:
+        """Preserve out-of-scope evidence before ACK; never certify completion.
+
+        The exact callback, project, session and generation identify the record.
+        Its existence also makes a crash between preservation and ACK recoverable
+        after enablement changes. This is not a managed terminal receipt.
+        """
+        value = _redact({"schema": 1, "disposition": "outside_disabled_governance",
+                        "provider": provider, "session": session,
+                        "project": project_key(project), "generation": generation,
+                        "event": {"event_id": event.event_id, "kind": event.kind,
+                                  "observed_at": event.observed_at,
+                                  "payload": _child_callback_payload(event)}})
+        # Normalize tuple-valued native metadata to its durable JSON shape.
+        value = json.loads(json.dumps(value, sort_keys=True))
+        digest = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        path = self.root / "unmanaged-callbacks" / (digest + ".json")
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8")) == value
+        if not create:
+            return False
+        self._write_json(path, value)
+        return True
 
     def finish_session_events(self, record: dict[str, Any], event_ids: set[str]) -> None:
         """Acknowledge only after the project transaction has committed."""

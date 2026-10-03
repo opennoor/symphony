@@ -77,6 +77,8 @@ Symphony assumes the session root runs at the economy tier: it exists to route w
 
 `stop` ends only the current root session's run and keeps project enablement. `stop --force` records an explicit interruption of that run when a safe stop cannot be completed. `disable` turns off future automatic governance project-wide and gracefully stops the current session's run; other sessions' live runs continue. Uninstalling removes plugin execution but does not rewrite the project or silently finish active work; disable first when possible.
 
+While disabled, ordinary untracked root agents run outside Symphony. Their callbacks are preserved privately under `~/.symphony/state/unmanaged-callbacks/` and do not create a managed run or block Stop. This records an observation, not successful completion. Live managed runs, tracked children, reserved Symphony roles, pending admissions, and unresolved foreign ownership remain guarded.
+
 ## Guarded execution
 
 A run is **guarded** only after the loaded Symphony hook has written a matching heartbeat for the current provider session. Installation, discovery, or trust alone is not proof of execution.

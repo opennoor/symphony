@@ -1,0 +1,57 @@
+{
+  "provenance": "Sanitized Symphony 1.7.0 Tabby macOS incident: disabled root, no managed admission; ordinary spawned review followed up once; two terminal callbacks.",
+  "session": "01a1012f-01c8-7bf0-81eb-f3de47193a55",
+  "enabled": false,
+  "pending": [
+    {
+      "ambiguous_owner": true,
+      "event_id": "4d86f5f76b3d9a9416054e35996bcae9be2a767a9d7ff8c5d9fe1f180a8396b5",
+      "generation": 1,
+      "kind": "subagent_stopped",
+      "observed_at": "2026-10-03T10:11:24.142102+00:00",
+      "payload": {
+        "_symphony_child_metadata": [
+          "task_name",
+          "parent_thread_id",
+          "model",
+          "model_reasoning_effort"
+        ],
+        "agent_id": "01a1013d-8692-78d0-b6d9-9efef1ae4557",
+        "agent_type": "default",
+        "last_assistant_message": "Code review complete; no actionable findings.",
+        "model": "gpt-6.1-sol",
+        "model_reasoning_effort": "high",
+        "parent_thread_id": "01a1012f-01c8-7bf0-81eb-f3de47193a55",
+        "provider": "codex",
+        "session_id": "01a1012f-01c8-7bf0-81eb-f3de47193a55",
+        "task_name": "macos_review",
+        "turn_id": "01a1013d-86ed-7151-82ac-21bb7eecdfab"
+      }
+    },
+    {
+      "ambiguous_owner": true,
+      "event_id": "30ef6835093e7b2f0ba3e454fabe8f2766466ca183c0489b988cd906b9aee234",
+      "generation": 1,
+      "kind": "subagent_stopped",
+      "observed_at": "2026-10-03T10:14:34.627815+00:00",
+      "payload": {
+        "_symphony_child_metadata": [
+          "task_name",
+          "parent_thread_id",
+          "model",
+          "model_reasoning_effort"
+        ],
+        "agent_id": "01a1013d-8692-78d0-b6d9-9efef1ae4557",
+        "agent_type": "default",
+        "last_assistant_message": "Documentation review complete; no actionable findings.",
+        "model": "gpt-6.1-sol",
+        "model_reasoning_effort": "high",
+        "parent_thread_id": "01a1012f-01c8-7bf0-81eb-f3de47193a55",
+        "provider": "codex",
+        "session_id": "01a1012f-01c8-7bf0-81eb-f3de47193a55",
+        "task_name": "macos_review",
+        "turn_id": "01a10141-aaa0-7bc3-b392-d228fe718035"
+      }
+    }
+  ]
+}

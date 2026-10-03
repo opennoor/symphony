@@ -416,6 +416,26 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                       if event.kind == "subagent_started" else event, epoch, current)
                      for event, epoch, current in batch]
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
+            callback_project = Path(record['project'] or project) if record else project
+            if (expected_owner == session and event_generation == generation
+                    and (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired
+                    and (store.preserve_unmanaged_callback(provider, session, callback_project, generation,
+                                                         event, create=False)
+                         or _outside_disabled_governance(state, event, provider, session))):
+                # Outside governance is not a successful managed result. Keep
+                # the original callback privately, then ACK only this inbox ID.
+                # Do not first send ordinary reports through the bounded managed
+                # queue: a large report would set its overflow flag permanently.
+                try:
+                    preserved = store.preserve_unmanaged_callback(
+                        provider, session, callback_project, generation, event)
+                except (OSError, ValueError):
+                    if current:
+                        store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    raise
+                if preserved:
+                    acknowledged.add(event.event_id)
+                    continue
             if (not current and provider == 'codex' and expected_owner == session
                     and event_generation == generation
                     and (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired):
@@ -999,6 +1019,54 @@ def _dispose_unmanaged_pre_run_terminal(
         return state, False
     committed, _ = reduce(state, disposition)
     return committed, True
+
+
+def _outside_disabled_governance(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """Ordinary root children have no Symphony obligation while disabled.
+
+    Disabled still governs live admitted work and callbacks from tracked agents.
+    Unknown parents, reserved roles, admission intents and receipts stay guarded.
+    This classification neither verifies an outcome nor opens/completes a run.
+    """
+    payload = event.payload
+    identity = payload.get('agent_id') or payload.get('subagent_id')
+    parent = payload.get('parent_thread_id')
+    if (state.enabled or event.kind not in {'subagent_started', 'subagent_stopped'}
+            or provider not in {'codex', 'claude'} or payload.get('provider') != provider
+            or not session or payload.get('session_id') != session
+            or not isinstance(identity, str) or not identity or identity == session
+            or parent not in ({session} if provider == 'codex' else {None, '', session})
+            or _observed_role(payload) or _fast_spawn(payload)
+            or payload.get('agent_type') not in ({'default'} if provider == 'codex'
+                                               else {'general-purpose'})
+            or any(isinstance(payload.get(key), str) and 'SYMPHONY_' in payload[key]
+                   for key in ('task_name', 'task', 'objective', 'last_assistant_message'))):
+        return False
+    intents = state.configuration.get('root_admission_intents', {})
+    admission_key = _root_admission_key(provider, {'session_id': session})
+    activation = state.activation.get(provider, {})
+    if (not isinstance(intents, Mapping) or admission_key in intents
+            or not isinstance(activation, Mapping) or session in activation.get('pending_sessions', ())
+            or f'{provider}:{session}' in state.active_runs):
+        return False
+    runs = (*state.active_runs.values(), *state.recent_runs)
+    if state.active_run is not None:
+        runs = (*runs, state.active_run)
+        if (not state.active_run.provider or not state.active_run.session_id
+                or (state.active_run.provider == provider and state.active_run.session_id == session)):
+            return False
+    if any(identity in {run.lead_identity, *(item.identity for item in run.delegations)}
+           or identity in run.assessment.get('_active_turns', {})
+           or identity in run.assessment.get('_terminal_turns', {}) for run in runs):
+        return False
+    if any(identity in {receipt.get('agent'), receipt.get('lead'), receipt.get('parent')}
+           for receipt in state.terminal_receipts):
+        return False
+    return not any(identity in {record.payload.get(key) for key in
+                               ('agent_id', 'identity', 'agent', 'lead_identity')}
+                   for record in state.event_history)
 
 
 def _unresolved_child_guidance(
