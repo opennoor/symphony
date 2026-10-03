@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from plugins.symphony.symphony.runtime import handle
+# Strict ownership/credit reducer; public host-turn liveness has separate tests.
+from plugins.symphony.symphony.runtime import _handle_core as handle
 from plugins.symphony.symphony.routing import profiles_for
 from plugins.symphony.symphony.store import StateStore
 

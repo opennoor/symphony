@@ -5,7 +5,10 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from plugins.symphony.scripts import package_smoke
 from plugins.symphony.scripts.package_smoke import _payload, run_smoke
 from plugins.symphony.symphony.host_evidence import _packet_purpose
 
@@ -15,6 +18,23 @@ SCRIPT = ROOT / "plugins" / "symphony" / "scripts" / "package_smoke.py"
 
 
 class PackageSmokeTests(unittest.TestCase):
+    def test_windows_claude_smoke_uses_git_bash_and_environment_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            root = home / 'Plugin with $literal and spaces'
+            (root / 'scripts').mkdir(parents=True)
+            (root / 'scripts/symphony_hook.py').write_text('')
+            programs = home / 'Program Files'
+            bash = programs / 'Git/bin/bash.exe'
+            bash.parent.mkdir(parents=True)
+            bash.write_bytes(b'fixture-not-executed')
+            command = 'python "${CLAUDE_PLUGIN_ROOT}/scripts/symphony_hook.py"'
+            with patch.object(package_smoke, 'os', SimpleNamespace(
+                    name='nt', environ={'ProgramFiles': str(programs)})):
+                argv = package_smoke._command_argv({'shell': 'bash', 'command': command}, root, 'claude')
+            self.assertEqual(argv, [str(bash), '-c', command])
+            self.assertNotIn(str(root), argv[-1])
+
     def test_child_spawn_packets_declare_substantive_purpose(self):
         plugin = ROOT / "plugins" / "symphony"
         for event in ("PreToolUse", "PostToolUse"):

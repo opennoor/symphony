@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import shutil
@@ -16,6 +17,7 @@ from typing import Mapping
 
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
+from . import diagnostics
 from .host_evidence import (
     _archived_fast_owner, _instant, _packet_purpose,
     archived_lead_followup,
@@ -26,6 +28,7 @@ from .host_evidence import (
     claude_current_native_lead_event, claude_recovered_lead_event,
     claude_substantive_launch,
     codex_substantive_launch,
+    codex_archived_followup_sequence,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
     codex_unmanaged_pre_run_terminal,
@@ -47,7 +50,7 @@ from .routing import (
     route_for_recorded,
     snapshot_for,
 )
-from .store import StateStore, project_key
+from .store import StateStore, project_key, state_lock_budget
 
 
 CONTROLS = {
@@ -58,6 +61,7 @@ CONTROLS = {
     "enable",
     "help",
     "proceed",
+    "report",
     "reassess",
     "start",
     "status",
@@ -286,7 +290,122 @@ def _retained_activation_command(retained: str, original: str) -> str:
             if os.name == "nt" else shlex.join(arguments))
 
 
+def _recovery_diagnostic(store: StateStore, provider: str, category: str, outcome: str) -> None:
+    host = {'Windows': 'windows', 'Linux': 'linux', 'Darwin': 'macos'}.get(platform.system(), 'other')
+    try:
+        store.record_recovery_diagnostic({'schema': 1, 'plugin_version': PLUGIN_VERSION,
+            'provider': provider, 'platform': host, 'category': category, 'outcome': outcome})
+    except Exception:
+        # Optional diagnostics cannot become a new hook dependency or blocker.
+        pass
+
+
 def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
+    """Keep host-turn liveness separate from durable task completion."""
+    if environ.get('SYMPHONY_CLAUDE_PROBE'):
+        return HookResult()
+    hook = payload.get('hook_event_name')
+    provider = str(environ.get('SYMPHONY_PROVIDER') or detect_provider(payload))
+    session = str(payload.get('session_id') or '')
+    try:
+        store = StateStore(Path(environ.get('SYMPHONY_STATE_DIR', Path.home() / '.symphony' / 'state')))
+        project = Path(payload.get('cwd') or os.getcwd()).resolve()
+    except Exception:
+        if hook == 'Stop':
+            # Even malformed entry metadata cannot trap a native host turn.
+            # No usable scope exists for a write, ACK or completion claim.
+            return HookResult()
+        raise
+    automatic_prompt = str(payload.get('prompt') or '').lstrip().startswith(
+        ('<hook_prompt', '<task-notification', '<subagent_notification'))
+    root_entry = (hook in {'UserPromptSubmit', 'SessionStart'} and session
+                  and not any(payload.get(field) for field in
+                              ('agent_id', 'subagent_id', 'parent_thread_id', 'agent_transcript_path')))
+    if root_entry:
+        try:
+            record = store.session_record(provider, session)
+            root_entry = not record or record.get('owner_session') in {None, '', session}
+        except (OSError, ValueError, TypeError):
+            # An unreadable alias cannot authorize root-only controls or resets.
+            root_entry = False
+    if hook == 'UserPromptSubmit' and root_entry and not automatic_prompt:
+        try:
+            store.stop_turn_budget(provider, session, project, reset=True)
+        except (OSError, ValueError, TypeError):
+            pass
+    if hook != 'Stop':
+        # Reporting is a root-only optional control, independent of managed
+        # ownership/Stop recovery. It never creates a task or grants credit.
+        if root_entry and hook == 'UserPromptSubmit':
+            try:
+                prompt = str(payload.get('prompt') or '')
+                control = _parse_control(prompt)
+                argument = (control[1] if control and control[0] == 'report' else
+                            diagnostics.reply_control(store, prompt, provider, session))
+                if argument is not None:
+                    text = diagnostics.control(store, argument, provider, session, environ)
+                    return render(provider, (Action('inject_context', {'text': text}),), hook)
+            except Exception:
+                return render(provider, (Action('inject_context', {'text':
+                    'Diagnostic sharing is unavailable. Reports stay local; continue the user task.'}),), hook)
+        result = _handle_core(payload, environ)
+        if root_entry:
+            try:
+                response = json.loads(result.stdout) if result.stdout else {}
+                existing = response.get('hookSpecificOutput', {})
+                if response.get('decision') == 'block' or existing.get('permissionDecision') == 'deny':
+                    return result
+                offer = diagnostics.notice(store, provider, session, environ)
+                if offer:
+                    output = response.setdefault('hookSpecificOutput', {'hookEventName': hook})
+                    output['additionalContext'] = str(output.get('additionalContext') or '') + '\n' + offer
+                    return replace(result, stdout=json.dumps(response))
+            except Exception:
+                pass
+        return result
+    try:
+        with state_lock_budget(2.0):
+            result = _handle_core(payload, environ)
+    except Exception as error:
+        category = ('state_io' if isinstance(error, OSError) else
+                    'state_shape' if isinstance(error, (ValueError, TypeError, KeyError)) else 'runtime_fault')
+        _recovery_diagnostic(store, provider, category, 'deferred')
+        # Do not dispatch Stop, acknowledge callbacks, invent outcomes or
+        # abandon agents after a runtime/storage fault. End this host turn.
+        return HookResult()
+    if result.recovery_kind == 'bookkeeping':
+        _recovery_diagnostic(store, provider, 'bookkeeping', 'deferred')
+        return HookResult()
+    if result.recovery_kind == 'native_recovery':
+        _recovery_diagnostic(store, provider, 'native_recovery', 'recovered')
+    if not result.stdout:
+        return result
+    try:
+        response = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return result
+    if response.get('decision') != 'block':
+        if response.get('systemMessage'):
+            # The assistant already communicates task progress. A permitted
+            # host turn needs no duplicate bookkeeping warning to the user.
+            _recovery_diagnostic(store, provider, 'incomplete_work', 'deferred')
+            return HookResult()
+        return result
+    category = result.recovery_kind or 'incomplete_work'
+    if category == 'bookkeeping':
+        _recovery_diagnostic(store, provider, category, 'deferred')
+        return HookResult()
+    try:
+        first = store.stop_turn_budget(provider, session, project) if session else False
+    except (OSError, ValueError, TypeError):
+        first = False
+    if first and payload.get('stop_hook_active') is not True:
+        return result
+    _recovery_diagnostic(store, provider, 'incomplete_work', 'deferred')
+    return HookResult()
+
+
+def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
     if environ.get("SYMPHONY_CLAUDE_PROBE"):
         return HookResult()
     provider = str(environ.get("SYMPHONY_PROVIDER") or detect_provider(payload))
@@ -309,6 +428,8 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
     if explicit_stop:
         source = replace(source, kind="stop_requested")
     expected_owner = ""
+    unknown_alias_pending = False
+    acknowledged: set[str] = set()
 
     def dispatch(state: ProjectState, event: Event) -> tuple[ProjectState, tuple[Action, ...]]:
         # Select the owning run under the store lock so parallel hooks cannot
@@ -335,7 +456,9 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         retired: frozenset[str] = frozenset(),
     ) -> tuple[ProjectState, tuple[tuple[Action, ...], set[str]]]:
         acknowledged: set[str] = set()
-        unresolved = False
+        unresolved = unknown_alias_pending
+        if unknown_alias_pending:
+            state = _hold_pending_batch(state, provider, session)
         lifecycle_source = source.kind in {"subagent_started", "subagent_stopped"}
         source_actions: tuple[Action, ...] = ()
         # The triggering lifecycle callback was timestamped before it waited
@@ -345,6 +468,34 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         batch = [(event, event_generation, False) for event, event_generation in pending]
         if lifecycle_source:
             batch.append((source, generation, True))
+        if provider == 'codex' and session:
+            retained = []
+            for event, epoch, current in batch:
+                if (epoch == generation and event.payload.get('agent_id') not in retired
+                        and _committed_codex_followup_source(state, event, session, generation)):
+                    if not current:
+                        acknowledged.add(event.event_id)
+                else:
+                    retained.append((event, epoch, current))
+            batch = retained
+        if provider == 'codex' and session and batch and all(
+                epoch == generation and (event.payload.get('agent_id') or event.payload.get('subagent_id'))
+                not in retired for event, epoch, _ in batch):
+            try:
+                historical = codex_archived_followup_sequence(
+                    state, tuple(event for event, _, _ in batch), session, generation,
+                    Path(record['project'] or project) if record else project, environ)
+                if historical is not None:
+                    committed = _commit_codex_followup_sequence(
+                        state, historical, session, dispatch,
+                        Path(record['project'] or project) if record else project, environ,
+                        source.observed_at, tuple(event for event, _, _ in batch), generation)
+                    if committed is not None:
+                        state = committed
+                        acknowledged.update(event.event_id for event, _, current in batch if not current)
+                        batch = []
+            except (OSError, TypeError, ValueError, AttributeError, KeyError):
+                pass
         if provider == 'claude' and session:
             retained = []
             for event, epoch, current in batch:
@@ -416,6 +567,21 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                       if event.kind == "subagent_started" else event, epoch, current)
                      for event, epoch, current in batch]
         for event, event_generation, current in sorted(batch, key=lambda item: item[0].observed_at):
+            callback_project = Path(record['project'] or project) if record else project
+            if (expected_owner == session and event_generation == generation
+                    and (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired
+                    and (store.preserve_unmanaged_callback(provider, session, callback_project, generation,
+                                                         event, create=False)
+                         or _outside_disabled_governance(state, event, provider, session))):
+                # Outside governance is not a successful managed result. Keep
+                # the original callback privately, then ACK only this inbox ID.
+                # Do not first send ordinary reports through the bounded managed
+                # queue: a large report would set its overflow flag permanently.
+                preserved = store.preserve_unmanaged_callback(
+                    provider, session, callback_project, generation, event)
+                if preserved:
+                    acknowledged.add(event.event_id)
+                    continue
             if (not current and provider == 'codex' and expected_owner == session
                     and event_generation == generation
                     and (event.payload.get('agent_id') or event.payload.get('subagent_id')) not in retired):
@@ -436,7 +602,6 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                                                    '_symphony_archived_native_event_id': followup[1].event_id,
                                                    '_symphony_archived_fast_escalation': True})
                 event = replace(event, payload={**event.payload, "_symphony_owner_conflict": False})
-            state = _hold_pending_batch(state, provider, session)
             pending_event_id = event.event_id
             if followup is not None and provider == 'claude' and event.kind == 'subagent_stopped':
                 # ACK the inbox ID, but commit the exact proven native event.
@@ -516,16 +681,23 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     store.queue_session_event(provider, session, event, ambiguous_owner=True)
                     unresolved = True
                     continue
+                # Hold actual current lifecycle work through the whole batch;
+                # unrelated retained callbacks must not impose this hold.
+                state = _hold_pending_batch(state, provider, session)
                 state, source_actions = dispatch(state, event)
                 continue
             disposition = _pending_child_disposition(state, event, provider, session)
             if disposition == "stale":
                 acknowledged.add(pending_event_id)
             elif disposition == "apply":
+                state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, event)
                 acknowledged.add(pending_event_id)
             else:
-                unresolved = True
+                if _pending_blocks_current_run(state, event, provider, session):
+                    unresolved = True
+                else:
+                    _recovery_diagnostic(store, provider, 'bookkeeping', 'deferred')
         unresolved_reason = _unresolved_child_guidance(
             state, provider, session, tuple(event for event, _, _ in batch
                                            if event.event_id not in acknowledged)) if unresolved else ""
@@ -570,7 +742,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                 if source.kind == "stop_requested" and scoped.active_run is not None:
                     return state, ((Action("block_stop", {"reason":
                         "Symphony could not verify the tracked lead's native Codex result. "
-                        "Return to this session after its result is available."}),), acknowledged)
+                        "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping'}),), acknowledged)
                 recovered = None
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
@@ -583,7 +755,7 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     if scoped.active_run is not None:
                         return state, ((Action("block_stop", {"reason":
                             "Symphony could not verify the tracked lead's latest native Codex turn. "
-                            "Return to this session after its result is available."}),), acknowledged)
+                            "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping'}),), acknowledged)
                     freshness, native_turn = "none", None
                 if freshness in {"running", "unknown"}:
                     reason = ("The tracked lead has a newer native turn still running. "
@@ -591,14 +763,17 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                               if freshness == "running" else
                               "Symphony could not verify the tracked lead's latest native turn. "
                               "Return to this session after its result is available.")
-                    return state, ((Action("block_stop", {"reason": reason}),), acknowledged)
+                    return state, ((Action("block_stop", {"reason": reason,
+                        'recovery_kind': 'bookkeeping' if freshness == 'unknown' else 'incomplete_work'}),), acknowledged)
                 if native_turn is not None:
                     state = _hold_pending_batch(state, provider, session)
                     state, _ = dispatch(state, native_turn)
         # A new turn delivered in this same hook can supersede an earlier
         # queued completion. Include it before releasing the archive hold.
         if source.kind != "stop_requested":
-            if pending and not lifecycle_source:
+            if pending and not lifecycle_source and any(
+                    _pending_blocks_current_run(state, event, provider, session)
+                    for event, _ in pending):
                 state = _hold_pending_batch(state, provider, session)
             if lifecycle_source:
                 actions = source_actions
@@ -639,12 +814,17 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                                   "Symphony could not verify the lead's native completion order. ")
                         return state, ((Action("block_stop", {"reason": reason
                             + "Resume the same lead after all children return, run the acceptance check "
-                              "and report the result again."}),), acknowledged)
+                              "and report the result again.",
+                            'recovery_kind': 'bookkeeping' if order == 'unknown' else 'incomplete_work'}),), acknowledged)
                     if run.outcome != evidence.active_run.outcome:
                         state = _merge_scope(state, scoped, evidence, f"{provider}:{session}", provider, session)
             state, actions = dispatch(state, source)
         if unresolved and source.kind in {"session_heartbeat", "user_prompt"}:
-            actions += (Action("inject_context", {"text": unresolved_reason}),)
+            actions += (Action("inject_context", {"text":
+                "Symphony retained unresolved lifecycle evidence privately. Continue the user's request "
+                "under the current routing and ownership rules; this evidence grants no completion credit. "
+                "Do not launch extra agents or spend a turn repairing bookkeeping solely because it exists. "
+                "Keep bookkeeping details out of the user response unless their work needs attention."}),)
         return state, (actions, acknowledged)
 
     session = str(source.payload.get("session_id") or "")
@@ -825,14 +1005,12 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     if source.kind in {"subagent_started", "subagent_stopped"}:
                         store.queue_session_event(provider, session, source)
                         return HookResult()
+                    # Unknown alias evidence cannot grant completion credit,
+                    # but it must not prevent a known root from continuing
+                    # safely admitted work. Routing/tool guards still run.
+                    unknown_alias_pending = True
                     if source.kind == "stop_requested":
                         return render(provider, _claude_native_stop_guard(source, reason), "Stop")
-                    if source.kind == "pre_tool_use":
-                        return render(provider, (Action("block_tool", {"reason": reason}),), "PreToolUse")
-                    if source.kind in {"user_prompt", "session_heartbeat"}:
-                        return render(provider, (Action("inject_context", {"text": reason}),),
-                                      str(payload.get("hook_event_name") or "UserPromptSubmit"))
-                    return HookResult()
                 pending = tuple(
                     (Event(item["event_id"], item["kind"], item["observed_at"],
                            {**item["payload"], "_symphony_owner_conflict":
@@ -852,12 +1030,12 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                     if source.kind in {"subagent_started", "subagent_stopped"}:
                         store.queue_session_event(provider, session, source)
                         return HookResult()
-                    action = ("block_stop" if source.kind == "stop_requested" else
-                              "block_tool" if source.kind == "pre_tool_use" else "inject_context")
-                    actions = (_claude_native_stop_guard(source, reason) if source.kind == "stop_requested"
-                               else (Action(action, {"reason": reason, "text": reason}),))
-                    return render(provider, actions,
-                                  str(payload.get("hook_event_name") or "UserPromptSubmit"))
+                    if source.kind == 'stop_requested':
+                        return render(provider, _claude_native_stop_guard(source, reason), 'Stop')
+                    # Retained overflow withholds archival, not normal tools
+                    # in a verified root. Its ordinary routing guards still
+                    # decide which operations may run.
+                    unknown_alias_pending = True
                 if source.kind == "subagent_stopped" and not pending and not bound.is_file():
                     return HookResult()
                 result = (store.update(Path(record["project"]),
@@ -877,7 +1055,11 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
                         store.finish_session_events(fresh, acknowledged)
     else:
         actions, _ = store.update(project, lambda state: transition(state))
-    return render(provider, actions, str(payload.get("hook_event_name") or "UserPromptSubmit"))
+    output = render(provider, actions, str(payload.get("hook_event_name") or "UserPromptSubmit"))
+    if (payload.get('hook_event_name') == 'Stop' and acknowledged
+            and not output.recovery_kind):
+        output = replace(output, recovery_kind='native_recovery')
+    return output
 
 
 def _is_root_origin(source: Event) -> bool:
@@ -1001,6 +1183,54 @@ def _dispose_unmanaged_pre_run_terminal(
     return committed, True
 
 
+def _outside_disabled_governance(
+    state: ProjectState, event: Event, provider: str, session: str,
+) -> bool:
+    """Ordinary root children have no Symphony obligation while disabled.
+
+    Disabled still governs live admitted work and callbacks from tracked agents.
+    Unknown parents, reserved roles, admission intents and receipts stay guarded.
+    This classification neither verifies an outcome nor opens/completes a run.
+    """
+    payload = event.payload
+    identity = payload.get('agent_id') or payload.get('subagent_id')
+    parent = payload.get('parent_thread_id')
+    if (state.enabled or event.kind not in {'subagent_started', 'subagent_stopped'}
+            or provider not in {'codex', 'claude'} or payload.get('provider') != provider
+            or not session or payload.get('session_id') != session
+            or not isinstance(identity, str) or not identity or identity == session
+            or parent not in ({session} if provider == 'codex' else {None, '', session})
+            or _observed_role(payload) or _fast_spawn(payload)
+            or payload.get('agent_type') not in ({'default'} if provider == 'codex'
+                                               else {'general-purpose'})
+            or any(isinstance(payload.get(key), str) and 'SYMPHONY_' in payload[key]
+                   for key in ('task_name', 'task', 'objective', 'last_assistant_message'))):
+        return False
+    intents = state.configuration.get('root_admission_intents', {})
+    admission_key = _root_admission_key(provider, {'session_id': session})
+    activation = state.activation.get(provider, {})
+    if (not isinstance(intents, Mapping) or admission_key in intents
+            or not isinstance(activation, Mapping) or session in activation.get('pending_sessions', ())
+            or f'{provider}:{session}' in state.active_runs):
+        return False
+    runs = (*state.active_runs.values(), *state.recent_runs)
+    if state.active_run is not None:
+        runs = (*runs, state.active_run)
+        if (not state.active_run.provider or not state.active_run.session_id
+                or (state.active_run.provider == provider and state.active_run.session_id == session)):
+            return False
+    if any(identity in {run.lead_identity, *(item.identity for item in run.delegations)}
+           or identity in run.assessment.get('_active_turns', {})
+           or identity in run.assessment.get('_terminal_turns', {}) for run in runs):
+        return False
+    if any(identity in {receipt.get('agent'), receipt.get('lead'), receipt.get('parent')}
+           for receipt in state.terminal_receipts):
+        return False
+    return not any(identity in {record.payload.get(key) for key in
+                               ('agent_id', 'identity', 'agent', 'lead_identity')}
+                   for record in state.event_history)
+
+
 def _unresolved_child_guidance(
     state: ProjectState, provider: str, session: str, events: tuple[Event, ...],
 ) -> str:
@@ -1119,6 +1349,25 @@ def _recoverable_fast_events(
                 and terminal.observed_at >= start.observed_at):
             recovered.update((start.event_id, terminal.event_id))
     return recovered
+
+
+def _pending_blocks_current_run(state: ProjectState, event: Event, provider: str, session: str) -> bool:
+    """A proven different parent/archived identity cannot hold today's run."""
+    run = state.active_runs.get(f'{provider}:{session}')
+    if run is None:
+        return True
+    identity = event.payload.get('agent_id') or event.payload.get('subagent_id')
+    parent = event.payload.get('parent_thread_id')
+    known = {run.session_id, run.lead_identity, *(item.identity for item in run.delegations)} - {None, ''}
+    if identity in known or parent in known - {session}:
+        return True
+    if any(old.provider == provider and old.session_id == session and old.lead_identity != run.lead_identity
+           and identity in {old.lead_identity, *(item.identity for item in old.delegations)}
+           for old in state.recent_runs):
+        return False
+    # Unknown or root-parented events could still be a missing current launch;
+    # withhold completion until their owning proof is available.
+    return not parent or parent in known
 
 
 def _pending_child_disposition(
@@ -2343,6 +2592,78 @@ def _commit_late_sendmessage_sources(state: ProjectState, sources: tuple[Event, 
                for source in sources):
         return None
     return candidate
+
+
+def _codex_followup_source_hash(source: Event) -> str:
+    payload = {key: value for key, value in source.payload.items()
+               if key not in {'_symphony_owner_conflict', '_symphony_verified_alias'}}
+    return hashlib.sha256(json.dumps({'kind': source.kind, 'payload': payload},
+                                     sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _committed_codex_followup_source(state: ProjectState, source: Event, session: str,
+                                     generation: int) -> bool:
+    if source.payload.get('provider') != 'codex' or source.payload.get('session_id') != session:
+        return False
+    digest = _codex_followup_source_hash(source)
+    return any(run.provider == 'codex' and run.session_id == session
+               and run.owner_generation == generation and any(
+                   isinstance(item, Mapping) and item.get('generation') == generation
+                   and item.get('hash') == digest
+                   for item in run.assessment.get('_codex_archived_followup_sources', ()))
+               for run in (*state.recent_runs, *state.active_runs.values()))
+
+
+def _commit_codex_followup_sequence(state: ProjectState, sequence: tuple, session: str, dispatch,
+                                   project: Path, environ: Mapping[str, str], committed_at: str,
+                                   sources: tuple[Event, ...], generation: int
+                                   ) -> ProjectState | None:
+    """Reduce proven historical work without transferring it to a newer run."""
+    archived, natives = sequence
+    boundary = _instant(committed_at)
+    if boundary is None or any(_instant(event.observed_at) is None
+                              or _instant(event.observed_at) > boundary
+                              for event in (*natives, *sources)):
+        return None
+    original = state
+    key = f'codex:{session}'
+    resumed = replace(archived, status='completing', outcome=None,
+                      assessment={**archived.assessment, '_batch_pending': True})
+    state = replace(state, active_run=resumed, active_runs={**state.active_runs, key: resumed},
+                    recent_runs=tuple(run for run in state.recent_runs if run != archived))
+    for event in natives:
+        state, _ = dispatch(state, replace(event, payload={**event.payload,
+                                                          '_symphony_owner_conflict': False}))
+        run = state.active_runs.get(key)
+        if not run or run.run_id != archived.run_id:
+            return None
+    run = state.active_runs[key]
+    if assessed_completion_chronology(replace(state, active_run=run), session, project, environ) != 'valid':
+        return None
+    run = replace(run, assessment={name: value for name, value in run.assessment.items()
+                                  if name != '_batch_pending'})
+    state = replace(state, active_run=run, active_runs={**state.active_runs, key: run})
+    # Historical work has all native results now; use the normal reducer to
+    # archive it. A later run, its admission and every foreign root stay intact.
+    state, _ = dispatch(state, Event(natives[-1].event_id + ':historical-stop', 'stop_requested',
+                                    committed_at, {'provider': 'codex', 'session_id': session,
+                                                   'cwd': str(project)}))
+    matches = [item for item in state.recent_runs if item.run_id == archived.run_id]
+    if key in state.active_runs or len(matches) != 1 or matches[0].status != 'completed':
+        return None
+    witnesses = tuple({'event_id': event.event_id, 'kind': event.kind,
+                       'generation': generation, 'hash': _codex_followup_source_hash(event)}
+                      for event in sources)
+    completed = replace(matches[0], assessment={**matches[0].assessment,
+        '_codex_archived_followup_sources': (*matches[0].assessment.get(
+            '_codex_archived_followup_sources', ()), *witnesses)})
+    state = replace(state, recent_runs=tuple(completed if run.run_id == completed.run_id else run
+                                            for run in state.recent_runs))
+    active = dict(state.active_runs)
+    if key in original.active_runs:
+        active[key] = original.active_runs[key]
+    return replace(state, active_run=original.active_run, active_runs=active,
+                   configuration=original.configuration)
 
 
 def _commit_sendmessage_sequence(state: ProjectState, sequence: tuple, sources: tuple[Event, ...],
@@ -4440,14 +4761,15 @@ def _governance(state: ProjectState) -> str:
 
 
 def _claude_native_stop_guard(source: Event, reason: str) -> tuple[Action, ...]:
-    if (source.payload.get('provider') == 'claude'
+    if (source.payload.get('provider') in {'claude', 'codex'}
             and source.kind == 'stop_requested' and source.payload.get('hook_event_name') == 'Stop'
             and source.payload.get('stop_hook_active') is True):
         # Release this host turn without treating unverifiable native work as
         # completed. Dispatching Stop here could archive the older outcome.
         return (Action('permit_stop', {'reason': reason +
-            ' This repeated Stop releases the host turn only; the run and unresolved evidence remain open.'}),)
-    return (Action('block_stop', {'reason': reason}),)
+            ' This repeated Stop releases the host turn only; the run and unresolved evidence remain open.',
+            'recovery_kind': 'bookkeeping'}),)
+    return (Action('block_stop', {'reason': reason, 'recovery_kind': 'bookkeeping'}),)
 
 
 def _claude_unknown_turn_guidance(run: RunState) -> str:
@@ -4757,8 +5079,8 @@ def _native_help(provider: str) -> str:
 
 def _help(provider: str) -> str:
     if provider == "claude":
-        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:boost [max|ultra|off], /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:help."
-    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|boost [max|ultra|off]|reassess|proceed|stop|version|help."
+        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:boost [xhigh|max|off], /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:report submit|decline <approval-code>, /symphony:help."
+    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|boost [xhigh|max|ultra|off]|reassess|proceed|stop|version|report submit|decline <approval-code>|help."
 
 
 def _fault_log(environ: Mapping[str, str]) -> Path:

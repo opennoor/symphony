@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from plugins.symphony.scripts.generate_agents import BODIES
 from plugins.symphony.symphony.model import Event
-from plugins.symphony.symphony.runtime import handle, _assessment_from_marker, _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT, _decision_markers
+from plugins.symphony.symphony.runtime import _handle_core as handle, _assessment_from_marker, _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT, _decision_markers
 from plugins.symphony.symphony.routing import Assessment, fast_lead_selection, profiles_for, resolve_tier, route_for, snapshot_for
 from plugins.symphony.symphony.store import StateStore
 

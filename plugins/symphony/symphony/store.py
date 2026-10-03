@@ -11,6 +11,7 @@ import time
 import tempfile
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,21 @@ except ImportError:  # pragma: no cover - exercised outside Windows
 
 
 SCHEMA_VERSION = 2
+_LOCK_DEADLINE: ContextVar[float | None] = ContextVar('symphony_lock_deadline', default=None)
+
+
+@contextmanager
+def state_lock_budget(seconds: float) -> Iterator[None]:
+    """Bound cumulative state-lock waiting for a native Stop recovery attempt."""
+    deadline = time.monotonic() + seconds
+    previous = _LOCK_DEADLINE.get()
+    token = _LOCK_DEADLINE.set(min(previous, deadline) if previous is not None else deadline)
+    try:
+        yield
+    finally:
+        _LOCK_DEADLINE.reset(token)
+_UNMANAGED_REPORT_COUNT = 100
+_UNMANAGED_REPORT_BYTES = 16 * 1024 * 1024
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
 _UpdateResult = TypeVar("_UpdateResult")
@@ -45,7 +61,19 @@ _SECRET_KEYS = {
     "client_secret",
     "private_key",
     "token",
+    "cookie",
+    "cookies",
+    "set_cookie",
+    "passphrase",
+    "pwd",
 }
+
+
+def _child_callback_payload(event: Event) -> dict[str, Any]:
+    # Preserve provider fields at the first durable boundary, including fields
+    # introduced by a later host version. Runtime replay flags are not inputs.
+    return {key: item for key, item in event.payload.items()
+            if key not in {'_symphony_owner_conflict', '_symphony_verified_alias'}}
 
 
 def project_key(project: Path) -> str:
@@ -320,7 +348,19 @@ def _text(value: Any, name: str) -> str:
 
 
 def _redact(value: Any, key: str = "") -> Any:
-    if key.lower().replace("-", "_") in _SECRET_KEYS:
+    normalized = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', key)
+    normalized = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', normalized)
+    normalized = re.sub(r'[^a-z0-9]+', '_', normalized.lower()).strip('_')
+    words = set(normalized.split('_'))
+    # A numeric count is metadata, never a credential container or value.
+    if normalized.endswith(('_count', '_counts')) and type(value) is int and value >= 0:
+        return value
+    phrased = '_' + normalized + '_'
+    if (any('_' + secret + '_' in phrased for secret in _SECRET_KEYS)
+            or words & {'password', 'passwords', 'passwd', 'secret', 'secrets', 'authorization',
+                        'credential', 'credentials', 'cookie', 'cookies', 'passphrase', 'passphrases',
+                        'apikey', 'apikeys', 'pwd', 'token', 'tokens', 'auth', 'authentication'}
+            or (words & {'key', 'keys'} and bool(words & {'api', 'private', 'encryption'}))):
         return "[REDACTED]"
     if isinstance(value, str):
         return redact_secrets(value)
@@ -344,6 +384,10 @@ def _local_lock(path: Path) -> threading.Lock:
 
 @contextmanager
 def _locked(path: Path, timeout: float | None = None) -> Iterator[None]:
+    budget = _LOCK_DEADLINE.get()
+    if budget is not None:
+        remaining = max(0, budget - time.monotonic())
+        timeout = min(timeout, remaining) if timeout is not None else remaining
     path.parent.mkdir(parents=True, exist_ok=True)
     local = _local_lock(path)
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -412,6 +456,48 @@ class StateStore:
     def _session_path(self, provider: str, session: str) -> Path:
         digest = hashlib.sha256(f"{provider}\0{session}".encode()).hexdigest()
         return self.root / f".session-{digest}.json"
+
+    def stop_turn_budget(self, provider: str, session: str, project: Path, *, reset: bool = False) -> bool:
+        """Allow at most one native Stop block per root user turn.
+
+        This sidecar is not an outcome or an acknowledgment. It never changes
+        project state, inbox entries, receipts, ownership or generation.
+        """
+        digest = hashlib.sha256(f'{provider}\0{session}'.encode()).hexdigest()
+        path = self.root / f'.stop-budget-{digest}.json'
+        with _locked(path, timeout=0.05):
+            record = self.session_record(provider, session)
+            scope = {'provider': provider, 'session': session,
+                     'project': (record or {}).get('state_name') or self._path(project).name,
+                     'generation': (record or {}).get('generation', 1)}
+            previous = json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else {}
+            spent = previous.get('scope') == scope and previous.get('blocked') is True
+            self._write_json(path, {'schema': 1, 'scope': scope, 'blocked': not reset})
+            return not spent
+
+    def record_recovery_diagnostic(self, report: dict[str, Any]) -> None:
+        """Aggregate allowlisted anonymous facts locally; never transmit them."""
+        allowed = {'schema', 'plugin_version', 'provider', 'platform', 'category', 'outcome'}
+        if (set(report) != allowed or type(report['schema']) is not int or report['schema'] != 1
+                or report['provider'] not in {'codex', 'claude'}
+                or report['platform'] not in {'windows', 'linux', 'macos', 'other'}
+                or report['category'] not in {'bookkeeping', 'incomplete_work', 'state_io', 'state_shape', 'runtime_fault', 'native_recovery'}
+                or report['outcome'] not in {'deferred', 'recovered'}
+                or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', str(report['plugin_version']))):
+            raise ValueError('invalid anonymous diagnostic')
+        day = datetime.now(timezone.utc).date().isoformat()
+        identity = json.dumps({**report, 'day': day}, sort_keys=True).encode()
+        path = self.root / 'diagnostics' / (hashlib.sha256(identity).hexdigest() + '.json')
+        with _locked(path.parent / '.aggregate', timeout=0.05):
+            previous = json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else {}
+            count = previous.get('occurrences', 0)
+            count = count if type(count) is int and 0 <= count <= 1_000_000 else 0
+            self._write_json(path, {**report, 'day': day, 'occurrences': min(count + 1, 1_000_000)})
+            # One directory lock avoids accumulating a lock file per daily
+            # aggregate and serializes retention against concurrent writers.
+            files = sorted(path.parent.glob('*.json'), key=lambda entry: entry.stat().st_mtime, reverse=True)
+            for expired in files[100:]:
+                expired.unlink(missing_ok=True)
 
     def _alias_path(self, provider: str, owner: str, child: str) -> Path:
         root_digest = hashlib.sha256(f"{provider}\0{owner}".encode()).hexdigest()
@@ -522,15 +608,7 @@ class StateStore:
             # session record and event under its own lock before replay.
             self._register_alias(provider, parent, session)
         pending = list(record["pending"])
-        event_payload = {
-            key: event.payload[key] for key in (
-                "provider", "session_id", "parent_thread_id", "agent_id", "subagent_id",
-                "turn_id", "prompt_id", "status", "last_assistant_message",
-                "agent_transcript_path", "transcript_path", "agent_type", "task_name",
-                "role", "model", "model_reasoning_effort", "task", "objective",
-                "_symphony_child_metadata",
-            ) if key in event.payload
-        }
+        event_payload = _child_callback_payload(event)
         entry = {"event_id": event.event_id, "kind": event.kind,
                  "observed_at": event.observed_at, "payload": _redact(event_payload),
                  "generation": record["generation"], "ambiguous_owner": ambiguous_owner}
@@ -547,13 +625,140 @@ class StateStore:
                 record["overflow"] = True
             self._write_json(self._session_path(record["provider"], record["session"]), record)
 
+    def preserve_unmanaged_callback(
+        self, provider: str, session: str, project: Path, generation: int,
+        event: Event, *, create: bool = True,
+    ) -> bool:
+        """Preserve out-of-scope evidence before ACK; never certify completion.
+
+        The exact callback, project, session and generation identify the record.
+        Its existence also makes a crash between preservation and ACK recoverable
+        after enablement changes. This is not a managed terminal receipt.
+        """
+        value = _redact({"schema": 1, "disposition": "outside_disabled_governance",
+                        "provider": provider, "session": session,
+                        "project": project_key(project), "generation": generation,
+                        "event": {"event_id": event.event_id, "kind": event.kind,
+                                  "observed_at": event.observed_at,
+                                  "payload": _child_callback_payload(event)}})
+        # Normalize tuple-valued native metadata to its durable JSON shape.
+        value = json.loads(json.dumps(value, sort_keys=True))
+        # Provider retries keep their callback ID and payload but acquire a new
+        # local observation time. Retain that time in the original evidence;
+        # bind replay to the stable identity, including the complete payload.
+        identity = {**value, 'event': {key: item for key, item in value['event'].items()
+                                     if key != 'observed_at'}}
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        index_path, index = self._unmanaged_observations(provider, session, value['project'], generation)
+        fact = index['entries'].get(digest)
+        if fact and fact['event_id'] != event.event_id:
+            raise ValueError('unmanaged observation event identity differs')
+        if fact and (not create or fact['acknowledged']):
+            return True
+        paths = [self.root / folder / (digest + '.json')
+                 for folder in ('unmanaged-callbacks', 'unmanaged-recovery')]
+        existing = next((path for path in paths if path.exists()), None)
+        if existing is not None:
+            saved = json.loads(existing.read_text(encoding='utf-8'))
+            if not isinstance(saved, dict) or not isinstance(saved.get('event'), dict):
+                raise ValueError('invalid unmanaged callback evidence')
+            saved_identity = {**saved, 'event': {key: item for key, item in saved['event'].items()
+                                               if key != 'observed_at'}}
+            if saved_identity != identity:
+                raise ValueError('unmanaged callback evidence differs from its identity hash')
+        if existing is None:
+            if not create:
+                return False
+            try:
+                self._write_json(paths[0], value)
+            except OSError:
+                # Separate from the managed inbox: no report-size limit, no
+                # overflow flag, and no invented obligation for disabled work.
+                self._write_json(paths[1], value)
+        elif not create:
+            return True
+        if fact is None:
+            index['entries'][digest] = {'event_id': event.event_id, 'acknowledged': False}
+            self._write_json(index_path, index)
+        return True
+
+    def _unmanaged_observations(
+        self, provider: str, session: str, project: str, generation: int,
+    ) -> tuple[Path, dict[str, Any]]:
+        scope = {'schema': 1, 'provider': provider, 'session': session,
+                 'project': project, 'generation': generation}
+        digest = hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
+        path = self.root / 'unmanaged-observations' / (digest + '.json')
+        if not path.exists():
+            return path, {**scope, 'entries': {}}
+        value = json.loads(path.read_text(encoding='utf-8'))
+        if (not isinstance(value, dict) or set(value) != {*scope, 'entries'}
+                or any(value[key] != expected for key, expected in scope.items())
+                or type(value['schema']) is not int or type(value['generation']) is not int
+                or not isinstance(value['entries'], dict)
+                or any(not re.fullmatch(r'[0-9a-f]{64}', key)
+                       or not isinstance(fact, dict) or set(fact) != {'event_id', 'acknowledged'}
+                       or not isinstance(fact['event_id'], str)
+                       or not fact['event_id'] or len(fact['event_id']) > 512
+                       or type(fact['acknowledged']) is not bool
+                       for key, fact in value['entries'].items())):
+            raise ValueError('invalid unmanaged observation facts')
+        return path, value
+
+    def _prune_unmanaged_reports(self, index: dict[str, Any], pending: set[str]) -> None:
+        """Bound acknowledged full reports; pending evidence is never pruned.
+
+        Small content hashes survive for this root's resumable lifetime, like
+        managed terminal receipts. They carry no report text or task credit.
+        """
+        candidates = []
+        for digest, fact in index['entries'].items():
+            if not fact['acknowledged'] or fact['event_id'] in pending:
+                continue
+            for folder in ('unmanaged-callbacks', 'unmanaged-recovery'):
+                path = self.root / folder / (digest + '.json')
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    continue
+                candidates.append((info.st_mtime_ns, path, info.st_size))
+        retained_bytes, retained_count = 0, 0
+        for _, path, size in sorted(candidates, reverse=True):
+            if (retained_count >= _UNMANAGED_REPORT_COUNT
+                    or retained_bytes + size > _UNMANAGED_REPORT_BYTES):
+                path.unlink(missing_ok=True)
+            else:
+                retained_bytes += size
+                retained_count += 1
+
     def finish_session_events(self, record: dict[str, Any], event_ids: set[str]) -> None:
         """Acknowledge only after the project transaction has committed."""
         if not event_ids:
             return
+        index = None
+        if record['project']:
+            index_path, index = self._unmanaged_observations(
+                record['provider'], record['session'], project_key(Path(record['project'])),
+                record['generation'])
+            changed = False
+            for fact in index['entries'].values():
+                if fact['event_id'] in event_ids and not fact['acknowledged']:
+                    fact['acknowledged'] = True
+                    changed = True
+            # Commit the tiny replay facts first. If ACK fails, the unchanged
+            # inbox still protects every pending full report from retention.
+            if changed:
+                self._write_json(index_path, index)
         record["pending"] = [item for item in record["pending"]
                              if item.get("event_id") not in event_ids]
         self._write_json(self._session_path(record["provider"], record["session"]), record)
+        if index is not None:
+            try:
+                self._prune_unmanaged_reports(index, {item['event_id'] for item in record['pending']})
+            except OSError:
+                # Cleanup failure must preserve data, not turn an ordinary
+                # completed observation into a new managed Stop obligation.
+                pass
 
     def rebind_session(self, record: dict[str, Any], project: Path, retired: set[str]) -> dict[str, Any]:
         """Move a settled native session to a new root project at a task boundary."""

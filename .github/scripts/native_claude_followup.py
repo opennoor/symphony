@@ -284,7 +284,9 @@ def replay_native_copies(root, original_state, native_home, project, session, ev
         def original_observation(provider, source):
             return replace(normalizer(provider, source), observed_at=original_trigger_time)
         with patch.object(runtime, 'event_from_payload', side_effect=original_observation):
-            return runtime.handle(payload, copied_env)
+            # This proof harness injects an ACK crash and must observe it.
+            # Public native Stop contains storage faults without credit.
+            return getattr(runtime, '_handle_core', runtime.handle)(payload, copied_env)
 
     counts = {}
     for mode in ('Stop', 'SessionStart', 'status', 'failed-ack', 'partial-ack'):

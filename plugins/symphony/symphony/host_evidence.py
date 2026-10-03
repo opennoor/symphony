@@ -2214,6 +2214,7 @@ def codex_completing_lead_turn(
 
 def _codex_root_followup(
     run: RunState, native: Event, project: Path, environ: Mapping[str, str],
+    *, through_started_at: bool = False,
 ) -> bool:
     """Bind a successful root followup to the original spawn and new turn."""
     sessions = Path(environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
@@ -2282,6 +2283,9 @@ def _codex_root_followup(
         return False
     archived = _instant(run.updated_at)
     followups = [(call_id, when) for call_id, when in followups if archived and when > archived]
+    if through_started_at:
+        began = _instant(native.payload.get('_symphony_native_started_at'))
+        followups = [(call_id, when) for call_id, when in followups if began and when <= began]
     if len(followups) != 1:
         return False
     call_id, called_at = followups[0]
@@ -2293,7 +2297,9 @@ def _codex_root_followup(
     archived = _instant(run.updated_at)
     return bool(response and response[0] == "" and len(deliveries) == 1
                 and began and completed and archived
-                and spawned_at <= starts[0][1] < archived < called_at <= deliveries[0] <= began
+                and spawned_at <= starts[0][1] < archived < called_at <= deliveries[0]
+                and called_at <= began <= completed
+                and deliveries[0] <= (completed if through_started_at else began)
                 and deliveries[0] <= response[1])
 
 
@@ -3423,6 +3429,167 @@ def claude_archived_mixed_sendmessage_sequence(
     return (*lead_proof[:3], anchor, {'natives': worker_natives, 'mapping': worker_mapping})
 
 
+def codex_archived_followup_sequence(
+    state: ProjectState, events: tuple[Event, ...], session: str, generation: int,
+    project: Path, environ: Mapping[str, str],
+) -> tuple[RunState, tuple[Event, ...]] | None:
+    """Prove an archived lead's completed continuation and fresh descendants.
+
+    Reconcile historical ownership independently of a later active run. Every
+    lead turn needs its own successful root delivery; every fresh child needs
+    an original native launch, exact callback body and completed native turn.
+    The caller still reduces the sequence and checks substantive handback
+    chronology before committing anything or acknowledging the inbox.
+    """
+    if not events or any(event.kind not in {'subagent_started', 'subagent_stopped'}
+                         or event.payload.get('provider') != 'codex'
+                         or event.payload.get('session_id') != session for event in events):
+        return None
+    lead_ids = {event.payload.get('agent_id') if event.payload.get('parent_thread_id') == session
+                else event.payload.get('parent_thread_id') for event in events}
+    if len(lead_ids) != 1:
+        return None
+    lead_id = next(iter(lead_ids))
+    candidates = [run for run in state.recent_runs if run.provider == 'codex'
+                  and run.session_id == session and run.lead_identity == lead_id
+                  and run.status == 'completed' and run.owner_generation == generation
+                  and not run.unreconciled]
+    if len(candidates) != 1 or any(
+            lead_id in {run.lead_identity, *(item.identity for item in run.delegations)}
+            for run in state.active_runs.values()):
+        return None
+    run = candidates[0]
+    if (not isinstance(run.assessment.get('substantive_contract'), Mapping)
+            or any(item.state.lower() not in {'completed', 'done', 'success', 'succeeded'}
+                   for item in run.delegations)):
+        return None
+    home = Path(environ.get('CODEX_HOME') or Path.home() / '.codex')
+    parent = _chronology_codex_file(home, lead_id, session, project)
+    if parent is None:
+        return None
+    lead = next((item for item in run.delegations
+                 if item.identity == lead_id and item.role == 'lead'), None)
+    observed = _native_lead_turns(replace(state, active_run=run), session, environ)
+    if lead is None or observed is None:
+        return None
+    archived_at = _instant(run.updated_at)
+    if archived_at is None:
+        return None
+    _, turns, order, latest, _ = observed
+    fresh = [token for token in order if turns[token].get('started_at')
+             and turns[token]['started_at'] > archived_at]
+    if not fresh or latest != fresh[-1]:
+        return None
+    final_at = turns[fresh[-1]].get('completed_at')
+    if final_at is None or any(
+            other.provider == 'codex' and other.session_id == session and other.run_id != run.run_id
+            and ((started := _instant(other.started_at)) is None or archived_at < started <= final_at)
+            for other in (*state.active_runs.values(), *state.recent_runs)):
+        return None
+    natives = []
+    boundary = run
+    for token in fresh:
+        turn = turns[token]
+        began, ended = turn.get('started_at'), turn.get('completed_at')
+        report = turn.get('message')
+        if (began is None or ended is None or began >= ended or turn.get('failed')
+                or turn.get('model') != lead.requested_tier
+                or turn.get('effort') != lead.requested_effort
+                or not isinstance(report, str) or not report.strip()
+                or len(report) > 100_000):
+            return None
+        starts = [index for index, row in enumerate(parent) if row.get('type') == 'event_msg'
+                  and row['payload'].get('type') == 'task_started']
+        matching = [index for index in starts if parent[index]['payload'].get('turn_id') == token]
+        if len(matching) != 1:
+            return None
+        index = matching[0]
+        next_start = next((value for value in starts if value > index), len(parent))
+        strict = _chronology_codex_turn([parent[0], *parent[index:next_start]], lead)
+        if strict is None or strict[:4] != (token, began, ended, report):
+            return None
+        native = Event(hashlib.sha256(f'codex-host-turn\0{lead_id}\0{token}'.encode()).hexdigest(),
+            'subagent_stopped', ended.isoformat(), {'provider': 'codex', 'session_id': session,
+            'agent_id': lead_id, 'agent_type': 'lead', 'parent_thread_id': session,
+            'turn_id': token, 'model': lead.requested_tier,
+            'model_reasoning_effort': lead.requested_effort, 'status': 'completed',
+            'last_assistant_message': report, 'cwd': str(project),
+            '_symphony_native_started_at': began.isoformat()})
+        if not _codex_root_followup(boundary, native, project, environ, through_started_at=True):
+            return None
+        natives.extend((replace(native, event_id=native.event_id + ':followup-start',
+                                kind='subagent_started', observed_at=began.isoformat(),
+                                payload={**native.payload, 'status': 'working'}), native))
+        boundary = replace(boundary, updated_at=ended.isoformat())
+    if _reported_status(natives[-1].payload['last_assistant_message']) != 'completed':
+        return None
+    old_ids = {item.identity for item in run.delegations}
+    child_ids = {event.payload.get('agent_id') for event in events} - {lead_id}
+    if child_ids & old_ids or None in child_ids:
+        return None
+    inventory = _chronology_calls('codex', parent)
+    if inventory is None:
+        return None
+    fresh_calls = {call[0] for call in inventory[0] if call[1] == 'spawn_agent'
+                   and archived_at < call[3] <= final_at}
+    launched_ids = {row['payload']['item'].get('agent_thread_id') for row in parent
+                    if row.get('type') == 'event_msg' and row['payload'].get('type') == 'item_completed'
+                    and row['payload'].get('item', {}).get('type') == 'SubAgentActivity'
+                    and row['payload']['item'].get('kind') == 'started'
+                    and row['payload']['item'].get('id') in fresh_calls}
+    if launched_ids != child_ids or len(fresh_calls) != len(child_ids):
+        return None
+    for identity in child_ids:
+        sources = [event for event in events if event.payload.get('agent_id') == identity]
+        starts = [event for event in sources if event.kind == 'subagent_started']
+        endings = [event for event in sources if event.kind == 'subagent_stopped']
+        if len(starts) != 1 or len(endings) != 1:
+            return None
+        payload = starts[0].payload
+        child = Delegation(identity, 'worker', '', 'completed', payload.get('model'),
+                           payload.get('model_reasoning_effort'))
+        rows = _chronology_codex_file(home, identity, lead_id, project)
+        if rows is None or _codex_child_purpose(rows[0]['payload'].get('agent_path'), child) != 'substantive':
+            return None
+        launch, terminal = _chronology_codex_launch(parent, rows, child), _chronology_codex_turn(rows, child)
+        if launch is None or terminal is None:
+            return None
+        token, began, ended, report, _ = terminal
+        if not any(turns[t]['started_at'] <= launch[0] <= began < ended
+                   <= turns[t]['completed_at'] for t in fresh):
+            return None
+        base = {'provider': 'codex', 'session_id': session, 'agent_id': identity,
+                'agent_type': 'worker', 'parent_thread_id': lead_id, 'turn_id': token,
+                'model': child.requested_tier, 'model_reasoning_effort': child.requested_effort,
+                'cwd': str(project)}
+        natives.extend((replace(starts[0], observed_at=began.isoformat(), payload={**base, 'status': 'working'}),
+                        replace(endings[0], observed_at=ended.isoformat(),
+                                payload={**base, 'status': 'completed', 'last_assistant_message': report})))
+    for source in events:
+        matches = [native for native in natives if native.kind == source.kind
+                   and native.payload['agent_id'] == source.payload.get('agent_id')
+                   and native.payload['turn_id'] == source.payload.get('turn_id')]
+        if len(matches) != 1:
+            return None
+        payload, native = source.payload, matches[0].payload
+        rows = parent if native['agent_id'] == lead_id else _chronology_codex_file(
+            home, native['agent_id'], lead_id, project)
+        role = 'lead' if native['agent_id'] == lead_id else 'worker'
+        if (payload.get('parent_thread_id') != native['parent_thread_id']
+                or rows is None or payload.get('task_name') not in {
+                    None, '', rows[0]['payload']['agent_path'].rsplit('/', 1)[-1]}
+                or payload.get('agent_type') not in ({None, '', 'default', 'lead'}
+                                                     if role == 'lead' else {None, '', 'worker'})
+                or payload.get('role') not in {None, '', role}
+                or payload.get('model') not in {None, '', native['model']}
+                or payload.get('model_reasoning_effort') not in {None, '', native['model_reasoning_effort']}
+                or source.kind == 'subagent_stopped' and (
+                    str(payload.get('status') or 'completed').lower() != 'completed'
+                    or payload.get('last_assistant_message') != native['last_assistant_message'])):
+            return None
+    return run, tuple(sorted(natives, key=lambda event: _instant(event.observed_at)))
+
+
 def archived_lead_followup(
     state: ProjectState, events: tuple[Event, ...], provider: str, session: str,
     project: Path, environ: Mapping[str, str],
@@ -3454,6 +3621,20 @@ def archived_lead_followup(
                                              allow_fast_escalation=allow_escalation)
         if (native is None or native.payload.get("status") != "completed"
                 or not _codex_root_followup(run, native, project, environ)):
+            return None
+        # The single-lead recovery cannot omit work launched by that turn.
+        # Fresh descendants require the complete sequence proof above.
+        home = Path(environ.get('CODEX_HOME') or Path.home() / '.codex')
+        paths = tuple((home / 'sessions').glob(f'*/*/*/*{run.lead_identity}.jsonl'))
+        if len(paths) != 1:
+            return None
+        rows = _complete_native_jsonl(paths[0])
+        began, ended = _instant(native.payload['_symphony_native_started_at']), _instant(native.observed_at)
+        if not rows or any(row.get('type') == 'response_item'
+                and row['payload'].get('type') == 'function_call'
+                and row['payload'].get('name') == 'spawn_agent'
+                and (when := _instant(row.get('timestamp'))) is not None and began <= when <= ended
+                for row in rows):
             return None
     elif provider == "claude":
         _, native = claude_completing_lead_turn(scoped, session, project, environ,

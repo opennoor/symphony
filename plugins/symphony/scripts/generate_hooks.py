@@ -62,7 +62,9 @@ def generated(root=PLUGIN):
         # for that outer shell to expand before the inner PowerShell starts.
         wrapper = ("iex ([IO.StreamReader]::new([IO.Compression.GZipStream]::new("
                    "[IO.MemoryStream]::new([Convert]::FromBase64String('" + payload + "')),"
-                   "[IO.Compression.CompressionMode]::Decompress))).ReadToEnd()")
+                   "[IO.Compression.CompressionMode]0))).ReadToEnd()")
+        # Windows PowerShell 5.1 cannot choose between enum/bool overloads
+        # from a bare integer. The typed zero selects Decompress explicitly.
         prefix = 'powershell.exe -NoProfile -NonInteractive -Command '
         capture = "[Environment]::SetEnvironmentVariable('SYMPHONY_CAPTURED_BOOTSTRAP','" + code.replace("'", "''") + "');"
         windows = 'cmd.exe /c ' + prefix + '"' + capture + wrapper + '"'

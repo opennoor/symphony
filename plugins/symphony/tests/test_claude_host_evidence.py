@@ -14,7 +14,7 @@ from plugins.symphony.symphony.host_evidence import (
 )
 from plugins.symphony.symphony.adapters import event_from_payload
 from plugins.symphony.symphony.model import Delegation, Event, ProjectState, RunState
-from plugins.symphony.symphony.runtime import _observe_delegation, handle
+from plugins.symphony.symphony.runtime import _observe_delegation, _handle_core as handle
 from plugins.symphony.symphony.store import StateStore
 
 

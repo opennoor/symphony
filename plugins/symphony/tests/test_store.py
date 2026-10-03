@@ -567,6 +567,65 @@ with Path(sys.argv[1]).open('a+b') as handle:
         self.assertNotIn("abcdefghijklmnop", contents)
         self.assertIn("[REDACTED]", contents)
 
+    def test_persistence_redacts_provider_credential_names_and_token_shapes(self):
+        secrets = ['credential-one', 'credential-two', 'credential-three',
+                   'ghp_' + 'a' * 36, 'github_pat_' + 'b' * 40,
+                   'sk-ant-api03-' + 'c' * 32, 'cookie-credential', 'passphrase-credential']
+        self.store.save(self.project, ProjectState(configuration={
+            'authToken': secrets[0], 'providerAPIKey': secrets[1],
+            'future': {'vendor.credentials': {'opaque': secrets[2]},
+                       'ordinary': [*secrets[3:6], 'harmless-provider-value'],
+                       'headers': {'Cookie': secrets[6]}, 'keyPassphrase': secrets[7]},
+            'tokenCount': 42,
+        }))
+        contents = self.state_path().read_text(encoding='utf-8')
+        for secret in secrets:
+            self.assertNotIn(secret, contents)
+        saved = self.store.load(self.project).configuration
+        self.assertEqual(saved['authToken'], '[REDACTED]')
+        self.assertEqual(saved['providerAPIKey'], '[REDACTED]')
+        self.assertEqual(saved['future']['vendor.credentials'], '[REDACTED]')
+        self.assertEqual(saved['future']['ordinary'][-1], 'harmless-provider-value')
+        self.assertEqual(saved['tokenCount'], 42)
+
+    def test_plural_credential_containers_do_not_persist_opaque_values(self):
+        fields = ['clientSecrets', 'passwords', 'provider.apiKeys', 'accessTokens', 'privateKeys']
+        self.store.save(self.project, ProjectState(configuration={
+            key: {'opaque': 'never-persist-this-value'} for key in fields}))
+        self.assertNotIn('never-persist-this-value', self.state_path().read_text())
+        self.assertEqual({key: '[REDACTED]' for key in fields}, self.store.load(self.project).configuration)
+
+    def test_credential_value_and_container_suffixes_are_redacted_but_numeric_counts_survive(self):
+        names = ['apiKeyValue', 'providerAPIKeyBundle', 'apiKeysByAccount', 'privateKeyPem',
+                 'encryptionKeyBytes', 'cookieJar', 'cookiesByDomain', 'cookieValues',
+                 'keyPassphraseValue', 'passphrasesByKey', 'accessTokenHeader', 'refreshTokenValue']
+        values = {name: {'nested': ['opaque-credential-' + str(index)]} for index, name in enumerate(names)}
+        counts = {'tokenCount': 42, 'apiKeyCount': 2, 'cookieJarCount': 3, 'passphraseCount': 4}
+        self.store.save(self.project, ProjectState(configuration={**values, **counts,
+            'apiKeyCountText': 'opaque-string-count', 'privateKeyCount': 'opaque-string-key',
+            'monkeyValue': 'harmless-provider-value'}))
+        contents = self.state_path().read_text()
+        self.assertNotIn('opaque-', contents)
+        saved = self.store.load(self.project).configuration
+        for name in names:
+            self.assertEqual('[REDACTED]', saved[name], name)
+        for name, count in counts.items():
+            self.assertEqual(count, saved[name], name)
+        self.assertEqual('harmless-provider-value', saved['monkeyValue'])
+
+    def test_generic_token_fields_redact_every_non_count_value(self):
+        for name in ('tokenCount', 'tokenBundle', 'tokensByAccount', 'vendorTokenMaterial'):
+            for value in ('opaque-token-credential', {'opaque': 'opaque-token-credential'},
+                          ['opaque-token-credential'], None, True, -1, 1.5):
+                with self.subTest(name=name, value=value):
+                    self.store.save(self.project, ProjectState(configuration={name: value,
+                        'token_count': 0, 'tokens_count': 42, 'ordinary': 'safe'}))
+                    saved = self.store.load(self.project).configuration
+                    self.assertEqual('[REDACTED]', saved[name])
+                    self.assertEqual(0, saved['token_count'])
+                    self.assertEqual(42, saved['tokens_count'])
+                    self.assertEqual('safe', saved['ordinary'])
+
 
 if __name__ == "__main__":
     unittest.main()

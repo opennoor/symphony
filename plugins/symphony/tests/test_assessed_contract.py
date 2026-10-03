@@ -12,10 +12,11 @@ from plugins.symphony.symphony.model import Action, Delegation, Event, ProjectSt
 from plugins.symphony.symphony.reducer import _substantive_child_completed, _stop_block_reason, reduce
 from plugins.symphony.symphony.store import StateStore
 from plugins.symphony.symphony.routing import Assessment, snapshot_for
+# Strict ownership/credit reducer; public host-turn liveness has separate tests.
 from plugins.symphony.symphony.runtime import (
     _accept_assessment, _observe_delegation, _queue_pending_delegation,
     _recovery_guidance, _render_actions,
-    handle,
+    _handle_core as handle,
 )
 
 
