@@ -44,15 +44,15 @@ unresolved managed results continue to require their native ownership evidence.
 - Replayed the full attached project state and both original pending callbacks
   in temporary storage: Stop permitted, both callbacks preserved exactly, zero
   managed runs and zero terminal receipts. Original user state was not edited.
-- Added a sanitized captured regression and 19 test methods covering ordinary
+- Added a sanitized captured regression and 20 test methods covering ordinary
   native/default reviews, follow-ups, both provider formats, managed exemptions,
   independent roots in a shared checkout, separate child worktrees, generation
   and retirement guards, archive errors, large results, and crash/retry behavior.
 - Real generated, installed hook commands passed the new regression for both
   providers. Codex parent/name/model metadata came from a native child fixture;
   the fixture was unchanged afterward.
-- Final unit suite after the Copilot fixes: 830 tests passed, seven
-  platform-dependent skips, 106.503 seconds.
+- Final unit suite after the Copilot fixes: 831 tests passed, seven
+  platform-dependent skips, 119.334 seconds.
   A temporary runner used the installed PowerShell binary directly because Snap
   confinement was unavailable, and relocated one private-clock fixture from the
   read-only home directory to `/tmp`. Assertions were unchanged. The runner used
@@ -91,3 +91,11 @@ excluding only the runtime's synthetic owner-conflict and verified-alias flags.
 Both providers' regressions preserve hook name, cwd, stop flags, an arbitrary
 nested provider field, and verified native metadata; live retries after enable
 continue to match the same complete representation.
+
+The fourth review identified the same field loss before archival on the queued
+recovery path. The first durable inbox boundary now uses the same complete,
+normalized, redacted payload representation as unmanaged observation storage.
+Existing inbox count and size limits remain enforced. A regression queues both
+provider formats, verifies full fields in durable pending storage, acknowledges
+and prunes the unmanaged report, enables Symphony, and retries through the live
+provider hook. The retry matches its original observation and does not block.

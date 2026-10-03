@@ -51,13 +51,10 @@ _SECRET_KEYS = {
 
 
 def _child_callback_payload(event: Event) -> dict[str, Any]:
-    return {key: event.payload[key] for key in (
-        "provider", "session_id", "parent_thread_id", "agent_id", "subagent_id",
-        "turn_id", "prompt_id", "status", "last_assistant_message",
-        "agent_transcript_path", "transcript_path", "agent_type", "task_name",
-        "role", "model", "model_reasoning_effort", "task", "objective",
-        "_symphony_child_metadata",
-    ) if key in event.payload}
+    # Preserve provider fields at the first durable boundary, including fields
+    # introduced by a later host version. Runtime replay flags are not inputs.
+    return {key: item for key, item in event.payload.items()
+            if key not in {'_symphony_owner_conflict', '_symphony_verified_alias'}}
 
 
 def project_key(project: Path) -> str:
@@ -566,9 +563,7 @@ class StateStore:
                         "project": project_key(project), "generation": generation,
                           "event": {"event_id": event.event_id, "kind": event.kind,
                                     "observed_at": event.observed_at,
-                                    "payload": {key: item for key, item in event.payload.items()
-                                                if key not in {'_symphony_owner_conflict',
-                                                               '_symphony_verified_alias'}}}})
+                                    "payload": _child_callback_payload(event)}})
         # Normalize tuple-valued native metadata to its durable JSON shape.
         value = json.loads(json.dumps(value, sort_keys=True))
         # Provider retries keep their callback ID and payload but acquire a new
