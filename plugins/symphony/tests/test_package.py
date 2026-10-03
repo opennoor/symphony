@@ -206,6 +206,28 @@ class PackageContractTests(unittest.TestCase):
                         self.assertEqual(activation['session_id'], session)
 
     @staticmethod
+    def _relay_powershell():
+        # Both captured launchers use Windows PowerShell for the inner relay.
+        # Use pwsh only for portable coverage outside Windows.
+        if os.name == 'nt':
+            return str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        return shutil.which('pwsh')
+
+    def test_windows_relay_fixture_uses_shipped_powershell_host(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        native = str(Path('fixture-system') / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        with patch(__name__ + '.os', SimpleNamespace(name='nt', environ={'SystemRoot': 'fixture-system'})), \
+                patch.object(shutil, 'which', return_value='portable-pwsh') as which:
+            self.assertEqual(self._relay_powershell(), native)
+            which.assert_not_called()
+        with patch(__name__ + '.os', SimpleNamespace(name='posix', environ={})), \
+                patch.object(shutil, 'which', return_value='portable-pwsh') as which:
+            self.assertEqual(self._relay_powershell(), 'portable-pwsh')
+            which.assert_called_once_with('pwsh')
+
+    @staticmethod
     def _mock_windows_discovery(relay, code):
         import base64
         encoded = base64.b64encode(code.encode()).decode()
@@ -262,7 +284,7 @@ class PackageContractTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_does_not_hide_other_interpreters_behind_broken_python_entries(self):
-        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        ps = self._relay_powershell()
         for working_name, broken_count in (('python3.exe', 6), ('python.exe', 2), ('python.exe', 6), ('py.exe', 6)):
             with self.subTest(working_name=working_name, broken_count=broken_count), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -286,7 +308,7 @@ class PackageContractTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_deduplicates_repeated_path_candidates(self):
-        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        ps = self._relay_powershell()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             broken, working = root / 'broken', root / 'working'
@@ -308,7 +330,7 @@ class PackageContractTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_discovery_timeout_preserves_candidates_without_running_the_hook_twice(self):
-        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        ps = self._relay_powershell()
         with tempfile.TemporaryDirectory() as temporary:
             probe = self._probe_executable(Path(temporary))
             for partial in ('none', 'complete', 'truncated-tail'):
@@ -335,7 +357,7 @@ class PackageContractTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_windows_relay_accepts_a_slow_working_interpreter_probe(self):
-        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        ps = self._relay_powershell()
         with tempfile.TemporaryDirectory(prefix='slow interpreter probe ') as temporary:
             directory = Path(temporary)
             probe = self._probe_executable(directory, delay=1800)
@@ -416,7 +438,7 @@ class PackageContractTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('pwsh') or os.name == 'nt', 'needs PowerShell')
     def test_empty_windows_path_never_launches_discovery(self):
-        ps = shutil.which('pwsh') or str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        ps = self._relay_powershell()
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / 'discovery-ran'
             code = 'from pathlib import Path;Path(' + repr(str(marker)) + ').write_text("ran")'
