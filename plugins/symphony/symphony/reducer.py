@@ -4,6 +4,8 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime
+import hashlib
+import json
 
 from .model import Action, Delegation, Event, ProjectState, RunState, persistable
 
@@ -20,6 +22,17 @@ def _proof_instant(value: object) -> datetime | None:
         return instant if instant.tzinfo is not None else None
     except ValueError:
         return None
+
+
+def _child_evidence_basis(run: RunState) -> str:
+    """What the lead could not have seen: every child's state and credit."""
+    children = run.assessment.get("_substantive_children")
+    basis = {
+        "delegations": sorted([item.identity, item.state, item.updated_at] for item in run.delegations
+                              if item.identity != run.lead_identity),
+        "children": json.dumps(children, sort_keys=True, default=str) if isinstance(children, Mapping) else "",
+    }
+    return hashlib.sha256(json.dumps(basis, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _active_identities(run: RunState) -> list[str]:
@@ -286,7 +299,9 @@ def _lead_started(state: ProjectState, event: Event):
         outcome=None,
         assessment={key: value for key, value in run.assessment.items()
                     if key not in {"_retryable_lead", "_fast_escalated", "_lead_route_mismatch",
-                                   "_lead_route_mismatch_owner", "_codex_unavailable_proof"}},
+                                   "_lead_route_mismatch_owner", "_codex_unavailable_proof",
+                                   "_reported_nonsuccess", "_reported_nonsuccess_basis",
+                                   "_awaiting_route_consent"}},
         updated_at=event.observed_at,
     )
     return replace(state, active_run=run), ()
@@ -473,6 +488,24 @@ def _lead_failed(state: ProjectState, event: Event):
     else:
         assessment["_retryable_lead"] = ""
         assessment.pop("_retryable_lead_turn", None)
+    # The lead's own explicit non-success report (blocked, incomplete, failed)
+    # is a known result, not missing evidence. Retrying cannot clear a blocker
+    # that needs the user, so Stop may end the run on it instead of warning on
+    # every later turn (#14). Never set for a claimed success that failed checks.
+    reported = event.payload.get("outcome")
+    reported_status = reported.get("status") if isinstance(reported, Mapping) else None
+    if (event.kind == "lead_failed" and event.payload.get("reported_outcome") is True
+            and isinstance(reported_status, str) and reported_status
+            and not _valid_outcome(reported)
+            and event.payload.get("reason") != "substantive_child_missing"
+            and event.payload.get("native_host_failed") is not True
+            and not assessment.get("_lead_route_mismatch")):
+        assessment["_reported_nonsuccess"] = reported_status.lower()[:32]
+        assessment["_reported_nonsuccess_basis"] = _child_evidence_basis(run)
+        assessment.pop("_substantive_child_missing", None)
+    else:
+        assessment.pop("_reported_nonsuccess", None)
+        assessment.pop("_reported_nonsuccess_basis", None)
     recovering = replace(run, status="recovering", outcome=None, assessment=assessment, updated_at=event.observed_at)
     if event.payload.get('reason') == 'substantive_child_missing':
         return replace(state, active_run=recovering), (Action('request_substantive_work', {}),)
@@ -529,35 +562,38 @@ def _reassess(state: ProjectState, event: Event):
 def _stop_block_reason(run: RunState) -> dict | None:
     """Return the payload for a stop block, or None when completion is permitted."""
     if run.assessment.get("_batch_pending"):
-        return {"reason": "child lifecycle reconciliation is still in progress"}
+        return {"reason": "child lifecycle reconciliation is still in progress", "code": "batch_pending"}
     ambiguous = run.assessment.get("_ambiguous_child_starts", ())
     if ambiguous:
         return {"reason": "child start has no invocation ID and matches an earlier start; "
-                "inspect or recover: " + ", ".join(map(str, ambiguous))}
+                "inspect or recover: " + ", ".join(map(str, ambiguous)), "code": "ambiguous_child_start"}
     ambiguous_stops = run.assessment.get("_ambiguous_child_stops", ())
     if ambiguous_stops:
         return {"reason": "child terminal does not match the latest native turn; "
-                "inspect or recover: " + ", ".join(map(str, ambiguous_stops))}
+                "inspect or recover: " + ", ".join(map(str, ambiguous_stops)), "code": "ambiguous_child_stop"}
     active = _active_identities(run)
     if active:
         return {"active": active}
     unresolved = [item.identity for item in run.delegations if item.state == "interrupted"
                   and (item.role != "lead" or item.identity == run.lead_identity)]
     if unresolved:
-        return {"reason": "interrupted work still requires reconciliation: " + ", ".join(unresolved)}
+        return {"reason": "interrupted work still requires reconciliation: " + ", ".join(unresolved),
+                "code": "interrupted_work"}
     pending = run.assessment.get("_pending_delegations", ())
     if pending:
         roles = [str(item.get("role") or "agent") for item in pending if isinstance(item, Mapping)]
-        return {"reason": "waiting for host launch confirmation: " + ", ".join(roles)}
+        return {"reason": "waiting for host launch confirmation: " + ", ".join(roles),
+                "code": "launch_unconfirmed"}
     invalid_consultants = run.assessment.get("_invalid_consultants", ())
     if invalid_consultants:
         return {
             "reason": "consultant results still require size/complexity classification: "
-            + ", ".join(map(str, invalid_consultants))
+            + ", ".join(map(str, invalid_consultants)),
+            "code": "consultant_unclassified",
         }
     mismatch = run.assessment.get("_lead_route_mismatch")
     if mismatch:
-        return {"reason": mismatch}
+        return {"reason": mismatch, "code": "lead_route_mismatch"}
     if not run.lead_identity and not _valid_outcome(run.outcome):
         return {"reason": "lead_not_started"}
     if not _substantive_child_completed(run):
@@ -599,6 +635,30 @@ def _stop_requested(state: ProjectState, event: Event):
             Action("archive_run", {"run_id": run.run_id}),
             Action("permit_stop"),
         )
+    explicit = event.payload.get("control") is True
+    if (reason.get("reason") in {"lead_not_started", "lead_outcome_missing", "substantive_child_missing"}
+            and run.assessment.get("_awaiting_route_consent")):
+        # A lead launch is held for the user's consent to a weaker route. Only
+        # the user can answer, and they cannot while Stop holds the turn, so
+        # the turn ends and the run stays open for the consent control. The
+        # user's own stop control declines instead and closes the run.
+        if explicit:
+            return _archive(state, run, "stopped", event.observed_at), (
+                Action("archive_run", {"run_id": run.run_id}), Action("permit_stop"))
+        return state, (Action("permit_stop"),)
+    if (reason.get("reason") in {"lead_outcome_missing", "substantive_child_missing"}
+            and run.assessment.get("_reported_nonsuccess")
+            and run.assessment.get("_reported_nonsuccess_basis") == _child_evidence_basis(run)):
+        # The lead reported its own non-success and nothing is still running.
+        # The root relays that report; retrying cannot clear a blocker that
+        # needs the user, so this turn ends without a warning (#14). The run
+        # stays open and unsuccessful: the same lead can finish it later (#12),
+        # or the user's stop control closes it as blocked, never completed.
+        if explicit:
+            blocked = replace(run, outcome={"status": run.assessment["_reported_nonsuccess"]})
+            return _archive(state, blocked, "blocked", event.observed_at), (
+                Action("archive_run", {"run_id": run.run_id}), Action("permit_stop"))
+        return state, (Action("permit_stop"),)
     if (event.payload.get('provider') in {'claude', 'codex'}
             and event.payload.get('hook_event_name') == 'Stop'
             and event.payload.get('stop_hook_active') is True):

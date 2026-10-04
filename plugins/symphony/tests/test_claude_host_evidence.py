@@ -25,6 +25,238 @@ REPORT = 'SYMPHONY_OUTCOME: {"status":"completed"}'
 
 
 class ClaudeHostEvidenceTests(unittest.TestCase):
+    def prepare_fast_handback_and_final(self, *, split_terminal=False, handback=True, final=None):
+        report = 'Verified mechanical result.\nSYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+        model, effort = 'claude-opus-5-5', 'medium'
+        agent_type = f'symphony:symphony-lead-{model}-{effort}'
+        self.write_native(model=model, effort=effort, handback=handback, report=report)
+        if not handback:
+            # Captured from Claude print mode, which offers no SubagentHandback:
+            # the lead's final message is its one report, ending with the ack.
+            report = final if final is not None else report + '\n\nReport delivered.'
+        self.write_root_prompt()
+        parent = [json.loads(line) for line in self.parent.read_text().splitlines()]
+        parent[-1]['message']['content'][0]['input']['subagent_type'] = agent_type
+        self.parent.write_text(''.join(json.dumps(row) + '\n' for row in parent))
+        self.meta.write_text(json.dumps({'agentType': agent_type, 'toolUseId': 'toolu_launch', 'spawnDepth': 1}))
+        child = [json.loads(line) for line in self.child.read_text().splitlines()]
+        child[-1]['message'].update(id='msg_native_final', content=[{'type': 'text', 'text': report}])
+        if split_terminal:
+            # Native Claude appends thinking/text chunks of one message as
+            # distinct assistant rows, each carrying the same end_turn.
+            thinking = {**child[-1], 'uuid': 'terminal-thinking', 'timestamp': '2026-09-29T02:01:59.995Z',
+                        'message': {**child[-1]['message'], 'content': [{'type': 'thinking', 'thinking': 'Verified.'}]}}
+            child.insert(-1, thinking)
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in child))
+        run = replace(self.run, assessment={
+            '_fast_pending': True, '_fast_route': {'model': model, 'effort': effort},
+            '_claude_fast_report_contract': 1,
+            '_claude_fast_launch_hash': hashlib.sha256(b'toolu_launch').hexdigest(),
+            '_claude_lead_start_identity': LEAD,
+            '_claude_lead_start_prompt_hash': hashlib.sha256(b'start-request-journal').hexdigest(),
+            '_lead_expected_route': {'identity': LEAD, 'model': model, 'effort': effort}},
+            delegations=(replace(self.run.delegations[0], requested_tier=model, requested_effort=effort),))
+        self.store.save(self.project, ProjectState(active_run=run, active_runs={f'claude:{SESSION}': run}))
+        callback = {'session_id': SESSION, 'cwd': str(self.project), 'hook_event_name': 'SubagentStop',
+                    'agent_id': LEAD, 'agent_type': agent_type, 'agent_transcript_path': str(self.child),
+                    'prompt_id': 'fdb4a2a5-137f-4bb9-8704-21c5328f6dac',
+                    'last_assistant_message': report, 'status': 'completed'}
+        merged = event_from_payload('claude', callback).payload['last_assistant_message']
+        self.assertEqual(2 if handback else report.count('SYMPHONY_FAST_DECISION: eligible'),
+                         merged.count('SYMPHONY_FAST_DECISION: eligible'))
+        return callback
+
+    def assert_fast_callback_archives(self, callback):
+        handle(callback, self.environ)
+        run = self.store.load(self.project).active_run
+        self.assertEqual('completing', run.status)
+        self.assertNotIn('_fast_pending', run.assessment)
+        self.assertEqual({'status': 'completed'}, run.outcome)
+        result = handle({'session_id': SESSION, 'cwd': str(self.project), 'hook_event_name': 'Stop'}, self.environ)
+        self.assertNotIn('"decision": "block"', result.stdout)
+        self.assertIsNone(self.store.load(self.project).active_run)
+        archived = self.store.load(self.project)
+        handle(callback, self.environ)
+        self.assertEqual(archived.recent_runs, self.store.load(self.project).recent_runs)
+        self.assertEqual(archived.terminal_receipts, self.store.load(self.project).terminal_receipts)
+        self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
+    def test_fast_handback_and_final_repeated_markers_use_one_native_report(self):
+        self.assert_fast_callback_archives(self.prepare_fast_handback_and_final())
+
+    def test_fast_report_without_a_handback_tool_completes_from_the_final_message(self):
+        self.assert_fast_callback_archives(self.prepare_fast_handback_and_final(handback=False))
+
+    def test_fast_report_without_a_handback_still_needs_one_decision_and_success(self):
+        base = 'Merged.\nSYMPHONY_FAST_DECISION: eligible\n'
+        for name, final in (('two-decisions', base + base + 'SYMPHONY_OUTCOME: {"status":"completed"}'),
+                            ('no-decision', 'Merged.\nSYMPHONY_OUTCOME: {"status":"completed"}'),
+                            ('blocked', base + 'SYMPHONY_OUTCOME: {"status":"blocked"}'),
+                            ('two-outcomes', base + 'SYMPHONY_OUTCOME: {"status":"completed"}\n'
+                                             'SYMPHONY_OUTCOME: {"status":"completed"}')):
+            with self.subTest(case=name):
+                self.tearDown()
+                self.setUp()
+                handle(self.prepare_fast_handback_and_final(handback=False, final=final), self.environ)
+                run = self.store.load(self.project).active_run
+                self.assertIsNotNone(run)
+                self.assertNotEqual({'status': 'completed'}, run.outcome)
+                handle({'session_id': SESSION, 'cwd': str(self.project), 'hook_event_name': 'Stop'},
+                       self.environ)
+                self.assertFalse(self.store.load(self.project).recent_runs)
+
+    def test_fast_native_terminal_thinking_and_text_chunks_are_one_message(self):
+        self.assert_fast_callback_archives(self.prepare_fast_handback_and_final(split_terminal=True))
+
+    def test_fast_native_callback_replay_after_recent_run_trim_is_idempotent(self):
+        callback = self.prepare_fast_handback_and_final()
+        self.assert_fast_callback_archives(callback)
+        retained = replace(self.store.load(self.project), recent_runs=())
+        self.assertIs(True, retained.terminal_receipts[-1]['native_fast_owner'])
+        self.assertEqual(1, retained.terminal_receipts[-1]['native_fast_report_contract'])
+        self.store.save(self.project, retained)
+        handle(callback, self.environ)
+        self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+        after = self.store.load(self.project)
+        self.assertIsNone(after.active_run)
+        self.assertEqual(retained.recent_runs, after.recent_runs)
+        self.assertEqual(retained.terminal_receipts, after.terminal_receipts)
+
+    def test_trimmed_fast_receipt_cannot_ack_missing_foreign_or_conflicting_native_report(self):
+        for case in ('missing-native', 'foreign-parent', 'conflicting-report'):
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                callback = self.prepare_fast_handback_and_final()
+                self.assert_fast_callback_archives(callback)
+                retained = replace(self.store.load(self.project), recent_runs=())
+                self.store.save(self.project, retained)
+                if case == 'missing-native':
+                    self.child.unlink()
+                elif case == 'foreign-parent':
+                    callback['parent_thread_id'] = 'foreign-root'
+                else:
+                    callback['last_assistant_message'] = callback['last_assistant_message'].replace(
+                        'Verified mechanical result.', 'A different mechanical result.')
+                self.assertFalse(claude_committed_native_terminal_replay(
+                    retained, event_from_payload('claude', callback), SESSION, self.project, self.environ))
+
+    def test_fast_handback_with_markerless_goodbye_retains_native_report(self):
+        callback = self.prepare_fast_handback_and_final()
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        rows[-1]['message']['content'][0]['text'] = 'Report delivered.'
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        callback['last_assistant_message'] = 'Report delivered.'
+        self.assert_fast_callback_archives(callback)
+
+    def test_fast_callback_without_transcript_path_cannot_bypass_canonical_report(self):
+        callback = self.prepare_fast_handback_and_final()
+        del callback['agent_transcript_path']
+        handle(callback, self.environ)
+        self.assertEqual('active', self.store.load(self.project).active_run.status)
+        self.assertIsNone(self.store.load(self.project).active_run.outcome)
+        self.assertTrue(self.store.session_record('claude', SESSION)['pending'])
+        result = handle({'session_id': SESSION, 'cwd': str(self.project), 'hook_event_name': 'Stop'}, self.environ)
+        self.assertIn('"decision": "block"', result.stdout)
+        self.assertFalse(self.store.load(self.project).recent_runs)
+
+    def test_fast_canonical_escalation_handback_enters_assessment(self):
+        callback = self.prepare_fast_handback_and_final()
+        report = 'Discovered material uncertainty.\nSYMPHONY_FAST_DECISION: escalate'
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        rows[1]['message']['content'][0]['input']['message'] = report
+        rows[-1]['message']['content'][0]['text'] = 'Report delivered.'
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        callback['last_assistant_message'] = 'Report delivered.'
+        handle(callback, self.environ)
+        run = self.store.load(self.project).active_run
+        self.assertEqual('assessing', run.status)
+        self.assertTrue(run.assessment['_fast_escalated'])
+        self.assertNotIn('_fast_pending', run.assessment)
+        self.assertIsNone(run.outcome)
+        self.assertFalse(self.store.session_record('claude', SESSION)['pending'])
+
+    def test_fast_handback_and_final_full_report_disagreement_is_rejected(self):
+        from plugins.symphony.symphony.host_evidence import claude_current_native_lead_event
+        for prose in ('Deleted branch feature-b; verification succeeded.',
+                      'Verification succeeded; feature-a was deleted.'):
+            with self.subTest(final_prose=prose):
+                callback = self.prepare_fast_handback_and_final()
+                markers = '\nSYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}'
+                handback = 'Deleted branch feature-a; verification succeeded.' + markers
+                final = prose + markers
+                rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+                rows[1]['message']['content'][0]['input']['message'] = handback
+                rows[-1]['message']['content'][0]['text'] = final
+                self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                callback['last_assistant_message'] = final
+                source = event_from_payload('claude', callback)
+                self.assertEqual(handback + '\n' + final, source.payload['last_assistant_message'])
+                self.assertIsNone(claude_current_native_lead_event(self.store.load(self.project), source,
+                    SESSION, self.project, self.environ))
+                handle(callback, self.environ)
+                self.assertEqual('active', self.store.load(self.project).active_run.status)
+                result = handle({'session_id': SESSION, 'cwd': str(self.project), 'hook_event_name': 'Stop'}, self.environ)
+                self.assertIn('"decision": "block"', result.stdout)
+                self.assertFalse(self.store.load(self.project).recent_runs)
+
+    def test_fast_repeated_marker_normalization_requires_exact_native_evidence(self):
+        from plugins.symphony.symphony.host_evidence import claude_current_native_lead_event
+        for case in ('foreign-session', 'wrong-model', 'malformed-journal', 'early-callback', 'different-report',
+                     'duplicate-handback-marker', 'conflicting-handback', 'failed-ack', 'duplicate-ack',
+                     'early-ack', 'later-prompt', 'distinct-terminal-message', 'earlier-terminal-text', 'duplicate-uuid',
+                     'duplicate-handback', 'foreign-handback', 'alternate-goodbye', 'missing-native-file'):
+            # A transcript with no handback whose final message is the whole
+            # report is the print-mode shape; it completes (tested above).
+            with self.subTest(case=case):
+                callback = self.prepare_fast_handback_and_final(split_terminal=True)
+                source = event_from_payload('claude', callback)
+                rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+                if case in ('foreign-session', 'wrong-model', 'malformed-journal', 'different-report'):
+                    field, value = {'foreign-session': ('session_id', 'foreign'),
+                        'wrong-model': ('model', 'claude-sonnet-5'),
+                        'malformed-journal': ('prompt_id', 'foreign'),
+                        'different-report': ('last_assistant_message', source.payload['last_assistant_message'] + '\nChanged.') }[case]
+                    source = replace(source, payload={**source.payload, field: value})
+                elif case == 'early-callback':
+                    source = replace(source, observed_at='2026-09-29T02:01:59Z')
+                elif case in ('duplicate-handback-marker', 'conflicting-handback'):
+                    block = rows[1]['message']['content'][0]['input']
+                    block['message'] = (block['message'] + '\nSYMPHONY_FAST_DECISION: eligible'
+                        if case == 'duplicate-handback-marker' else block['message'].replace('eligible', 'escalate'))
+                elif case == 'failed-ack':
+                    rows[2]['message']['content'][0]['is_error'] = True
+                elif case == 'duplicate-ack':
+                    rows.insert(3, json.loads(json.dumps(rows[2])))
+                elif case == 'early-ack':
+                    rows[2]['timestamp'] = '2026-09-29T02:01:39Z'
+                elif case == 'later-prompt':
+                    rows.append({**rows[0], 'uuid': 'newer-prompt', 'timestamp': '2026-09-29T02:03:00Z'})
+                elif case == 'distinct-terminal-message':
+                    rows[-2]['message']['id'] = 'different-native-message'
+                elif case == 'earlier-terminal-text':
+                    rows[-2]['message']['content'] = [{'type': 'text', 'text': callback['last_assistant_message']}]
+                elif case == 'duplicate-uuid':
+                    rows[-2]['uuid'] = rows[-1]['uuid']
+                elif case == 'duplicate-handback':
+                    rows.insert(2, json.loads(json.dumps(rows[1])))
+                elif case == 'foreign-handback':
+                    rows[1]['agentId'] = 'foreign'
+                elif case == 'alternate-goodbye':
+                    rows[-1]['message']['content'][0]['text'] = 'Finished.'
+                self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                if case == 'missing-native-file':
+                    self.child.unlink()
+                self.assertIsNone(claude_current_native_lead_event(self.store.load(self.project), source,
+                    SESSION, self.project, self.environ))
+                if case in ('duplicate-handback', 'foreign-handback', 'alternate-goodbye', 'missing-native-file'):
+                    callback['last_assistant_message'] = rows[-1]['message']['content'][0]['text']
+                    handle(callback, self.environ)
+                    result = handle({'session_id': SESSION, 'cwd': str(self.project),
+                                     'hook_event_name': 'Stop'}, self.environ)
+                    self.assertIn('"decision": "block"', result.stdout)
+                    self.assertFalse(self.store.load(self.project).recent_runs)
+
     def test_unknown_native_stop_retry_releases_turn_without_archiving_or_losing_evidence(self):
         self.write_root_prompt()
         run = replace(self.run, status='completing', started_at='2026-09-29T02:01:00.001+00:00',
@@ -65,7 +297,10 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                      'duplicate-id', 'foreign-root', 'foreign-cwd', 'foreign-provider', 'foreign-session',
                      'child-before-hook', 'terminal-before-hook', 'wrong-model', 'wrong-effort', 'wrong-route'):
             with self.subTest(case=case):
-                self.write_native()
+                self.write_native(handback=True, report='SYMPHONY_FAST_DECISION: eligible\n' + REPORT)
+                fixture = [json.loads(line) for line in self.child.read_text().splitlines()]
+                fixture[-1]['message']['content'][0]['text'] = 'Report delivered.'
+                self.child.write_text(''.join(json.dumps(row) + '\n' for row in fixture))
                 self.write_root_prompt()
                 assessment = {'_fast_route': {'model': 'claude-sonnet-5', 'effort': 'low'},
                     '_claude_fast_launch_hash': hashlib.sha256(b'toolu_launch').hexdigest(),
@@ -856,7 +1091,7 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
                            "hook_event_name": "UserPromptSubmit",
                            "prompt": "$symphony:symphony status"}, self.environ)
         context = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Invoke the normal `/symphony:stop`", context)
+        self.assertIn("end this root turn; the native Stop hook verifies and archives the run", context)
         self.assertNotIn("tracked work still requires reconciliation", context)
         active = self.store.load(self.project).active_run
         self.assertEqual("original-run", active.run_id)
@@ -906,7 +1141,7 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         response = handle({"session_id": SESSION, "cwd": str(self.project),
                            "hook_event_name": "SessionStart"}, self.environ)
         context = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Invoke the normal `/symphony:stop`", context)
+        self.assertIn("end this root turn; the native Stop hook verifies and archives the run", context)
         self.assertNotIn("continue unfinished work", context)
         self.assertEqual("completing", self.store.load(self.project).active_run.status)
 

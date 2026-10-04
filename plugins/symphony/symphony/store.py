@@ -20,6 +20,45 @@ from typing import Any, Callable, Iterator, TypeVar
 from .memory import redact_secrets
 from .model import Delegation, Event, ProjectState, RunState
 
+
+DIAGNOSTIC_CATEGORIES = frozenset({'bookkeeping', 'incomplete_work', 'state_io', 'state_shape',
+                                   'runtime_fault', 'native_recovery'})
+# retained: harmless evidence kept for later; it never prompts a sharing offer.
+DIAGNOSTIC_OUTCOMES = frozenset({'deferred', 'recovered', 'retained'})
+DIAGNOSTIC_HOOKS = frozenset({'', 'Stop', 'UserPromptSubmit', 'SessionStart', 'PreToolUse',
+                              'PostToolUse', 'PostToolUseFailure', 'SubagentStart', 'SubagentStop',
+                              'Interrupt'})
+_DIAGNOSTIC_V1 = frozenset({'schema', 'plugin_version', 'provider', 'platform', 'category', 'outcome'})
+# Schema 2 names where and what, using only code identifiers: a lowercase
+# signal code from Symphony's own guard and reason names, an exception class,
+# and a Symphony module.function:line.
+_DIAGNOSTIC_V2 = _DIAGNOSTIC_V1 | {'hook', 'signal', 'detail', 'site'}
+
+
+def valid_diagnostic_fields(report: object) -> bool:
+    """Every field is an enum or a code identifier; nothing can carry task text."""
+    if not isinstance(report, dict) or type(report.get('schema')) is not int:
+        return False
+    if set(report) != {1: _DIAGNOSTIC_V1, 2: _DIAGNOSTIC_V2}.get(report['schema'], set()):
+        return False
+    if not (report['provider'] in {'codex', 'claude'}
+            and report['platform'] in {'windows', 'linux', 'macos', 'other'}
+            and report['category'] in DIAGNOSTIC_CATEGORIES
+            and report['outcome'] in DIAGNOSTIC_OUTCOMES
+            and isinstance(report['plugin_version'], str)
+            and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', report['plugin_version'])):
+        return False
+    if report['schema'] == 1:
+        return report['outcome'] != 'retained'
+    return (report['hook'] in DIAGNOSTIC_HOOKS
+            and isinstance(report['signal'], str)
+            and bool(re.fullmatch(r'[a-z][a-z0-9_]{0,47}', report['signal']))
+            and isinstance(report['detail'], str)
+            and bool(re.fullmatch(r'(?:[A-Za-z][A-Za-z0-9_]{0,63})?', report['detail']))
+            and isinstance(report['site'], str)
+            and bool(re.fullmatch(r'(?:[a-z_]{1,32}\.[A-Za-z_][A-Za-z0-9_]{0,63}:[0-9]{1,6})?',
+                                  report['site'])))
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on platforms without fcntl
@@ -143,8 +182,13 @@ def _receipt_from_dict(value: Any) -> dict[str, object]:
                 "turn", "result", "parent", "lead")
     optional = ("status", "native_agent_type", "native_model", "native_effort",
                 "native_launch_prompt_hash", "native_terminal_id", "native_report_hash")
-    if 'native_fast_escalation' in receipt and type(receipt['native_fast_escalation']) is not bool:
-        raise ValueError('terminal receipt.native_fast_escalation must be a boolean')
+    for flag in ('native_fast_escalation', 'native_fast_owner'):
+        if flag in receipt and type(receipt[flag]) is not bool:
+            raise ValueError(f'terminal receipt.{flag} must be a boolean')
+    if 'native_fast_report_contract' in receipt and (
+            type(receipt['native_fast_report_contract']) is not int
+            or receipt['native_fast_report_contract'] != 1):
+        raise ValueError('terminal receipt.native_fast_report_contract must be version 1')
     if 'native_owner_generation' in receipt and (
             type(receipt['native_owner_generation']) is not int or receipt['native_owner_generation'] < 0):
         raise ValueError('terminal receipt.native_owner_generation must be a nonnegative integer')
@@ -158,7 +202,11 @@ def _receipt_from_dict(value: Any) -> dict[str, object]:
             **({'native_owner_generation': receipt['native_owner_generation']}
                if 'native_owner_generation' in receipt else {}),
             **({'native_fast_escalation': receipt['native_fast_escalation']}
-               if 'native_fast_escalation' in receipt else {})}
+               if 'native_fast_escalation' in receipt else {}),
+            **({'native_fast_owner': receipt['native_fast_owner']}
+               if 'native_fast_owner' in receipt else {}),
+            **({'native_fast_report_contract': receipt['native_fast_report_contract']}
+               if 'native_fast_report_contract' in receipt else {})}
 
 
 def _run_from_dict(value: Any) -> RunState:
@@ -477,17 +525,12 @@ class StateStore:
 
     def record_recovery_diagnostic(self, report: dict[str, Any]) -> None:
         """Aggregate allowlisted anonymous facts locally; never transmit them."""
-        allowed = {'schema', 'plugin_version', 'provider', 'platform', 'category', 'outcome'}
-        if (set(report) != allowed or type(report['schema']) is not int or report['schema'] != 1
-                or report['provider'] not in {'codex', 'claude'}
-                or report['platform'] not in {'windows', 'linux', 'macos', 'other'}
-                or report['category'] not in {'bookkeeping', 'incomplete_work', 'state_io', 'state_shape', 'runtime_fault', 'native_recovery'}
-                or report['outcome'] not in {'deferred', 'recovered'}
-                or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', str(report['plugin_version']))):
+        if not valid_diagnostic_fields(report):
             raise ValueError('invalid anonymous diagnostic')
         day = datetime.now(timezone.utc).date().isoformat()
         identity = json.dumps({**report, 'day': day}, sort_keys=True).encode()
-        path = self.root / 'diagnostics' / (hashlib.sha256(identity).hexdigest() + '.json')
+        # The outcome prefix lets retention keep faults over routine context.
+        path = self.root / 'diagnostics' / f"{report['outcome']}-{hashlib.sha256(identity).hexdigest()}.json"
         with _locked(path.parent / '.aggregate', timeout=0.05):
             previous = json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else {}
             count = previous.get('occurrences', 0)
@@ -495,7 +538,10 @@ class StateStore:
             self._write_json(path, {**report, 'day': day, 'occurrences': min(count + 1, 1_000_000)})
             # One directory lock avoids accumulating a lock file per daily
             # aggregate and serializes retention against concurrent writers.
-            files = sorted(path.parent.glob('*.json'), key=lambda entry: entry.stat().st_mtime, reverse=True)
+            # Evict routine context before any fault: a one-off deferred fault
+            # must survive until the user decides whether to share it.
+            files = sorted(path.parent.glob('*.json'), reverse=True, key=lambda entry: (
+                not entry.name.startswith(('recovered-', 'retained-')), entry.stat().st_mtime))
             for expired in files[100:]:
                 expired.unlink(missing_ok=True)
 

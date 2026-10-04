@@ -13,13 +13,14 @@ import shutil
 import shlex
 import subprocess
 import sys
+import traceback
 from typing import Mapping
 
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
 from . import diagnostics
 from .host_evidence import (
-    _archived_fast_owner, _instant, _packet_purpose,
+    _archived_fast_owner, _instant, _packet_purpose, _reported_status,
     archived_lead_followup,
     assessed_completion_chronology,
     claude_archived_sendmessage_sequence, claude_archived_mixed_sendmessage_sequence, claude_sendmessage_source_hash,
@@ -27,7 +28,10 @@ from .host_evidence import (
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
     claude_current_native_lead_event, claude_recovered_lead_event,
     claude_substantive_launch,
+    _CLAUDE_FAST_ACK,
     codex_substantive_launch,
+    codex_child_followup_start,
+    codex_deferred_child_turns,
     codex_archived_followup_sequence,
     codex_completing_lead_turn, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
@@ -35,7 +39,7 @@ from .host_evidence import (
     retained_fast_escalation_receipt,
 )
 from .model import Action, Delegation, Event, ProjectState, RunState, persistable
-from .reducer import _ACTIVE_STATES, _stop_block_reason, _substantive_child_completed, reduce
+from .reducer import _ACTIVE_STATES, _active_identities, _child_evidence_basis, _stop_block_reason, _substantive_child_completed, reduce
 from .routing import (
     Assessment,
     EFFORTS,
@@ -50,7 +54,7 @@ from .routing import (
     route_for_recorded,
     snapshot_for,
 )
-from .store import StateStore, project_key, state_lock_budget
+from .store import DIAGNOSTIC_HOOKS, StateStore, project_key, state_lock_budget
 
 
 CONTROLS = {
@@ -73,15 +77,15 @@ HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
 _ROOT_EXECUTION_TOOLS = {"Bash", "PowerShell", "Write", "Edit", "NotebookEdit"}
 _CODEX_LIFECYCLE_GUIDANCE = (
     "Reuse returned evidence. Wake idle children for work/evidence with followup_task; send_message only queues. "
-    "wait_agent only for active work; timeout_ms<=60000. "
+    "wait_agent only for active work, timeout_ms 300000. "
 )
 _CHILD_PURPOSE_GUIDANCE = (
     "Purpose: substantive (work/review) or independent_review (verification only). "
     "Codex suffix: __<purpose>[_unique]; Claude: `purpose: <purpose>`. "
 )
 _LEAD_VERIFICATION_CONTRACT = (
-    "After all children return, integrate and execute your packet's acceptance_check yourself with native tools; "
-    "worker checks cannot substitute. If you ended a WAITING turn, do this on waking before completion."
+    "After children return, integrate and run acceptance_check yourself with native tools, also on waking from WAITING; "
+    "worker checks cannot substitute. Phase updates only; success needs accepted evidence."
 )
 _ASSESSED_LEAD_CONTRACT = (
     "delegate implementation, diagnosis, design, review, and product judgment to workers or consultants; "
@@ -290,11 +294,34 @@ def _retained_activation_command(retained: str, original: str) -> str:
             if os.name == "nt" else shlex.join(arguments))
 
 
-def _recovery_diagnostic(store: StateStore, provider: str, category: str, outcome: str) -> None:
+def _diagnostic_site(error: BaseException | None) -> str:
+    """The innermost Symphony frame as module.function:line, never a path."""
+    frames = traceback.extract_tb(error.__traceback__) if error is not None else ()
+    for frame in reversed(frames):
+        parts = Path(frame.filename).parts
+        if (len(parts) >= 2 and parts[-2] == 'symphony' and frame.filename.endswith('.py')
+                and not frame.name.startswith('<')):
+            return f"{Path(frame.filename).stem}.{frame.name}:{frame.lineno}"
+    return ''
+
+
+def _diagnostic_signal(value: object, fallback: str) -> str:
+    text = str(value or '')
+    return text if re.fullmatch(r'[a-z][a-z0-9_]{0,47}', text) else fallback
+
+
+def _recovery_diagnostic(store: StateStore, provider: str, category: str, outcome: str,
+                         signal: str = '', *, hook: str = 'Stop',
+                         error: BaseException | None = None) -> None:
     host = {'Windows': 'windows', 'Linux': 'linux', 'Darwin': 'macos'}.get(platform.system(), 'other')
+    detail = type(error).__name__ if error is not None else ''
     try:
-        store.record_recovery_diagnostic({'schema': 1, 'plugin_version': PLUGIN_VERSION,
-            'provider': provider, 'platform': host, 'category': category, 'outcome': outcome})
+        store.record_recovery_diagnostic({'schema': 2, 'plugin_version': PLUGIN_VERSION,
+            'provider': provider, 'platform': host, 'category': category, 'outcome': outcome,
+            'hook': hook if hook in DIAGNOSTIC_HOOKS else '',
+            'signal': _diagnostic_signal(signal, 'unspecified'),
+            'detail': detail if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', detail) else '',
+            'site': _diagnostic_site(error)})
     except Exception:
         # Optional diagnostics cannot become a new hook dependency or blocker.
         pass
@@ -348,7 +375,15 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             except Exception:
                 return render(provider, (Action('inject_context', {'text':
                     'Diagnostic sharing is unavailable. Reports stay local; continue the user task.'}),), hook)
-        result = _handle_core(payload, environ)
+        try:
+            result = _handle_core(payload, environ)
+        except Exception as error:
+            category = ('state_io' if isinstance(error, OSError) else
+                        'state_shape' if isinstance(error, (ValueError, TypeError, KeyError))
+                        else 'runtime_fault')
+            _recovery_diagnostic(store, provider, category, 'deferred', 'hook_exception',
+                                 hook=str(hook or ''), error=error)
+            raise
         if root_entry:
             try:
                 response = json.loads(result.stdout) if result.stdout else {}
@@ -369,15 +404,16 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
     except Exception as error:
         category = ('state_io' if isinstance(error, OSError) else
                     'state_shape' if isinstance(error, (ValueError, TypeError, KeyError)) else 'runtime_fault')
-        _recovery_diagnostic(store, provider, category, 'deferred')
+        _recovery_diagnostic(store, provider, category, 'deferred', 'stop_hook_exception', error=error)
         # Do not dispatch Stop, acknowledge callbacks, invent outcomes or
         # abandon agents after a runtime/storage fault. End this host turn.
         return HookResult()
     if result.recovery_kind == 'bookkeeping':
-        _recovery_diagnostic(store, provider, 'bookkeeping', 'deferred')
+        _recovery_diagnostic(store, provider, 'bookkeeping', 'deferred', result.recovery_signal)
         return HookResult()
     if result.recovery_kind == 'native_recovery':
-        _recovery_diagnostic(store, provider, 'native_recovery', 'recovered')
+        _recovery_diagnostic(store, provider, 'native_recovery', 'recovered',
+                             result.recovery_signal or 'native_events_replayed')
     if not result.stdout:
         return result
     try:
@@ -388,12 +424,13 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         if response.get('systemMessage'):
             # The assistant already communicates task progress. A permitted
             # host turn needs no duplicate bookkeeping warning to the user.
-            _recovery_diagnostic(store, provider, 'incomplete_work', 'deferred')
+            _recovery_diagnostic(store, provider, 'incomplete_work', 'deferred',
+                                 result.recovery_signal or 'stop_notice_suppressed')
             return HookResult()
         return result
     category = result.recovery_kind or 'incomplete_work'
     if category == 'bookkeeping':
-        _recovery_diagnostic(store, provider, category, 'deferred')
+        _recovery_diagnostic(store, provider, category, 'deferred', result.recovery_signal)
         return HookResult()
     try:
         first = store.stop_turn_budget(provider, session, project) if session else False
@@ -401,7 +438,8 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
         first = False
     if first and payload.get('stop_hook_active') is not True:
         return result
-    _recovery_diagnostic(store, provider, 'incomplete_work', 'deferred')
+    _recovery_diagnostic(store, provider, 'incomplete_work', 'deferred',
+                         'repeat_' + (result.recovery_signal or 'block'))
     return HookResult()
 
 
@@ -426,7 +464,9 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
     explicit_stop = (source.kind == "user_prompt" and
                      _parse_control(str(source.payload.get("prompt") or "")) == ("stop", ""))
     if explicit_stop:
-        source = replace(source, kind="stop_requested")
+        # Marked as the user's own control: it may close a run that a native
+        # Stop leaves open for the user (a reported blocker, a consent hold).
+        source = replace(source, kind="stop_requested", payload={**source.payload, "control": True})
     expected_owner = ""
     unknown_alias_pending = False
     acknowledged: set[str] = set()
@@ -444,7 +484,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
         current_source = replace(event, payload=current_payload)
         scoped = _scope_state(state, current_key, current_session, provider)
         next_scoped, actions = _transition(scoped, current_source, provider, current_payload, environ)
-        rendered = _render_actions(actions, next_scoped, provider, event.kind)
+        rendered = _render_actions(actions, next_scoped, provider, event.kind,
+                                   control_stop=event.payload.get("control") is True)
         merged = _merge_scope(state, scoped, next_scoped, current_key, provider, current_session)
         control = _parse_control(str(event.payload.get("prompt") or "")) if event.kind == "user_prompt" else None
         if next_scoped.active_run or event.kind == "stop_requested" or (control and control[0] in {"disable", "stop"}):
@@ -620,6 +661,17 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     scoped, event, expected_owner, project, environ)
                 if native is not None:
                     event = native
+                elif (scoped.active_run and scoped.active_run.assessment.get('_fast_pending')
+                        and event.kind == 'subagent_stopped'
+                        and (event.payload.get('agent_id') or event.payload.get('subagent_id'))
+                            == scoped.active_run.lead_identity
+                        and _fast_report_claims_credit(event.payload)):
+                    # Independent native evidence must prove the fast report.
+                    # Raw callback markers cannot bypass a rejected handback.
+                    if current:
+                        store.queue_session_event(provider, session, event)
+                    unresolved = True
+                    continue
             if (provider == "claude" and expected_owner
                     and _observed_role(event.payload) in {"", "lead"}
                     and claude_committed_native_start_replay(
@@ -697,12 +749,17 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 if _pending_blocks_current_run(state, event, provider, session):
                     unresolved = True
                 else:
-                    _recovery_diagnostic(store, provider, 'bookkeeping', 'deferred')
+                    # Evidence for a run this hook does not own is kept for
+                    # its owner. That is expected and never worth a report.
+                    _recovery_diagnostic(store, provider, 'bookkeeping', 'retained',
+                                         'pending_child_for_other_run', hook=str(
+                                             source.payload.get('hook_event_name') or ''))
         unresolved_reason = _unresolved_child_guidance(
             state, provider, session, tuple(event for event, _, _ in batch
                                            if event.event_id not in acknowledged)) if unresolved else ""
         if source.kind == "stop_requested" and unresolved:
-            return state, (_claude_native_stop_guard(source, unresolved_reason), acknowledged)
+            return state, (_claude_native_stop_guard(source, unresolved_reason,
+                                                     'unresolved_child_evidence'), acknowledged)
         if (not unresolved and provider == "claude"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"claude:{session}", session, provider)
@@ -712,7 +769,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 if source.kind == "stop_requested" and scoped.active_run is not None:
                     return state, (_claude_native_stop_guard(source,
                         "Symphony could not verify the tracked lead's native Claude result. "
-                        "Return to this session after its result is available."), acknowledged)
+                        "Return to this session after its result is available.",
+                        'claude_lead_result_unverified'), acknowledged)
                 recovered = None
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
@@ -725,24 +783,31 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 except Exception:
                     if scoped.active_run is not None:
                         return state, (_claude_native_stop_guard(source,
-                            _claude_unknown_turn_guidance(scoped.active_run)), acknowledged)
+                            _claude_unknown_turn_guidance(scoped.active_run),
+                            'claude_lead_turn_unverified'), acknowledged)
                     freshness, native_turn = "none", None
                 if freshness == "unknown":
                     return state, (_claude_native_stop_guard(source,
-                        _claude_unknown_turn_guidance(scoped.active_run)), acknowledged)
+                        _claude_unknown_turn_guidance(scoped.active_run),
+                        'claude_lead_turn_unknown'), acknowledged)
                 if native_turn is not None:
                     state = _hold_pending_batch(state, provider, session)
                     state, _ = dispatch(state, native_turn)
         if (not unresolved and provider == "codex"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"codex:{session}", session, provider)
+            before_recovery = scoped
+            scoped = _reconcile_codex_child_proofs(scoped, source, project, environ)
+            if scoped != before_recovery:
+                state = _merge_scope(state, before_recovery, scoped, f"codex:{session}", provider, session)
             try:
                 recovered = codex_recovered_lead_event(scoped, session, environ)
             except Exception:
                 if source.kind == "stop_requested" and scoped.active_run is not None:
                     return state, ((Action("block_stop", {"reason":
                         "Symphony could not verify the tracked lead's native Codex result. "
-                        "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping'}),), acknowledged)
+                        "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping',
+                        'recovery_signal': 'codex_lead_result_unverified'}),), acknowledged)
                 recovered = None
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
@@ -755,7 +820,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     if scoped.active_run is not None:
                         return state, ((Action("block_stop", {"reason":
                             "Symphony could not verify the tracked lead's latest native Codex turn. "
-                            "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping'}),), acknowledged)
+                            "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping',
+                            'recovery_signal': 'codex_lead_turn_unverified'}),), acknowledged)
                     freshness, native_turn = "none", None
                 if freshness in {"running", "unknown"}:
                     reason = ("The tracked lead has a newer native turn still running. "
@@ -764,7 +830,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                               "Symphony could not verify the tracked lead's latest native turn. "
                               "Return to this session after its result is available.")
                     return state, ((Action("block_stop", {"reason": reason,
-                        'recovery_kind': 'bookkeeping' if freshness == 'unknown' else 'incomplete_work'}),), acknowledged)
+                        'recovery_kind': 'bookkeeping' if freshness == 'unknown' else 'incomplete_work',
+                        'recovery_signal': 'codex_lead_turn_' + freshness}),), acknowledged)
                 if native_turn is not None:
                     state = _hold_pending_batch(state, provider, session)
                     state, _ = dispatch(state, native_turn)
@@ -815,7 +882,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                         return state, ((Action("block_stop", {"reason": reason
                             + "Resume the same lead after all children return, run the acceptance check "
                               "and report the result again.",
-                            'recovery_kind': 'bookkeeping' if order == 'unknown' else 'incomplete_work'}),), acknowledged)
+                            'recovery_kind': 'bookkeeping' if order == 'unknown' else 'incomplete_work',
+                            'recovery_signal': 'completion_order_' + order}),), acknowledged)
                     if run.outcome != evidence.active_run.outcome:
                         state = _merge_scope(state, scoped, evidence, f"{provider}:{session}", provider, session)
             state, actions = dispatch(state, source)
@@ -897,7 +965,9 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     if owners == () and bound is None and record is None:
                         actions, _ = store.update(project, lambda state: transition(state))
                         return render(provider, actions, "Stop")
-                    return render(provider, _claude_native_stop_guard(source, reason),
+                    return render(provider, _claude_native_stop_guard(
+                        source, reason, 'owner_state_unavailable' if owners is None else
+                        'owner_state_conflict' if conflict else 'owner_unverified'),
                                   str(payload.get("hook_event_name") or "Stop"))
                 if source.kind in {"user_prompt", "session_heartbeat"}:
                     return render(provider, (Action("inject_context", {"text": reason}),),
@@ -1010,7 +1080,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     # safely admitted work. Routing/tool guards still run.
                     unknown_alias_pending = True
                     if source.kind == "stop_requested":
-                        return render(provider, _claude_native_stop_guard(source, reason), "Stop")
+                        return render(provider, _claude_native_stop_guard(
+                            source, reason, 'child_owner_unresolved'), "Stop")
                 pending = tuple(
                     (Event(item["event_id"], item["kind"], item["observed_at"],
                            {**item["payload"], "_symphony_owner_conflict":
@@ -1031,7 +1102,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                         store.queue_session_event(provider, session, source)
                         return HookResult()
                     if source.kind == 'stop_requested':
-                        return render(provider, _claude_native_stop_guard(source, reason), 'Stop')
+                        return render(provider, _claude_native_stop_guard(
+                            source, reason, 'pending_event_overflow'), 'Stop')
                     # Retained overflow withholds archival, not normal tools
                     # in a verified root. Its ordinary routing guards still
                     # decide which operations may run.
@@ -2163,7 +2235,8 @@ def _handle_prompt(
         )
     if name == "stop":
         kind = "force_stop" if argument == "--force" else "stop_requested"
-        return reduce(state, _derived(state, source, kind))
+        # The user's own control, as distinct from a native host Stop.
+        return reduce(state, _derived(state, source, kind, {"control": True}))
     return state, (Action("inject_context", {"text": f"Unknown Symphony control: {name}. Use {_native_help(provider)}."}),)
 
 
@@ -2868,6 +2941,19 @@ def _record_substantive_child(state: ProjectState, source: Event, role: str,
     return replace(state, active_run=updated)
 
 
+def _reconcile_codex_child_proofs(state: ProjectState, source: Event, project: Path,
+                                  environ: Mapping[str, str]) -> ProjectState:
+    for started, native in codex_deferred_child_turns(state, source, project, environ):
+        run = state.active_run
+        starts = run.assessment.get('_start_event_ids', ())
+        state = replace(state, active_run=replace(run, assessment={**run.assessment,
+            '_start_event_ids': (*starts, started.event_id) if started.event_id not in starts else starts}))
+        role = _observed_role(started.payload)
+        state = _record_substantive_child(state, started, role, {}, successful=False, environ=environ)
+        state = _record_substantive_child(state, native, role, {}, successful=True, environ=environ)
+    return state
+
+
 def _observe_delegation(
     state: ProjectState, source: Event, environ: Mapping[str, str] | None = None,
 ) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -2895,6 +2981,17 @@ def _observe_delegation(
         (item for item in state.active_run.delegations if item.identity == str(identity)),
         None,
     )
+    if (source.kind == 'subagent_stopped' and current and current.role == 'lead'
+            and current.identity == state.active_run.lead_identity
+            and source.payload.get('provider') == 'codex' and environ is not None
+            and isinstance(source.payload.get('cwd'), str) and Path(source.payload['cwd']).is_absolute()):
+        state = _reconcile_codex_child_proofs(state, source, Path(source.payload['cwd']), environ)
+    if (source.kind == 'subagent_stopped' and current and current.role in {'worker', 'consultant'}
+            and environ is not None and source.payload.get('provider') == 'codex'):
+        started = codex_child_followup_start(state.active_run, source, environ)
+        if started is not None:
+            state, recovered = _observe_delegation(state, started, environ)
+            opening += recovered
     assessment = state.active_run.assessment
     token = _child_turn_token(source.payload)
     terminal_matches_active_start = False
@@ -2996,6 +3093,10 @@ def _observe_delegation(
             receipt["native_agent_type"] = str(source.payload.get("agent_type") or "")
             receipt["native_model"] = str(source.payload.get("model") or "")
             receipt["native_effort"] = str(source.payload.get("model_reasoning_effort") or "")
+            if source.payload.get('provider') == 'claude' and _archived_fast_owner(state.active_run):
+                receipt['native_fast_owner'] = True
+                if state.active_run.assessment.get('_claude_fast_report_contract') == 1:
+                    receipt['native_fast_report_contract'] = 1
             if source.payload.get('_symphony_archived_fast_escalation') is True:
                 receipt['native_fast_escalation'] = True
             followup_start = f"{source.payload.get('_symphony_archived_native_event_id', source.event_id)}:followup-start"
@@ -3338,6 +3439,9 @@ def _observe_delegation(
                 "The fast lead already handed off. Await the independent assessment and replacement lead."}),)
         successful = status.lower() in {"completed", "done", "success", "succeeded"}
         outcome = {"status": status}
+        # Only the lead's own single valid marker is its report; the native
+        # status fallback above is host state, not a statement of a blocker.
+        reported_outcome = False
         report = str(source.payload.get("last_assistant_message") or "")
         fast_pending = bool(state.active_run.assessment.get("_fast_pending"))
         fast_continuation = bool(not fast_pending and source.payload.get('_symphony_native_recovery')
@@ -3386,19 +3490,22 @@ def _observe_delegation(
                 "assessor for the full task."}),)
         if fast_pending and fast_decision != "eligible":
             successful = False
+        if (fast_pending and fast_decision != "eligible"
+                and _fast_report_claims_credit({"last_assistant_message": report})):
             actions += (Action("inject_context", {"text":
                 "Fast lead decision missing or invalid. Recover the same lead's terminal decision; "
                 "an assessor can start only after an explicit escalation."}),)
         outcome_lines = [line for line in report.splitlines() if line.strip().startswith("SYMPHONY_OUTCOME:")]
         if outcome_lines:
             try:
-                if len(outcome_lines) != 1:
+                if len(outcome_lines) != 1 and not _repeated_nonsuccess(outcome_lines):
                     raise ValueError('multiple outcome reports')
                 reported = json.loads(outcome_lines[0].strip().removeprefix("SYMPHONY_OUTCOME:").strip())
                 reported_status = reported.get("status") if isinstance(reported, Mapping) else None
                 if not isinstance(reported_status, str) or not reported_status:
                     raise ValueError("outcome status missing")
                 outcome = {"status": reported_status}
+                reported_outcome = True
                 successful = successful and reported_status.lower() in {"completed", "done", "success", "succeeded"}
             except (TypeError, ValueError):
                 successful = False
@@ -3559,11 +3666,13 @@ def _observe_delegation(
                 ),
             )
             return state, actions
+        missing_substantive = False
         if successful and not _substantive_child_completed(state.active_run):
             assessment = dict(state.active_run.assessment)
             assessment['_substantive_child_missing'] = True
             state = replace(state, active_run=replace(state.active_run, assessment=assessment))
             successful = False
+            missing_substantive = True
         completion_kind = "lead_completed" if successful else "lead_failed"
         # Only the lifecycle fact is recorded. The lead's prose belongs to the
         # host transcript, not to Symphony's durable state.
@@ -3578,8 +3687,10 @@ def _observe_delegation(
                     "owner_generation": state.active_run.owner_generation,
                     "outcome": outcome,
                     **({'reason': 'substantive_child_missing'} if completion_kind == 'lead_failed'
-                       and state.active_run.assessment.get('_substantive_child_missing') else {}),
+                       and missing_substantive else {}),
                     **({"turn_token": token} if completion_kind == "lead_failed" and token else {}),
+                    **({"reported_outcome": True} if completion_kind == "lead_failed"
+                       and reported_outcome else {}),
                     **({"native_host_failed": True} if completion_kind == "lead_failed"
                         and terminal_matches_active_start
                         and status.lower() in {"failed", "interrupted", "cancelled", "canceled", "error", "terminated"}
@@ -3627,6 +3738,10 @@ def _mark_fast_run(state: ProjectState, selection: Mapping[str, str], provider: 
     assessment = {**run.assessment, "_fast_pending": True,
                   "_fast_route": dict(selection),
                   "_lead_expected_route": dict(selection)}
+    if provider == "claude":
+        # Persist the launch contract, never infer it from a callback. Older
+        # archived owners still use their independently proven native contract.
+        assessment["_claude_fast_report_contract"] = 1
     if _boost_preference(state, provider, run.session_id) != "off" or not selection["model"]:
         assessment["_fast_disallowed"] = True
     return replace(state, active_run=replace(run, assessment=assessment))
@@ -3815,12 +3930,12 @@ def _prepare_delegation(
         drift = _route_drift(recorded, required_model, required_effort)
         if drift and drift["weaker"]:
             if _accepted_route(state, provider, spawn_session) != f"{required_model}/{required_effort}":
-                return state, (_drift_block(provider, drift),)
+                return _awaiting_route_consent(state), (_drift_block(provider, drift),)
         elif drift:
             actions += (_drift_notice(drift),)
         clamp = () if fast_launch else _clamp_actions(state, provider, route, spawn_session)
         if any(item.kind == "block_tool" for item in clamp):
-            return state, clamp
+            return _awaiting_route_consent(state), clamp
         actions += clamp
         if model != required_model or effort != required_effort:
             return state, (
@@ -3928,6 +4043,24 @@ def _accepted_profile(state: ProjectState, provider: str, session_id: str) -> st
     return _carried_acceptance(state, provider, session_id, "profile")
 
 
+def _consented_profile(state: ProjectState, provider: str, session_id: str, profile: str) -> bool:
+    """Whether this session accepted the clamp for exactly this profile.
+
+    An unreadable entitlement is the empty profile, and consent to it is real
+    consent: comparing truthy strings made `proceed` impossible to satisfy
+    whenever the probe failed, so the lead stayed blocked forever.
+    """
+    recorded = state.activation.get(provider, {})
+    if not isinstance(recorded, Mapping) or not session_id:
+        return False
+    entry = (recorded.get("accepted") or {}).get(session_id)
+    if isinstance(entry, Mapping):
+        return str(entry.get("profile") or "") == profile
+    # Records written before acceptance was keyed by session carry no proof
+    # that an empty value was ever accepted.
+    return bool(profile) and _accepted_profile(state, provider, session_id) == profile
+
+
 def _accepted_route(state: ProjectState, provider: str, session_id: str) -> str:
     return _carried_acceptance(state, provider, session_id, "route")
 
@@ -3950,7 +4083,7 @@ def _clamp_actions(
     profile = _applied_profile(state, provider) if profile_id is None else profile_id
     clamp = clamp_against_best(provider, route, profile or None)
     if clamp["tier_clamped"]:
-        if _accepted_profile(state, provider, session_id) == profile and profile:
+        if _consented_profile(state, provider, session_id, profile):
             return ()
         control = _control_name("proceed", provider)
         reason = (
@@ -3972,6 +4105,18 @@ def _clamp_actions(
             ),
         )
     return ()
+
+
+def _awaiting_route_consent(state: ProjectState) -> ProjectState:
+    """Mark a lead launch held for the user's consent, so Stop lets them answer.
+
+    A replacement lead can be held too; the next lead start clears the mark.
+    """
+    run = state.active_run
+    if not run or run.assessment.get("_awaiting_route_consent"):
+        return state
+    assessment = {**run.assessment, "_awaiting_route_consent": True}
+    return replace(state, active_run=replace(run, assessment=assessment))
 
 
 def _required_lead_route(recorded: Mapping[str, object]) -> tuple[str, str]:
@@ -4365,15 +4510,27 @@ def _consume_parent_actions(
         return state, ()
     assessment = dict(state.active_run.assessment)
     pending = assessment.pop("_pending_parent_actions", ())
+    reason = _stop_block_reason(state.active_run)
+    settled = reason is None or not (reason.get("active") or reason.get("code") in {
+        "batch_pending", "launch_unconfirmed"})
     actions = tuple(
         Action(str(item.get("kind") or ""), dict(item.get("payload") or {}))
         for item in pending
         if isinstance(item, Mapping) and item.get("kind")
+        and not (settled and str((item.get("payload") or {}).get("text") or "").startswith(_WAIT_NOTICE))
     )
     return (
         replace(state, active_run=replace(state.active_run, assessment=assessment)),
         actions,
     )
+
+
+def _block_signal(payload: Mapping[str, object]) -> str:
+    """The reducer's fixed reason code, before it becomes guidance prose."""
+    for value in (payload.get("code"), payload.get("reason")):
+        if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,47}", value):
+            return value
+    return "active_work" if payload.get("active") else "unclassified_block"
 
 
 def _stop_block_text(
@@ -4402,6 +4559,7 @@ def _render_actions(
     provider: str,
     source_kind: str = "",
     scope: str = "this project",
+    control_stop: bool = False,
 ) -> tuple[Action, ...]:
     # A stop control arrives as a prompt, where blocking would reject the user's
     # own message; only a real Stop event may answer with a block decision.
@@ -4421,24 +4579,33 @@ def _render_actions(
                     and not state.active_run.assessment.get('size')):
                 text += (' Request a fresh independent assessment of the full current objective, '
                          'then launch its matrix-selected lead; the old direct route cannot complete it.')
+            signal = {key: action.payload[key] for key in ('recovery_kind', 'recovery_signal')
+                      if action.payload.get(key)}
+            if not signal.get('recovery_signal'):
+                signal['recovery_signal'] = _block_signal(action.payload)
             rendered.append(
                 Action("inject_context", {"text": text})
                 if prompt_originated
-                else Action("block_stop", {"reason": text})
+                else Action("block_stop", {"reason": text, **signal})
             )
         elif action.kind == 'permit_stop' and action.payload.get('reason') and not prompt_originated:
             reason = action.payload['reason']
+            signal = {key: action.payload[key] for key in ('recovery_kind', 'recovery_signal')
+                      if action.payload.get(key)}
             if isinstance(reason, Mapping):
+                signal.setdefault('recovery_signal', 'released_' + _block_signal(reason))
                 status = '/symphony:status' if provider == 'claude' else '$symphony:symphony status'
                 reason = (f'Symphony released this repeated host Stop for {scope}; unfinished work remains open. '
                           f'Inspect `{status}` on the next turn, reconcile the tracked agents and evidence, '
                           'and confirm durable completion before reporting success.')
-            rendered.append(Action('permit_stop', {'reason': reason}))
-        elif action.kind == "permit_stop" and prompt_originated:
+            rendered.append(Action('permit_stop', {'reason': reason, **signal}))
+        elif action.kind == "permit_stop" and (prompt_originated or control_stop):
+            closed = any(item.kind == "archive_run" for item in actions)
             rendered.append(
                 Action(
                     "inject_context",
-                    {"text": f"Symphony has no active work in {scope} to stop."},
+                    {"text": f"Symphony closed the run in {scope}; nothing is left running."
+                     if closed else f"Symphony has no active work in {scope} to stop."},
                 )
             )
         elif action.kind == "run_abandoned":
@@ -4516,8 +4683,7 @@ def _render_actions(
             identities = ", ".join(map(str, action.payload.get("active", ())))
             reason = f"active agents: {identities}" if identities else "pending launches or unreconciled results"
             rendered.append(Action("inject_context", {"text":
-                f"The lead reported completion while Symphony still tracks {reason}. "
-                "Reconcile this work before completing the run."}))
+                f"{_WAIT_NOTICE}{reason}. Reconcile this work before completing the run."}))
         elif action.kind == "block_completion":
             text = (
                 "Symphony invalidated the earlier lead outcome after later work failed. Register a recovered lead and integrate the result before reporting completion."
@@ -4553,25 +4719,35 @@ def _provider_cells(snapshot, role: str) -> list[str]:
     return cells
 
 
+_FAST_EXECUTION_CONTRACT = (
+    'Use routine read-only inspection of repo state, tools, and UI. '
+    'With confident intent, authorized scope, tools, and checks, execute the full task directly at capable/medium: '
+    'git branch/merge cleanup, simple shell commands, known browser/computer steps. '
+    'Authorized merged-branch deletion is routine; commands need not be prescribed. '
+    'Clean, verifiable merges of unique commits stay routine. '
+    'Check all results are complete, correct, and accurate. '
+    'Only uncertainty, ambiguity, conflicts, risk of losing unmerged work, unsafe tools, material risk, '
+    'design/product judgment, or substantive implementation, diagnosis, or review requires escalation. '
+    'Otherwise pause further changes, report evidence/completed steps, return '
+    '`SYMPHONY_FAST_DECISION: escalate` without completion; root requests exactly one independent assessor. '
+    'Do not spawn workers or other descendants. '
+    'Verified success: `SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {"status":"completed"}`, once each. '
+    'Blocked on missing access/input: eligible, `{"status":"blocked"}`, and what is needed. '
+    'No status/wait narration. '
+    'Resume only this task.'
+)
+_CLAUDE_FAST_REPORT_CONTRACT = (
+    f' Claude: with SubagentHandback, send the full report there and end exactly `{_CLAUDE_FAST_ACK}`;'
+    ' without it, end with the full report.'
+)
+
+
 def _lead_guidance(state: ProjectState, provider: str) -> str:
     """Give the starting lead its children's exact provider spawn contract."""
     if state.active_run and (state.active_run.assessment.get('_fast_pending')
                              or _archived_fast_owner(state.active_run)):
-        return (
-            'You are the registered Symphony fast lead. Before any changes, decide whether the WHOLE '
-            'objective consists only of predetermined mechanical steps with an expected result, bounded '
-            'scope, clear requirements, low risk, available required tools, and concrete verification. '
-            'A brief request or supplied command alone does not establish eligibility. Implementation, '
-            'diagnosis, design, substantive review, product judgment, mixed work, or uncertainty requires '
-            'escalation before any changes, including tiny features and run-and-fix objectives. '
-            'Do not spawn workers, consultants, assessors, or any other descendants. '
-            'If eligible, perform the mechanical steps, verify the result, and return exactly one '
-            '`SYMPHONY_FAST_DECISION: eligible` line and one valid '
-            '`SYMPHONY_OUTCOME: {"status":"completed"}` line. Otherwise make no changes and return '
-            'exactly one `SYMPHONY_FAST_DECISION: escalate` line without a completion outcome. '
-            'The root then requests independent assessment. A resumed fast turn only reconciles the same '
-            'bounded mechanical task; a new or substantive objective requires fresh assessment before changes.'
-        )
+        return ('You are the registered Symphony fast lead. ' + _FAST_EXECUTION_CONTRACT
+                + (_CLAUDE_FAST_REPORT_CONTRACT if provider == 'claude' else ''))
     if not state.active_run or not (state.active_run.assessment.get('size')
                                     and state.active_run.assessment.get('complexity')):
         return ('Symphony has no accepted assessment for this lead. Do not execute project work or spawn children. '
@@ -4653,30 +4829,19 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                        "If occupied, append a unique underscore suffix for a fresh child. Keep this fast prefix; "
                        "generic assessed-lead names apply after assessment; never use them for a fast spawn. ")
             return (
-                "For implementation, diagnosis, run-and-fix, design, review, or uncertainty, "
-                "spawn the assessor directly. Do not probe with another agent or run project commands at the root. "
-                "Symphony fast route: the root is a courier. For a wholly predetermined mechanical objective, "
-                "spawn one capable lead at "
+                "Substantive implementation/diagnosis/design/review: spawn the assessor directly. "
+                "Symphony fast route: for routine or plausibly mechanical tasks, the root "
+                "MUST attempt the capable/medium fast lead; never conservatively bypass it. "
+                "Spawn one lead at "
                 f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
                 "`SYMPHONY_FAST_ROUTE: lead` on separate lines. " + spawn +
-                "Relay the whole request and acceptance checks; the root never executes it. Before any changes, the lead "
-                "decides whether the WHOLE objective consists only of predetermined mechanical steps "
-                "with an expected result, scope bounded, requirements clear, risk low, required tools "
-                "(including browser or computer control when needed) available, and verification concrete. "
-                "Examples: supplied bash/git command or specified browser page. "
-                "Implementation, diagnosis, design, substantive review, "
-                "product judgment, mixed work, or uncertainty requires escalation before any changes, "
-                "even for a tiny feature. A run-and-fix request escalates as a whole. "
-                "Only eligible mechanical work runs directly and returns exact lines "
-                "`SYMPHONY_FAST_DECISION: eligible` and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`. "
-                "Otherwise make no changes and return "
-                "`SYMPHONY_FAST_DECISION: escalate`; then spawn an independent strongest/high assessor "
-                "for the original task, then the matrix-selected lead. "
-                "The fast lead cannot spawn descendants. Preserve the run; await native terminal results and normal Stop. "
+                "Relay the full task/checks; root never executes it. "
+                + _FAST_EXECUTION_CONTRACT +
+                (_CLAUDE_FAST_REPORT_CONTRACT if provider == 'claude' else '') +
+                " Await native results and normal Stop. "
                 + ("Claude agents run in the background; end your turn after spawning and wait for the host result. "
                    if provider == "claude" else "")
-                + "For assessed-first work, or after an attempted fast lead returns native escalation, "
-                "use this assessment contract: "
+                + "Assessed-first or after an attempted fast lead returns native escalation: "
                 + _assessed_guidance("", provider, state, session_id)
                 + f"\n\nTask reminder (full original request governs if clipped):\n{task}"
             )
@@ -4765,7 +4930,8 @@ def _governance(state: ProjectState) -> str:
     return "enabled" if state.enabled else "transactional"
 
 
-def _claude_native_stop_guard(source: Event, reason: str) -> tuple[Action, ...]:
+def _claude_native_stop_guard(source: Event, reason: str,
+                              signal: str = 'native_evidence_unverified') -> tuple[Action, ...]:
     if (source.payload.get('provider') in {'claude', 'codex'}
             and source.kind == 'stop_requested' and source.payload.get('hook_event_name') == 'Stop'
             and source.payload.get('stop_hook_active') is True):
@@ -4773,8 +4939,9 @@ def _claude_native_stop_guard(source: Event, reason: str) -> tuple[Action, ...]:
         # completed. Dispatching Stop here could archive the older outcome.
         return (Action('permit_stop', {'reason': reason +
             ' This repeated Stop releases the host turn only; the run and unresolved evidence remain open.',
-            'recovery_kind': 'bookkeeping'}),)
-    return (Action('block_stop', {'reason': reason, 'recovery_kind': 'bookkeeping'}),)
+            'recovery_kind': 'bookkeeping', 'recovery_signal': signal}),)
+    return (Action('block_stop', {'reason': reason, 'recovery_kind': 'bookkeeping',
+                                  'recovery_signal': signal}),)
 
 
 def _claude_unknown_turn_guidance(run: RunState) -> str:
@@ -4797,24 +4964,49 @@ def _claude_unknown_turn_guidance(run: RunState) -> str:
     )
 
 
+_WAIT_NOTICE = "The lead reported completion while Symphony still tracks "
+
+
+def _repeated_nonsuccess(outcome_lines: list[str]) -> bool:
+    """Identical repeats of one non-success outcome are one report.
+
+    Claude's merged callback carries a handback and a final message that may
+    repeat it exactly. Only a non-success is admitted this way; a repeated
+    success claim still needs native proof of a single report.
+    """
+    unique = {line.strip() for line in outcome_lines}
+    status = _reported_status(next(iter(unique))) if len(unique) == 1 else None
+    return status is not None and status != "completed"
+
+
+def _fast_report_claims_credit(payload: Mapping[str, object]) -> bool:
+    """Whether a fast lead's callback asks for completion or escalation.
+
+    An explicit non-success outcome (blocked, failed, incomplete) grants
+    nothing, so it needs no native proof before it is recorded; holding it
+    for proof that only success can supply left honest blockers pending.
+    """
+    report = str(payload.get("last_assistant_message") or "")
+    lines = [line.strip() for line in report.splitlines()]
+    escalates = any(line.startswith("SYMPHONY_FAST_DECISION:")
+                    and line.removeprefix("SYMPHONY_FAST_DECISION:").strip() == "escalate"
+                    for line in lines)
+    outcomes = [line for line in lines if line.startswith("SYMPHONY_OUTCOME:")]
+    return escalates or not outcomes or not (
+        _repeated_nonsuccess(outcomes) if len(outcomes) > 1
+        else _reported_status(outcomes[0]) not in {None, "completed"})
+
+
 def _completion_ready_guidance(run: RunState, provider: str) -> str:
     if run.status != "completing" or _stop_block_reason(run) is not None:
         return ""
-    host = provider or run.provider or "codex"
-    if host == "codex":
-        return (
-            "The lead outcome and tracked work are reconciled. Finish this root turn "
-            "now so the native Stop hook can verify and archive the run, then check "
-            "durable status. Do not type a stop control as assistant prose, call "
-            "list_agents, or spawn or follow up a completed lead solely because this "
-            "run remains completing."
-        )
-    stop = _control_name("stop", host)
+    # Ending the root turn is what archives: both hosts run Stop then. Asking
+    # the root to type stop/status controls only produced visible chatter.
     return (
-        "The lead outcome and tracked work are reconciled. Invoke the normal "
-        f"`{stop}` control in this same session now, then check durable status. "
-        "The Stop guard verifies native freshness before archiving. Do not follow up "
-        "or replace a completed lead solely because this run remains completing."
+        "The lead outcome and tracked work are reconciled. Report the result and end this "
+        "root turn; the native Stop hook verifies and archives the run. Do not invoke "
+        "Symphony stop or status controls, call list_agents, or follow up a completed lead "
+        "because this run remains completing."
     )
 
 
@@ -4843,10 +5035,14 @@ def _refresh_completion_guidance(
             return actions
     else:
         return actions
+    # A completion reported while the batch hold was still applied rendered a
+    # wait notice; the committed batch has since settled it, so drop it.
     return tuple(
         Action("inject_context", {**action.payload, "text": new})
         if action.kind == "inject_context" and action.payload.get("text") == old else action
         for action in actions
+        if not (action.kind == "inject_context"
+                and str(action.payload.get("text") or "").startswith(_WAIT_NOTICE))
     )
 
 
@@ -4944,6 +5140,20 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
         and any(item.identity == run.lead_identity and item.state in {"working", "pending", "failed", "completed"}
                 for item in run.delegations) else ""
     )
+    reported = run.assessment.get("_reported_nonsuccess")
+    if (reported and not _active_identities(run) and not awaiting
+            and run.assessment.get("_reported_nonsuccess_basis") == _child_evidence_basis(run)):
+        # A known blocker, not missing evidence: say so, and do not push the
+        # root to retry a lead whose report cannot change on its own (#14).
+        return (
+            f"Symphony run {run.run_id} is open: lead {run.lead_identity} reported `{reported}`. "
+            "Relay that blocker plainly and do not retry the lead unchanged. Only if this message "
+            "supplies what the lead needed, continue that same lead: "
+            + (retry + claude_retry or "resume it and await its new result. ")
+            + "Never report the task as completed while it stays blocked. If the user moves on, "
+            f"tell them `{_control_name('stop', run.provider or provider or 'codex')}` closes this "
+            "run as blocked before new work starts."
+        )
     return (
         f"Symphony run {run.run_id} remains {run.status}.{lead} "
         f"Observed agents: {records or 'none'}. "
@@ -5151,6 +5361,7 @@ def _record_hook_decision(payload: Mapping[str, object], result: HookResult,
                         "other_block" if response.get("decision") == "block" else "permit")
         record = {"session_id": str(payload.get("session_id") or ""),
                   "category": category,
+                  "signal": result.recovery_signal or None,
                   "reason_hash": hashlib.sha256(reason.encode()).hexdigest()[:12] if reason else None,
                   "observed_at": datetime.now(timezone.utc).isoformat(),
                   "plugin_version": PLUGIN_VERSION}

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ EVENT_KINDS = {
 class HookResult:
     stdout: str = ""
     recovery_kind: str = ""
+    # Which guard produced a Stop block or notice, for anonymous diagnostics.
+    recovery_signal: str = ""
 
 
 def detect_provider(payload: dict[str, Any]) -> str:
@@ -274,7 +277,8 @@ def render(
             )
         return HookResult(json.dumps({"decision": "block", "reason": reason}),
                           str(block.payload.get('recovery_kind') or 'incomplete_work')
-                          if block.kind == 'block_stop' else '')
+                          if block.kind == 'block_stop' else '',
+                          _recovery_signal(block.payload) if block.kind == 'block_stop' else '')
     if provider in {'claude', 'codex'} and hook_event_name == 'Stop':
         notice_action = next((action for action in actions
                               if action.kind == 'permit_stop' and action.payload.get('reason')), None)
@@ -282,7 +286,8 @@ def render(
             # additionalContext would continue Claude's Stop loop. The common
             # systemMessage field displays a warning without requesting a turn.
             return HookResult(json.dumps({'systemMessage': notice_action.payload['reason']}),
-                              str(notice_action.payload.get('recovery_kind') or ''))
+                              str(notice_action.payload.get('recovery_kind') or ''),
+                              _recovery_signal(notice_action.payload))
     if context:
         return HookResult(
             json.dumps(
@@ -295,6 +300,17 @@ def render(
             )
         )
     return HookResult()
+
+
+def _recovery_signal(payload: Any) -> str:
+    """A fixed reason code for diagnostics; free-text reasons stay local."""
+    explicit = str(payload.get('recovery_signal') or '')
+    if explicit:
+        return explicit
+    reason = str(payload.get('reason') or '')
+    if re.fullmatch(r'[a-z][a-z0-9_]{0,47}', reason):
+        return reason
+    return 'active_work' if payload.get('active') else 'unclassified_block'
 
 
 def _active_reason(active: Any) -> str:

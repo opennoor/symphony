@@ -53,6 +53,21 @@ class StateStoreTests(unittest.TestCase):
             with self.subTest(malformed=malformed), self.assertRaises(ValueError):
                 _receipt_from_dict({**receipt, 'native_fast_escalation': malformed})
 
+    def test_native_fast_report_receipt_provenance_is_strict_and_retained(self):
+        from plugins.symphony.symphony.store import _receipt_from_dict
+        receipt = {key: key for key in ('provider', 'session', 'agent', 'run_id',
+                                       'turn', 'result', 'parent', 'lead')}
+        receipt.update(native_fast_owner=True, native_fast_report_contract=1, native_owner_generation=7)
+        self.store.save(self.project, ProjectState(terminal_receipts=(receipt,)))
+        loaded = self.store.load(self.project).terminal_receipts[0]
+        for key in ('native_fast_owner', 'native_fast_report_contract', 'native_owner_generation'):
+            self.assertEqual(receipt[key], loaded[key])
+        for field, values in (('native_fast_owner', (None, 0, 1, 'true')),
+                              ('native_fast_report_contract', (None, False, True, 0, 2, '1'))):
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    _receipt_from_dict({**receipt, field: value})
+
     def test_round_trips_the_complete_domain_model_as_json(self):
         event = Event("event-1", "task_received", "2026-09-17T10:00:00+00:00", {"task": "ship"})
         delegation = Delegation(

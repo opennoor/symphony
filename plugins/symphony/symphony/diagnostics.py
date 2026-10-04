@@ -18,24 +18,58 @@ import time
 from typing import Mapping
 
 
-from .store import StateStore, _locked
+from .store import StateStore, _locked, valid_diagnostic_fields
 
 
 REPOSITORY = 'opennoor/symphony'
 SHARE = 'Share the accumulated sanitized report'
 DECLINE = 'Keep it local'
-FIELDS = {'schema', 'plugin_version', 'provider', 'platform', 'category', 'outcome', 'day', 'occurrences'}
+
+# What each signal means and where a maintainer starts. A signal missing here
+# still reports; the table says so, and the site names the code that fired.
+SIGNALS = {
+    'hook_exception': 'A Symphony hook raised the named exception at the named site. The host turn continued; '
+                      'that hook made no state change. Start at the site.',
+    'stop_hook_exception': 'The Stop hook raised the named exception at the named site and released the turn '
+                           'without recording completion. Start at the site.',
+    'claude_lead_result_unverified': "The lead's native Claude result could not be read from its transcript.",
+    'claude_lead_turn_unverified': "Reading the lead's latest native Claude turn failed.",
+    'claude_lead_turn_unknown': "The lead's latest native Claude turn could not be matched to its start.",
+    'codex_lead_result_unverified': "The lead's native Codex result could not be read from its rollout.",
+    'codex_lead_turn_unverified': "Reading the lead's latest native Codex turn failed.",
+    'codex_lead_turn_unknown': "The lead's latest native Codex turn could not be matched to its start.",
+    'codex_lead_turn_running': 'Stop arrived while the lead still had a newer native turn running.',
+    'unresolved_child_evidence': 'A child event is queued that the current run must reconcile before completing.',
+    'child_owner_unresolved': 'A child result arrived whose root session could not be proven.',
+    'owner_state_unavailable': "The root session's project state snapshot was unavailable during Stop.",
+    'owner_state_conflict': 'One root session appeared active in more than one project state.',
+    'owner_unverified': "A child event's root project was not yet verified.",
+    'pending_event_overflow': 'More child events were retained than can be safely replayed.',
+    'native_evidence_unverified': 'Native host evidence for the run could not be verified.',
+    'completion_order_early': 'The lead reported completion before all child results were available.',
+    'completion_order_unknown': "The lead's native completion order could not be verified.",
+    'lead_outcome_missing': 'The tracked lead ended without a reconciled outcome.',
+    'lead_not_started': 'Assessment finished but no lead was launched before Stop.',
+    'substantive_child_missing': 'The lead reported success without the required delegated work.',
+    'active_work': 'Stop arrived while tracked agents were still active.',
+    'batch_pending': 'Child lifecycle events were still being reconciled.',
+    'ambiguous_child_start': 'A child start matched an earlier start and carried no invocation ID.',
+    'ambiguous_child_stop': "A child terminal did not match that child's latest native turn.",
+    'interrupted_work': 'Interrupted work still needed reconciliation.',
+    'launch_unconfirmed': 'A delegated launch was never confirmed by the host.',
+    'consultant_unclassified': 'A consultant result lacked its size/complexity classification.',
+    'lead_route_mismatch': 'The lead ran at a different model or effort than the route selected.',
+    'stop_notice_suppressed': 'A Stop notice was withheld from the user because the turn was released.',
+    'pending_child_for_other_run': 'Evidence for a run another hook owns was kept for that owner. Expected.',
+    'native_events_replayed': 'Queued native events were replayed and the run recovered.',
+}
 
 
 def _valid_report(item: object) -> bool:
-    return (isinstance(item, dict) and set(item) == FIELDS
-            and type(item['schema']) is int and item['schema'] == 1
-            and isinstance(item['plugin_version'], str) and len(item['plugin_version']) <= 40
-            and bool(re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', item['plugin_version']))
-            and item['provider'] in {'codex', 'claude'}
-            and item['platform'] in {'windows', 'linux', 'macos', 'other'}
-            and item['category'] in {'bookkeeping', 'incomplete_work', 'state_io', 'state_shape', 'runtime_fault', 'native_recovery'}
-            and item['outcome'] in {'deferred', 'recovered'}
+    if not isinstance(item, dict):
+        return False
+    fields = {key: value for key, value in item.items() if key not in {'day', 'occurrences'}}
+    return (set(item) - set(fields) == {'day', 'occurrences'} and valid_diagnostic_fields(fields)
             and isinstance(item['day'], str) and bool(re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', item['day']))
             and type(item['occurrences']) is int and 1 <= item['occurrences'] <= 1_000_000)
 
@@ -50,10 +84,46 @@ def snapshot(store: StateStore) -> list[dict]:
             item = json.loads(path.read_text())
             if not _valid_report(item):
                 continue
-            reports.append({key: item[key] for key in sorted(FIELDS)})
+            reports.append({key: item[key] for key in sorted(item)})
         except (OSError, ValueError, TypeError):
             continue
     return reports
+
+
+def _grouped(reports: list[dict]) -> list[dict]:
+    """One row per distinct signal and site, counts summed across days."""
+    rows: dict[tuple, dict] = {}
+    for item in reports:
+        key = (item['plugin_version'], item['provider'], item['platform'], item['category'],
+               item['outcome'], item.get('signal', ''), item.get('hook', ''),
+               item.get('site', ''), item.get('detail', ''))
+        row = rows.setdefault(key, {'plugin_version': key[0], 'provider': key[1], 'platform': key[2],
+                                    'category': key[3], 'outcome': key[4], 'signal': key[5],
+                                    'hook': key[6], 'site': key[7], 'detail': key[8],
+                                    'occurrences': 0, 'first_day': item['day'], 'last_day': item['day']})
+        row['occurrences'] += item['occurrences']
+        row['first_day'] = min(row['first_day'], item['day'])
+        row['last_day'] = max(row['last_day'], item['day'])
+    # Faults first, then rows that name their signal, then the most frequent:
+    # the top row names the issue.
+    return sorted(rows.values(), key=lambda row: (row['outcome'] != 'deferred', not row['signal'],
+                                                  -row['occurrences'], row['signal'], row['site']))
+
+
+def signature(reports: list[dict]) -> str:
+    """Same versions and fault signals and sites, same issue thread."""
+    rows = _grouped(reports)
+    faults = [row for row in rows if row['outcome'] == 'deferred'] or rows
+    identity = sorted({(row['plugin_version'], row['provider'], row['category'],
+                        row['signal'] or row['category'], row['site']) for row in faults})
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:16]
+
+
+def issue_title(reports: list[dict]) -> str:
+    top = _grouped(reports)[0]
+    label = top['signal'] or top['category']
+    return (f"Symphony {top['plugin_version']} diagnostics: {label} "
+            f"({top['provider']}, {top['platform']})")
 
 
 def _scope(provider: str, session: str) -> str:
@@ -88,10 +158,12 @@ def launch_worker(store: StateStore, mode: str, environ: Mapping[str, str]) -> N
 
 
 def question(record: dict) -> str:
-    return (f"Help improve Symphony by opening a public diagnostic issue in {REPOSITORY} "
-            f"using GitHub account @{record['account']}? It includes only plugin version, provider, "
-            'OS, recovery category/outcome, day and counts accumulated until submission; no task text, '
-            'raw logs, paths or project/session IDs. Your work continues either way. '
+    return (f"Help improve Symphony by sharing a public diagnostic report in {REPOSITORY} "
+            f"using GitHub account @{record['account']}? It opens an issue, or comments on the open "
+            "issue that already has the same signature. It includes only plugin version, provider, "
+            'OS, hook name, recovery category/outcome/signal, the Symphony code location and exception '
+            'type, day and counts accumulated until submission; no task text, raw logs, paths or '
+            'project/session IDs. Your work continues either way. '
             f"Approval code: {record['id']}")
 
 
@@ -130,7 +202,7 @@ def notice(store: StateStore, provider: str, session: str, environ: Mapping[str,
               and record.get('scope') == _scope(provider, session)):
             record['notified'] = True
             store._write_json(_path(store), record)
-            return f"The approved diagnostic issue was opened: {record['url']}. Continue the user task."
+            return f"The approved diagnostic report was shared: {record['url']}. Continue the user task."
         elif (record.get('phase') == 'approved'
               and record.get('scope') == _scope(provider, session)
               and time.time() - record.get('publish_scheduled', 0) > 60):
@@ -219,17 +291,48 @@ def _credential_environ(environ: Mapping[str, str]) -> dict[str, str]:
     return {**environ, 'GH_TOKEN': token}
 
 
-def issue_body(record: dict) -> str:
+def _validated_reports(record: dict) -> list[dict]:
     # Revalidate persisted approved data too: edits cannot smuggle private text.
     reports = record['reports']
     if (not isinstance(reports, list) or not 1 <= len(reports) <= 100
             or not re.fullmatch(r'[a-f0-9]{32}', record['id'])
             or any(not _valid_report(item) for item in reports)):
         raise ValueError('invalid approved snapshot')
-    return ('## Sanitized Symphony recovery report\n\n'
-            'Shared with user approval. These counters describe retained or recovered lifecycle events; '
-            'they do not claim that application work failed or a managed run completed.\n\n'
-            '```json\n' + json.dumps(reports, indent=2, sort_keys=True) + '\n```\n\n'
+    return reports
+
+
+def issue_body(record: dict) -> str:
+    reports = _validated_reports(record)
+    rows = _grouped(reports)
+    table = ['| Signal | Category | Outcome | Hook | Site | Exception | Count | Days | Version | Host |',
+             '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
+    for row in rows:
+        days = row['first_day'] if row['first_day'] == row['last_day'] else f"{row['first_day']}..{row['last_day']}"
+        table.append(f"| `{row['signal'] or '(schema 1)'}` | {row['category']} | {row['outcome']} | "
+                     f"{row['hook'] or '-'} | {('`' + row['site'] + '`') if row['site'] else '-'} | "
+                     f"{row['detail'] or '-'} | {row['occurrences']} | {days} | {row['plugin_version']} | "
+                     f"{row['provider']}/{row['platform']} |")
+    meanings = []
+    for name in dict.fromkeys(row['signal'] for row in rows if row['signal']):
+        meanings.append(f"- `{name}`: {SIGNALS.get(name, 'Not described by this Symphony version; start at its site.')}")
+    if any(not row['signal'] for row in rows):
+        meanings.append('- `(schema 1)`: recorded by a Symphony build before 1.8.0, which kept only the '
+                        'category and outcome.')
+    return ('## Sanitized Symphony diagnostic report\n\n'
+            'Shared with user approval. Each row counts one kind of lifecycle event that Symphony deferred, '
+            'retained, or recovered. **deferred** means Symphony released the host turn without settling the '
+            'run; **retained** means evidence was kept for a later owner; **recovered** means it settled. '
+            'No task text, transcripts, paths, or session IDs are included; *Site* is the Symphony '
+            'function and line that recorded the event.\n\n'
+            + '\n'.join(table) + '\n\n### What the signals mean\n\n' + '\n'.join(meanings)
+            + '\n\n### Triage\n\n'
+              '1. Check out the reported version and open each *Site*.\n'
+              '2. A `deferred` row with an exception or a `*_unverified` signal is a Symphony defect until '
+              'shown otherwise; `retained` and `recovered` rows are context.\n'
+              '3. Later reports with the same signature are added to this issue as comments.\n\n'
+            '<details><summary>Sanitized records</summary>\n\n'
+            '```json\n' + json.dumps(reports, indent=2, sort_keys=True) + '\n```\n\n</details>\n\n'
+            f"<!-- symphony-signature:{signature(reports)} -->\n"
             f"<!-- symphony-diagnostic:{record['id']} -->\n")
 
 
@@ -270,13 +373,33 @@ def worker(root: str, mode: str) -> None:
             urls = {item['url'] for item in matches if f'<!-- {marker} -->' in item.get('body', '')}
             if len(urls) > 1:
                 raise ValueError('ambiguous diagnostic issue')
+            if not urls and record.get('comment_target'):
+                # A comment's lost response is recovered from that issue's
+                # comments since the attempt, not from issue search.
+                comments = json.loads(_gh(['api', '--hostname', 'github.com',
+                    f"repos/{REPOSITORY}/issues/{record['comment_target']}/comments"
+                    f"?since={record['attempted_at']}&per_page=100",
+                    '--jq', '[.[] | {url:.html_url,body:.body}]'], environ))
+                urls = {item['url'] for item in comments if f'<!-- {marker} -->' in item.get('body', '')}
+                if len(urls) > 1:
+                    raise ValueError('ambiguous diagnostic comment')
             if urls:
                 url = next(iter(urls))
             elif record.get('create_attempted'):
                 # Search indexing may lag after a timeout. Preserve the
-                # approved snapshot rather than risk another public issue.
+                # approved snapshot rather than risk another public report.
                 return
             else:
+                # A report whose signature already has an open issue joins it.
+                # Search failure raises, which keeps the snapshot local.
+                key = signature(_validated_reports(record))
+                same = json.loads(_gh(['api', '--hostname', 'github.com', 'search/issues', '--method', 'GET',
+                    '-f', f'q=repo:{REPOSITORY} is:issue is:open "symphony-signature:{key}" in:body',
+                    '--jq', '[.items[] | {number:.number,body:.body}]'], environ))
+                numbers = sorted(item['number'] for item in same
+                                 if type(item.get('number')) is int and item['number'] > 0
+                                 and f'<!-- symphony-signature:{key} -->' in str(item.get('body') or ''))
+                existing = str(numbers[0]) if numbers else ''
                 path = store.root / 'diagnostic-issue.md'
                 descriptor, temporary = tempfile.mkstemp(dir=store.root, prefix='.diagnostic-issue-')
                 try:
@@ -287,10 +410,19 @@ def worker(root: str, mode: str) -> None:
                     Path(temporary).unlink(missing_ok=True)
                 with _locked(_path(store), timeout=0.05):
                     record['create_attempted'] = True
+                    if existing:
+                        record['comment_target'] = existing
+                        record['attempted_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 60))
                     store._write_json(_path(store), record)
-                url = _gh(['issue', 'create', '--repo', REPOSITORY, '--title', 'Symphony lifecycle recovery diagnostics',
-                           '--body-file', str(path)], environ)
-            if not re.fullmatch(r'https://github\.com/opennoor/symphony/issues/[1-9][0-9]*', url):
+                if existing:
+                    url = _gh(['issue', 'comment', existing, '--repo', REPOSITORY,
+                               '--body-file', str(path)], environ)
+                else:
+                    url = _gh(['issue', 'create', '--repo', REPOSITORY,
+                               '--title', issue_title(_validated_reports(record)),
+                               '--body-file', str(path)], environ)
+            if not re.fullmatch(r'https://github\.com/opennoor/symphony/issues/[1-9][0-9]*'
+                                r'(?:#issuecomment-[1-9][0-9]*)?', url):
                 raise ValueError('invalid diagnostic issue URL')
             with _locked(_path(store), timeout=0.05):
                 record.update(phase='published', url=url)

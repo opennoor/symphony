@@ -16,6 +16,85 @@ from plugins.symphony.symphony.store import StateStore
 
 
 class FastRouteTests(unittest.TestCase):
+    def test_honest_fast_blocker_is_recorded_without_native_proof_and_stop_stays_quiet(self):
+        """A non-success report grants nothing, so it is not held for proof (#14)."""
+        blocked = 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"blocked"}'
+        reports = (blocked,
+                   'Release URL does not resolve.\nSYMPHONY_OUTCOME: {"status":"blocked"}',
+                   # Claude's merged handback plus a final message repeating it exactly.
+                   'Needs access.\n' + blocked + '\nNeeds access.\n' + blocked)
+        for provider in ('claude', 'codex'):
+            for report in reports:
+                with self.subTest(provider=provider, report=report):
+                    self.tearDown()
+                    self.setUp()
+                    _, started = self.start_fast(provider)
+                    with patch('plugins.symphony.symphony.runtime.claude_current_native_lead_event',
+                               return_value=None):
+                        self.hook(provider, "SubagentStop", **started, status="completed",
+                                  last_assistant_message=report)
+                    run = self.run_state()
+                    self.assertEqual('recovering', run.status)
+                    self.assertEqual('blocked', run.assessment['_reported_nonsuccess'])
+                    self.assertIsNone(run.outcome)
+                    for _ in range(2):
+                        result = self.hook(provider, "Stop")
+                        self.assertNotIn('"decision": "block"', result.stdout)
+                    self.assertIsNotNone(self.run_state())
+                    self.assertFalse(self.store.load(self.project).recent_runs)
+                    # The user's own stop control, through the real prompt
+                    # hook, closes it as blocked and says so.
+                    control = '/symphony:stop' if provider == 'claude' else '$symphony:symphony stop'
+                    closed = self.hook(provider, "UserPromptSubmit", prompt=control)
+                    self.assertIn('closed the run', closed.stdout)
+                    self.assertIsNone(self.run_state())
+                    archived = self.store.load(self.project).recent_runs[-1]
+                    self.assertEqual(('blocked', {'status': 'blocked'}), (archived.status, archived.outcome))
+
+    def test_fast_success_claims_still_need_native_proof(self):
+        _, started = self.start_fast('claude')
+        with patch('plugins.symphony.symphony.runtime.claude_current_native_lead_event', return_value=None):
+            self.hook('claude', "SubagentStop", **started, status="completed", last_assistant_message=
+                      'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}')
+        run = self.run_state()
+        self.assertTrue(run.assessment.get('_fast_pending'))
+        self.assertIsNone(run.outcome)
+        self.assertNotIn('_reported_nonsuccess', run.assessment)
+
+    def test_confident_mechanical_guidance_requires_direct_capable_execution(self):
+        from plugins.symphony.symphony.runtime import _lead_guidance
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.tearDown()
+                self.setUp()
+                self.hook(provider, 'SessionStart')
+                control = '$symphony:symphony start ' if provider == 'codex' else '/symphony:start '
+                response = self.hook(provider, 'UserPromptSubmit', prompt=control +
+                    'Merge the finished branch and clean up the merged local branch')
+                text = json.loads(response.stdout)['hookSpecificOutput']['additionalContext']
+                self.assertIn('MUST attempt the capable/medium fast lead', text)
+                self.assertNotIn('wholly predetermined', text)
+                self.assertIn('routine read-only inspection', text)
+                _, started = self.start_fast(provider)
+                guidance = _lead_guidance(self.store.load(self.project), provider)
+                for text in (guidance, BODIES['lead']):
+                    self.assertIn('execute the full task directly', text)
+                    self.assertIn('complete, correct, and accurate', text)
+                    self.assertIn('risk of losing unmerged work', text)
+                    self.assertIn('verifiable merges of unique commits stay routine', text)
+                    self.assertIn('routine read-only inspection', text)
+                    self.assertIn('exactly one independent assessor', text)
+                for text in ((guidance, BODIES['lead']) if provider == 'claude' else (BODIES['lead'],)):
+                    self.assertIn('with SubagentHandback, send the full report there', text)
+                    self.assertIn('without it, end with the full report', text)
+                    self.assertIn('end exactly `Report delivered.`', text)
+                self.assertEqual(self.run_state().assessment['_fast_route']['effort'], 'medium')
+                self.assertEqual([item.role for item in self.run_state().delegations], ['lead'])
+                self.stop_fast(provider, started,
+                    'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}')
+                self.hook(provider, 'Stop')
+                self.assertIsNone(self.run_state())
+
     def test_fast_launch_identity_is_distinct_from_later_assessed_names(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):
@@ -112,6 +191,10 @@ class FastRouteTests(unittest.TestCase):
                 self.setUp()
                 self.start_fast(provider, launch_id=launch_id, root_prompt='root-prompt')
                 assessment = self.run_state().assessment
+                if provider == 'claude':
+                    self.assertEqual(assessment['_claude_fast_report_contract'], 1)
+                else:
+                    self.assertNotIn('_claude_fast_report_contract', assessment)
                 if provider == 'claude' and launch_id == 'toolu_launch':
                     self.assertEqual(assessment['_claude_fast_launch_hash'],
                                      hashlib.sha256(launch_id.encode()).hexdigest())
@@ -142,16 +225,27 @@ class FastRouteTests(unittest.TestCase):
                             **({'turn_id': 'next-turn'} if provider == 'codex' else {'prompt_id': 'next-turn'}))
                     guidance = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
                     self.assertIn('registered Symphony fast lead', guidance)
-                    self.assertIn('WHOLE objective', guidance)
-                    self.assertIn('escalation before any changes', guidance)
+                    self.assertIn('execute the full task directly', guidance)
+                    self.assertIn('pause further changes', guidance)
                     self.assertIn('Do not spawn workers', guidance)
                     self.assertIn('SYMPHONY_FAST_DECISION: escalate', guidance)
                     self.assertNotIn('Symphony worker routes', guidance)
                     self.assertNotIn('Every worker spawn', guidance)
 
     def stop_fast(self, provider, started, report, status="completed", profile=None):
-        self.hook(provider, "SubagentStop", profile, **started,
-                  status=status, last_assistant_message=report)
+        if provider == 'claude':
+            # Routing unit fixtures use synthetic IDs. Model the native
+            # admission boundary here; file-backed host-evidence tests prove
+            # the canonical handback/ack and missing-evidence rejection.
+            self.assertEqual(self.run_state().assessment['_claude_fast_report_contract'], 1)
+            with patch('plugins.symphony.symphony.runtime.claude_current_native_lead_event',
+                       side_effect=lambda state, event, *args: event) as native_admission:
+                self.hook(provider, "SubagentStop", profile, **started,
+                          status=status, last_assistant_message=report)
+                native_admission.assert_called()
+        else:
+            self.hook(provider, "SubagentStop", profile, **started,
+                      status=status, last_assistant_message=report)
 
     def start_native_codex_fast(self, observed_model=None):
         provider = "codex"
@@ -203,14 +297,13 @@ class FastRouteTests(unittest.TestCase):
                     payload = json.loads(result.stdout)
                     text = payload["hookSpecificOutput"]["additionalContext"]
                     self.assertIn(task, text)
-                    self.assertIn("WHOLE objective consists only of predetermined mechanical steps", text)
-                    self.assertIn("before any changes", text)
-                    self.assertIn("bash/git command", text)
-                    self.assertIn("browser page", text)
-                    self.assertIn("even for a tiny feature", text)
-                    self.assertIn("run-and-fix request escalates as a whole", text)
-                    for substantive in ("Implementation", "diagnosis", "design", "substantive review",
-                                        "product judgment", "mixed work", "uncertainty"):
+                    self.assertIn("MUST attempt the capable/medium fast lead", text)
+                    self.assertIn("routine read-only inspection", text)
+                    self.assertIn("git branch/merge cleanup", text)
+                    self.assertIn("browser/computer steps", text)
+                    self.assertIn("complete, correct, and accurate", text)
+                    for substantive in ("implementation", "diagnosis", "design", "review",
+                                        "judgment", "uncertainty", "conflicts"):
                         self.assertIn(substantive, text)
                     self.assertIn("SYMPHONY_FAST_DECISION: escalate", text)
                     self.assertIn('"complexity":"simple|mixed|complex"', text)
@@ -218,7 +311,7 @@ class FastRouteTests(unittest.TestCase):
                     self.assertIn("substantive small work uses one worker", text)
                     self.assertIsNone(self.run_state())
         lead = BODIES["lead"]
-        self.assertIn("WHOLE objective consists only of predetermined mechanical steps", lead)
+        self.assertIn("execute the full task directly", lead)
         self.assertIn("assign the substantive work to one worker", lead)
         self.assertIn("assign substantive work to bounded worker packets", lead)
         self.assertNotIn("do quick glue work", lead)
