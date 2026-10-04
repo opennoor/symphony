@@ -500,6 +500,12 @@ def worker(root: str, mode: str) -> None:
                 finally:
                     Path(temporary).unlink(missing_ok=True)
                 with _locked(_path(store), timeout=0.05):
+                    # Revocation wins: recheck the user's choice and the queue
+                    # at the last moment before anything becomes public.
+                    latest = _read(store)
+                    if (preference(store).get('sharing') == 'off' or latest.get('id') != record.get('id')
+                            or latest.get('phase') != 'approved'):
+                        return
                     record['create_attempted'] = True
                     if existing:
                         record['comment_target'] = existing

@@ -340,6 +340,26 @@ class DiagnosticReportingTests(unittest.TestCase):
         d.notice(self.store, 'codex', 'root', self.env)
         self.launch.assert_called_once_with(self.store, 'probe', self.env)
 
+    def test_report_off_during_publication_wins_the_race(self):
+        self.approved()
+        def gh(arguments, environ):
+            if arguments[:2] == ['api', '--hostname'] and 'user' in arguments:
+                return 'User'
+            if 'search/issues' in arguments:
+                # The user revokes while the worker is searching.
+                d.control(self.store, 'off', 'codex', 'root', self.env)
+                return '[]'
+            raise AssertionError('nothing may be published after report off: ' + ' '.join(arguments))
+        with patch.object(d, '_gh', side_effect=gh):
+            d.worker(str(self.store.root), 'publish')
+        self.assertNotEqual('published', d._read(self.store).get('phase'))
+
+    def test_report_off_reaches_diagnostics_even_when_the_session_record_is_unreadable(self):
+        with patch.object(StateStore, 'session_record', side_effect=OSError('unreadable')):
+            handle({'hook_event_name': 'UserPromptSubmit', 'session_id': 'root', 'cwd': str(self.project),
+                    'prompt': '$symphony:symphony report off'}, {**self.env, 'SYMPHONY_PROVIDER': 'codex'})
+        self.assertEqual('off', d.preference(self.store)['sharing'])
+
     def test_failed_search_never_attempts_issue_creation(self):
         self.approved()
         with patch.object(d, '_gh', side_effect=['User', OSError('offline')]) as gh:

@@ -354,7 +354,10 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
     if hook != 'Stop':
         # Reporting is a root-only optional control, independent of managed
         # ownership/Stop recovery. It never creates a task or grants credit.
-        if root_entry and hook == 'UserPromptSubmit':
+        revoke = hook == 'UserPromptSubmit' and _parse_control(str(payload.get('prompt') or '')) == ('report', 'off')
+        if (root_entry or revoke) and hook == 'UserPromptSubmit':
+            # Turning sharing off is always safe, even when Symphony cannot
+            # read its own session record; everything else is root-only.
             try:
                 prompt = str(payload.get('prompt') or '')
                 control = _parse_control(prompt)
@@ -2270,7 +2273,8 @@ def _handle_prompt(
 def _task_guidance(state: ProjectState, task: str, provider: str, session_id: str = "") -> str:
     """Guidance for substantive work: recover an active run, or open a new one."""
     if _applied_profile(state, provider) == NO_PROFILE:
-        return "Symphony has no launchable route in this account's available model roster."
+        return ("Symphony has no launchable route in this account's available model roster; "
+                "do the task without Symphony at full quality.")
     if state.active_run:
         return _recovery_guidance(state, provider)
     return _assessment_guidance(task, provider, state, session_id)
@@ -3845,9 +3849,10 @@ def _prepare_delegation(
     try:
         profiles_for(provider)
     except (OSError, ValueError, KeyError, TypeError):
-        return state, (_block_tool("Symphony capability profiles are invalid; repair the shipped profiles before spawning."),)
+        # A broken shipped map is Symphony's own defect: never stop the spawn.
+        return state, ()
     if _applied_profile(state, provider) == NO_PROFILE:
-        return state, (_block_tool("Symphony has no launchable route in this account's available model roster."),)
+        return state, ()
     fast_launch = role == "lead" and _marker_value(values, "SYMPHONY_FAST_ROUTE:") == "lead"
     if not state.active_run and role != "assessor" and not fast_launch:
         return state, (

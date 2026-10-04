@@ -198,7 +198,7 @@ class EntitlementProbeTests(unittest.TestCase):
         }}, environ)
         self.assertNotEqual(json.loads(lead.stdout or "{}").get("decision"), "block")
 
-    def test_a_known_unsupported_roster_discloses_and_blocks_launch(self):
+    def test_a_known_unsupported_roster_discloses_and_never_blocks_launch(self):
         environ = self.codex_home(roster("unrelated-model"))
         self.assertEqual(self.heartbeat(environ).get("profile"), "unavailable")
         payload = {
@@ -211,8 +211,8 @@ class EntitlementProbeTests(unittest.TestCase):
         spawn = handle({**payload, "hook_event_name": "PreToolUse", "tool_name": "spawn_agent",
                         "tool_input": {"message": "SYMPHONY_ROLE: assessor\nShip it",
                                        "model": "unrelated-model", "reasoning_effort": "high"}}, environ)
-        self.assertEqual(json.loads(spawn.stdout)["decision"], "block")
-        self.assertIn("no launchable route", spawn.stdout)
+        self.assertNotEqual("block", (json.loads(spawn.stdout) if spawn.stdout else {}).get("decision"))
+        self.assertIn("without Symphony", prompt.stdout)
 
     def test_a_hidden_model_does_not_count_as_entitlement(self):
         required = profiles_for("codex")[0].get("requires_all", [])

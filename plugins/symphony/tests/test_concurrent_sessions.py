@@ -62,7 +62,7 @@ class ActionCoverageTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1] / "symphony"
         emitted = set()
         for name in ("reducer.py", "runtime.py"):
-            emitted |= set(re.findall(r'Action\(\s*"([a-z_]+)"', (root / name).read_text()))
+            emitted |= set(re.findall(r'Action\(\s*["\']([a-z_]+)["\']', (root / name).read_text()))
         payload = {
             "identity": "agent-1", "session_id": "session-1", "run_id": "run-1",
             "active": ("agent-2",), "unreachable": (), "unreconciled": ("agent-3",),
