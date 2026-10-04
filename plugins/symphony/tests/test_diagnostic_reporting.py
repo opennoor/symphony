@@ -270,6 +270,42 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.assertEqual(1, len(recorded))
         self.assertEqual(('KeyError', 'runtime.broken:2'), (recorded[0]['detail'], recorded[0]['site']))
 
+    def test_report_on_shares_silently_and_rotates_the_counts(self):
+        self.assertIn('sharing is on', d.control(self.store, 'on', 'codex', 'root', self.env))
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # probe, silent
+        with patch.object(d, '_gh', side_effect=['User', 'true']):
+            d.worker(str(self.store.root), 'probe')
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # auto-approve, silent
+        record = d._read(self.store)
+        self.assertEqual(('approved', True), (record['phase'], record['auto']))
+        with patch.object(d, '_gh', side_effect=['User', '[]', '[]',
+                                                 'https://github.com/opennoor/symphony/issues/5']):
+            d.worker(str(self.store.root), 'publish')
+        self.assertEqual('published', d._read(self.store)['phase'])
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # no "was shared" chatter
+        self.assertEqual([], d.snapshot(self.store))  # shared counts start over
+
+    def test_report_off_stays_quiet_until_the_backlog_grows_and_reminds_rarely(self):
+        self.assertIn('sharing is off', d.control(self.store, 'off', 'codex', 'root', self.env))
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))
+        self.launch.assert_not_called()
+        for _ in range(25):
+            self.store.record_recovery_diagnostic(self.report)
+        reminder = d.notice(self.store, 'codex', 'root', self.env)
+        self.assertIn('report on', reminder)
+        self.assertIn('one short line', reminder)
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # not again this week
+        self.launch.assert_not_called()
+
+    def test_decline_sets_the_standing_choice_and_names_the_way_back(self):
+        record = self.offered()
+        result = d.control(self.store, 'decline ' + record['id'], 'codex', 'root', self.env)
+        self.assertIn('report on', result)
+        self.assertEqual('off', d.preference(self.store)['sharing'])
+
+    def test_the_offer_mentions_the_standing_commands(self):
+        self.assertIn('report on', self.offered()['id'] and self.offer_text)
+
     def test_failed_search_never_attempts_issue_creation(self):
         self.approved()
         with patch.object(d, '_gh', side_effect=['User', OSError('offline')]) as gh:
@@ -370,6 +406,7 @@ class DiagnosticReportingTests(unittest.TestCase):
                 # One separate local queue per host.
                 if provider == 'claude':
                     d._path(self.store).unlink()
+                    d._preference_path(self.store).unlink()
                     self.launch.reset_mock()
                 record = self.offered(provider)
                 reply = {'question': d.question(record), 'answer': d.SHARE}

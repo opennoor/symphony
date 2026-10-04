@@ -157,6 +157,46 @@ def launch_worker(store: StateStore, mode: str, environ: Mapping[str, str]) -> N
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **options)
 
 
+_CYCLE_SECONDS = 24 * 3600       # at most one silent report per day when opted in
+_SUGGEST_SECONDS = 7 * 24 * 3600  # an opted-out user hears about growth at most weekly
+
+
+def _preference_path(store: StateStore) -> Path:
+    return store.root / 'diagnostic-preference.json'
+
+
+def preference(store: StateStore) -> dict:
+    """The user's standing choice: sharing 'on', 'off', or never asked ('')."""
+    try:
+        value = json.loads(_preference_path(store).read_text()) if _preference_path(store).is_file() else {}
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) and value.get('sharing') in {'on', 'off'} else {}
+
+
+def _set_preference(store: StateStore, sharing: str, **extra) -> None:
+    store._write_json(_preference_path(store), {**preference(store), 'sharing': sharing, **extra})
+
+
+def _fault_count(reports: list[dict]) -> int:
+    return sum(item['occurrences'] for item in reports
+               if item['outcome'] == 'deferred' and item['category'] != 'incomplete_work')
+
+
+def _command(provider: str) -> str:
+    return '$symphony:symphony report' if provider == 'codex' else '/symphony:report'
+
+
+def _rotate(store: StateStore, through: float) -> None:
+    """Shared counts start over; occurrences recorded after approval stay."""
+    for path in (store.root / 'diagnostics').glob('*.json'):
+        try:
+            if not path.is_symlink() and path.stat().st_mtime <= through:
+                path.unlink()
+        except OSError:
+            pass
+
+
 def question(record: dict) -> str:
     return (f"Help improve Symphony by sharing a public diagnostic report in {REPOSITORY} "
             f"using GitHub account @{record['account']}? It opens an issue, or comments on the open "
@@ -168,25 +208,50 @@ def question(record: dict) -> str:
 
 
 def notice(store: StateStore, provider: str, session: str, environ: Mapping[str, str]) -> str:
-    """Claim one offer across parallel sessions; never wait for its answer."""
+    """Claim one offer across parallel sessions; never wait for its answer.
+
+    The user is asked once. Opted in, reports go out silently at most daily.
+    Opted out, a one-line reminder appears only when the backlog has grown
+    several-fold, at most weekly. Nothing here ever pauses the user's work.
+    """
     reports = snapshot(store)
     # Successful housekeeping and expected background waits stay invisible.
     # Only an unexpected deferred fault can start a new sharing offer.
-    fault = any(item['outcome'] == 'deferred' and item['category'] != 'incomplete_work' for item in reports)
-    if not session or (not fault and not _path(store).is_file()):
+    faults = _fault_count(reports)
+    standing = preference(store).get('sharing', '')
+    if not session or (not faults and not _path(store).is_file()):
+        return ''
+    if standing == 'off':
+        choice = preference(store)
+        if (faults >= max(20, 5 * int(choice.get('suggested_count') or 0))
+                and time.time() - float(choice.get('suggested_at') or 0) > _SUGGEST_SECONDS):
+            _set_preference(store, 'off', suggested_count=faults, suggested_at=time.time())
+            return (f'Symphony has collected {faults} anonymous error reports on this machine. Mention once, '
+                    f'in one short line, that `{_command(provider)} on` would share them to help fix Symphony; '
+                    'then continue the user task.')
         return ''
     probe = False
     publish = False
     with _locked(_path(store), timeout=0.05):
         record = _read(store)
+        if (standing == 'on' and faults and record.get('phase') in {'published', 'idle'}
+                and time.time() - float(record.get('cycle_at') or record.get('publish_scheduled') or 0) > _CYCLE_SECONDS):
+            record = {}
         if not record or (record.get('phase') == 'checking' and time.time() - record.get('started', 0) > 60):
             record = {'id': secrets.token_hex(16), 'phase': 'checking', 'started': time.time()}
             store._write_json(_path(store), record)
             probe = True
+        elif record.get('phase') == 'available' and standing == 'on':
+            # Opted in: share silently with the account the user approved.
+            record.update(phase='approved', scope=_scope(provider, session), reports=reports,
+                          repository=REPOSITORY, publish_scheduled=time.time(), auto=True,
+                          approved_at=time.time())
+            store._write_json(_path(store), record)
+            publish = True
         elif record.get('phase') == 'available':
             record.update(phase='offered', scope=_scope(provider, session))
             store._write_json(_path(store), record)
-            command = '$symphony:symphony report' if provider == 'codex' else '/symphony:report'
+            command = _command(provider)
             return ('Optional diagnostic sharing; do not pause or delegate the user task. '
                     'Ask once with a nonblocking question tool if available, using exactly this question: '
                     + question(record) + f' Suggested answers: "{SHARE}" and "{DECLINE}". '
@@ -197,8 +262,9 @@ def notice(store: StateStore, provider: str, session: str, environ: Mapping[str,
                     'through tools, edit transcripts or manufacture hook invocations. If the host does '
                     'not deliver a nonblocking reply to that hook, keep reports local and leave the '
                     'explicit user-entered submit/decline commands available. '
+                    f'Mention that `{command} on` or `{command} off` changes this choice later. '
                     'Continue their work meanwhile.')
-        elif (record.get('phase') == 'published' and not record.get('notified')
+        elif (record.get('phase') == 'published' and not record.get('notified') and not record.get('auto')
               and record.get('scope') == _scope(provider, session)):
             record['notified'] = True
             store._write_json(_path(store), record)
@@ -239,8 +305,17 @@ def reply_control(store: StateStore, prompt: str, provider: str, session: str) -
 
 def control(store: StateStore, argument: str, provider: str, session: str, environ: Mapping[str, str]) -> str:
     parts = argument.split()
+    if parts in (['on'], ['off']):
+        # Only the user's own command reaches here (trusted prompt hook).
+        _set_preference(store, parts[0], changed_at=time.time())
+        if parts[0] == 'off':
+            return ('Diagnostic sharing is off. Reports stay on this machine; '
+                    f'`{_command(provider)} on` turns it back on. Continue the user task.')
+        return ('Diagnostic sharing is on: anonymous error reports are shared at most daily without '
+                f'asking. `{_command(provider)} off` turns it off. Continue the user task.')
     if len(parts) != 2 or parts[0] not in {'submit', 'decline'} or not re.fullmatch(r'[a-f0-9]{32}', parts[1]):
-        return 'Use report submit <approval-code> or report decline <approval-code>. No report was sent.'
+        return ('Use report on, report off, report submit <approval-code> or report decline '
+                '<approval-code>. No report was sent.')
     publish = False
     with _locked(_path(store), timeout=0.05):
         record = _read(store)
@@ -251,16 +326,20 @@ def control(store: StateStore, argument: str, provider: str, session: str, envir
                 return 'The earlier submission decision is already recorded.'
             record['phase'] = 'declined'
             store._write_json(_path(store), record)
-            return 'Diagnostic sharing declined. Reports remain local; continue the user task.'
+            _set_preference(store, 'off', changed_at=time.time(), suggested_count=_fault_count(snapshot(store)),
+                            suggested_at=time.time())
+            return (f'Diagnostic sharing declined. Reports remain local; `{_command(provider)} on` '
+                    'changes this later. Continue the user task.')
         if record.get('phase') == 'published':
             return f"Diagnostic issue: {record['url']}"
         if record.get('phase') not in {'offered', 'approved'}:
             return 'No pending approval matches this request. No report was sent.'
         if record['phase'] == 'offered':
             record.update(phase='approved', reports=snapshot(store), repository=REPOSITORY,
-                          publish_scheduled=time.time())
+                          publish_scheduled=time.time(), approved_at=time.time())
             store._write_json(_path(store), record)
         publish = True
+    _set_preference(store, 'on', changed_at=time.time())
     if publish:
         launch_worker(store, 'publish', environ)
     return 'Sharing approved. Submission runs in the background; continue the user task. If unavailable, the approved report stays local.'
@@ -425,8 +504,10 @@ def worker(root: str, mode: str) -> None:
                                 r'(?:#issuecomment-[1-9][0-9]*)?', url):
                 raise ValueError('invalid diagnostic issue URL')
             with _locked(_path(store), timeout=0.05):
-                record.update(phase='published', url=url)
+                record.update(phase='published', url=url, cycle_at=time.time())
                 store._write_json(_path(store), record)
+            # Shared counts start over, so the next report holds only new events.
+            _rotate(store, float(record.get('approved_at') or 0))
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
         # No raw exception, auth output or network log is persisted or surfaced.
         if mode == 'probe':

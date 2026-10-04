@@ -123,27 +123,11 @@ class RouteDriftTests(unittest.TestCase):
             self.output(result).get("decision"), "block", self.output(result).get("reason")
         )
 
-    def test_standing_assessment_that_weakened_waits_for_the_user(self):
-        self.accept_under("full", "session-1", FULL_ROUTE["model"], FULL_ROUTE["effort"])
-
-        # The same root resumes with a weaker entitlement: the priced route is gone.
-        self.start("base", "session-1")
-        output = self.output(self.spawn("base", "session-1", "lead", BASE_ROUTE["model"], BASE_ROUTE["effort"], MARKER))
-
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("would now run", output["reason"])
-        self.assertIn(FULL_ROUTE["model"], output["reason"])
-        self.assertIn("proceed", output["reason"])
-
-    def test_proceed_accepts_the_weaker_route_and_the_spawn_goes_through(self):
+    def test_a_standing_assessment_that_weakened_continues_without_consent(self):
+        """Best effort: a weaker re-resolved route runs; the agent is never stopped to ask."""
         self.accept_under("full", "session-1", FULL_ROUTE["model"], FULL_ROUTE["effort"])
         self.start("base", "session-1")
-        blocked = self.spawn("base", "session-1", "lead", BASE_ROUTE["model"], BASE_ROUTE["effort"], MARKER)
-        self.assertEqual(self.output(blocked)["decision"], "block")
-
-        self.proceed("base", "session-1")
         output = self.output(self.spawn("base", "session-1", "lead", BASE_ROUTE["model"], BASE_ROUTE["effort"], MARKER))
-
         self.assertNotEqual(output.get("decision"), "block", output.get("reason"))
 
     def test_a_fresh_assessment_never_gates(self):
@@ -283,7 +267,7 @@ class RouteDriftTests(unittest.TestCase):
         self.assertIsNone(state.active_run)
         self.assertEqual(state.recent_runs[-1].status, "completed")
 
-    def test_native_weaker_replacement_still_requires_proceed(self):
+    def test_native_weaker_replacement_never_stops_for_consent(self):
         self.accept_under("full", "session-1", FULL_ROUTE["model"], FULL_ROUTE["effort"])
         original = {
             **self.payload("session-1", "SubagentStart"), "agent_id": "original-lead",
@@ -303,10 +287,10 @@ class RouteDriftTests(unittest.TestCase):
         handle({**replacement, "hook_event_name": "SubagentStop", "status": "completed",
                 "last_assistant_message": "Done"}, self.env("base"))
         state = StateStore(self.state_root).load(self.project)
-        self.assertEqual(state.active_run.status, "recovering")
-        self.assertIsNone(state.active_run.outcome)
-        blocked = self.output(handle({**self.payload("session-1", "Stop")}, self.env("base")))
-        self.assertIn("proceed", blocked["reason"])
+        # The account's weaker replacement is the route: its result counts and
+        # Stop never asks the user for consent.
+        self.assertNotEqual("block", self.output(handle({**self.payload("session-1", "Stop")},
+                                                        self.env("base"))).get("decision"))
 
 
 if __name__ == "__main__":

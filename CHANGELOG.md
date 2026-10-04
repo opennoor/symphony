@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.0 — prepared 2026-10-05
+
+Symphony is now a best-effort token-efficiency helper: its own problems never stop, slow or alarm the user.
+
+- Hold a turn only while the user's delegated work is still running or an assessed task's lead was never launched. Bookkeeping, unverifiable evidence, ownership and outcome-marker problems no longer block Stop; they are counted privately.
+- A new user prompt closes a run that has nothing left running instead of replaying its recovery on every later prompt. Finished runs close as `completed`, others as `superseded`; host notifications never close a run.
+- Never block the root's own tools. Questions, single commands, quick lookups and other low-token work are done directly with no agent; routing substantive work stays guidance.
+- Remove the weaker-route consent gate: the account's own model route is used without stopping for `/symphony:proceed`, which deadlocked sessions whose entitlement could not be read.
+- Stop surfacing internal bookkeeping to the model: no per-prompt "retained evidence" note, interruption or stale-owner notices, or "plugin defect" messages.
+- Diagnostics ask once. `report on` shares anonymous error reports silently, at most daily, and counts start over after each share; `report off` keeps them local, with a one-line reminder only when the backlog has grown several-fold, at most weekly. Declining names the way back.
+- Leads run at most three children at once and wait and retry when a host agent limit refuses a spawn.
+- A user's `/symphony:stop` never blocks their own prompt; it reports what is still running instead.
+
 ## 1.8.1 — prepared 2026-10-05
 
 - Never block a user's work on activation. When a chat gets no Symphony hook guidance (for example, Codex on Windows where the hook cannot run), the agent says so once in one line and does the task without Symphony at full quality (a low-cost root hands non-simple work to one capable agent), instead of stopping to ask whether to continue unguarded. Hook guidance in the turn is itself proof that Symphony is active; the activation checker is now a `status` diagnostic, not a gate.

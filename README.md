@@ -45,6 +45,7 @@ $symphony:symphony boost [xhigh|max|ultra|off]
 $symphony:symphony stop [--force]
 $symphony:symphony disable
 $symphony:symphony version
+$symphony:symphony report on|off
 $symphony:symphony report submit|decline <approval-code>
 $symphony:symphony help
 ```
@@ -63,6 +64,7 @@ Claude Code exposes native slash commands:
 /symphony:stop [--force]
 /symphony:disable
 /symphony:version
+/symphony:report on|off
 /symphony:report submit|decline <approval-code>
 /symphony:help
 ```

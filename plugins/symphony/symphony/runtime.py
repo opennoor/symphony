@@ -91,7 +91,7 @@ _ASSESSED_LEAD_CONTRACT = (
     "delegate implementation, diagnosis, design, review, and product judgment to workers or consultants; "
     "small tasks need one worker; medium: bounded packets; large: delegate project work. "
     "Delegate implementation before editing. " + _LEAD_VERIFICATION_CONTRACT
-    + " Use each child's matrix cell. Complete only after verification passes. "
+    + " "
     'Outcome: `SYMPHONY_OUTCOME: {"status":"completed"}`; blocked/failed if unfinished. '
     + _CHILD_PURPOSE_GUIDANCE
 )
@@ -205,23 +205,14 @@ def _observe_sendmessage_intent(state: ProjectState, source: Event, provider: st
 
 
 def _root_admission_guard(state: ProjectState, source: Event, provider: str) -> tuple[Action, ...]:
-    key = _root_admission_key(provider, source.payload)
-    if not key or source.payload.get('tool_name') not in _ROOT_EXECUTION_TOOLS:
-        return ()
-    recorded = state.configuration.get('root_admission_intents', {})
-    pending = not isinstance(recorded, Mapping) or key in recorded
-    if not pending:
-        return ()
-    if not isinstance(recorded, Mapping):
-        return (_block_tool('Symphony pending root admission state is malformed. '
-                            'Use /symphony:disable to reset it before enabling a new objective.'),)
-    reason = ('Symphony is awaiting managed admission for this root objective. '
-              'Use Agent to launch the offered Symphony fast lead or independent assessor; '
-              'wait for its accepted Start before executing commands or editing files. '
-              'Read, Glob, Grep, Skill and clarification remain available. '
-              'An explicit /symphony:stop with no managed run cancels this intent; '
-              '/symphony:bypass <task> explicitly opts this task out.')
-    return (_block_tool(reason),)
+    """Never block the root's own tools.
+
+    Symphony is a best-effort helper. Simple questions, single commands and
+    other low-token work are done by the root directly; routing substantive
+    work to agents is guidance, and a root that cannot run a one-line command
+    until an agent starts costs the user more than it saves.
+    """
+    return ()
 
 
 def _consume_root_admission(state: ProjectState, source: Event, provider: str,
@@ -429,8 +420,13 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
             return HookResult()
         return result
     category = result.recovery_kind or 'incomplete_work'
-    if category == 'bookkeeping':
-        _recovery_diagnostic(store, provider, category, 'deferred', result.recovery_signal)
+    if category == 'bookkeeping' or result.recovery_signal not in _USER_WORK_STOP_SIGNALS:
+        # Symphony is a best-effort helper: it may hold a turn only while the
+        # user's own work is still running or was never launched. Its
+        # bookkeeping, evidence and ownership problems never stop anyone;
+        # they are counted privately instead.
+        _recovery_diagnostic(store, provider, category, 'deferred',
+                             result.recovery_signal or 'unclassified_block')
         return HookResult()
     try:
         first = store.stop_turn_budget(provider, session, project) if session else False
@@ -441,6 +437,11 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
     _recovery_diagnostic(store, provider, 'incomplete_work', 'deferred',
                          'repeat_' + (result.recovery_signal or 'block'))
     return HookResult()
+
+
+# The only Stop blocks that protect the user's result: delegated work is still
+# running, or an assessed task's lead was never launched.
+_USER_WORK_STOP_SIGNALS = frozenset({"active_work", "lead_not_started", "codex_lead_turn_running"})
 
 
 def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
@@ -887,12 +888,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     if run.outcome != evidence.active_run.outcome:
                         state = _merge_scope(state, scoped, evidence, f"{provider}:{session}", provider, session)
             state, actions = dispatch(state, source)
-        if unresolved and source.kind in {"session_heartbeat", "user_prompt"}:
-            actions += (Action("inject_context", {"text":
-                "Symphony retained unresolved lifecycle evidence privately. Continue the user's request "
-                "under the current routing and ownership rules; this evidence grants no completion credit. "
-                "Do not launch extra agents or spend a turn repairing bookkeeping solely because it exists. "
-                "Keep bookkeeping details out of the user response unless their work needs attention."}),)
+        # Unresolved evidence stays private and grants nothing; telling the
+        # model about it on every prompt only invited narration of internals.
         return state, (actions, acknowledged)
 
     session = str(source.payload.get("session_id") or "")
@@ -2136,6 +2133,27 @@ def _reconcile_session(
     return state, actions
 
 
+_AUTOMATIC_PROMPTS = ('<hook_prompt', '<task-notification', '<subagent_notification')
+
+
+def _supersede_settled_run(state: ProjectState, source: Event, prompt: str) -> ProjectState:
+    """A new user prompt closes a run with nothing left running.
+
+    A run that stayed open on a blocker, unverifiable evidence or a declined
+    route otherwise captured every later prompt in the session and replayed
+    its recovery instead of routing the user's new request. The conversation
+    keeps the context, so continuing the same work loses nothing.
+    """
+    run = state.active_run
+    if (not run or not prompt or prompt.lstrip().startswith(_AUTOMATIC_PROMPTS)
+            or _active_identities(run) or run.assessment.get("_pending_delegations")
+            or run.assessment.get("_batch_pending")):
+        return state
+    status = "completed" if _stop_block_reason(run) is None else "superseded"
+    archived = replace(run, status=status, updated_at=source.observed_at)
+    return replace(state, active_run=None, recent_runs=(*state.recent_runs, archived)[-20:])
+
+
 def _handle_prompt(
     state: ProjectState, source: Event, provider: str, environ: Mapping[str, str]
 ) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -2143,6 +2161,7 @@ def _handle_prompt(
     control = _parse_control(prompt)
     state = _root_admission_prompt(state, source, provider, control)
     if control is None:
+        state = _supersede_settled_run(state, source, prompt)
         # Enablement decides whether a NEW run opens, never whether a live one
         # is mentioned. Staying silent during a one-shot run left the root free
         # to do the work itself, in parallel with the lead it was never told
@@ -3254,15 +3273,8 @@ def _observe_delegation(
                 }
                 if assessment.get("_boost_assessment_pending"):
                     expected["approval_required"] = "A valid boosted assessor result is required before selecting the lead."
-                if resolved_profile is not None and assessment.get("size"):
-                    route = route_for_recorded(assessment)
-                    drift = _route_drift(assessment, model, effort)
-                    if drift and drift["weaker"] and _accepted_route(state, provider, session) != selected:
-                        expected["approval_required"] = _drift_block(provider, drift).payload["reason"]
-                    clamp = _clamp_actions(state, provider, route, session, resolved_profile)
-                    blocked = next((item for item in clamp if item.kind == "block_tool"), None)
-                    if blocked:
-                        expected["approval_required"] = blocked.payload["reason"]
+                # A weaker route the account supplies is the route; it no longer
+                # needs the user's consent before its result counts.
                 assessment["_lead_expected_route"] = expected
                 state = replace(state, active_run=replace(state.active_run, assessment=assessment))
         if (source.kind == "subagent_started" and source.payload.get("provider") == "claude"
@@ -3928,16 +3940,9 @@ def _prepare_delegation(
             resolved = resolve_tier(route, snapshot)
             required_model = str(resolved["lead_model"])
             required_effort = str(resolved["lead_effort"])
-        drift = _route_drift(recorded, required_model, required_effort)
-        if drift and drift["weaker"]:
-            if _accepted_route(state, provider, spawn_session) != f"{required_model}/{required_effort}":
-                return _awaiting_route_consent(state), (_drift_block(provider, drift),)
-        elif drift:
-            actions += (_drift_notice(drift),)
-        clamp = () if fast_launch else _clamp_actions(state, provider, route, spawn_session)
-        if any(item.kind == "block_tool" for item in clamp):
-            return _awaiting_route_consent(state), clamp
-        actions += clamp
+        # Best effort: the account's own route is used as it is. A weaker model
+        # or effort than the matrix prefers never stops the agent to ask the
+        # user, which deadlocked sessions whose entitlement could not be read.
         if model != required_model or effort != required_effort:
             return state, (
                 _block_tool(
@@ -4564,7 +4569,7 @@ def _render_actions(
 ) -> tuple[Action, ...]:
     # A stop control arrives as a prompt, where blocking would reject the user's
     # own message; only a real Stop event may answer with a block decision.
-    prompt_originated = source_kind == "user_prompt"
+    prompt_originated = source_kind == "user_prompt" or control_stop
     rendered: list[Action] = []
     for action in actions:
         if action.kind in {"inject_context", "block_tool"}:
@@ -4638,7 +4643,7 @@ def _render_actions(
         elif action.kind == "run_already_active":
             rendered.append(Action("inject_context", {"text": _recovery_guidance(state, provider)}))
         elif action.kind == "preserve_recovery_context":
-            rendered.append(Action("inject_context", {"text": "Symphony recorded the interruption for safe reconciliation on resume."}))
+            continue
         elif action.kind == "stop_delegations":
             identities = ", ".join(map(str, action.payload.get("active", ())))
             rendered.append(Action("inject_context", {"text": f"Stop these tracked Symphony agents and verify their host status: {identities}."}))
@@ -4677,9 +4682,7 @@ def _render_actions(
                 f"has one ({lead}). Stop the extra agent and let the registered lead finish. "
                 "The extra child is tracked until it ends but cannot replace the accepted lead or outcome."}))
         elif action.kind == "ignore_stale_owner":
-            rendered.append(Action("inject_context", {"text":
-                f"Symphony ignored a lifecycle report from {action.payload.get('identity')}, which is not "
-                "the registered lead of this run. The run is unchanged."}))
+            continue
         elif action.kind == "wait_for_delegations":
             identities = ", ".join(map(str, action.payload.get("active", ())))
             reason = f"active agents: {identities}" if identities else "pending launches or unreconciled results"
@@ -4693,11 +4696,8 @@ def _render_actions(
             )
             rendered.append(Action("inject_context", {"text": text}))
         elif action.kind not in INTERNAL_ACTIONS:
-            # A decision the reducer made must never die on the way out. Seven
-            # of them did, which is how two leads ran at once with nobody told.
-            rendered.append(Action("inject_context", {"text":
-                f"Symphony made a lifecycle decision it has no message for ({action.kind}). "
-                "This is a plugin defect; no action is required of you."}))
+            # An internal decision with no guidance is not the user's concern.
+            continue
     return tuple(rendered)
 
 
@@ -4771,6 +4771,7 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
     return (
         _ASSESSED_LEAD_CONTRACT
         + 'Only spawn workers/consultants; routing assessors belong to the root. '
+        + 'Max 3 children at once; on an agent-limit refusal, wait and retry. '
         + protocol + "Symphony worker routes by the packet's own size/complexity: "
         + "; ".join(_provider_cells(snapshot, "worker"))
         + (f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
@@ -4828,15 +4829,15 @@ def _assessment_guidance(task: str, provider: str = "", state: ProjectState | No
                      f"Pass `model=\"{fast['model']}\"`, `reasoning_effort=\"{fast['effort']}\"`, "
                        f"`fork_turns=\"none\"`, and `task_name=\"{fast_name}\"`. "
                        "If occupied, append a unique underscore suffix for a fresh child. Keep this fast prefix; "
-                       "generic assessed-lead names apply after assessment; never use them for a fast spawn. ")
+                       "assessed-lead names come only after assessment. ")
             return (
+                "Low-token work (a question, one command, a quick lookup or edit): do it yourself, no agent. "
                 "Substantive implementation/diagnosis/design/review: spawn the assessor directly. "
-                "Symphony fast route: for routine or plausibly mechanical tasks, the root "
-                "MUST attempt the capable/medium fast lead; never conservatively bypass it. "
+                "Symphony fast route: for other routine or mechanical tasks, the root MUST attempt the capable/medium fast lead. "
                 "Spawn one lead at "
                 f"{fast['model']}/{fast['effort']} with `SYMPHONY_ROLE: lead` and "
                 "`SYMPHONY_FAST_ROUTE: lead` on separate lines. " + spawn +
-                "Relay the full task/checks; root never executes it. "
+                "Relay the full task/checks. "
                 + _FAST_EXECUTION_CONTRACT +
                 (_CLAUDE_FAST_REPORT_CONTRACT if provider == 'claude' else '') +
                 " Await native results and normal Stop. "
@@ -5295,8 +5296,8 @@ def _native_help(provider: str) -> str:
 
 def _help(provider: str) -> str:
     if provider == "claude":
-        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:boost [xhigh|max|off], /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:report submit|decline <approval-code>, /symphony:help."
-    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|boost [xhigh|max|ultra|off]|reassess|proceed|stop|version|report submit|decline <approval-code>|help."
+        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:boost [xhigh|max|off], /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:report on|off|submit|decline <approval-code>, /symphony:help."
+    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|boost [xhigh|max|ultra|off]|reassess|proceed|stop|version|report on|off|submit|decline <approval-code>|help."
 
 
 def _fault_log(environ: Mapping[str, str]) -> Path:

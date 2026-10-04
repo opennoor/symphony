@@ -667,41 +667,10 @@ class ClampGateTests(unittest.TestCase):
         _, result = self.open_and_spawn_lead("latest")
         self.assertNotEqual(self.output(result).get("decision"), "block")
 
-    def test_a_tier_clamp_blocks_and_names_the_control(self):
+    def test_a_tier_clamp_never_stops_the_agent(self):
+        """Best effort: the account's weaker route is used; nobody is asked to consent."""
         _, result = self.open_and_spawn_lead("base")
-        output = self.output(result)
-        self.assertEqual(output.get("decision"), "block")
-        self.assertIn(CODEX_BASE_ROUTE["model"], output["reason"])
-        self.assertIn(CODEX_FULL_ROUTE["model"], output["reason"])
-        self.assertIn("$symphony:symphony proceed", output["reason"])
-        self.assertIn("continue this session", output["reason"])
-        self.assertIn("availability is checked again in a new session", output["reason"])
-        self.assertNotIn("start a new session", output["reason"])
-
-    def test_accepting_the_clamp_unblocks_the_rest_of_the_session(self):
-        environ, blocked = self.open_and_spawn_lead("base")
-        self.assertEqual(self.output(blocked).get("decision"), "block")
-
-        accepted = self.send(
-            environ, hook_event_name="UserPromptSubmit", prompt="$symphony:symphony proceed"
-        )
-        self.assertIn("accepted", self.output(accepted)["hookSpecificOutput"]["additionalContext"].lower())
-
-        marker = json.dumps(
-            {"size": CODEX_DRIFT_SIZE, "complexity": CODEX_DRIFT_COMPLEXITY,
-             "risk": "normal", "rationale": "x", "topology": "direct"}
-        )
-        retried = self.send(
-            environ,
-            hook_event_name="PreToolUse",
-            tool_name="spawn_agent",
-            tool_input={
-                "message": f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {marker}\nShip it",
-                "model": CODEX_BASE_ROUTE["model"],
-                "reasoning_effort": CODEX_BASE_ROUTE["effort"],
-            },
-        )
-        self.assertNotIn("decision", self.output(retried))
+        self.assertNotEqual(self.output(result).get("decision"), "block")
 
     def test_acceptance_does_not_survive_into_a_new_session(self):
         environ, _ = self.open_and_spawn_lead("base")

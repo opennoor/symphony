@@ -59,19 +59,13 @@ class UnreadableEntitlementConsentTests(unittest.TestCase):
             "message": f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {MARKER}\nShip it",
             "model": FLOOR_ROUTE["model"], "reasoning_effort": FLOOR_ROUTE["effort"]})
 
-    def test_proceed_holds_when_no_entitlement_could_be_read(self):
+    def test_unreadable_entitlement_never_stops_the_lead_launch(self):
         self.send("SessionStart")
         self.send("PreToolUse", tool_name="spawn_agent", tool_input={
             "message": "SYMPHONY_ROLE: assessor\nShip it",
             "model": FLOOR.tiers["strongest"], "reasoning_effort": "high"})
-        blocked = self.spawn_lead()
-        self.assertEqual("block", blocked.get("decision"))
-        self.assertIn("no entitlement could be read", blocked["reason"])
-
-        accepted = self.send("UserPromptSubmit", prompt="$symphony:symphony proceed")
-        self.assertIn("accepted", accepted["hookSpecificOutput"]["additionalContext"].lower())
-        retried = self.spawn_lead()
-        self.assertNotEqual("block", retried.get("decision"), retried.get("reason"))
+        launched = self.spawn_lead()
+        self.assertNotEqual("block", launched.get("decision"), launched.get("reason"))
 
     def test_consent_to_an_unreadable_profile_does_not_carry_to_another_session(self):
         self.send("SessionStart")
