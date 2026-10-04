@@ -32,7 +32,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             retained = next((directory / "retained runtimes").iterdir())
             context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-            command = context.split("Check activation through the verified launcher: ", 1)[1]
+            command = context.split("Activation diagnostic for status only: ", 1)[1]
             self.assertLess(len(command), 1200)
             self.assertNotIn("base64", command)
             executable = shlex.split(command)[1 if os.name == 'nt' else 0]
@@ -466,7 +466,7 @@ while len(list(gate.glob("ready-*"))) < 4:
                 def output(result):
                     # Captured hook context embeds a long launcher; keep the
                     # signal and omit that command from CI diagnostics.
-                    stdout = result.stdout.split("Check activation through the verified launcher:", 1)[0]
+                    stdout = result.stdout.split("Activation diagnostic for status only:", 1)[0]
                     return {"returncode": result.returncode, "stdout": stdout[:400],
                             "stderr": result.stderr[:400]}
 

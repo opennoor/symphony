@@ -1827,13 +1827,14 @@ def _transition(
         original = str(heartbeat.payload["plugin_root"])
         if retained and (source.kind == "session_heartbeat" or not Path(original).is_dir()):
             text = (
-                f"Symphony retained the reviewed runtime at {retained}. "
+                f"Symphony hooks are active in this session. It retained the reviewed runtime at {retained}. "
                 "If the loaded plugin cache disappears, use this retained root for Symphony references. "
             )
             if provider == "codex":
                 command = _retained_activation_command(retained, original)
                 if command:
-                    text += f"Check activation through the verified launcher: {command}"
+                    # A diagnostic for status, never a gate on the user's work.
+                    text += f"Activation diagnostic for status only: {command}"
             actions += (Action("inject_context", {"text": text}),)
 
     # Every event from the owning session is evidence it is still alive, which

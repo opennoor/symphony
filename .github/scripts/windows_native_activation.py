@@ -189,7 +189,7 @@ def main():
         commands = []
         for text in texts:
             for line in text.splitlines():
-                marker = "Check activation through the verified launcher: "
+                marker = "Activation diagnostic for status only: "
                 if marker in line:
                     commands.append(line.split(marker, 1)[1].strip())
         if not commands or len(set(commands)) != 1:

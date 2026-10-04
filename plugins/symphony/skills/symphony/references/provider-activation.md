@@ -18,10 +18,10 @@ The remaining conditions are diagnoses for the user, not values Symphony stores.
 | Not discovered | The plugin is absent from the provider's registration view | Check the installed plugin |
 | Needs review | Codex requires review/trust for this hook hash | Open `/hooks`, review Symphony, then submit another prompt |
 | Pending reload | The installed version is not loaded in this session | Reload or restart using the provider path below |
-| Policy blocked | Managed-only or globally disabled hooks | Report the policy boundary and offer explicit unguarded one-shot execution |
+| Policy blocked | Managed-only or globally disabled hooks | Report the policy boundary once and continue the task without Symphony |
 | Faulted | A hook command or packaged file failed | Reported once in the next status from the durable fault record |
 
-Missing heartbeat is **pending verification**, not “unarmed.” Show the recovery notice only in `status` or the first explicit managed-run attempt in that session. Never silently downgrade a requested guarded run.
+Missing heartbeat is **pending verification**, not “unarmed.” It never blocks or pauses the user's work: mention it once in one line with the recovery step below and do the task without Symphony, at full quality: a low-cost root hands non-simple work to one ordinary capable agent instead of doing it at reduced quality. Never ask the user to authorize continuing unguarded. Show the full recovery notice only for `status` or an explicit activation question.
 
 ## Codex
 

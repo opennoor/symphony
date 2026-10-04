@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.8.1 — prepared 2026-10-05
+
+- Never block a user's work on activation. When a chat gets no Symphony hook guidance (for example, Codex on Windows where the hook cannot run), the agent says so once in one line and does the task without Symphony at full quality (a low-cost root hands non-simple work to one capable agent), instead of stopping to ask whether to continue unguarded. Hook guidance in the turn is itself proof that Symphony is active; the activation checker is now a `status` diagnostic, not a gate.
+
 ## 1.8.0 — prepared 2026-10-04
 
 - Route routine or plausibly mechanical tasks through one capable/medium fast lead. Permit bounded discovery and verified authorized git, shell, and browser work without requiring every command in advance; escalate substantive work and actual uncertainty or risk to independent assessment.

@@ -43,7 +43,7 @@ class WindowsNativeDiagnosticsTests(unittest.TestCase):
                     patch.object(native.shutil, 'which', return_value='codex.exe'), \
                     patch.object(native, 'original_native_activation', return_value=(checked, 'session', {'plugin_root': str(root)})), \
                     patch.object(native, 'native_session_rows', return_value=[{'payload': {'content': [{'text':
-                        'Check activation through the verified launcher: PRIVATE_CHECKER_COMMAND'}]}}]), \
+                        'Activation diagnostic for status only: PRIVATE_CHECKER_COMMAND'}]}}]), \
                     patch.object(native.subprocess, 'run', side_effect=[failed, checked, failed, checked, rejected]), \
                     redirect_stdout(output):
                 self.assertEqual(native.main(), 0)
