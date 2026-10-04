@@ -956,8 +956,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     )
                     return HookResult()
                 if source.kind == "pre_tool_use":
-                    return render(provider, (Action("block_tool", {"reason": reason}),),
-                                  str(payload.get("hook_event_name") or "PreToolUse"))
+                    # Symphony's own ownership uncertainty never blocks a tool.
+                    return HookResult()
                 if source.kind == "stop_requested":
                     if owners == () and bound is None and record is None:
                         actions, _ = store.update(project, lambda state: transition(state))
@@ -2096,6 +2096,9 @@ def _claude_accepts(model: str) -> bool:
 INTERNAL_ACTIONS = frozenset(
     {"archive_run", "permit_completion", "spawn_assessor", "permit_stop", "run_abandoned"}
 )
+# Decisions the model needs no message for: narrating them only exposed
+# Symphony's bookkeeping (best-effort rule 6).
+SILENT_ACTIONS = frozenset({"ignore_stale_owner", "preserve_recovery_context"})
 
 
 def _control_name(name: str, provider: str) -> str:
@@ -2145,11 +2148,15 @@ def _supersede_settled_run(state: ProjectState, source: Event, prompt: str) -> P
     keeps the context, so continuing the same work loses nothing.
     """
     run = state.active_run
+    # An active or completing run may still have a live native turn whose
+    # callback is late; the normal Stop checks that before archiving.
     if (not run or not prompt or prompt.lstrip().startswith(_AUTOMATIC_PROMPTS)
+            or run.status in {"active", "completing"}
             or _active_identities(run) or run.assessment.get("_pending_delegations")
             or run.assessment.get("_batch_pending")):
         return state
-    status = "completed" if _stop_block_reason(run) is None else "superseded"
+    status = ("completed" if _stop_block_reason(run) is None
+              else "blocked" if run.assessment.get("_reported_nonsuccess") else "superseded")
     archived = replace(run, status=status, updated_at=source.observed_at)
     return replace(state, active_run=None, recent_runs=(*state.recent_runs, archived)[-20:])
 
@@ -4642,7 +4649,7 @@ def _render_actions(
             )
         elif action.kind == "run_already_active":
             rendered.append(Action("inject_context", {"text": _recovery_guidance(state, provider)}))
-        elif action.kind == "preserve_recovery_context":
+        elif action.kind in SILENT_ACTIONS:
             continue
         elif action.kind == "stop_delegations":
             identities = ", ".join(map(str, action.payload.get("active", ())))
@@ -4681,7 +4688,7 @@ def _render_actions(
                 f"Symphony refused to register {action.payload.get('identity')} as lead: this run already "
                 f"has one ({lead}). Stop the extra agent and let the registered lead finish. "
                 "The extra child is tracked until it ends but cannot replace the accepted lead or outcome."}))
-        elif action.kind == "ignore_stale_owner":
+        elif action.kind in SILENT_ACTIONS:
             continue
         elif action.kind == "wait_for_delegations":
             identities = ", ".join(map(str, action.payload.get("active", ())))
@@ -4758,7 +4765,7 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
     protocol = (
         'Workers: explicit model, reasoning_effort, fork_turns="none", '
         'task_name=symphony_worker_<model>_<effort>__<purpose>. '
-        'Bounded packet starts SYMPHONY_ROLE: worker; objective/ownership/evidence/'
+        'Packet starts SYMPHONY_ROLE: worker; objective/ownership/evidence/'
         'constraints/acceptance_check/return_contract/size/complexity. '
         + _CODEX_LIFECYCLE_GUIDANCE
         if provider == "codex" else
@@ -4771,7 +4778,7 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
     return (
         _ASSESSED_LEAD_CONTRACT
         + 'Only spawn workers/consultants; routing assessors belong to the root. '
-        + 'Max 3 children at once; on an agent-limit refusal, wait and retry. '
+        + 'Parallel independent children (max 6), dependents in order; if refused, wait, retry. '
         + protocol + "Symphony worker routes by the packet's own size/complexity: "
         + "; ".join(_provider_cells(snapshot, "worker"))
         + (f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."

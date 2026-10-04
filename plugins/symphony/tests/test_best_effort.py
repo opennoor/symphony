@@ -63,7 +63,8 @@ class BestEffortStopTests(unittest.TestCase):
         result = self.send("UserPromptSubmit", prompt="Now rename the config file")
         state = self.store.load(self.project)
         self.assertIsNone(state.active_run)
-        self.assertEqual("superseded", state.recent_runs[-1].status)
+        # Recorded honestly: the lead's own blocker, never a completion.
+        self.assertEqual("blocked", state.recent_runs[-1].status)
         text = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertNotIn("remains", text)
         self.assertIn("Now rename the config file", text)
@@ -71,6 +72,14 @@ class BestEffortStopTests(unittest.TestCase):
     def test_running_work_is_not_superseded_by_a_prompt(self):
         lead = Delegation("lead", "lead", "task", "working", "m", "medium")
         self.seed(lead)
+        self.send("UserPromptSubmit", prompt="How is it going?")
+        self.assertIsNotNone(self.store.load(self.project).active_run)
+
+    def test_a_completing_run_is_left_for_stop_to_verify(self):
+        # A completed lead may still have a newer native turn running whose
+        # callback is late; only the Stop path checks that.
+        lead = Delegation("lead", "lead", "task", "completed", "m", "medium")
+        self.seed(lead, status="completing")
         self.send("UserPromptSubmit", prompt="How is it going?")
         self.assertIsNotNone(self.store.load(self.project).active_run)
 

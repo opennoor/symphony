@@ -22,7 +22,7 @@ from .store import StateStore, _locked, valid_diagnostic_fields
 
 
 REPOSITORY = 'opennoor/symphony'
-SHARE = 'Share the accumulated sanitized report'
+SHARE = 'Share reports now and automatically later'
 DECLINE = 'Keep it local'
 
 # What each signal means and where a maintainer starts. A signal missing here
@@ -203,7 +203,8 @@ def question(record: dict) -> str:
             "issue that already has the same signature. It includes only plugin version, provider, "
             'OS, hook name, recovery category/outcome/signal, the Symphony code location and exception '
             'type, day and counts accumulated until submission; no task text, raw logs, paths or '
-            'project/session IDs. Your work continues either way. '
+            'project/session IDs. Approving also shares later reports automatically, at most daily, '
+            'from this GitHub account until `report off`. Your work continues either way. '
             f"Approval code: {record['id']}")
 
 
@@ -241,12 +242,14 @@ def notice(store: StateStore, provider: str, session: str, environ: Mapping[str,
             record = {'id': secrets.token_hex(16), 'phase': 'checking', 'started': time.time()}
             store._write_json(_path(store), record)
             probe = True
-        elif record.get('phase') == 'available' and standing == 'on':
+        elif (record.get('phase') == 'available' and standing == 'on'
+              and preference(store).get('account', record.get('account')) == record.get('account')):
             # Opted in: share silently with the account the user approved.
             record.update(phase='approved', scope=_scope(provider, session), reports=reports,
                           repository=REPOSITORY, publish_scheduled=time.time(), auto=True,
                           approved_at=time.time())
             store._write_json(_path(store), record)
+            _set_preference(store, 'on', account=record.get('account'))
             publish = True
         elif record.get('phase') == 'available':
             record.update(phase='offered', scope=_scope(provider, session))
@@ -308,6 +311,13 @@ def control(store: StateStore, argument: str, provider: str, session: str, envir
     if parts in (['on'], ['off']):
         # Only the user's own command reaches here (trusted prompt hook).
         _set_preference(store, parts[0], changed_at=time.time())
+        with _locked(_path(store), timeout=0.05):
+            record = _read(store)
+            if parts[0] == 'off' and record.get('phase') in {'checking', 'available', 'offered', 'approved'}:
+                # Revoke anything queued; the publisher also rechecks the choice.
+                store._write_json(_path(store), {**record, 'phase': 'declined'})
+            elif parts[0] == 'on' and record.get('phase') in {'declined', 'unavailable', 'offered'}:
+                store._write_json(_path(store), {})
         if parts[0] == 'off':
             return ('Diagnostic sharing is off. Reports stay on this machine; '
                     f'`{_command(provider)} on` turns it back on. Continue the user task.')
@@ -339,7 +349,7 @@ def control(store: StateStore, argument: str, provider: str, session: str, envir
                           publish_scheduled=time.time(), approved_at=time.time())
             store._write_json(_path(store), record)
         publish = True
-    _set_preference(store, 'on', changed_at=time.time())
+    _set_preference(store, 'on', changed_at=time.time(), account=record.get('account'))
     if publish:
         launch_worker(store, 'publish', environ)
     return 'Sharing approved. Submission runs in the background; continue the user task. If unavailable, the approved report stays local.'
@@ -435,6 +445,8 @@ def worker(root: str, mode: str) -> None:
                         store._write_json(_path(store), latest)
                 return
             if mode != 'publish' or record.get('phase') != 'approved' or record.get('repository') != REPOSITORY:
+                return
+            if preference(store).get('sharing') == 'off':
                 return
             environ = _credential_environ(os.environ)
             if _account(environ).lower() != record['account'].lower():

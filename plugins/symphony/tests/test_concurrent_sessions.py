@@ -68,12 +68,17 @@ class ActionCoverageTests(unittest.TestCase):
             "active": ("agent-2",), "unreachable": (), "unreconciled": ("agent-3",),
             "reason": "outcome_missing", "task": "ship it", "owner_generation": 2,
         }
-        leaky = []
-        for kind in sorted(emitted - set(runtime_module.INTERNAL_ACTIONS)):
-            for produced in runtime_module._render_actions((Action(kind, payload),), ProjectState(), "codex", ""):
-                text = produced.payload.get("text") or produced.payload.get("reason") or ""
+        leaky, dropped = [], []
+        for kind in sorted(emitted - set(runtime_module.INTERNAL_ACTIONS) - set(runtime_module.SILENT_ACTIONS)):
+            produced = runtime_module._render_actions((Action(kind, payload),), ProjectState(), "codex", "")
+            if not produced:
+                dropped.append(kind)
+            for item in produced:
+                text = item.payload.get("text") or item.payload.get("reason") or ""
                 if "None" in text or "plugin defect" in text:
                     leaky.append(kind)
+        # Every emitted decision is rendered, or explicitly declared internal or silent.
+        self.assertEqual([], dropped)
         self.assertEqual([], leaky)
 
     def test_an_unknown_internal_decision_is_silent(self):

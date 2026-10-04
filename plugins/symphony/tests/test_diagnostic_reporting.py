@@ -306,6 +306,40 @@ class DiagnosticReportingTests(unittest.TestCase):
     def test_the_offer_mentions_the_standing_commands(self):
         self.assertIn('report on', self.offered()['id'] and self.offer_text)
 
+    def test_report_off_revokes_a_queued_publication(self):
+        self.approved()
+        d.control(self.store, 'off', 'codex', 'root', self.env)
+        with patch.object(d, '_gh', side_effect=['User', '[]', '[]', 'https://github.com/opennoor/symphony/issues/9']) as gh:
+            d.worker(str(self.store.root), 'publish')
+        gh.assert_not_called()
+        self.assertNotEqual('published', d._read(self.store).get('phase'))
+
+    def test_approval_question_discloses_standing_consent(self):
+        record = self.offered()
+        self.assertIn('later reports automatically', d.question(record))
+        self.assertIn('report off', d.question(record))
+
+    def test_standing_consent_does_not_transfer_to_another_account(self):
+        d.control(self.store, 'on', 'codex', 'root', self.env)
+        d.notice(self.store, 'codex', 'root', self.env)
+        with patch.object(d, '_gh', side_effect=['User', 'true']):
+            d.worker(str(self.store.root), 'probe')
+        d.notice(self.store, 'codex', 'root', self.env)
+        self.assertEqual('User', d.preference(self.store)['account'])
+        # A later cycle finds a different logged-in account: ask, never auto-share.
+        self.store._write_json(d._path(self.store), {'id': 'a' * 32, 'phase': 'available', 'account': 'Other'})
+        text = d.notice(self.store, 'codex', 'root', self.env)
+        self.assertIn('@Other', text)
+        self.assertEqual('offered', d._read(self.store)['phase'])
+
+    def test_report_on_reopens_sharing_after_a_decline(self):
+        record = self.offered()
+        d.control(self.store, 'decline ' + record['id'], 'codex', 'root', self.env)
+        self.launch.reset_mock()
+        d.control(self.store, 'on', 'codex', 'root', self.env)
+        d.notice(self.store, 'codex', 'root', self.env)
+        self.launch.assert_called_once_with(self.store, 'probe', self.env)
+
     def test_failed_search_never_attempts_issue_creation(self):
         self.approved()
         with patch.object(d, '_gh', side_effect=['User', OSError('offline')]) as gh:
