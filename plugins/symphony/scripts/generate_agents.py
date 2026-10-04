@@ -31,7 +31,7 @@ from symphony.routing import (  # noqa: E402
     route_for,
     snapshot_for,
 )
-from symphony.runtime import _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT  # noqa: E402
+from symphony.runtime import _ASSESSOR_CONTRACT, _CONSULTANT_CONTRACT, _LEAD_VERIFICATION_CONTRACT, _FAST_EXECUTION_CONTRACT, _CLAUDE_FAST_REPORT_CONTRACT  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 REFERENCE = Path(__file__).resolve().parents[1] / "skills/symphony/references/capability-routing.md"
@@ -72,18 +72,7 @@ PRACTICES = (
 
 BODIES = {
     "lead": (
-        "If the packet has `SYMPHONY_FAST_ROUTE: lead`, decide before any changes whether the "
-        "WHOLE objective consists only of predetermined mechanical steps with an expected result, "
-        "scope bounded, requirements clear, risk low, required tools (including browser or computer "
-        "control when needed) available, and verification concrete. Eligible examples: run a supplied "
-        "bash/git command and report its result, or read a specified browser page through known steps. "
-        "Implementation, diagnosis, design, substantive review, product judgment, mixed work, or uncertainty "
-        "requires escalation before any changes, even for a tiny feature. A run-and-fix request escalates "
-        "as a whole. A tool name, short task, or supplied command alone does not establish eligibility. "
-        "If ineligible, make no changes and end with `SYMPHONY_FAST_DECISION: escalate`; "
-        "the root will hand the original task to an independent assessor. Do not spawn children "
-        "on this route. If eligible, work directly and end with `SYMPHONY_FAST_DECISION: eligible` "
-        "and `SYMPHONY_OUTCOME: {\"status\":\"completed\"}`.\n\n"
+        "If the packet has `SYMPHONY_FAST_ROUTE: lead`, " + _FAST_EXECUTION_CONTRACT + _CLAUDE_FAST_REPORT_CONTRACT + "\n\n"
         "For assessed packets, the matrix fixes your topology. Assign substantive implementation, diagnosis, "
         "design, review tasks, and product judgment to workers or consultants. Delegate implementation before editing; "
         "your edits integrate returned worker changes. After workers return, run your own native "
@@ -115,6 +104,9 @@ BODIES = {
         'completion is sufficient. If reporting an outcome, use one JSON line: `SYMPHONY_OUTCOME: {"status":"completed"}`; '
         "use blocked or failed when work remains. Archived followup only reconciles the same bounded task; "
         "a new or substantive objective starts a fresh assessment and delegation scope.\n\n"
+        "Keep final summaries concise and proportional to the evidence. Check factual claims against "
+        "the requirements, inspected artifacts, and fresh results; describe only coverage actually exercised. "
+        "Omit resolved internal wait and recovery narration; disclose unresolved errors and missing checks.\n\n"
         "You cannot ask the user questions: record open decisions and assumptions in your result."
     ),
     "worker": (

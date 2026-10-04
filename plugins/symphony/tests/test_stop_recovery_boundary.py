@@ -44,7 +44,11 @@ class StopRecoveryBoundaryTests(unittest.TestCase):
         reports = [json.loads(path.read_text()) for path in paths]
         for report in reports:
             self.assertEqual({'schema', 'plugin_version', 'provider', 'platform', 'category',
-                              'outcome', 'day', 'occurrences'}, set(report))
+                              'outcome', 'hook', 'signal', 'detail', 'site', 'day', 'occurrences'},
+                             set(report))
+            self.assertEqual(2, report['schema'])
+            self.assertRegex(report['signal'], r'^[a-z][a-z0-9_]*$')
+            self.assertNotEqual('unspecified', report['signal'])
             text = json.dumps(report)
             for secret in ('private-session', 'private-run', 'private-objective', 'private-project',
                            'private-lead', 'private-secret', str(self.base)):
@@ -282,9 +286,17 @@ class StopRecoveryBoundaryTests(unittest.TestCase):
                 self.assertEqual('', handle(payload, env).stdout)
 
     def test_diagnostics_reject_unapproved_fields_and_opaque_values(self):
-        valid = {'schema': 1, 'plugin_version': '1.7.5', 'provider': 'codex', 'platform': 'linux',
-                 'category': 'bookkeeping', 'outcome': 'deferred'}
-        for report in ({**valid, 'prompt': 'private-secret'}, {**valid, 'category': 'private-secret'}):
+        valid = {'schema': 2, 'plugin_version': '1.8.0', 'provider': 'codex', 'platform': 'linux',
+                 'category': 'bookkeeping', 'outcome': 'deferred', 'hook': 'Stop',
+                 'signal': 'codex_lead_turn_unknown', 'detail': 'ValueError',
+                 'site': 'host_evidence.codex_completing_lead_turn:120'}
+        legacy = {key: valid[key] for key in ('plugin_version', 'provider', 'platform', 'category', 'outcome')}
+        for report in ({**valid, 'prompt': 'private-secret'}, {**valid, 'category': 'private-secret'},
+                       {**valid, 'signal': 'private secret'}, {**valid, 'detail': 'private-secret text'},
+                       {**valid, 'site': '/home/private-project/runtime.py:1'},
+                       {**valid, 'hook': 'private-secret'}, {**valid, 'outcome': 'private'},
+                       {**legacy, 'schema': 1, 'outcome': 'retained'},
+                       {**legacy, 'schema': 1, 'signal': 'lead_outcome_missing'}):
             with self.assertRaises(ValueError):
                 self.store.record_recovery_diagnostic(report)
         self.assertFalse((self.store.root / 'diagnostics').exists())

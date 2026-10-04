@@ -65,8 +65,10 @@ class ClaudeCompatTests(unittest.TestCase):
         ]["additionalContext"]
         self.assertIn("`symphony:symphony-lead-claude-opus-5-5-medium`", text)
         self.assertIn("SYMPHONY_FAST_DECISION: escalate", text)
-        self.assertIn("even for a tiny feature", text)
-        self.assertIn("requires escalation before any changes", text)
+        self.assertIn("Substantive implementation/diagnosis/design/review: spawn the assessor directly", text)
+        self.assertIn("for routine or plausibly mechanical tasks", text)
+        self.assertIn("MUST attempt the capable/medium fast lead", text)
+        self.assertIn("execute the full task directly at capable/medium", text)
         self.assertIn("end your turn", text)
 
     def test_assessment_marker_is_read_from_the_handback_report(self):

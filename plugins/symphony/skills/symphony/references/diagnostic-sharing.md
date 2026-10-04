@@ -5,9 +5,19 @@ not keep a native host turn open or make the root invent a completed outcome.
 Continue the actual user task under its routing and completion contract.
 
 The plugin aggregates sanitized counters locally: plugin version, provider, OS,
-recovery category and outcome, UTC day, and occurrence count. These reports omit
-task text, raw logs, exceptions, paths, project/session IDs, native launches and
-results. Private recovery evidence is never an issue attachment.
+hook name, recovery category, outcome and signal, UTC day, and occurrence count.
+A fault also records its exception type and the Symphony code location that
+raised it, as `module.function:line`. Every field is a fixed vocabulary value or
+a code identifier, validated again before publication. These reports omit task
+text, raw logs, exception messages, paths, project/session IDs, native launches
+and results. Private recovery evidence is never an issue attachment.
+
+The signal names which guard fired (for example `codex_lead_turn_unknown` or
+`hook_exception`). The issue lists each signal with what it means, where in the
+code it was recorded and how often, and a signature of the versions, signals and
+sites. A later report with the same signature is added to the open issue as a
+comment rather than opening a new one. Evidence kept for another session's run is
+recorded as `retained`; it is context only and never starts a sharing offer.
 
 Successful recovery and expected background waits stay quiet. When an unexpected
 deferred fault is recorded, a detached worker checks the locally available `gh` login and

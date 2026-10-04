@@ -262,7 +262,7 @@ class HostEvidenceTests(unittest.TestCase):
                            "hook_event_name": "UserPromptSubmit", "turn_id": "root-turn",
                            "prompt": "$symphony:symphony status"}, self.environ)
         context = json.loads(response.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Finish this root turn now so the native Stop hook", context)
+        self.assertIn("end this root turn; the native Stop hook verifies and archives the run", context)
         self.assertNotIn("Invoke the normal `$symphony:symphony stop`", context)
         self.assertNotIn("tracked work still requires reconciliation", context)
         self.assertEqual("completing", self.store.load(self.project).active_run.status)
@@ -1029,6 +1029,352 @@ class CompletionChronologyTests(unittest.TestCase):
                 'type': 'function_call_output', 'call_id': 'followup', 'output': 'queued'}}])
         self.write()
         self.assertEqual('independent_review', self.bind_purpose()['purpose'])
+
+    def reviewer_followup_fixture(self):
+        self.purpose_fixture('codex', 'independent_review')
+        proof = {**self.run.assessment['_substantive_children'][self.child],
+                 'completed_at': self.stamp(11), 'reviewed': False}
+        work = Delegation('work', 'worker', 'implementation', 'completed', self.model, 'low', self.stamp(3))
+        work_proof = {**proof, 'purpose': 'substantive', 'turn': 'turn_id:work',
+                      'start_event_id': 'work-start', 'admitted_at': self.stamp(2),
+                      'completed_at': self.stamp(3)}
+        self.run = replace(self.run, status='recovering', outcome=None,
+            assessment={**self.run.assessment,
+                'substantive_contract': {**self.run.assessment['substantive_contract'], 'review_required': True},
+                '_start_event_ids': ['child-start', 'work-start'],
+                '_substantive_children': {self.child: proof, 'work': work_proof},
+                '_substantive_child_missing': True},
+            delegations=(*self.run.delegations, work))
+        self.state = replace(self.state, active_run=self.run)
+        path = self.rows[self.child][0]['payload']['agent_path']
+        self.rows[self.lead].extend([
+            {'timestamp': self.stamp(14), 'type': 'response_item', 'payload': {
+                'type': 'function_call', 'name': 'followup_task', 'call_id': 'review-followup',
+                'arguments': json.dumps({'target': path, 'message': 'Return the review result.'})}},
+            {'timestamp': self.stamp(15), 'type': 'event_msg', 'payload': {
+                'type': 'item_completed', 'thread_id': self.lead, 'item': {
+                    'type': 'SubAgentActivity', 'kind': 'interacted', 'id': 'review-followup',
+                    'agent_thread_id': self.child, 'agent_path': path}}},
+            {'timestamp': self.stamp(15), 'type': 'response_item', 'payload': {
+                'type': 'function_call_output', 'call_id': 'review-followup', 'output': ''}}])
+        report = 'All findings resolved.\nSYMPHONY_REVIEW: passed'
+        self.rows[self.child].extend([
+            {'timestamp': self.stamp(16), 'type': 'event_msg', 'payload': {
+                'type': 'task_started', 'turn_id': 'review-followup-turn'}},
+            {'timestamp': self.stamp(16), 'type': 'turn_context', 'payload': {
+                'turn_id': 'review-followup-turn', 'model': self.model, 'effort': 'low'}},
+            {'timestamp': self.stamp(17), 'type': 'response_item', 'payload': {
+                'type': 'message', 'role': 'assistant', 'phase': 'final_answer',
+                'content': [{'type': 'output_text', 'text': report}]}},
+            {'timestamp': self.stamp(18), 'type': 'event_msg', 'payload': {
+                'type': 'task_complete', 'turn_id': 'review-followup-turn', 'last_agent_message': report}}])
+        self.write()
+        source = replace(self.source, event_id='review-followup-end', observed_at=self.stamp(19),
+            payload={**self.source.payload, 'turn_id': 'review-followup-turn', 'last_assistant_message': report})
+        return source, proof
+
+    def test_reviewer_followup_terminal_without_start_refreshes_current_epoch_proof(self):
+        from plugins.symphony.symphony.runtime import _observe_delegation
+        from plugins.symphony.symphony.reducer import _substantive_child_completed, reduce
+        source, proof = self.reviewer_followup_fixture()
+        self.assertFalse(_substantive_child_completed(self.run))
+        self.state, _ = _observe_delegation(self.state, source, self.env)
+        updated = self.state.active_run
+        self.assertEqual(updated.assessment['substantive_contract']['epoch'], proof['epoch'])
+        self.assertTrue(updated.assessment['_substantive_children'][self.child]['reviewed'])
+        self.assertTrue(_substantive_child_completed(updated))
+        self.assertNotIn('_substantive_child_missing', updated.assessment)
+        self.state = replace(self.state, active_run=replace(updated, status='completing', outcome={'status': 'completed'}))
+        self.state, _ = reduce(self.state, Event('stop', 'stop_requested', self.stamp(25), {}))
+        self.assertIsNone(self.state.active_run)
+
+    def reviewer_followup_stop_fixture(self, *, premature_callback=False, deferred_case=''):
+        """Complete native work/review deliveries and the lead's final turn."""
+        from plugins.symphony.symphony.runtime import _observe_delegation
+        source, _ = self.reviewer_followup_fixture()
+        work_id = '01a0ec7c-2222-7222-8333-555555555555'
+        work_path = '/root/lead/symphony_worker_gpt_6_luna_low__substantive_work'
+        work_rows = json.loads(json.dumps(self.rows[self.child][:5]))
+        work_rows[0]['payload'].update(id=work_id, agent_path=work_path)
+        work_rows[1]['payload']['turn_id'] = work_rows[2]['payload']['turn_id'] = 'work-turn'
+        work_rows[1]['timestamp'] = work_rows[2]['timestamp'] = self.stamp(3)
+        work_rows[3]['timestamp'] = work_rows[4]['timestamp'] = self.stamp(4)
+        work_rows[4]['payload']['turn_id'] = 'work-turn'
+        self.rows[work_id] = work_rows
+        self.paths[work_id] = self.paths[self.child].with_name('rollout-' + work_id + '.jsonl')
+        work_launch = json.loads(json.dumps(self.rows[self.lead][3:6]))
+        for row in work_launch:
+            row['timestamp'] = self.stamp(3)
+            payload = row['payload']
+            if 'call_id' in payload:
+                payload['call_id'] = 'spawn-work'
+            if payload.get('type') == 'function_call':
+                args = json.loads(payload['arguments'])
+                args['task_name'] = work_path.rsplit('/', 1)[-1]
+                payload['arguments'] = json.dumps(args)
+            elif payload.get('type') == 'function_call_output':
+                payload['output'] = json.dumps({'task_name': work_path})
+            else:
+                payload['item'].update(id='spawn-work', agent_thread_id=work_id, agent_path=work_path)
+        self.rows[self.lead][3:3] = work_launch
+        def delivery(identity, path, second):
+            return {'timestamp': self.stamp(second), 'type': 'event_msg', 'payload': {
+                'type': 'item_completed', 'thread_id': self.lead, 'item': {
+                    'type': 'SubAgentActivity', 'kind': 'completed',
+                    'agent_thread_id': identity, 'agent_path': path}}}
+        self.rows[self.lead].insert(6, delivery(work_id, work_path, 4))
+        path = self.rows[self.child][0]['payload']['agent_path']
+        self.current_review_delivery = delivery(self.child, path, 19)
+        if premature_callback:
+            original = 'Review incomplete.\nSYMPHONY_OUTCOME: {"status":"blocked"}'
+            self.rows[self.child][3]['payload']['content'][0]['text'] = original
+            self.rows[self.child][4]['payload']['last_agent_message'] = original
+            report = 'All findings resolved.\nSYMPHONY_REVIEW: passed\nSYMPHONY_OUTCOME: {"status":"completed"}'
+            source = replace(source, observed_at='2026-10-02T10:00:18.510962+00:00',
+                payload={**source.payload, 'last_assistant_message': report,
+                         'model': self.model, 'model_reasoning_effort': 'low'})
+            self.rows[self.child][-2]['payload']['content'][0]['text'] = report
+            self.rows[self.child][-1]['payload']['last_agent_message'] = report
+            self.rows[self.child][-1]['timestamp'] = '2026-10-02T10:00:18.550+00:00'
+        report = 'Integrated and verified.\nSYMPHONY_OUTCOME: {"status":"' + ('blocked' if premature_callback else 'completed') + '"}'
+        self.rows[self.lead].extend([self.current_review_delivery,
+            {'timestamp': self.stamp(20), 'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'lead-final'}},
+            {'timestamp': self.stamp(20), 'type': 'turn_context', 'payload': {
+                'turn_id': 'lead-final', 'model': self.model, 'effort': 'low'}},
+            {'timestamp': self.stamp(21), 'type': 'response_item', 'payload': {
+                'type': 'message', 'role': 'assistant', 'phase': 'final_answer',
+                'content': [{'type': 'output_text', 'text': report}]}},
+            {'timestamp': self.stamp(22), 'type': 'event_msg', 'payload': {
+                'type': 'task_complete', 'turn_id': 'lead-final', 'last_agent_message': report}}])
+        assessment = dict(self.run.assessment)
+        proofs = dict(assessment['_substantive_children'])
+        proofs[work_id] = {**proofs.pop('work'), 'turn': 'turn_id:work-turn',
+                          'admitted_at': self.stamp(3), 'completed_at': self.stamp(4)}
+        assessment['_substantive_children'] = proofs
+        assessment['_terminal_turns'] = {**assessment['_terminal_turns'], work_id: ['turn_id:work-turn']}
+        run = replace(self.run, assessment=assessment, delegations=tuple(
+            replace(item, identity=work_id, updated_at=self.stamp(4)) if item.identity == 'work' else item
+            for item in self.run.delegations))
+        self.state = replace(self.state, active_run=run)
+        self.write()
+        self.state, _ = _observe_delegation(self.state, source, self.env)
+        if premature_callback:
+            self.assertFalse(self.state.active_run.assessment['_substantive_children'][self.child]['reviewed'])
+            # Ordinary native callbacks persist blank optional native fields,
+            # unlike plugin-recovered callbacks. Match the observed codec shape.
+            self.state = replace(self.state, terminal_receipts=tuple({**receipt, **dict.fromkeys((
+                'native_agent_type', 'native_model', 'native_effort', 'native_launch_prompt_hash',
+                'native_terminal_id', 'native_report_hash'), '')} for receipt in self.state.terminal_receipts))
+            if deferred_case == 'missing-completion':
+                self.rows[self.child].pop()
+            elif deferred_case == 'duplicate-completion':
+                self.rows[self.child].append(json.loads(json.dumps(self.rows[self.child][-1])))
+            elif deferred_case == 'different-final':
+                self.rows[self.child][-2]['payload']['content'][0]['text'] = 'Different report'
+            elif deferred_case == 'different-model':
+                self.rows[self.child][-3]['payload']['model'] = 'gpt-6-sol'
+            elif deferred_case == 'missing-followup':
+                self.rows[self.lead] = [row for row in self.rows[self.lead]
+                    if row['payload'].get('call_id') != 'review-followup']
+            elif deferred_case == 'foreign-parent':
+                self.current_review_delivery['payload']['thread_id'] = self.session
+            elif deferred_case == 'duplicate-delivery':
+                self.rows[self.lead].append(json.loads(json.dumps(self.current_review_delivery)))
+            elif deferred_case == 'missing-delivery':
+                self.rows[self.lead].remove(self.current_review_delivery)
+            elif deferred_case == 'early-delivery':
+                self.current_review_delivery['timestamp'] = self.stamp(17)
+            elif deferred_case == 'stale-epoch':
+                run = self.state.active_run
+                proofs = {**run.assessment['_substantive_children']}
+                proofs[self.child] = {**proofs[self.child], 'epoch': 'old-epoch'}
+                self.state = replace(self.state, active_run=replace(run,
+                    assessment={**run.assessment, '_substantive_children': proofs}))
+            self.write()
+        lead_fields = {**source.payload, 'agent_id': self.lead, 'role': 'lead',
+                       'parent_thread_id': self.session, 'turn_id': 'lead-final'}
+        self.state, _ = _observe_delegation(self.state,
+            Event('lead-final-start', 'subagent_started', self.stamp(20), {**lead_fields, 'status': 'working'}), self.env)
+        self.state, _ = _observe_delegation(self.state,
+            Event('lead-final-end', 'subagent_stopped', self.stamp(23),
+                  {**lead_fields, 'status': 'completed', 'last_assistant_message': report}), self.env)
+        self.assertEqual('recovering' if premature_callback else 'completing', self.state.active_run.status)
+
+    def test_native_callback_before_task_complete_is_credited_only_at_later_stop(self):
+        from plugins.symphony.symphony.runtime import _observe_delegation
+        self.reviewer_followup_stop_fixture(premature_callback=True)
+        # The callback was uncredited at emission (asserted in the fixture).
+        # The later lead Stop reconciles its durable completion before gating.
+        self.assertTrue(self.state.active_run.assessment['_substantive_children'][self.child]['reviewed'])
+        self.assertIn('turn_id:review-followup-turn', self.state.active_run.assessment['_terminal_turns'][self.child])
+        store = StateStore(self.base / 'state')
+        run = self.state.active_run
+        store.save(self.project, replace(self.state, active_runs={f'codex:{self.session}': run}))
+        result = handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'Stop'},
+                        {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROVIDER': 'codex'})
+        recovered = store.load(self.project)
+        self.assertTrue(recovered.active_run.assessment['_substantive_children'][self.child]['reviewed'])
+        # The lead explicitly reported blocked after seeing that review, and
+        # nothing changed since: Stop ends the turn quietly (#14) but the run
+        # stays open for the same lead's later verification.
+        self.assertNotIn('"decision": "block"', result.stdout)
+        self.assertEqual('blocked', recovered.active_run.assessment['_reported_nonsuccess'])
+        self.assertFalse(recovered.recent_runs)
+        report = 'Fresh acceptance check passed.\nSYMPHONY_OUTCOME: {"status":"completed"}'
+        self.rows[self.session].extend([
+            {'timestamp': self.stamp(24), 'type': 'response_item', 'payload': {
+                'type': 'function_call', 'name': 'followup_task', 'call_id': 'verify-lead',
+                'arguments': json.dumps({'target': '/root/lead', 'message': 'Verify all acceptance checks.'})}},
+            {'timestamp': self.stamp(24), 'type': 'event_msg', 'payload': {
+                'type': 'item_completed', 'thread_id': self.session, 'item': {
+                    'type': 'SubAgentActivity', 'kind': 'interacted', 'id': 'verify-lead',
+                    'agent_thread_id': self.lead, 'agent_path': '/root/lead'}}},
+            {'timestamp': self.stamp(24), 'type': 'response_item', 'payload': {
+                'type': 'function_call_output', 'call_id': 'verify-lead', 'output': ''}}])
+        self.rows[self.lead].extend([
+            {'timestamp': self.stamp(25), 'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'lead-verified'}},
+            {'timestamp': self.stamp(25), 'type': 'turn_context', 'payload': {
+                'turn_id': 'lead-verified', 'model': self.model, 'effort': 'low'}},
+            {'timestamp': self.stamp(27), 'type': 'response_item', 'payload': {
+                'type': 'message', 'role': 'assistant', 'phase': 'final_answer',
+                'content': [{'type': 'output_text', 'text': report}]}},
+            {'timestamp': self.stamp(28), 'type': 'event_msg', 'payload': {
+                'type': 'task_complete', 'turn_id': 'lead-verified', 'last_agent_message': report}}])
+        self.write()
+        fields = {'provider': 'codex', 'session_id': self.session, 'agent_id': self.lead,
+                  'parent_thread_id': self.session, 'turn_id': 'lead-verified', 'role': 'lead',
+                  'cwd': str(self.project), 'model': self.model, 'model_reasoning_effort': 'low'}
+        recovered, _ = _observe_delegation(recovered,
+            Event('verified-start', 'subagent_started', self.stamp(25), {**fields, 'status': 'working'}), self.env)
+        recovered, _ = _observe_delegation(recovered,
+            Event('verified-end', 'subagent_stopped', self.stamp(29),
+                  {**fields, 'status': 'completed', 'last_assistant_message': report}), self.env)
+        self.state = recovered
+        self.assertEqual('valid', self.check())
+        store.save(self.project, replace(recovered, active_runs={f'codex:{self.session}': recovered.active_run}))
+        result = handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'Stop'},
+                        {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROVIDER': 'codex'})
+        self.assertNotIn('"decision": "block"', result.stdout)
+        self.assertIsNone(store.load(self.project).active_run)
+        self.assertEqual('completed', store.load(self.project).recent_runs[-1].status)
+
+    def test_deferred_native_callback_with_blank_receipt_still_requires_strict_evidence(self):
+        for case in ('missing-completion', 'duplicate-completion', 'different-final', 'different-model',
+                     'missing-followup', 'foreign-parent', 'duplicate-delivery', 'missing-delivery',
+                     'early-delivery', 'stale-epoch'):
+            with self.subTest(case=case):
+                self.reviewer_followup_stop_fixture(premature_callback=True, deferred_case=case)
+                self.assertFalse(self.state.active_run.assessment['_substantive_children'][self.child]['reviewed'])
+                store = StateStore(self.base / 'state')
+                run = self.state.active_run
+                store.save(self.project, replace(self.state, active_runs={f'codex:{self.session}': run}))
+                result = handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'Stop'},
+                    {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROVIDER': 'codex'})
+                # The lead's explicit blocked report ends the turn quietly (#14),
+                # but the unproven review stays uncredited and nothing archives.
+                self.assertNotIn('"decision": "block"', result.stdout)
+                held = store.load(self.project).active_run
+                self.assertEqual('blocked', held.assessment['_reported_nonsuccess'])
+                self.assertFalse(held.assessment['_substantive_children'][self.child]['reviewed'])
+                self.assertFalse(store.load(self.project).recent_runs)
+
+    def test_reviewer_followup_archives_through_native_chronology_and_runtime_stop(self):
+        self.reviewer_followup_stop_fixture()
+        self.assertEqual('valid', self.check())
+        store = StateStore(self.base / 'state')
+        run = self.state.active_run
+        store.save(self.project, replace(self.state, active_runs={f'codex:{self.session}': run}))
+        result = handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'Stop'},
+                        {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROVIDER': 'codex'})
+        self.assertNotIn('"decision": "block"', result.stdout)
+        archived = store.load(self.project)
+        self.assertIsNone(archived.active_run)
+        self.assertEqual('completed', archived.recent_runs[-1].status)
+
+    def test_reviewer_followup_stop_rejects_duplicate_or_unmatched_deliveries(self):
+        for case in ('duplicate-current', 'missing-current', 'early-current', 'unmatched-prior',
+                     'unobserved-prior', 'foreign-parent', 'foreign-path', 'stale-proof'):
+            with self.subTest(case=case):
+                self.reviewer_followup_stop_fixture()
+                delivery = self.current_review_delivery
+                rows = self.rows[self.lead]
+                if case == 'duplicate-current':
+                    rows.insert(rows.index(delivery), json.loads(json.dumps(delivery)))
+                elif case == 'missing-current':
+                    rows.remove(delivery)
+                elif case == 'early-current':
+                    delivery['timestamp'] = self.stamp(17)
+                elif case == 'unmatched-prior':
+                    original = next(row for row in rows if row['payload'].get('item', {}).get('kind') == 'completed'
+                                    and row['payload']['item'].get('agent_thread_id') == self.child)
+                    original['timestamp'] = self.stamp(10)
+                elif case == 'unobserved-prior':
+                    run = self.state.active_run
+                    turns = {**run.assessment['_terminal_turns'], self.child: ['turn_id:review-followup-turn']}
+                    self.state = replace(self.state, active_run=replace(run,
+                        assessment={**run.assessment, '_terminal_turns': turns}))
+                elif case == 'foreign-parent':
+                    delivery['payload']['thread_id'] = self.session
+                elif case == 'foreign-path':
+                    delivery['payload']['item']['agent_path'] = '/root/foreign'
+                else:
+                    run = self.state.active_run
+                    proofs = {**run.assessment['_substantive_children']}
+                    proofs[self.child] = {**proofs[self.child], 'epoch': 'old-epoch'}
+                    self.state = replace(self.state, active_run=replace(run,
+                        assessment={**run.assessment, '_substantive_children': proofs}))
+                self.write()
+                self.assertEqual('unknown', self.check())
+                store = StateStore(self.base / 'state')
+                run = self.state.active_run
+                store.save(self.project, replace(self.state, active_runs={f'codex:{self.session}': run}))
+                result = handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'Stop'},
+                    {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROVIDER': 'codex'})
+                self.assertIn('"decision": "block"', result.stdout)
+                self.assertIsNotNone(store.load(self.project).active_run)
+                self.assertFalse(store.load(self.project).recent_runs)
+
+    def test_reviewer_followup_rejects_unproven_and_foreign_continuations(self):
+        from plugins.symphony.symphony.runtime import _observe_delegation
+        from plugins.symphony.symphony.host_evidence import codex_child_followup_start
+        for case in ('stale-epoch', 'foreign-parent', 'foreign-session', 'foreign-turn', 'foreign-report',
+                     'missing-call', 'missing-activity', 'failed-ack', 'newer-start', 'superseded-proof',
+                     'changed-purpose', 'changed-owner', 'missing-proof', 'duplicate-call'):
+            with self.subTest(case=case):
+                source, proof = self.reviewer_followup_fixture()
+                if case in {'foreign-parent', 'foreign-session', 'foreign-turn', 'foreign-report'}:
+                    field = {'foreign-parent': 'parent_thread_id', 'foreign-session': 'session_id',
+                             'foreign-turn': 'turn_id', 'foreign-report': 'last_assistant_message'}[case]
+                    source = replace(source, payload={**source.payload, field: 'foreign'})
+                elif case in {'stale-epoch', 'changed-owner', 'superseded-proof', 'missing-proof'}:
+                    proofs = dict(self.run.assessment['_substantive_children'])
+                    if case == 'missing-proof':
+                        proofs.pop(self.child)
+                    else:
+                        key, value = {'stale-epoch': ('epoch', 'old'), 'changed-owner': ('owner_generation', 9),
+                                      'superseded-proof': ('successful', False)}[case]
+                        proofs[self.child] = {**proof, key: value}
+                    self.run = replace(self.run, assessment={**self.run.assessment, '_substantive_children': proofs})
+                elif case == 'changed-purpose':
+                    self.rows[self.child][0]['payload']['agent_path'] += '_foreign'
+                elif case == 'newer-start':
+                    self.rows[self.child].append({'timestamp': self.stamp(19), 'type': 'event_msg',
+                        'payload': {'type': 'task_started', 'turn_id': 'newer-turn'}})
+                else:
+                    rows = self.rows[self.lead]
+                    if case == 'missing-call':
+                        self.rows[self.lead] = [row for row in rows if row['payload'].get('call_id') != 'review-followup']
+                    elif case == 'missing-activity':
+                        self.rows[self.lead] = [row for row in rows if row['payload'].get('item', {}).get('id') != 'review-followup']
+                    elif case == 'failed-ack':
+                        rows[-1]['payload']['output'] = 'failed'
+                    else:
+                        rows.append(rows[-3])
+                self.write()
+                self.state = replace(self.state, active_run=self.run)
+                self.assertIsNone(codex_child_followup_start(self.run, source, self.env))
+                self.state, _ = _observe_delegation(self.state, source, self.env)
+                self.assertFalse(self.state.active_run.assessment['_substantive_children'].get(self.child, {}).get('reviewed', False))
 
     def test_codex_purpose_revalidates_start_before_parent_result(self):
         self.purpose_fixture('codex')

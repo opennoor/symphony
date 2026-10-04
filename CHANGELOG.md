@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.8.0 — prepared 2026-10-04
+
+- Route routine or plausibly mechanical tasks through one capable/medium fast lead. Permit bounded discovery and verified authorized git, shell, and browser work without requiring every command in advance; escalate substantive work and actual uncertainty or risk to independent assessment.
+- Reconcile successful Codex child followups and delayed native terminal delivery at normal lifecycle boundaries. Require the original launch, current assessment and owner, exact completed turn, and unique native delivery before granting substantive or independent-review credit.
+- Recognize Claude Skill expansions as companions of the original worker invocation only when bound to a unique native Skill call in the same prompt, session, and child. Keep genuine later prompts, ambiguous metadata, stale launches, and foreign evidence uncredited.
+- Reconcile Claude fast-route hand-back and final reports with their exact native callbacks, including repeated markers and split terminal message chunks. Keep conflicting or incomplete evidence unresolved and report recovery without claiming completion.
+- Require concise final summaries checked against requirements and fresh verification. Omit resolved internal wait and recovery narration, while disclosing unresolved errors and missing checks.
+- Complete Claude fast-route runs on hosts without `SubagentHandback`, such as print mode. The lead's final message is then its single report, still requiring one fast decision and a completed outcome and matching its exact native callback. Previously every such run stayed open after correct work.
+- Record an honest fast-lead `blocked`, `failed` or `incomplete` report without waiting for native success proof it can never have. Completion and escalation claims still require native evidence.
+- Stop no longer repeats its warning after a lead explicitly reports a blocker that needs the user (#14). The run stays open and unsuccessful, the same lead can finish it once the blocker is resolved (#12), and new child evidence after the report restores the normal guard.
+- Let `/symphony:proceed` hold when the account's model entitlement could not be read. Consent to the conservative route no longer depends on a non-empty profile, which previously kept the lead blocked indefinitely.
+- Let the turn end while a lead launch waits for the user's consent to a weaker route, instead of blocking Stop on a lead that only the user can release.
+- Tell the root to report and end its turn once a run is reconciled, on both hosts, rather than typing stop or status controls that surfaced as chatter. Drop a stale "still tracks pending launches" notice once the lifecycle batch settles.
+- Let the user's own stop control close a run that is blocked on a reported blocker (recorded as `blocked`) or held for route consent (recorded as `stopped`), and say that the run was closed.
+- Keep a worker that loaded a Skill verifiable at Stop: Claude's Skill expansion rows, bound to one native Skill call, are part of that turn for completion chronology as they already were for child credit.
+- Treat an exact repeat of one non-success outcome as a single report, so a blocked Claude fast report whose final message repeats its handback is recorded; repeated success claims still need native proof.
+- Wait for Codex children in five-minute intervals instead of one minute. `wait_agent` returns as soon as a child finishes, so the repeated "Waiting for agents" blocks in the Codex UI drop sharply.
+- Make diagnostic reports actionable: each records the hook, a fixed signal naming the guard that fired, and for faults the exception type and Symphony code location. Issues explain every signal, lead with the faults, carry a signature, and repeat reports join the open issue as comments. Evidence kept for another session's run no longer prompts a sharing offer, and non-Stop hook faults are now counted.
+
 ## 1.7.5 — prepared 2026-10-03
 
 - Correct Codex's generated Interrupt timeout to its supported three-second limit while preserving every other provider/event timeout.

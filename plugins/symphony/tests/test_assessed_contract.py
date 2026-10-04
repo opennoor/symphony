@@ -803,6 +803,103 @@ class AssessedContractTests(unittest.TestCase):
                     self.state, _ = reduce(self.state, self.event('stop_requested'))
                     self.assertIsNone(self.state.active_run)
 
+    def test_claude_skill_turn_companion_preserves_first_worker_credit(self):
+        # Captured Claude 2.1.284 worker a8153d0b loaded a Skill: its expansion
+        # is a user/text turnCompanion, following the Skill result/attachment
+        # in file order but timestamped before them. It is not a new task.
+        from plugins.symphony.tests.native_child_fixture import write_claude_child_launch
+        for case in ('valid', 'foreign-session', 'foreign-agent', 'foreign-prompt', 'not-sidechain',
+                     'not-meta', 'not-companion', 'missing-source', 'foreign-source', 'wrong-tool',
+                     'foreign-tool-agent', 'foreign-tool-session', 'foreign-tool-prompt', 'not-tool-sidechain',
+                     'missing-tool', 'late-tool', 'future-tool', 'early-tool', 'late-tool-row',
+                     'duplicate-tool', 'duplicate-companion', 'early-companion', 'future-companion',
+                     'new-invocation', 'new-assessment'):
+            with self.subTest(case=case):
+                self.begin('claude')
+                run = self.state.active_run
+                route = run.assessment['route']
+                fields = dict(provider='claude', session_id='root', agent_id='worker', role='worker',
+                              cwd=str(self.project), model=route['lead_model'],
+                              model_reasoning_effort=route['lead_effort'], prompt_id='worker-turn')
+                start = self.event('subagent_started', **fields)
+                # Native files may not be readable yet at SubagentStart.
+                self.state, _ = _observe_delegation(self.state, start, self.environ)
+                parent, child = write_claude_child_launch(self.environ['CLAUDE_CONFIG_DIR'], self.project,
+                    run, 'worker', 'worker', fields['model'], fields['model_reasoning_effort'], 'worker-turn')
+                rows = [json.loads(line) for line in child.read_text().splitlines()]
+                rows[0]['promptId'] = 'worker-turn'
+                common = dict(sessionId='root', agentId='worker', isSidechain=True, cwd=str(self.project))
+                skill = dict(common, type='assistant', uuid='skill-call', timestamp='2026-10-01T14:00:03.100Z',
+                    message={'content': [{'type': 'tool_use', 'name': 'Skill', 'id': 'skill-use',
+                                          'input': {'skill': 'superpowers:test-driven-development'}}]})
+                companion = dict(common, type='user', uuid='skill-text', promptId='worker-turn',
+                    timestamp='2026-10-01T14:00:03.200Z', isMeta=True, turnCompanion=True,
+                    sourceToolUseID='skill-use', parentUuid='skill-hook',
+                    message={'content': [{'type': 'text', 'text': 'Base directory for this skill: /fixture/tdd\nSkill instructions'}]})
+                rows.extend([skill, dict(common, type='user', uuid='skill-result',
+                    timestamp='2026-10-01T14:00:03.300Z', promptId='worker-turn',
+                    message={'content': [{'type': 'tool_result', 'tool_use_id': 'skill-use',
+                                          'content': 'Launching skill: superpowers:test-driven-development'}]}),
+                    dict(common, type='attachment', uuid='skill-hook', timestamp='2026-10-01T14:00:03.250Z',
+                         attachment={'type': 'hook_success', 'hookName': 'PostToolUse:Skill', 'toolUseID': 'skill-use'}),
+                    companion])
+                changes = {'foreign-session': ('sessionId', 'foreign'), 'foreign-agent': ('agentId', 'foreign'),
+                           'foreign-prompt': ('promptId', 'foreign'), 'not-sidechain': ('isSidechain', False),
+                           'not-meta': ('isMeta', False), 'not-companion': ('turnCompanion', False),
+                           'foreign-source': ('sourceToolUseID', 'foreign'),
+                           'early-companion': ('timestamp', '2026-10-01T14:00:01Z'),
+                           'future-companion': ('timestamp', '2099-01-01T00:00:00Z')}
+                if case in changes:
+                    key, value = changes[case]
+                    companion[key] = value
+                if case == 'missing-source':
+                    companion.pop('sourceToolUseID')
+                if case == 'wrong-tool':
+                    skill['message']['content'][0]['name'] = 'Bash'
+                if case == 'foreign-tool-agent':
+                    skill['agentId'] = 'foreign'
+                if case == 'foreign-tool-session':
+                    skill['sessionId'] = 'foreign'
+                if case == 'foreign-tool-prompt':
+                    skill['promptId'] = 'foreign'
+                if case == 'not-tool-sidechain':
+                    skill['isSidechain'] = False
+                if case == 'missing-tool':
+                    rows.remove(skill)
+                if case in {'late-tool', 'future-tool', 'early-tool'}:
+                    skill['timestamp'] = {'late-tool': '2026-10-01T14:00:03.400Z',
+                                          'future-tool': '2099-01-01T00:00:00Z',
+                                          'early-tool': '2026-10-01T14:00:00Z'}[case]
+                if case == 'late-tool-row':
+                    rows.remove(skill)
+                    rows.append(skill)
+                if case == 'duplicate-tool':
+                    rows.append(skill)
+                if case == 'duplicate-companion':
+                    rows.append(companion)
+                if case == 'new-invocation':
+                    rows.append({**rows[0], 'uuid': 'new-task', 'message': {'content': 'New task'}})
+                child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                terminal = self.event('subagent_stopped', **fields, status='completed')
+                if case == 'new-assessment':
+                    self.assess()
+                self.state, _ = _observe_delegation(self.state, terminal, self.environ)
+                self.assertEqual(_substantive_child_completed(self.state.active_run), case == 'valid')
+                if case == 'valid':
+                    proof = self.state.active_run.assessment['_substantive_children']['worker']
+                    self.assertEqual(proof['start_event_id'], start.event_id)
+                    self.assertEqual(proof['parent'], 'lead')
+                    self.assertEqual(proof['purpose'], 'substantive')
+                    self.assertEqual(proof['native_prompt_hash'], hashlib.sha256(rows[0]['uuid'].encode()).hexdigest())
+                    self.assertNotIn('superseded_by', proof)
+                    accepted = self.state
+                    self.state, _ = _observe_delegation(self.state, terminal, self.environ)
+                    self.assertEqual(self.state, accepted)
+                    self.child('lead', 'lead', True, 'lead-1')
+                    self.state, actions = reduce(self.state, self.event('stop_requested'))
+                    self.assertIsNone(self.state.active_run)
+                    self.assertFalse(any(action.kind == 'request_substantive_work' for action in actions))
+
     def test_first_tokenless_invocation_uses_accepted_start_and_reused_start_stays_ambiguous(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):
@@ -914,3 +1011,49 @@ class AssessedContractTests(unittest.TestCase):
                     self.worker()
                     self.child('lead', 'lead', True, 'lead-1', report=report)
                     self.assertEqual(self.state.active_run.status, expected)
+
+
+class ClaudeSkillCompanionChronologyTests(unittest.TestCase):
+    """A worker that loads a Skill must still be verifiable at Stop."""
+
+    def rows(self, variant='valid'):
+        common = dict(sessionId='root', agentId='worker', isSidechain=True)
+        rows = [
+            dict(common, type='user', uuid='prompt', timestamp='2026-10-01T14:00:01.000Z', promptId='turn',
+                 message={'content': 'Do the task'}),
+            dict(common, type='assistant', uuid='call', timestamp='2026-10-01T14:00:03.100Z',
+                 message={'content': [{'type': 'tool_use', 'name': 'Skill', 'id': 'skill-use',
+                                       'input': {'skill': 'superpowers:test-driven-development'}}]}),
+            dict(common, type='user', uuid='result', timestamp='2026-10-01T14:00:03.300Z',
+                 message={'content': [{'type': 'tool_result', 'tool_use_id': 'skill-use',
+                                       'content': 'Launching skill'}]}),
+            dict(common, type='attachment', uuid='hook', timestamp='2026-10-01T14:00:03.250Z',
+                 attachment={'type': 'hook_success'}),
+            # Captured order: after the result in the file, stamped before it.
+            dict(common, type='user', uuid='companion', timestamp='2026-10-01T14:00:03.200Z', promptId='turn',
+                 isMeta=True, turnCompanion=True, sourceToolUseID='skill-use',
+                 message={'content': [{'type': 'text', 'text': 'Skill instructions'}]}),
+            dict(common, type='assistant', uuid='final', timestamp='2026-10-01T14:00:04.000Z',
+                 message={'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': REPORT}]}),
+        ]
+        if variant == 'duplicate-companion':
+            rows.insert(5, dict(rows[4], uuid='companion-2'))
+        if variant == 'not-skill':
+            rows[1]['message']['content'][0]['name'] = 'Bash'
+        if variant == 'foreign-agent':
+            rows[4]['agentId'] = 'foreign'
+        return rows
+
+    def test_bound_companion_is_part_of_the_turn_and_unbound_text_still_fails(self):
+        from datetime import datetime, timezone
+        from plugins.symphony.symphony.host_evidence import _chronology_report, _claude_skill_companions
+        done = datetime(2026, 10, 1, 14, 0, 5, tzinfo=timezone.utc)
+        for variant in ('valid', 'duplicate-companion', 'not-skill', 'foreign-agent'):
+            with self.subTest(variant=variant):
+                rows = self.rows(variant)
+                self.assertEqual({4} if variant == 'valid' else set(), _claude_skill_companions(rows))
+                self.assertEqual(variant == 'valid',
+                                 _chronology_report('claude', rows[1:], done, REPORT, 'lead') is not None)
+
+
+REPORT = 'Implemented and tested.\nSYMPHONY_OUTCOME: {"status":"completed"}'

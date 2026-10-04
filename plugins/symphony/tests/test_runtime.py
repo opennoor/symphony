@@ -370,26 +370,20 @@ class RuntimeTests(unittest.TestCase):
                 environ = self.claude_environ if provider == "claude" else self.environ
                 text = self.context(handle(self.payload(f"{control}status" if provider == "claude"
                                                         else f"{control} status", provider), environ))
-                if provider == "claude":
-                    self.assertIn(f"`{control}stop`", text)
-                    self.assertIn("Invoke the normal", text)
-                else:
-                    self.assertIn("Finish this root turn now so the native Stop hook", text)
-                    self.assertIn("Do not type a stop control as assistant prose", text)
-                    self.assertNotIn("Invoke the normal", text)
-                self.assertIn("then check durable status", text)
-                if provider == "claude":
-                    self.assertIn("Do not follow up or replace a completed lead", text)
-                else:
-                    self.assertIn("or spawn or follow up a completed lead", text)
+                # Ending the turn archives on both hosts; typed controls
+                # and status checks only surfaced as user-visible chatter.
+                self.assertIn("end this root turn; the native Stop hook verifies and archives the run", text)
+                self.assertIn("Do not invoke Symphony stop or status controls", text)
+                self.assertNotIn("Invoke the normal", text)
+                self.assertNotIn("then check durable status", text)
+                self.assertIn("follow up a completed lead", text)
                 self.assertNotIn("tracked work still requires reconciliation", text)
                 self.assertEqual("completing", StateStore(self.state_root).load(self.project)
                                  .active_runs[f"{provider}:{run.session_id}"].status)
 
                 guidance = runtime_module._recovery_guidance(
                     ProjectState(active_run=run), provider)
-                self.assertIn("Invoke the normal" if provider == "claude" else
-                              "Finish this root turn", guidance)
+                self.assertIn("end this root turn; the native Stop hook verifies and archives the run", guidance)
                 self.assertNotIn("continue unfinished work", guidance)
 
     def test_completing_run_with_unfinished_work_does_not_guide_stop(self):
@@ -400,7 +394,7 @@ class RuntimeTests(unittest.TestCase):
                          Delegation("worker-1", "worker", "task", "working", "", "")),
         ), enabled=True)
         status = self.context(handle(self.payload("$symphony:symphony status"), self.environ))
-        self.assertNotIn("Invoke the normal", status)
+        self.assertNotIn("end this root turn; the native Stop hook verifies and archives the run", status)
         self.assertIn("tracked work still requires reconciliation", status)
         guidance = runtime_module._recovery_guidance(ProjectState(active_run=run), "codex")
         self.assertIn("continue unfinished work", guidance)
@@ -1305,8 +1299,10 @@ class RuntimeTests(unittest.TestCase):
         # identity, without a second SubagentStart.
         handle({**stopped, "last_assistant_message": 'SYMPHONY_OUTCOME: {"status":"blocked"}'}, self.environ)
         self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "recovering")
-        self.assertIn("tracked lead has no reconciled outcome",
-                      self.output(handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ))["reason"])
+        # An explicit blocked report is a known result: Stop ends the turn
+        # without a warning, and the run stays open for the same lead (#14).
+        self.assertEqual("", handle({**self.payload(""), "hook_event_name": "Stop"}, self.environ).stdout)
+        self.assertEqual(StateStore(self.state_root).load(self.project).active_run.status, "recovering")
 
         # Native followup_task can end again with identical prose, but its
         # new turn_id makes this a new result rather than a replay.
@@ -2202,7 +2198,7 @@ class RuntimeTests(unittest.TestCase):
                 with self.subTest(provider=provider, role=role):
                     for instruction in ('Reuse returned evidence', 'Wake idle children for work/evidence with followup_task',
                                         'send_message only queues',
-                                        'wait_agent only for active work', 'timeout_ms<=60000'):
+                                        'wait_agent only for active work', 'timeout_ms 300000'):
                         if provider == 'codex':
                             self.assertIn(instruction, guidance)
                         else:

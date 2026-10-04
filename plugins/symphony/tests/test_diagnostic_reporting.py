@@ -144,11 +144,13 @@ class DiagnosticReportingTests(unittest.TestCase):
 
     def test_public_issue_uses_approved_snapshot_fixed_repo_and_no_private_evidence(self):
         record = self.approved()
-        with patch.object(d, '_gh', side_effect=['User', '[]', 'https://github.com/opennoor/symphony/issues/123']) as gh:
+        with patch.object(d, '_gh', side_effect=['User', '[]', '[]',
+                                                 'https://github.com/opennoor/symphony/issues/123']) as gh:
             d.worker(str(self.store.root), 'publish')
-        self.assertEqual(3, gh.call_count)
+        self.assertEqual(4, gh.call_count)
         args = gh.call_args_list[-1].args[0]
         self.assertEqual(['issue', 'create', '--repo', 'opennoor/symphony'], args[:4])
+        self.assertEqual('Symphony 1.7.5 diagnostics: bookkeeping (codex, linux)', args[args.index('--title') + 1])
         body = (self.store.root / 'diagnostic-issue.md').read_text()
         for private in ('User', 'root', str(self.project), 'last_assistant_message'):
             self.assertNotIn(private, body)
@@ -162,7 +164,7 @@ class DiagnosticReportingTests(unittest.TestCase):
 
     def test_lost_create_response_searches_exact_marker_and_never_duplicates(self):
         record = self.approved()
-        with patch.object(d, '_gh', side_effect=['User', '[]', subprocess.TimeoutExpired('gh', 8)]):
+        with patch.object(d, '_gh', side_effect=['User', '[]', '[]', subprocess.TimeoutExpired('gh', 8)]):
             d.worker(str(self.store.root), 'publish')
         self.assertEqual('approved', d._read(self.store)['phase'])
         with patch.object(d, '_gh', side_effect=['User', '[]']) as gh:
@@ -174,6 +176,99 @@ class DiagnosticReportingTests(unittest.TestCase):
             d.worker(str(self.store.root), 'publish')
         self.assertEqual(2, gh.call_count)
         self.assertEqual('published', d._read(self.store)['phase'])
+
+    def test_same_signature_joins_the_open_issue_as_a_comment(self):
+        self.store.record_recovery_diagnostic({
+            'schema': 2, 'plugin_version': '1.8.0', 'provider': 'claude', 'platform': 'linux',
+            'category': 'runtime_fault', 'outcome': 'deferred', 'hook': 'Stop',
+            'signal': 'stop_hook_exception', 'detail': 'KeyError', 'site': 'runtime._stop_requested:42'})
+        record = self.approved()
+        key = d.signature(record['reports'])
+        same = [{'number': 20, 'body': 'older <!-- symphony-signature:' + key + ' -->'},
+                {'number': 19, 'body': 'quoted symphony-signature:' + key}]
+        comment = 'https://github.com/opennoor/symphony/issues/20#issuecomment-7'
+        with patch.object(d, '_gh', side_effect=['User', '[]', json.dumps(same), comment]) as gh:
+            d.worker(str(self.store.root), 'publish')
+        args = gh.call_args_list[-1].args[0]
+        self.assertEqual(['issue', 'comment', '20', '--repo', 'opennoor/symphony'], args[:5])
+        self.assertEqual(comment, d._read(self.store)['url'])
+        body = (self.store.root / 'diagnostic-issue.md').read_text()
+        # The fault row leads, with its meaning and code location.
+        self.assertLess(body.index('stop_hook_exception'), body.index('(schema 1)'))
+        self.assertIn('`runtime._stop_requested:42`', body)
+        self.assertIn('| KeyError |', body)
+        self.assertIn(d.SIGNALS['stop_hook_exception'], body)
+        self.assertIn('<!-- symphony-signature:' + key + ' -->', body)
+        self.assertEqual('Symphony 1.8.0 diagnostics: stop_hook_exception (claude, linux)',
+                         d.issue_title(record['reports']))
+
+    def test_signature_ignores_counts_and_days_but_not_fault_sites(self):
+        row = {'schema': 2, 'plugin_version': '1.8.0', 'provider': 'codex', 'platform': 'linux',
+               'category': 'bookkeeping', 'outcome': 'deferred', 'hook': 'Stop',
+               'signal': 'codex_lead_turn_unknown', 'detail': '', 'site': '', 'day': '2026-10-03',
+               'occurrences': 1}
+        later = {**row, 'day': '2026-10-04', 'occurrences': 9}
+        retained = {**row, 'outcome': 'retained', 'signal': 'pending_child_for_other_run'}
+        self.assertEqual(d.signature([row]), d.signature([later, retained]))
+        self.assertNotEqual(d.signature([row]), d.signature([{**row, 'site': 'runtime.handle:9'}]))
+
+    def test_retained_evidence_never_starts_a_sharing_offer(self):
+        (self.store.root / 'diagnostics').mkdir(exist_ok=True)
+        for path in (self.store.root / 'diagnostics').glob('*.json'):
+            path.unlink()
+        self.store.record_recovery_diagnostic({
+            'schema': 2, 'plugin_version': '1.8.0', 'provider': 'codex', 'platform': 'linux',
+            'category': 'bookkeeping', 'outcome': 'retained', 'hook': 'SubagentStop',
+            'signal': 'pending_child_for_other_run', 'detail': '', 'site': ''})
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))
+        self.launch.assert_not_called()
+
+    def test_lost_comment_response_is_recovered_from_that_issues_comments(self):
+        self.store.record_recovery_diagnostic({
+            'schema': 2, 'plugin_version': '1.8.0', 'provider': 'codex', 'platform': 'linux',
+            'category': 'runtime_fault', 'outcome': 'deferred', 'hook': 'Stop',
+            'signal': 'stop_hook_exception', 'detail': 'OSError', 'site': 'store.load:10'})
+        record = self.approved()
+        key = d.signature(record['reports'])
+        same = [{'number': 20, 'body': '<!-- symphony-signature:' + key + ' -->'}]
+        with patch.object(d, '_gh', side_effect=['User', '[]', json.dumps(same),
+                                                 subprocess.TimeoutExpired('gh', 8)]):
+            d.worker(str(self.store.root), 'publish')
+        pending = d._read(self.store)
+        self.assertEqual(('approved', '20'), (pending['phase'], pending['comment_target']))
+        posted = [{'url': 'https://github.com/opennoor/symphony/issues/20#issuecomment-9',
+                   'body': '<!-- symphony-diagnostic:' + record['id'] + ' -->'}]
+        with patch.object(d, '_gh', side_effect=['User', '[]', json.dumps(posted)]) as gh:
+            d.worker(str(self.store.root), 'publish')
+        self.assertIn('issues/20/comments?since=', gh.call_args_list[-1].args[0][3])
+        self.assertEqual(posted[0]['url'], d._read(self.store)['url'])
+        self.assertEqual('published', d._read(self.store)['phase'])
+
+    def test_retention_keeps_faults_over_routine_context(self):
+        base = {'schema': 2, 'plugin_version': '1.8.0', 'provider': 'codex', 'platform': 'linux',
+                'category': 'bookkeeping', 'hook': 'Stop', 'detail': '', 'site': ''}
+        fault = {**base, 'outcome': 'deferred', 'signal': 'codex_lead_turn_unknown'}
+        self.store.record_recovery_diagnostic(fault)
+        for index in range(120):
+            self.store.record_recovery_diagnostic({**base, 'outcome': 'retained',
+                                                   'signal': f'pending_child_for_other_run_{index}'[:48]})
+        signals = {item.get('signal') for item in d.snapshot(self.store) if item.get('outcome') == 'deferred'}
+        self.assertIn('codex_lead_turn_unknown', signals)
+
+    def test_generator_frames_do_not_drop_the_fault_record(self):
+        from plugins.symphony.symphony.runtime import _recovery_diagnostic
+        # The raising frame is a generator inside Symphony's own package.
+        namespace = {}
+        exec(compile("def broken():\n    return any(item['missing'] for item in [{}])\n",
+                     "/plugin/symphony/runtime.py", "exec"), namespace)
+        try:
+            namespace['broken']()
+        except KeyError as error:
+            _recovery_diagnostic(self.store, 'claude', 'state_shape', 'deferred', 'hook_exception',
+                                 hook='UserPromptSubmit', error=error)
+        recorded = [item for item in d.snapshot(self.store) if item.get('signal') == 'hook_exception']
+        self.assertEqual(1, len(recorded))
+        self.assertEqual(('KeyError', 'runtime.broken:2'), (recorded[0]['detail'], recorded[0]['site']))
 
     def test_failed_search_never_attempts_issue_creation(self):
         self.approved()
