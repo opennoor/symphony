@@ -96,8 +96,9 @@ class ClaudeIsolatedWorktreeTests(unittest.TestCase):
             self.assertNotIn('gate.py', worker['prompt'])
             self.assertIn('An Agent launch acknowledgment is not a worker result', packet['prompt'])
             self.assertIn("without retrying without isolation", root_prompt)
+            # Best effort: neither profile's route is gated behind consent.
             for selected, label, blocked in ((profile, agent, False),
-                                             ("sonnet", "symphony:symphony-lead-claude-sonnet-5-low", True)):
+                                             ("sonnet", "symphony:symphony-lead-claude-sonnet-5-low", False)):
                 state = ProjectState(activation={"claude": {"profile": selected}},
                                      active_run=RunState("run", "fixture", status="assessed",
                                                         assessment={"size": "small", "complexity": "simple"}))

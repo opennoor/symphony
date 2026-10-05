@@ -442,7 +442,8 @@ class PolicyCheckTests(unittest.TestCase):
                                            "reasoning_effort": "high"},
                         }, {"SYMPHONY_PROVIDER": "codex", "SYMPHONY_PROFILE": "full",
                             "SYMPHONY_STATE_DIR": str(Path(directory) / "state")})
-                        self.assertEqual(json.loads(response.stdout)["decision"], "block")
+                        # A broken shipped map is Symphony's problem: it never stops the agent.
+                        self.assertNotEqual("block", (json.loads(response.stdout) if response.stdout else {}).get("decision"))
                     finally:
                         routing._profiles.cache_clear()
 

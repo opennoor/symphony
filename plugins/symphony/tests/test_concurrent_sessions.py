@@ -52,48 +52,40 @@ def _foreign_heartbeats(project: str, state_dir: str, provider: str, profile: st
 
 
 class ActionCoverageTests(unittest.TestCase):
-    """No action the reducer emits may vanish on the way to the host."""
+    """Guidance the host renders is real text; internal decisions stay silent.
 
-    def test_every_emitted_action_is_rendered_or_declared_internal(self):
+    Before 1.9 every unrendered decision surfaced as "plugin defect" text, an
+    unactionable warning (best-effort rule 6). Silence is now the default.
+    """
+
+    def test_rendered_actions_never_leak_placeholder_values(self):
         root = Path(__file__).resolve().parents[1] / "symphony"
         emitted = set()
         for name in ("reducer.py", "runtime.py"):
-            emitted |= set(re.findall(r'Action\(\s*"([a-z_]+)"', (root / name).read_text()))
-        # A populated payload, so a branch renders real values rather than the
-        # literal word None, and so the catch-all is distinguishable from a
-        # real branch. Asserting only "something came back" proves nothing:
-        # the catch-all guarantees that for every kind, invented ones included.
+            emitted |= set(re.findall(r'Action\(\s*["\']([a-z_]+)["\']', (root / name).read_text()))
         payload = {
             "identity": "agent-1", "session_id": "session-1", "run_id": "run-1",
             "active": ("agent-2",), "unreachable": (), "unreconciled": ("agent-3",),
             "reason": "outcome_missing", "task": "ship it", "owner_generation": 2,
         }
-        unhandled, leaky = [], []
-        for kind in sorted(emitted - set(runtime_module.INTERNAL_ACTIONS)):
-            produced = runtime_module._render_actions(
-                (Action(kind, payload),), ProjectState(), "codex", ""
-            )
+        leaky, dropped = [], []
+        for kind in sorted(emitted - set(runtime_module.INTERNAL_ACTIONS) - set(runtime_module.SILENT_ACTIONS)):
+            produced = runtime_module._render_actions((Action(kind, payload),), ProjectState(), "codex", "")
             if not produced:
-                unhandled.append(kind)
-                continue
-            text = produced[0].payload.get("text") or produced[0].payload.get("reason") or ""
-            if "has no message for" in text:
-                unhandled.append(kind)
-            if "None" in text:
-                leaky.append(kind)
-        self.assertEqual(
-            [], unhandled,
-            f"emitted actions with no real message, so the host never learns of them: {unhandled}",
-        )
-        self.assertEqual([], leaky, f"these render a literal None into their text: {leaky}")
+                dropped.append(kind)
+            for item in produced:
+                text = item.payload.get("text") or item.payload.get("reason") or ""
+                if "None" in text or "plugin defect" in text:
+                    leaky.append(kind)
+        # Every emitted decision is rendered, or explicitly declared internal or silent.
+        self.assertEqual([], dropped)
+        self.assertEqual([], leaky)
 
-    def test_the_catch_all_is_what_makes_an_unknown_action_visible(self):
-        """Guards the guard: an invented kind must still surface loudly."""
+    def test_an_unknown_internal_decision_is_silent(self):
         produced = runtime_module._render_actions(
             (Action("totally_made_up_kind", {}),), ProjectState(), "codex", ""
         )
-        self.assertTrue(produced)
-        self.assertIn("has no message for", produced[0].payload["text"])
+        self.assertEqual((), produced)
 
 
 class PacketCompletenessTests(unittest.TestCase):
@@ -326,25 +318,13 @@ class ConcurrentSessionTests(unittest.TestCase):
 
         self.assertEqual("root-a", self.state()["active_run"]["session_id"])
 
-    def test_consent_still_holds_at_the_gate_after_a_stranger_heartbeats(self):
-        """The gate runs on a spawn, which fires no heartbeat of its own.
-
-        Carrying consent correctly is useless if the check that blocks the
-        spawn reads a different field, which is what it did.
-        """
+    def test_a_weaker_profile_spawn_is_not_gated_after_a_stranger_heartbeats(self):
         env = {**self.environ, "SYMPHONY_PROFILE": "base"}
         handle(self.payload("root-a", "SessionStart"), env)
         self.spawn_in("root-a", env, "assessor", CODEX_STRONGEST, "high")
-        blocked = self.text(self.spawn_in("root-a", env, "lead", BASE_DRIFT["model"], BASE_DRIFT["effort"], MARKER))
-        self.assertIn("proceed", blocked)
-
-        handle({**self.payload("root-a"), "prompt": "$symphony:symphony proceed"}, env)
         handle(self.payload("stranger", "SessionStart"), env)
-
         after = self.text(self.spawn_in("root-a", env, "lead", BASE_DRIFT["model"], BASE_DRIFT["effort"], MARKER))
-        self.assertNotIn(
-            "proceed", after, "a stranger's heartbeat undid the clamp this session accepted"
-        )
+        self.assertNotIn("proceed", after)
 
     def test_stale_run_remains_with_its_original_session(self):
         self.run_with_live_lead("root-a")

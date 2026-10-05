@@ -218,7 +218,7 @@ The tables below are generated from `profiles.json` with the runtime resolver. T
 
 Each provider ships several profiles: an account routes through the best one it is entitled to, and through the conservative floor when entitlement cannot be read. A clamp is measured against the best profile, not the applied one.
 
-A **tier clamp** means a weaker model does the work. It blocks the lead spawn and waits: the user accepts it with `/symphony:proceed` (Codex: `$symphony:symphony proceed`), which holds for the rest of that provider session and is asked again in the next one. An **effort clamp** on the same model is announced and the run continues, because effort is the dimension the matrix already trades away under risk.
+A clamp never stops the agent or the user (Symphony is a best-effort helper): the account's own route is used as it is. `/symphony:proceed` (Codex: `$symphony:symphony proceed`) remains accepted for compatibility but is no longer needed.
 
 ## Optional phase practices
 

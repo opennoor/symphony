@@ -198,7 +198,7 @@ class EntitlementProbeTests(unittest.TestCase):
         }}, environ)
         self.assertNotEqual(json.loads(lead.stdout or "{}").get("decision"), "block")
 
-    def test_a_known_unsupported_roster_discloses_and_blocks_launch(self):
+    def test_a_known_unsupported_roster_discloses_and_never_blocks_launch(self):
         environ = self.codex_home(roster("unrelated-model"))
         self.assertEqual(self.heartbeat(environ).get("profile"), "unavailable")
         payload = {
@@ -211,8 +211,8 @@ class EntitlementProbeTests(unittest.TestCase):
         spawn = handle({**payload, "hook_event_name": "PreToolUse", "tool_name": "spawn_agent",
                         "tool_input": {"message": "SYMPHONY_ROLE: assessor\nShip it",
                                        "model": "unrelated-model", "reasoning_effort": "high"}}, environ)
-        self.assertEqual(json.loads(spawn.stdout)["decision"], "block")
-        self.assertIn("no launchable route", spawn.stdout)
+        self.assertNotEqual("block", (json.loads(spawn.stdout) if spawn.stdout else {}).get("decision"))
+        self.assertIn("without Symphony", prompt.stdout)
 
     def test_a_hidden_model_does_not_count_as_entitlement(self):
         required = profiles_for("codex")[0].get("requires_all", [])
@@ -667,41 +667,10 @@ class ClampGateTests(unittest.TestCase):
         _, result = self.open_and_spawn_lead("latest")
         self.assertNotEqual(self.output(result).get("decision"), "block")
 
-    def test_a_tier_clamp_blocks_and_names_the_control(self):
+    def test_a_tier_clamp_never_stops_the_agent(self):
+        """Best effort: the account's weaker route is used; nobody is asked to consent."""
         _, result = self.open_and_spawn_lead("base")
-        output = self.output(result)
-        self.assertEqual(output.get("decision"), "block")
-        self.assertIn(CODEX_BASE_ROUTE["model"], output["reason"])
-        self.assertIn(CODEX_FULL_ROUTE["model"], output["reason"])
-        self.assertIn("$symphony:symphony proceed", output["reason"])
-        self.assertIn("continue this session", output["reason"])
-        self.assertIn("availability is checked again in a new session", output["reason"])
-        self.assertNotIn("start a new session", output["reason"])
-
-    def test_accepting_the_clamp_unblocks_the_rest_of_the_session(self):
-        environ, blocked = self.open_and_spawn_lead("base")
-        self.assertEqual(self.output(blocked).get("decision"), "block")
-
-        accepted = self.send(
-            environ, hook_event_name="UserPromptSubmit", prompt="$symphony:symphony proceed"
-        )
-        self.assertIn("accepted", self.output(accepted)["hookSpecificOutput"]["additionalContext"].lower())
-
-        marker = json.dumps(
-            {"size": CODEX_DRIFT_SIZE, "complexity": CODEX_DRIFT_COMPLEXITY,
-             "risk": "normal", "rationale": "x", "topology": "direct"}
-        )
-        retried = self.send(
-            environ,
-            hook_event_name="PreToolUse",
-            tool_name="spawn_agent",
-            tool_input={
-                "message": f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {marker}\nShip it",
-                "model": CODEX_BASE_ROUTE["model"],
-                "reasoning_effort": CODEX_BASE_ROUTE["effort"],
-            },
-        )
-        self.assertNotIn("decision", self.output(retried))
+        self.assertNotEqual(self.output(result).get("decision"), "block")
 
     def test_acceptance_does_not_survive_into_a_new_session(self):
         environ, _ = self.open_and_spawn_lead("base")

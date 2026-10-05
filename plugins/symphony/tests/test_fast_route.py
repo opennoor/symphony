@@ -108,7 +108,7 @@ class FastRouteTests(unittest.TestCase):
                 if provider == 'codex':
                     name = 'symphony_lead_fast_' + selected['model'].replace('-', '_').replace('.', '_') + '_' + selected['effort']
                     self.assertIn('task_name=\\"' + name + '\\"', result.stdout)
-                    self.assertIn('never use them for a fast spawn', result.stdout)
+                    self.assertIn('assessed-lead names come only after assessment', result.stdout)
                     self.assertIn('append a unique underscore suffix for a fresh child', result.stdout)
                     self.assertIn('for assessor and assessed lead', result.stdout)
                 else:

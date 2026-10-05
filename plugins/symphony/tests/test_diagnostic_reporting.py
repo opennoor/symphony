@@ -270,6 +270,96 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.assertEqual(1, len(recorded))
         self.assertEqual(('KeyError', 'runtime.broken:2'), (recorded[0]['detail'], recorded[0]['site']))
 
+    def test_report_on_shares_silently_and_rotates_the_counts(self):
+        self.assertIn('sharing is on', d.control(self.store, 'on', 'codex', 'root', self.env))
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # probe, silent
+        with patch.object(d, '_gh', side_effect=['User', 'true']):
+            d.worker(str(self.store.root), 'probe')
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # auto-approve, silent
+        record = d._read(self.store)
+        self.assertEqual(('approved', True), (record['phase'], record['auto']))
+        with patch.object(d, '_gh', side_effect=['User', '[]', '[]',
+                                                 'https://github.com/opennoor/symphony/issues/5']):
+            d.worker(str(self.store.root), 'publish')
+        self.assertEqual('published', d._read(self.store)['phase'])
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # no "was shared" chatter
+        self.assertEqual([], d.snapshot(self.store))  # shared counts start over
+
+    def test_report_off_stays_quiet_until_the_backlog_grows_and_reminds_rarely(self):
+        self.assertIn('sharing is off', d.control(self.store, 'off', 'codex', 'root', self.env))
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))
+        self.launch.assert_not_called()
+        for _ in range(25):
+            self.store.record_recovery_diagnostic(self.report)
+        reminder = d.notice(self.store, 'codex', 'root', self.env)
+        self.assertIn('report on', reminder)
+        self.assertIn('one short line', reminder)
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))  # not again this week
+        self.launch.assert_not_called()
+
+    def test_decline_sets_the_standing_choice_and_names_the_way_back(self):
+        record = self.offered()
+        result = d.control(self.store, 'decline ' + record['id'], 'codex', 'root', self.env)
+        self.assertIn('report on', result)
+        self.assertEqual('off', d.preference(self.store)['sharing'])
+
+    def test_the_offer_mentions_the_standing_commands(self):
+        self.assertIn('report on', self.offered()['id'] and self.offer_text)
+
+    def test_report_off_revokes_a_queued_publication(self):
+        self.approved()
+        d.control(self.store, 'off', 'codex', 'root', self.env)
+        with patch.object(d, '_gh', side_effect=['User', '[]', '[]', 'https://github.com/opennoor/symphony/issues/9']) as gh:
+            d.worker(str(self.store.root), 'publish')
+        gh.assert_not_called()
+        self.assertNotEqual('published', d._read(self.store).get('phase'))
+
+    def test_approval_question_discloses_standing_consent(self):
+        record = self.offered()
+        self.assertIn('later reports automatically', d.question(record))
+        self.assertIn('report off', d.question(record))
+
+    def test_standing_consent_does_not_transfer_to_another_account(self):
+        d.control(self.store, 'on', 'codex', 'root', self.env)
+        d.notice(self.store, 'codex', 'root', self.env)
+        with patch.object(d, '_gh', side_effect=['User', 'true']):
+            d.worker(str(self.store.root), 'probe')
+        d.notice(self.store, 'codex', 'root', self.env)
+        self.assertEqual('User', d.preference(self.store)['account'])
+        # A later cycle finds a different logged-in account: ask, never auto-share.
+        self.store._write_json(d._path(self.store), {'id': 'a' * 32, 'phase': 'available', 'account': 'Other'})
+        text = d.notice(self.store, 'codex', 'root', self.env)
+        self.assertIn('@Other', text)
+        self.assertEqual('offered', d._read(self.store)['phase'])
+
+    def test_report_on_reopens_sharing_after_a_decline(self):
+        record = self.offered()
+        d.control(self.store, 'decline ' + record['id'], 'codex', 'root', self.env)
+        self.launch.reset_mock()
+        d.control(self.store, 'on', 'codex', 'root', self.env)
+        d.notice(self.store, 'codex', 'root', self.env)
+        self.launch.assert_called_once_with(self.store, 'probe', self.env)
+
+    def test_report_off_during_publication_wins_the_race(self):
+        self.approved()
+        def gh(arguments, environ):
+            if arguments[:2] == ['api', '--hostname'] and 'user' in arguments:
+                return 'User'
+            if 'search/issues' in arguments:
+                # The user revokes while the worker is searching.
+                d.control(self.store, 'off', 'codex', 'root', self.env)
+                return '[]'
+            raise AssertionError('nothing may be published after report off: ' + ' '.join(arguments))
+        with patch.object(d, '_gh', side_effect=gh):
+            d.worker(str(self.store.root), 'publish')
+        self.assertNotEqual('published', d._read(self.store).get('phase'))
+
+    def test_report_off_reaches_diagnostics_even_when_the_session_record_is_unreadable(self):
+        with patch.object(StateStore, 'session_record', side_effect=OSError('unreadable')):
+            handle({'hook_event_name': 'UserPromptSubmit', 'session_id': 'root', 'cwd': str(self.project),
+                    'prompt': '$symphony:symphony report off'}, {**self.env, 'SYMPHONY_PROVIDER': 'codex'})
+        self.assertEqual('off', d.preference(self.store)['sharing'])
+
     def test_failed_search_never_attempts_issue_creation(self):
         self.approved()
         with patch.object(d, '_gh', side_effect=['User', OSError('offline')]) as gh:
@@ -370,6 +460,7 @@ class DiagnosticReportingTests(unittest.TestCase):
                 # One separate local queue per host.
                 if provider == 'claude':
                     d._path(self.store).unlink()
+                    d._preference_path(self.store).unlink()
                     self.launch.reset_mock()
                 record = self.offered(provider)
                 reply = {'question': d.question(record), 'answer': d.SHARE}

@@ -590,7 +590,7 @@ class HostEvidenceTests(unittest.TestCase):
                 self.assertIn("Do not resume", result.stdout)
                 self.assertIn("or repeat Stop", result.stdout)
             else:
-                self.assertIn("no completion credit", result.stdout)
+                self.assertNotIn("retained unresolved", result.stdout)
         self.assertIsNone(self.store.load(self.project).active_run)
         self.assertEqual((stronger,), self.store.load(self.project).recent_runs)
         self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))
@@ -627,7 +627,10 @@ class HostEvidenceTests(unittest.TestCase):
         for event, prompt in (("Stop", ""), ("UserPromptSubmit", "$symphony:symphony status")):
             result = handle({"session_id": ROOT_ID, "cwd": str(self.project),
                              "hook_event_name": event, "prompt": prompt}, self.environ)
-            self.assertIn("unresolved child result" if event == 'Stop' else "no completion credit", result.stdout)
+            if event == 'Stop':
+                self.assertIn("unresolved child result", result.stdout)
+            else:
+                self.assertNotIn("retained unresolved", result.stdout)
         self.assertIsNone(self.store.load(self.project).active_run)
         self.assertEqual((archived,), self.store.load(self.project).recent_runs)
         self.assertEqual(1, len(self.store.session_record("codex", ROOT_ID)["pending"]))

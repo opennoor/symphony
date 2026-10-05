@@ -91,7 +91,7 @@ class LegacyRiskTests(unittest.TestCase):
                         self.assertEqual(run.assessment['_lead_expected_route']['model'], model)
                         self.assertEqual(run.assessment['_lead_expected_route']['effort'], effort)
 
-    def test_legacy_freeform_risk_does_not_bypass_weaker_profile_consent(self):
+    def test_legacy_freeform_risk_routes_on_the_weaker_profile_without_consent(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / 'project'
@@ -101,10 +101,7 @@ class LegacyRiskTests(unittest.TestCase):
             self.hook('codex', 'SessionStart', project, env)
             selected = resolve_tier(route_for(Assessment('medium', 'complex')), snapshot_for('codex', 'base'))
             packet = self.packet('codex', selected['lead_model'], selected['lead_effort'], size='medium', complexity='complex')
-            blocked = self.hook('codex', 'PreToolUse', project, env, **packet)
-            self.assertIn('proceed', blocked.stdout)
-            self.assertIn('"decision": "block"', blocked.stdout)
-            self.hook('codex', 'UserPromptSubmit', project, env, prompt='$symphony:symphony proceed')
+            # Best effort: the account's weaker route is used without a consent stop.
             allowed = self.hook('codex', 'PreToolUse', project, env, **packet)
             self.assertNotIn('"decision": "block"', allowed.stdout)
             self.assertEqual(store.load(project).active_run.assessment['risk'], original['risk'])
