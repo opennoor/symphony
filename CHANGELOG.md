@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.5 — prepared 2026-10-08
+
+- Fix the loop where a sized task's implementer was refused with "Spawn the Symphony assessor first" and re-sizing repeated it. A prompt arriving between sizing and the lead launch (the user's go-ahead, or an agent hand-back delivered as a prompt) no longer closes the run; only runs whose lead has ended are closed by a new prompt.
+- A root that stops after sizing to wait for the user's go-ahead is no longer pushed by Stop; the next prompt's guidance names the lead to launch.
+- A lead carrying a valid route is never refused because Symphony lost its run: the run is reopened from that route, and kept only if the spawn is accepted. A child Symphony cannot place runs unmanaged instead of being blocked.
+- A fresh sizing or fast task replaces a sized run that never got its lead, on Claude and on Codex, and the replaced run stays in history.
+- When a new request closes a blocked run, that run's queued notes are dropped instead of reaching the model; a blocked lead's note no longer tells the root to ask the user to stop the run.
+- The Stop hook's status line now reads "Symphony end-of-turn check" instead of claiming active work is being reconciled.
+
 ## 1.9.0 — prepared 2026-10-05
 
 Symphony is now a best-effort token-efficiency helper: its own problems never stop, slow or alarm the user.
