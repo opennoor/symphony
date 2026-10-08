@@ -443,8 +443,8 @@ def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult
 
 
 # The only Stop blocks that protect the user's result: delegated work is still
-# running, or an assessed task's lead was never launched.
-_USER_WORK_STOP_SIGNALS = frozenset({"active_work", "lead_not_started", "codex_lead_turn_running"})
+# running. A root that stops after sizing may be waiting for the user's go-ahead.
+_USER_WORK_STOP_SIGNALS = frozenset({"active_work", "codex_lead_turn_running"})
 
 
 def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
@@ -1754,9 +1754,12 @@ def _merge_scope(
     if after.active_run:
         run = replace(after.active_run, session_id=session, provider=provider)
         runs[f"{provider}:{session}"] = run
-    history = original.recent_runs
-    if before.active_run and not after.active_run and after.recent_runs:
-        history = (*history, after.recent_runs[-1])[-20:]
+    # Every run this scope archived joins the history, including one replaced
+    # by a new run in the same hook (a fresh sizing after an unled one).
+    known = {(run.run_id, run.status, run.updated_at) for run in before.recent_runs}
+    added = tuple(run for run in after.recent_runs
+                  if (run.run_id, run.status, run.updated_at) not in known)
+    history = (*original.recent_runs, *added)[-20:]
     # Keep the old scalar view useful for readers of a single-run state. It is
     # never used to select the run for a hook.
     latest = run or next(reversed(tuple(runs.values())), None)
@@ -1846,6 +1849,11 @@ def _transition(
         )
 
     if source.kind == "user_prompt":
+        prompt_text = str(source.payload.get("prompt") or "").strip()
+        if _parse_control(prompt_text) is None:
+            # Close a settled run first: its queued notes must not reach the
+            # model after the user has moved on.
+            state = _supersede_settled_run(state, source, prompt_text)
         state, deferred = _consume_parent_actions(state)
         actions += deferred
         state, prompt_actions = _handle_prompt(state, source, provider, environ)
@@ -2153,8 +2161,10 @@ def _supersede_settled_run(state: ProjectState, source: Event, prompt: str) -> P
     run = state.active_run
     # An active or completing run may still have a live native turn whose
     # callback is late; the normal Stop checks that before archiving.
+    # A run between its assessment and its lead is mid-pipeline: the user's
+    # "go ahead", or a hand-back delivered as a prompt, continues it.
     if (not run or not prompt or prompt.lstrip().startswith(_AUTOMATIC_PROMPTS)
-            or run.status in {"active", "completing"}
+            or not run.lead_identity or run.status in {"active", "completing"}
             or _active_identities(run) or run.assessment.get("_pending_delegations")
             or run.assessment.get("_batch_pending")):
         return state
@@ -2992,6 +3002,12 @@ def _observe_delegation(
     if not identity:
         return state, ()
     opening: tuple[Action, ...] = ()
+    if (source.kind == "subagent_started" and state.active_run
+            and (_observed_role(source.payload) == "assessor" or _fast_spawn(source.payload))
+            and str(identity) not in {item.identity for item in state.active_run.delegations}):
+        # Codex reports a spawn only at start: a new sizing or fast task
+        # replaces a sized run that never got its lead, as on Claude.
+        state = _supersede_leadless_run(state, source)
     if not state.active_run:
         fast = _fast_spawn(source.payload)
         if source.kind != "subagent_started" or (_observed_role(source.payload) != "assessor" and not fast):
@@ -3727,6 +3743,16 @@ def _observe_delegation(
     return state, actions
 
 
+def _supersede_leadless_run(state: ProjectState, source: Event) -> ProjectState:
+    """A sized run that never got its lead yields to a fresh spawn."""
+    run = state.active_run
+    if (not run or run.lead_identity or not run.assessment.get("size") or _active_identities(run)
+            or run.assessment.get("_pending_delegations") or run.assessment.get("_fast_escalated")):
+        return state
+    archived = replace(run, status="superseded", updated_at=source.observed_at)
+    return replace(state, active_run=None, recent_runs=(*state.recent_runs, archived)[-20:])
+
+
 def _open_run(
     state: ProjectState, source: Event, objective: str
 ) -> tuple[ProjectState, tuple[Action, ...]]:
@@ -3855,11 +3881,17 @@ def _prepare_delegation(
         return state, ()
     fast_launch = role == "lead" and _marker_value(values, "SYMPHONY_FAST_ROUTE:") == "lead"
     if not state.active_run and role != "assessor" and not fast_launch:
-        return state, (
-            _block_tool(
-                "Spawn the Symphony assessor first; a run begins when the assessor starts."
-            ),
-        )
+        if role != "lead" or _assessment_from_marker(values, "SYMPHONY_ROUTE:") is None:
+            # Best effort: a child Symphony cannot place still runs, unmanaged.
+            return state, ()
+        # A lead carrying a valid route continues assessed work whose run
+        # Symphony no longer holds: open it from that route rather than refuse.
+        # Keep the opened run only if the lead spawn itself is accepted.
+        opened, _ = _open_run(state, source, _tool_objective(values))
+        accepted, actions = _prepare_delegation(opened, source, provider)
+        if any(action.kind == "block_tool" for action in actions):
+            return state, actions
+        return accepted, actions
     model, effort = _requested_model_effort(values, provider, role)
     if not model or not effort:
         if provider == "claude":
@@ -3902,6 +3934,7 @@ def _prepare_delegation(
             return state, (_block_tool("Name the Codex fast lead `symphony_lead_fast_<model>_<effort>`."),)
         if _boost_preference(state, provider, str(source.payload.get("session_id") or "")) != "off":
             return state, (_block_tool("An assessor boost is active; spawn the selected boosted assessor first."),)
+        state = _supersede_leadless_run(state, source)
         if state.active_run:
             return state, (_block_tool("A run already owns this task; continue its recorded route."),)
         selection = fast_lead_selection(_snapshot(state, provider))
@@ -3913,6 +3946,9 @@ def _prepare_delegation(
             ),)
         state, actions = _open_run(state, source, objective)
         state = _mark_fast_run(state, selection, provider)
+    if role == "assessor":
+        # A fresh sizing, for this task or a new one, starts a fresh run.
+        state = _supersede_leadless_run(state, source)
     if role == "assessor" and not state.active_run:
         state, actions = _open_run(state, source, objective)
     if role == "lead":
@@ -5104,6 +5140,12 @@ def _substantive_recovery_guidance(run: RunState | None, provider: str) -> str:
 
 def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
     run = state.active_run
+    if (run and not run.lead_identity and isinstance(run.assessment.get("route"), Mapping)
+            and not _active_identities(run) and not run.assessment.get("_pending_delegations")):
+        return ("Symphony sized this session's task and its lead has not started. If this message "
+                "continues that task, launch its lead now: " + _assessed_lead_guidance(run, provider)
+                + " If it is a different task, handle it as new; a new assessor or fast lead replaces "
+                "the sized run.")
     if run and run.assessment.get('_substantive_child_missing'):
         return _substantive_recovery_guidance(run, provider)
     if not run:
@@ -5164,9 +5206,8 @@ def _recovery_guidance(state: ProjectState, provider: str = "") -> str:
             "Relay that blocker plainly and do not retry the lead unchanged. Only if this message "
             "supplies what the lead needed, continue that same lead: "
             + (retry + claude_retry or "resume it and await its new result. ")
-            + "Never report the task as completed while it stays blocked. If the user moves on, "
-            f"tell them `{_control_name('stop', run.provider or provider or 'codex')}` closes this "
-            "run as blocked before new work starts."
+            + "Never report the task as completed while it stays blocked. If the user asks for "
+            "something else, just handle it; this run closes on its own."
         )
     return (
         f"Symphony run {run.run_id} remains {run.status}.{lead} "

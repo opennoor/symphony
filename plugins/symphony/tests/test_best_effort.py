@@ -69,6 +69,17 @@ class BestEffortStopTests(unittest.TestCase):
         self.assertNotIn("remains", text)
         self.assertIn("Now rename the config file", text)
 
+    def test_a_closed_runs_queued_notes_never_reach_the_next_task(self):
+        lead = Delegation("lead", "lead", "task", "completed", "m", "medium")
+        stale = {"kind": "inject_context", "payload": {"text": "STALE blocked-run note: send stop first"}}
+        self.seed(lead, status="recovering", _reported_nonsuccess="blocked",
+                  _pending_parent_actions=[stale])
+        result = self.send("UserPromptSubmit", prompt="Add a .gitignore and commit it")
+        self.assertNotIn("STALE", result.stdout)
+        self.assertNotIn("$symphony:symphony stop", result.stdout)
+        self.assertIn("Add a .gitignore", result.stdout)  # routed as the new task
+        self.assertEqual("blocked", self.store.load(self.project).recent_runs[-1].status)
+
     def test_running_work_is_not_superseded_by_a_prompt(self):
         lead = Delegation("lead", "lead", "task", "working", "m", "medium")
         self.seed(lead)
@@ -92,3 +103,115 @@ class BestEffortStopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SizedTaskContinuationTests(unittest.TestCase):
+    """Reported 2026-10-08: sizing finished, then every implementer launch was
+    refused with "Spawn the Symphony assessor first", and re-sizing looped.
+
+    In an interactive session the assessor's hand-back, or the user's "go
+    ahead", arrives as a prompt between sizing and the lead launch.
+    """
+
+    MARKER = json.dumps({"size": "small", "complexity": "simple", "risk": "normal",
+                         "rationale": "bounded", "topology": "delegated"})
+
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.project = root / "project"
+        self.project.mkdir()
+        self.store = StateStore(root / "state")
+
+    def env(self, provider):
+        return {"SYMPHONY_STATE_DIR": str(self.store.root), "SYMPHONY_PROVIDER": provider,
+                "SYMPHONY_PROFILE": profiles_for(provider)[0]["id"], "SYMPHONY_REPORT_WORKER": "0"}
+
+    def send(self, provider, event, **fields):
+        extra = {"turn_id": "t", "model": "m"} if provider == "codex" else {}
+        return handle({"session_id": "root", "cwd": str(self.project), "hook_event_name": event,
+                       **extra, **fields}, self.env(provider))
+
+    def spawn(self, provider, role, choice, marker=""):
+        body = f"SYMPHONY_ROLE: {role}\n" + (f"SYMPHONY_ROUTE: {marker}\n" if marker else "") + "Ship it"
+        if provider == "claude":
+            kind = f"symphony:symphony-{role}-{choice['model']}-{choice['effort']}"
+            self.launches = getattr(self, "launches", 0) + 1
+            return self.send(provider, "PreToolUse", tool_name="Agent", tool_use_id=f"launch-{role}-{self.launches}",
+                             tool_input={"subagent_type": kind, "prompt": body})
+        return self.send(provider, "PreToolUse", tool_name="spawn_agent", tool_input={
+            "message": body, "model": choice["model"], "reasoning_effort": choice["effort"]})
+
+    def size(self, provider):
+        from plugins.symphony.symphony.routing import assessor_selection, snapshot_for
+        snapshot = snapshot_for(provider, profiles_for(provider)[0]["id"])
+        assessor = assessor_selection(snapshot, "off")
+        self.send(provider, "SessionStart")
+        self.send(provider, "UserPromptSubmit", prompt="/symphony:enable" if provider == "claude"
+                  else "$symphony:symphony enable")
+        self.send(provider, "UserPromptSubmit", prompt="Add a slugify helper with tests")
+        self.assertNotIn("block", self.spawn(provider, "assessor", assessor).stdout)
+        kind = (f"symphony:symphony-assessor-{assessor['model']}-{assessor['effort']}" if provider == "claude"
+                else f"symphony_assessor_{assessor['model'].replace('-', '_').replace('.', '_')}_{assessor['effort']}")
+        child = {"agent_id": "assessor-1", "agent_type": kind, "parent_thread_id": "root"}
+        if provider == "codex":
+            child.update(model=assessor["model"], model_reasoning_effort=assessor["effort"])
+        self.send(provider, "SubagentStart", **child)
+        self.send(provider, "SubagentStop", status="completed",
+                  last_assistant_message=f"SYMPHONY_ASSESSMENT: {self.MARKER}", **child)
+        return snapshot.matrix["small/simple"]
+
+    def test_go_ahead_after_sizing_keeps_the_run_and_launches_the_lead(self):
+        for provider in ("codex", "claude"):
+            for between in ("Go ahead and implement it.",
+                            "Another Claude session sent a message: [Subagent hand-back] sizing done"):
+                with self.subTest(provider=provider, between=between):
+                    self.tearDown() if False else None
+                    self.setUp()
+                    lead = self.size(provider)
+                    run = self.store.load(self.project).active_run
+                    self.assertTrue(run.assessment.get("size"), run.assessment)
+                    # Waiting for the user after sizing never holds the turn.
+                    stop = self.send(provider, "Stop")
+                    self.assertNotIn('"decision": "block"', stop.stdout)
+                    prompt = self.send(provider, "UserPromptSubmit", prompt=between)
+                    self.assertIsNotNone(self.store.load(self.project).active_run)
+                    self.assertIn("launch its lead", prompt.stdout)
+                    launched = self.spawn(provider, "lead", lead, self.MARKER)
+                    self.assertNotIn("Spawn the Symphony assessor first", launched.stdout)
+                    self.assertNotIn('"decision": "block"', launched.stdout)
+                    self.assertNotIn('"deny"', launched.stdout)
+
+    def test_a_lead_with_a_valid_route_is_never_refused_for_a_missing_run(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                self.setUp()
+                from plugins.symphony.symphony.routing import snapshot_for
+                lead = snapshot_for(provider, profiles_for(provider)[0]["id"]).matrix["small/simple"]
+                self.send(provider, "SessionStart")
+                launched = self.spawn(provider, "lead", lead, self.MARKER)
+                self.assertNotIn('"deny"', launched.stdout)
+                self.assertNotIn('"decision": "block"', launched.stdout)
+                run = self.store.load(self.project).active_run
+                self.assertEqual(("small", "simple"), (run.assessment.get("size"), run.assessment.get("complexity")))
+
+    def test_a_new_sizing_replaces_a_sized_run_that_never_got_its_lead(self):
+        from plugins.symphony.symphony.routing import assessor_selection, snapshot_for
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                self.setUp()
+                self.size(provider)
+                first = self.store.load(self.project).active_run.run_id
+                assessor = assessor_selection(snapshot_for(provider, profiles_for(provider)[0]["id"]), "off")
+                if provider == "claude":
+                    self.spawn(provider, "assessor", assessor)
+                else:
+                    # Codex reports a spawn only when the child starts.
+                    kind = f"symphony_assessor_{assessor['model'].replace('-', '_').replace('.', '_')}_{assessor['effort']}"
+                    self.send(provider, "SubagentStart", agent_id="assessor-2", agent_type=kind,
+                              parent_thread_id="root", model=assessor["model"],
+                              model_reasoning_effort=assessor["effort"])
+                state = self.store.load(self.project)
+                self.assertNotEqual(first, state.active_run.run_id)
+                self.assertEqual("superseded", state.recent_runs[-1].status)
