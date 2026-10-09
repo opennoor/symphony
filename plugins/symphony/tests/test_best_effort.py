@@ -101,10 +101,6 @@ class BestEffortStopTests(unittest.TestCase):
         self.assertIsNotNone(self.store.load(self.project).active_run)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SizedTaskContinuationTests(unittest.TestCase):
     """Reported 2026-10-08: sizing finished, then every implementer launch was
     refused with "Spawn the Symphony assessor first", and re-sizing looped.
@@ -215,3 +211,55 @@ class SizedTaskContinuationTests(unittest.TestCase):
                 state = self.store.load(self.project)
                 self.assertNotEqual(first, state.active_run.run_id)
                 self.assertEqual("superseded", state.recent_runs[-1].status)
+
+
+class AgentLaunchedSessionTests(unittest.TestCase):
+    """A `codex exec` or `claude -p` started by another agent is that agent's
+    tool call: Symphony stays out and never touches the project's state."""
+
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.project = root / "project"
+        self.project.mkdir()
+        self.state = root / "state"
+        self.transcript = root / "rollout.jsonl"
+
+    def run_hook(self, provider, originator="codex_exec", **env):
+        self.transcript.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": "thread-1", "session_id": "thread-1", "originator": originator}}) + "\n")
+        payload = {"session_id": "thread-1" if provider == "codex" else "root", "cwd": str(self.project),
+                   "hook_event_name": "UserPromptSubmit", "prompt": "Implement the importer",
+                   "transcript_path": str(self.transcript)}
+        if provider == "codex":
+            payload.update(turn_id="t", model="m")
+        handle(payload, {"SYMPHONY_STATE_DIR": str(self.state), "SYMPHONY_PROVIDER": provider,
+                         "SYMPHONY_REPORT_WORKER": "0", **env})
+        return self.state.exists() and any(self.state.iterdir())
+
+    def test_agent_launched_headless_sessions_stand_down(self):
+        cases = [("codex", "codex_exec", {"CLAUDECODE": "1"}),
+                 ("codex", "codex_exec", {"CODEX_THREAD_ID": "outer-thread"}),
+                 ("claude", "", {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli", "CLAUDE_CODE_EXECPATH": "/claude"}),
+                 ("claude", "", {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli", "CODEX_THREAD_ID": "outer-thread"})]
+        for provider, originator, env in cases:
+            with self.subTest(provider=provider, env=env):
+                self.setUp()
+                self.assertFalse(self.run_hook(provider, originator, **env))
+
+    def test_interactive_human_and_opted_in_sessions_are_still_routed(self):
+        cases = [("codex", "codex_cli_rs", {"CLAUDECODE": "1"}),  # interactive Codex in an agent's tmux
+                 ("codex", "codex_exec", {}),  # a person's own codex exec
+                 ("codex", "codex_exec", {"CODEX_THREAD_ID": "thread-1"}),  # Codex's own thread
+                 ("codex", "codex_exec", {"CLAUDECODE": "1", "SYMPHONY_AGENT_SESSIONS": "1"}),
+                 ("claude", "", {"CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_EXECPATH": "/claude"}),
+                 ("claude", "", {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})]
+        for provider, originator, env in cases:
+            with self.subTest(provider=provider, originator=originator, env=env):
+                self.setUp()
+                self.assertTrue(self.run_hook(provider, originator, **env))
+
+
+if __name__ == "__main__":
+    unittest.main()

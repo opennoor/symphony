@@ -318,12 +318,46 @@ def _recovery_diagnostic(store: StateStore, provider: str, category: str, outcom
         pass
 
 
+def _launched_by_another_agent(payload: Mapping, environ: Mapping[str, str], provider: str) -> bool:
+    """A headless session started from another agent's shell owns no task.
+
+    `codex exec` or `claude -p` run by an agent (a review, a quick lookup) is
+    already orchestrated by that agent; routing it again only adds agents and
+    delay. Each host scrubs its own markers for its hooks, so only the outer
+    shell's survive. Set SYMPHONY_AGENT_SESSIONS=1 to route such sessions.
+    """
+    if environ.get('SYMPHONY_AGENT_SESSIONS') == '1':
+        return False
+    try:
+        if provider == 'claude':
+            return (str(environ.get('CLAUDE_CODE_ENTRYPOINT') or '').startswith('sdk')
+                    and bool(environ.get('CODEX_THREAD_ID') or environ.get('CLAUDE_CODE_EXECPATH')))
+        outer_thread = environ.get('CODEX_THREAD_ID')
+        if environ.get('CLAUDECODE') != '1' and not outer_thread:
+            return False
+        with open(str(payload.get('transcript_path') or ''), encoding='utf-8') as handle:
+            header = json.loads(handle.readline(4 * 1024 * 1024)).get('payload') or {}
+        if header.get('originator') != 'codex_exec':
+            return False
+        spawn = ((header.get('source') or {}).get('subagent') or {}).get('thread_spawn') or {} \
+            if isinstance(header.get('source'), Mapping) else {}
+        own = {header.get('id'), header.get('session_id'), spawn.get('parent_thread_id'),
+               payload.get('session_id')}
+        return environ.get('CLAUDECODE') == '1' or outer_thread not in own
+    except Exception:
+        return False
+
+
 def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
     """Keep host-turn liveness separate from durable task completion."""
     if environ.get('SYMPHONY_CLAUDE_PROBE'):
         return HookResult()
     hook = payload.get('hook_event_name')
     provider = str(environ.get('SYMPHONY_PROVIDER') or detect_provider(payload))
+    if _launched_by_another_agent(payload, environ, provider):
+        # Pure no-op: no state is read or written, so the launching agent's
+        # own run in this project is never touched.
+        return HookResult()
     session = str(payload.get('session_id') or '')
     try:
         store = StateStore(Path(environ.get('SYMPHONY_STATE_DIR', Path.home() / '.symphony' / 'state')))
