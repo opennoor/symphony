@@ -39,7 +39,7 @@ from .host_evidence import (
     retained_fast_escalation_receipt,
 )
 from .model import Action, Delegation, Event, ProjectState, RunState, persistable
-from .reducer import _ACTIVE_STATES, _active_identities, _child_evidence_basis, _stop_block_reason, _substantive_child_completed, reduce
+from .reducer import _ACTIVE_STATES, _active_identities, _child_evidence_basis, _stop_block_reason, _substantive_child_completed, reduce, waive_repeated_substantive_request
 from .routing import (
     Assessment,
     EFFORTS,
@@ -318,12 +318,46 @@ def _recovery_diagnostic(store: StateStore, provider: str, category: str, outcom
         pass
 
 
+def _launched_by_another_agent(payload: Mapping, environ: Mapping[str, str], provider: str) -> bool:
+    """A headless session started from another agent's shell owns no task.
+
+    `codex exec` or `claude -p` run by an agent (a review, a quick lookup) is
+    already orchestrated by that agent; routing it again only adds agents and
+    delay. Each host scrubs its own markers for its hooks, so only the outer
+    shell's survive. Set SYMPHONY_AGENT_SESSIONS=1 to route such sessions.
+    """
+    if environ.get('SYMPHONY_AGENT_SESSIONS') == '1':
+        return False
+    try:
+        if provider == 'claude':
+            return (str(environ.get('CLAUDE_CODE_ENTRYPOINT') or '').startswith('sdk')
+                    and bool(environ.get('CODEX_THREAD_ID') or environ.get('CLAUDE_CODE_EXECPATH')))
+        outer_thread = environ.get('CODEX_THREAD_ID')
+        if environ.get('CLAUDECODE') != '1' and not outer_thread:
+            return False
+        with open(str(payload.get('transcript_path') or ''), encoding='utf-8') as handle:
+            header = json.loads(handle.readline(4 * 1024 * 1024)).get('payload') or {}
+        if header.get('originator') != 'codex_exec':
+            return False
+        spawn = ((header.get('source') or {}).get('subagent') or {}).get('thread_spawn') or {} \
+            if isinstance(header.get('source'), Mapping) else {}
+        own = {header.get('id'), header.get('session_id'), spawn.get('parent_thread_id'),
+               payload.get('session_id')}
+        return environ.get('CLAUDECODE') == '1' or outer_thread not in own
+    except Exception:
+        return False
+
+
 def handle(payload: dict, environ: Mapping[str, str] = os.environ) -> HookResult:
     """Keep host-turn liveness separate from durable task completion."""
     if environ.get('SYMPHONY_CLAUDE_PROBE'):
         return HookResult()
     hook = payload.get('hook_event_name')
     provider = str(environ.get('SYMPHONY_PROVIDER') or detect_provider(payload))
+    if _launched_by_another_agent(payload, environ, provider):
+        # Pure no-op: no state is read or written, so the launching agent's
+        # own run in this project is never touched.
+        return HookResult()
     session = str(payload.get('session_id') or '')
     try:
         store = StateStore(Path(environ.get('SYMPHONY_STATE_DIR', Path.home() / '.symphony' / 'state')))
@@ -3707,6 +3741,8 @@ def _observe_delegation(
             )
             return state, actions
         missing_substantive = False
+        if successful:
+            state = replace(state, active_run=waive_repeated_substantive_request(state.active_run))
         if successful and not _substantive_child_completed(state.active_run):
             assessment = dict(state.active_run.assessment)
             assessment['_substantive_child_missing'] = True
@@ -3804,7 +3840,8 @@ def _escalate_fast_run(state: ProjectState, source: Event, *, fresh_assessment: 
     assessment = dict(run.assessment)
     if fresh_assessment:
         for key in ('size', 'complexity', 'risk', 'rationale', 'topology', 'route',
-                    'substantive_contract', '_substantive_children', '_substantive_child_missing'):
+                    'substantive_contract', '_substantive_children', '_substantive_child_missing',
+                    '_substantive_requested', '_substantive_waived'):
             assessment.pop(key, None)
         if source.payload.get('_symphony_archived_fast_escalation') is True:
             assessment['_archived_fast_escalation_turn'] = _child_turn_token(source.payload)
@@ -4598,12 +4635,15 @@ def _stop_block_text(
         reason = "assessment work has ended; reconcile its result and launch the selected lead"
     elif reason == 'substantive_child_missing':
         reason = 'resume the SAME registered lead to delegate substantive work, integrate and verify its result, then report completion'
-    force = "/symphony:stop --force" if provider == "claude" else "$symphony:symphony stop --force"
+    # The user can act on none of this: delegated work is healthy and its
+    # result arrives on its own. Never relay it as a warning or a stop offer.
+    lead = (f"Delegated work is still running for {scope} ({active}). Let it finish; its result "
+            "arrives on its own. Do not poll or relaunch it."
+            if active and not payload.get("reason") else f"Before ending this turn for {scope}: {reason}.")
     return (
-        f"Symphony stop is blocked for {scope}: {reason}. Let the tracked agents finish, "
-        f"return to this run on the next turn, or run `{force}` to end the run and "
-        "record what was not reconciled. Keep protocol markers out of the final answer, "
-        "and report completion only after durable status confirms it."
+        f"{lead} If you end the turn, tell the user only what is still in progress, without "
+        "mentioning Symphony, this check, or stop commands. Keep protocol markers out of the "
+        "final answer, and report completion only after durable status confirms it."
     )
 
 
