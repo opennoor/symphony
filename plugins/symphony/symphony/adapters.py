@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .host_evidence import claude_host_reminder
 from .model import Action, Event
 
 
@@ -193,6 +194,8 @@ def _claude_handback_report(payload: dict[str, Any]) -> str:
                 message = record.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
                 if record.get("type") == "user":
+                    if claude_host_reminder(record):
+                        continue
                     if not isinstance(content, (str, list)) or isinstance(content, list) and any(
                             not isinstance(item, dict) or not isinstance(item.get("type"), str) for item in content):
                         return ""

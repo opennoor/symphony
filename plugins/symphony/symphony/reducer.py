@@ -372,9 +372,26 @@ def _valid_outcome(outcome) -> bool:
     return isinstance(status, str) and status.lower() in {"completed", "done", "success", "succeeded"}
 
 
+def waive_repeated_substantive_request(run: RunState) -> RunState:
+    """Trust a lead's completion once it was already asked for missing proof.
+
+    Symphony never bounces the same lead twice over its own evidence: an
+    unreadable host transcript must not loop the user's work.
+    """
+    if not run.assessment.get('_substantive_requested') or _substantive_child_completed(run):
+        return run
+    assessment = {**run.assessment, '_substantive_waived': True}
+    assessment.pop('_substantive_child_missing', None)
+    return replace(run, assessment=assessment)
+
+
 def _substantive_child_completed(run: RunState) -> bool:
-    """Legacy routes have no contract; present contracts require scoped proof."""
-    if 'substantive_contract' not in run.assessment:
+    """Legacy routes have no contract; present contracts require scoped proof.
+
+    Best effort: a lead is asked once to add missing delegated work or review
+    (see `waive_repeated_substantive_request`); its next completion is trusted.
+    """
+    if 'substantive_contract' not in run.assessment or run.assessment.get('_substantive_waived'):
         return True
     contract = run.assessment['substantive_contract']
     if (not isinstance(contract, Mapping) or type(contract.get('version')) is not int
@@ -442,6 +459,7 @@ def _lead_completed(state: ProjectState, event: Event):
         return state, (Action("block_completion", {"reason": "outcome_missing"}),)
     if "substantive_contract" in run.assessment:
         outcome = {"status": "completed"}
+    run = waive_repeated_substantive_request(run)
     if not _substantive_child_completed(run):
         assessment = {**run.assessment, '_substantive_child_missing': True}
         token = event.payload.get('turn_token') or run.assessment.get('_active_turns', {}).get(identity)
@@ -508,6 +526,7 @@ def _lead_failed(state: ProjectState, event: Event):
         assessment.pop("_reported_nonsuccess_basis", None)
     recovering = replace(run, status="recovering", outcome=None, assessment=assessment, updated_at=event.observed_at)
     if event.payload.get('reason') == 'substantive_child_missing':
+        recovering = replace(recovering, assessment={**recovering.assessment, '_substantive_requested': True})
         return replace(state, active_run=recovering), (Action('request_substantive_work', {}),)
     return replace(state, active_run=recovering), (
         Action("replace_lead", {"owner_generation": run.owner_generation + 1}),

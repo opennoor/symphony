@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.6 — prepared 2026-10-09
+
+- Credit Claude workers in interactive sessions. Claude Code writes its own SubagentHandback reminders into each subagent's turn; Symphony counted them as extra prompts, so no worker ever earned credit, hand-back reports after a reminder were lost, and the lead was sent back to "delegate substantive work" after every completion. Those reminders are now ignored wherever Symphony reads a Claude turn, while real follow-ups from a lead or the root still count.
+- A lead is asked at most once to add missing delegated work or review; its next completion is trusted instead of being bounced again.
+- While delegated work is still running, the end-of-turn note no longer offers `/symphony:stop --force` or other Symphony wording for the agent to relay; a healthy run never reads as stuck.
+
 ## 1.9.5 — prepared 2026-10-08
 
 - Fix the loop where a sized task's implementer was refused with "Spawn the Symphony assessor first" and re-sizing repeated it. A prompt arriving between sizing and the lead launch (the user's go-ahead, or an agent hand-back delivered as a prompt) no longer closes the run; only runs whose lead has ended are closed by a new prompt.

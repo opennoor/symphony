@@ -991,6 +991,28 @@ class CompletionChronologyTests(unittest.TestCase):
                         self.assertEqual(purpose, self.bind_purpose()['purpose'])
                         self.assertEqual('valid', self.check())
 
+    def test_claude_host_reminders_inside_a_worker_turn_are_not_new_prompts(self):
+        # Interactive Claude writes its SubagentHandback notices into the
+        # child's own turn; they once denied every worker its credit.
+        for extra in ('reminder', 'peer'):
+            with self.subTest(extra=extra):
+                self.purpose_fixture('claude')
+                prompt = self.rows[self.child][0]
+                for offset, text in ((1, '<system-reminder>\nYour final report is delivered through SubagentHandback.\n</system-reminder>'),
+                                     (2, '[handback-send-enforce] Your report has not been delivered.')):
+                    self.rows[self.child].insert(offset, {**json.loads(json.dumps(prompt)), 'isMeta': True,
+                        'uuid': f'reminder-{offset}', 'message': {'role': 'user', 'content': text}})
+                if extra == 'peer':
+                    # A real follow-up from the lead is still a second invocation.
+                    self.rows[self.child].append({**json.loads(json.dumps(prompt)), 'isMeta': True,
+                        'uuid': 'peer-followup', 'origin': {'kind': 'peer', 'from': self.lead},
+                        'message': {'role': 'user', 'content': 'Another Claude session sent a message'}})
+                self.write()
+                if extra == 'peer':
+                    self.assertIsNone(self.bind_purpose())
+                else:
+                    self.assertEqual('substantive', self.bind_purpose()['purpose'])
+
     def test_codex_purpose_requires_exact_launch_chain_and_original_name(self):
         for case in ('missing-purpose', 'wrong-parent', 'wrong-project', 'wrong-model',
                      'missing-result', 'duplicate-activity', 'spoofed-result'):

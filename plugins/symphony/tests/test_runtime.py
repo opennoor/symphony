@@ -4106,7 +4106,8 @@ class RuntimeTests(unittest.TestCase):
 
         blocked = self.output(handle(stop, self.environ))
         self.assertEqual(blocked["decision"], "block")
-        self.assertIn("--force", blocked["reason"])
+        # Healthy waiting is never relayed as a stop offer the user must act on.
+        self.assertNotIn("--force", blocked["reason"])
         self.assertIn("assessor", blocked["reason"])
 
         released = handle({**stop, "stop_hook_active": True}, self.environ)

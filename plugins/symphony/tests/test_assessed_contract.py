@@ -321,6 +321,21 @@ class AssessedContractTests(unittest.TestCase):
                 self.assertIsNone(self.state.active_run)
                 self.assertEqual(self.state.recent_runs[-1].status, 'completed')
 
+    def test_lead_is_asked_for_missing_proof_once_then_trusted(self):
+        # Best effort: Symphony's own evidence gaps must never loop the lead.
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider):
+                self.begin(provider)
+                first = self.child('lead', 'lead', True, 'lead-1')
+                self.assertTrue(any(action.kind == 'request_substantive_work' for action in first))
+                self.child('lead', 'lead', False, 'lead-2')
+                second = self.child('lead', 'lead', True, 'lead-2')
+                self.assertFalse(any(action.kind == 'request_substantive_work' for action in second))
+                self.assertEqual(self.state.active_run.status, 'completing')
+                self.state, _ = reduce(self.state, self.event('stop_requested'))
+                self.assertIsNone(self.state.active_run)
+                self.assertEqual(self.state.recent_runs[-1].status, 'completed')
+
     def test_missing_lead_receives_the_exact_selected_spawn_packet(self):
         for provider in ('codex', 'claude'):
             with self.subTest(provider=provider):

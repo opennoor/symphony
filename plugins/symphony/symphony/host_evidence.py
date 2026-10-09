@@ -1102,6 +1102,18 @@ def _claude_observed_fast_launch(run: RunState, launch_id: str, root_prompt: str
                 and hashlib.sha256(launch_id.encode()).hexdigest() == pinned)
 
 
+def claude_host_reminder(row) -> bool:
+    """Claude Code's own nudge inside a running subagent turn, not a prompt.
+
+    Interactive Claude writes reminders such as the SubagentHandback notice
+    and `[handback-send-enforce]` as meta user rows. Real follow-ups carry an
+    `origin` (coordinator, peer, task notification) and Skill expansions a
+    source tool call; a reminder has neither and starts no new invocation.
+    """
+    return (isinstance(row, Mapping) and row.get('type') == 'user' and row.get('isMeta') is True
+            and 'origin' not in row and 'sourceToolUseID' not in row and 'turnCompanion' not in row)
+
+
 def _claude_tool_result_content(content) -> bool:
     return (isinstance(content, list) and bool(content)
         and any(isinstance(item, dict) and item.get('type') == 'tool_result' for item in content)
@@ -1220,7 +1232,7 @@ def _claude_substantive_launch(
         return None
     prompts, companions = [], []
     for row in child_rows:
-        if row.get('type') != 'user':
+        if row.get('type') != 'user' or claude_host_reminder(row):
             continue
         message = row.get('message')
         content = message.get('content') if isinstance(message, dict) else None
@@ -1800,7 +1812,7 @@ def _claude_native_prompt_activity(
                 # A textual prompt may also use a block list. The existing
                 # terminal reader cannot identify that turn, so keep Stop.
                 return "unknown", None
-        if row.get("type") == "user" and isinstance(content, str):
+        if row.get("type") == "user" and isinstance(content, str) and not claude_host_reminder(row):
             prompt_id = row.get("uuid")
             when = _instant(row.get("timestamp"))
             if (not isinstance(prompt_id, str) or not prompt_id or when is None
@@ -3073,7 +3085,7 @@ def _claude_historical_worker_terminal(rows: list[dict], prompt_index: int,
             continue
         message = row.get('message')
         content = message.get('content') if isinstance(message, dict) else None
-        if _claude_tool_result_content(content) or index in companions:
+        if _claude_tool_result_content(content) or index in companions or claude_host_reminder(row):
             continue
         if (not isinstance(content, str) or not content.strip()
                 or not isinstance(row.get('uuid'), str) or not row['uuid']
@@ -3236,7 +3248,7 @@ def _claude_historical_worker_deliveries(
                 continue
             message = row.get('message')
             content = message.get('content') if isinstance(message, dict) else None
-            if _claude_tool_result_content(content):
+            if _claude_tool_result_content(content) or claude_host_reminder(row):
                 continue
             when = _instant(row.get('timestamp'))
             if not isinstance(content, str) or when is None:
@@ -3327,7 +3339,7 @@ def _claude_sendmessage_late_callback(source: Event, native: Event, session: str
             continue
         message = row.get('message')
         content = message.get('content') if isinstance(message, Mapping) else None
-        if _claude_tool_result_content(content):
+        if _claude_tool_result_content(content) or claude_host_reminder(row):
             continue
         when = _instant(row.get('timestamp'))
         if not isinstance(content, str) or when is None:
@@ -3473,7 +3485,7 @@ def claude_archived_sendmessage_sequence(
         content = message.get('content') if isinstance(message, dict) else None
         # Tool results are part of a turn. Every other user row must be a
         # supported textual prompt; malformed/opaque rows cannot hide reuse.
-        if _claude_tool_result_content(content):
+        if _claude_tool_result_content(content) or claude_host_reminder(row):
             continue
         if not isinstance(content, str):
             return None
