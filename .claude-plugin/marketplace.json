@@ -11,7 +11,7 @@
       "source": "./plugins/symphony",
       "description": "Task-sized orchestration with durable lifecycle recovery and compact delegation visibility.",
       "category": "productivity",
-      "version": "1.9.6"
+      "version": "1.9.7"
     }
   ]
 }

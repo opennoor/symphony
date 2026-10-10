@@ -1864,6 +1864,71 @@ def claude_completing_lead_turn(
     return "completed", event
 
 
+def claude_lead_turn_running(
+    state: ProjectState, session: str, project: Path, environ: Mapping[str, str],
+) -> bool:
+    """The completed lead's own transcript shows a newer turn without its end.
+
+    Read from the lead's transcript alone: Claude Code rewrites a resumed
+    agent's metadata without its launch ID, which the stricter native checks
+    need. Unreadable evidence is not proof of a live turn; it would otherwise
+    hold a finished run open for good.
+    """
+    run = state.active_run
+    lead_id = run.lead_identity if run else None
+    if (not run or run.provider != "claude" or run.status != "completing" or run.session_id != session
+            or not isinstance(lead_id, str) or not _CLAUDE_ID.fullmatch(lead_id)):
+        return False
+    projects = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    try:
+        paths = tuple(projects.glob(f"*/{session}/subagents/agent-{lead_id}.jsonl"))
+        if len(paths) != 1 or paths[0].is_symlink():
+            return False
+        with paths[0].open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            window = 256 * 1024
+            while True:
+                stream.seek(max(0, size - window))
+                data = stream.read()
+                if data and not data.endswith(b"\n"):
+                    return True  # the host is still writing this turn
+                ended = _claude_tail_turn_ended(
+                    data.decode("utf-8", "replace").splitlines()[1 if size > len(data) else 0:])
+                # Widen until a deciding row is in view: one tool result can
+                # outgrow the window, with reminders or attachments after it.
+                if ended is not None:
+                    return not ended
+                if len(data) >= size or window >= _MAX_TRANSCRIPT_BYTES:
+                    return False
+                window *= 4
+    except OSError:
+        return False
+
+
+def _claude_tail_turn_ended(lines: list[str]) -> bool | None:
+    """Whether the last deciding row ends a turn; None when none is in view."""
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return True  # unreadable evidence is not proof of a live turn
+        # Real follow-ups are meta rows with an origin; only host reminders skip.
+        if (not isinstance(row, dict) or row.get("type") not in {"user", "assistant"}
+                or claude_host_reminder(row)):
+            continue
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        # A turn ends on an assistant reply that calls no tool, including a
+        # failed one. Claude may record it with a null stop_reason, so the
+        # shape decides unless the reason says the turn continues.
+        return (row["type"] == "assistant" and isinstance(content, list)
+                and message.get("stop_reason") not in {"tool_use", "pause_turn"}
+                and not any(isinstance(item, dict) and item.get("type") == "tool_use"
+                            for item in content))
+    return None
+
+
 def _claude_callback_matches_native(
     source: Event, native: Event, session: str, *, allow_conflict: bool = False,
     allow_fast_escalation: bool = False, allow_request_journal: bool = False,
@@ -2512,6 +2577,24 @@ def codex_recovered_lead_event(
     }
     event_id = hashlib.sha256(f"codex-host-turn\0{lead_id}\0{latest_started}".encode()).hexdigest()
     return Event(event_id, "subagent_stopped", completed_at.isoformat(), payload)
+
+
+def codex_lead_turn_running(state: ProjectState, session: str, environ: Mapping[str, str]) -> bool:
+    """A completed lead's newest native turn has started and not finished.
+
+    Liveness only: unlike codex_completing_lead_turn it does not require that
+    turn's route to match, since a running turn on another route is still live.
+    """
+    run = state.active_run
+    if not run or run.status != "completing" or run.provider != "codex":
+        return False
+    observed = _native_lead_turns(state, session, environ)
+    if observed is None:
+        return False
+    _, turns, _, latest_started, _ = observed
+    turn = turns.get(latest_started or "", {})
+    # An aborted turn ends without a completion; it is not live.
+    return bool(turn.get("started")) and turn.get("completed_at") is None and not turn.get("failed")
 
 
 def codex_completing_lead_turn(

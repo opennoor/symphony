@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.7 — prepared 2026-10-10
+
+- Fix a finished run that refused every later task, on Claude Code and Codex. When Symphony could not verify the lead's latest turn, or a child launch was never confirmed, the run stayed "completing" for good. Claude Code rewrites a resumed agent's metadata without its launch ID, which is one way the turn becomes unverifiable. Every new lead was then refused with "invoke stop to archive it", which the agent could not do itself. Now the user's next prompt, including a `start` control, closes a finished run. The new request is assessed fresh instead of inheriting the old route. The run stays open only while its lead is visibly in a newer turn: on Claude this is read from the lead's own transcript, on Codex from the native turn record.
+- A `/symphony:stop` (Codex: `$symphony:symphony stop`) typed by the user now closes a run when nothing is running. That includes runs held only by Symphony's own bookkeeping or by evidence it cannot verify. Such a run is recorded as stopped, never completed. A tracked child or a lead visibly mid-turn still waits, as before.
+- When the lead guard does fire, it now says that only a stop typed by the user closes the run, so the agent asks for it instead of trying to invoke it itself.
+
 ## 1.9.6 — prepared 2026-10-09
 
 - Credit Claude workers in interactive sessions. Claude Code writes its own SubagentHandback reminders into each subagent's turn; Symphony counted them as extra prompts, so no worker ever earned credit, hand-back reports after a reminder were lost, and the lead was sent back to "delegate substantive work" after every completion. Those reminders are now ignored wherever Symphony reads a Claude turn, while real follow-ups from a lead or the root still count.
