@@ -26,14 +26,14 @@ from .host_evidence import (
     claude_archived_sendmessage_sequence, claude_archived_mixed_sendmessage_sequence, claude_sendmessage_source_hash,
     _claude_sendmessage_late_callback,
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
-    claude_current_native_lead_event, claude_recovered_lead_event,
+    claude_current_native_lead_event, claude_lead_turn_running, claude_recovered_lead_event,
     claude_substantive_launch,
     _CLAUDE_FAST_ACK,
     codex_substantive_launch,
     codex_child_followup_start,
     codex_deferred_child_turns,
     codex_archived_followup_sequence,
-    codex_completing_lead_turn, codex_recovered_lead_event,
+    codex_completing_lead_turn, codex_lead_turn_running, codex_recovered_lead_event,
     codex_unavailable_lead_proof,
     codex_unmanaged_pre_run_terminal,
     retained_fast_escalation_receipt,
@@ -536,6 +536,12 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
     ) -> tuple[ProjectState, tuple[tuple[Action, ...], set[str]]]:
         acknowledged: set[str] = set()
         unresolved = unknown_alias_pending
+        # The user's own stop closes a run Symphony cannot verify, as stopped.
+        explicit = source.kind == "stop_requested" and source.payload.get("control") is True
+        unverified = False
+        # A finished run yields to the user's next task unless its lead is
+        # visibly in a newer turn (see _supersede_settled_run).
+        lead_turn_live = False
         if unknown_alias_pending:
             state = _hold_pending_batch(state, provider, session)
         lifecycle_source = source.kind in {"subagent_started", "subagent_stopped"}
@@ -804,7 +810,9 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             try:
                 recovered = claude_recovered_lead_event(scoped, session, project, environ)
             except Exception:
-                if source.kind == "stop_requested" and scoped.active_run is not None:
+                if explicit:
+                    unverified = True
+                elif source.kind == "stop_requested" and scoped.active_run is not None:
                     return state, (_claude_native_stop_guard(source,
                         "Symphony could not verify the tracked lead's native Claude result. "
                         "Return to this session after its result is available.",
@@ -813,18 +821,26 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, recovered)
+            if source.kind == "user_prompt":
+                scoped = _scope_state(state, f"claude:{session}", session, provider)
+                lead_turn_live = _claude_turn_live(scoped, session, project, environ)
             if source.kind == "stop_requested":
                 scoped = _scope_state(state, f"claude:{session}", session, provider)
                 try:
                     freshness, native_turn = claude_completing_lead_turn(
                         scoped, session, project, environ)
                 except Exception:
-                    if scoped.active_run is not None:
-                        return state, (_claude_native_stop_guard(source,
-                            _claude_unknown_turn_guidance(scoped.active_run),
-                            'claude_lead_turn_unverified'), acknowledged)
-                    freshness, native_turn = "none", None
-                if freshness == "unknown":
+                    freshness, native_turn = ("failed" if scoped.active_run is not None else "none"), None
+                # The user's stop closes a run it cannot verify, but never one
+                # whose lead is visibly mid-turn: that waits like running work.
+                if freshness in {"unknown", "failed"} and explicit and not _claude_turn_live(
+                        scoped, session, project, environ):
+                    unverified = True
+                elif freshness == "failed":
+                    return state, (_claude_native_stop_guard(source,
+                        _claude_unknown_turn_guidance(scoped.active_run),
+                        'claude_lead_turn_unverified'), acknowledged)
+                elif freshness == "unknown":
                     return state, (_claude_native_stop_guard(source,
                         _claude_unknown_turn_guidance(scoped.active_run),
                         'claude_lead_turn_unknown'), acknowledged)
@@ -841,7 +857,9 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             try:
                 recovered = codex_recovered_lead_event(scoped, session, environ)
             except Exception:
-                if source.kind == "stop_requested" and scoped.active_run is not None:
+                if explicit:
+                    unverified = True
+                elif source.kind == "stop_requested" and scoped.active_run is not None:
                     return state, ((Action("block_stop", {"reason":
                         "Symphony could not verify the tracked lead's native Codex result. "
                         "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping',
@@ -850,18 +868,28 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, recovered)
+            if source.kind == "user_prompt":
+                scoped = _scope_state(state, f"codex:{session}", session, provider)
+                lead_turn_live = _codex_turn_live(scoped, session, environ)
             if source.kind == "stop_requested":
                 scoped = _scope_state(state, f"codex:{session}", session, provider)
                 try:
                     freshness, native_turn = codex_completing_lead_turn(scoped, session, environ)
                 except Exception:
-                    if scoped.active_run is not None:
+                    if scoped.active_run is not None and not (
+                            explicit and not _codex_turn_live(scoped, session, environ)):
                         return state, ((Action("block_stop", {"reason":
                             "Symphony could not verify the tracked lead's latest native Codex turn. "
                             "Return to this session after its result is available.", 'recovery_kind': 'bookkeeping',
                             'recovery_signal': 'codex_lead_turn_unverified'}),), acknowledged)
+                    unverified = scoped.active_run is not None
                     freshness, native_turn = "none", None
-                if freshness in {"running", "unknown"}:
+                # As on Claude: the user's stop never closes a visibly live turn.
+                # A newer turn that aborted reads "running" here but is not live.
+                if (freshness in {"running", "unknown"} and explicit
+                        and not _codex_turn_live(scoped, session, environ)):
+                    unverified = True
+                elif freshness in {"running", "unknown"}:
                     reason = ("The tracked lead has a newer native turn still running. "
                               "Wait for its result before completing this run."
                               if freshness == "running" else
@@ -883,7 +911,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             if lifecycle_source:
                 actions = source_actions
             else:
-                state, actions = dispatch(state, source)
+                state, actions = dispatch(state, replace(source, payload={
+                    **source.payload, "lead_turn_live": True}) if lead_turn_live else source)
             if not unresolved:
                 before_finish = state
                 state = _finish_pending_batch(state, provider, session, source)
@@ -904,7 +933,9 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                                     for item in run.delegations)):
                     evidence = replace(scoped, active_run=replace(run, outcome={"status": "completed"}))
                     order = assessed_completion_chronology(evidence, session, project, environ)
-                    if order != "valid":
+                    if order != "valid" and explicit:
+                        unverified = True
+                    elif order != "valid":
                         turns = run.assessment.get("_terminal_turns", {}).get(run.lead_identity, ())
                         token = turns[-1] if turns else ""
                         failed = _derived(scoped, source, "lead_failed", {
@@ -924,7 +955,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                             'recovery_signal': 'completion_order_' + order}),), acknowledged)
                     if run.outcome != evidence.active_run.outcome:
                         state = _merge_scope(state, scoped, evidence, f"{provider}:{session}", provider, session)
-            state, actions = dispatch(state, source)
+            state, actions = dispatch(state, replace(source, payload={
+                **source.payload, "native_unverified": True}) if unverified else source)
         # Unresolved evidence stays private and grants nothing; telling the
         # model about it on every prompt only invited narration of internals.
         return state, (actions, acknowledged)
@@ -1884,10 +1916,11 @@ def _transition(
 
     if source.kind == "user_prompt":
         prompt_text = str(source.payload.get("prompt") or "").strip()
-        if _parse_control(prompt_text) is None:
+        control = _parse_control(prompt_text)
+        if control is None or control[0] == "start" and control[1]:
             # Close a settled run first: its queued notes must not reach the
-            # model after the user has moved on.
-            state = _supersede_settled_run(state, source, prompt_text)
+            # model after the user has moved on, whether in prose or `start`.
+            state = _supersede_settled_run(state, source, control[1] if control else prompt_text)
         state, deferred = _consume_parent_actions(state)
         actions += deferred
         state, prompt_actions = _handle_prompt(state, source, provider, environ)
@@ -2193,16 +2226,26 @@ def _supersede_settled_run(state: ProjectState, source: Event, prompt: str) -> P
     keeps the context, so continuing the same work loses nothing.
     """
     run = state.active_run
-    # An active or completing run may still have a live native turn whose
-    # callback is late; the normal Stop checks that before archiving.
+    # An active run may still have a live native turn whose callback is late.
+    # A completing run whose lead reported is finished: the root's Stop
+    # normally archives it, and when Symphony cannot verify that lead's turn
+    # the run otherwise held every later task, on either host. It stays open
+    # only while its lead is visibly in a newer turn. By the user's next
+    # prompt the root's turn has ended, so a child launch still unconfirmed
+    # never started (refused or interrupted); a host reports a start within
+    # seconds, so this cannot drop live work.
     # A run between its assessment and its lead is mid-pipeline: the user's
     # "go ahead", or a hand-back delivered as a prompt, continues it.
+    finished = run is not None and run.status == "completing" and bool(run.outcome)
     if (not run or not prompt or prompt.lstrip().startswith(_AUTOMATIC_PROMPTS)
-            or not run.lead_identity or run.status in {"active", "completing"}
-            or _active_identities(run) or run.assessment.get("_pending_delegations")
+            or not run.lead_identity or run.status == "active"
+            or (run.status == "completing" and (not finished or source.payload.get("lead_turn_live")))
+            or _active_identities(run)
+            or (run.assessment.get("_pending_delegations") and not finished)
             or run.assessment.get("_batch_pending")):
         return state
-    status = ("completed" if _stop_block_reason(run) is None
+    status = ("superseded" if run.status == "completing"
+              else "completed" if _stop_block_reason(run) is None
               else "blocked" if run.assessment.get("_reported_nonsuccess") else "superseded")
     archived = replace(run, status=status, updated_at=source.observed_at)
     return replace(state, active_run=None, recent_runs=(*state.recent_runs, archived)[-20:])
@@ -3993,9 +4036,9 @@ def _prepare_delegation(
             return state, (_block_tool("Recover the fast lead's decision before another lead can start."),)
         if state.active_run.status == "completing" and state.active_run.lead_identity:
             return state, (_block_tool(
-                "The tracked lead has already completed this run. Invoke the normal "
-                f"`{_control_name('stop', provider)}` control to verify and archive it "
-                "before starting another task."
+                "The tracked lead has already completed this run, and Symphony still holds it. "
+                f"Only a `{_control_name('stop', provider)}` typed by the user closes it; invoking "
+                "it yourself does nothing. Ask the user to type it, then retry this lead."
             ),)
         if state.active_run.assessment.get("_fast_escalated") and not state.active_run.assessment.get("size"):
             return state, (_block_tool("The fast lead escalated. Wait for an independent accepted assessment before another lead starts."),)
@@ -5018,6 +5061,21 @@ def _governance(state: ProjectState) -> str:
     every prompt after the first quietly runs at the session's own model.
     """
     return "enabled" if state.enabled else "transactional"
+
+
+def _claude_turn_live(state: ProjectState, session: str, project: Path,
+                      environ: Mapping[str, str]) -> bool:
+    try:
+        return claude_lead_turn_running(state, session, project, environ)
+    except Exception:
+        return False
+
+
+def _codex_turn_live(state: ProjectState, session: str, environ: Mapping[str, str]) -> bool:
+    try:
+        return codex_lead_turn_running(state, session, environ)
+    except Exception:
+        return False
 
 
 def _claude_native_stop_guard(source: Event, reason: str,

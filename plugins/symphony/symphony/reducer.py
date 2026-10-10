@@ -648,13 +648,14 @@ def _stop_requested(state: ProjectState, event: Event):
         # abandoned the live run, so the lead spawn was refused and the
         # assessment had to be repeated. The run stays open.
         return state, (Action("permit_stop"),)
+    explicit = event.payload.get("control") is True
     reason = _stop_block_reason(run)
-    if reason is None:
+    if reason is None and not event.payload.get("native_unverified"):
         return _archive(state, run, "completed", event.observed_at), (
             Action("archive_run", {"run_id": run.run_id}),
             Action("permit_stop"),
         )
-    explicit = event.payload.get("control") is True
+    reason = reason or {"reason": "native evidence unverified"}
     if (reason.get("reason") in {"lead_not_started", "lead_outcome_missing", "substantive_child_missing"}
             and run.assessment.get("_awaiting_route_consent")):
         # A lead launch is held for the user's consent to a weaker route. Only
@@ -678,6 +679,12 @@ def _stop_requested(state: ProjectState, event: Event):
             return _archive(state, blocked, "blocked", event.observed_at), (
                 Action("archive_run", {"run_id": run.run_id}), Action("permit_stop"))
         return state, (Action("permit_stop"),)
+    if explicit and not _active_identities(run):
+        # Nothing tracked is running; only Symphony's own bookkeeping or
+        # evidence it cannot verify holds the run. The user's stop must take,
+        # or they are left with --force alone. It never claims completion.
+        return _archive(state, run, "stopped", event.observed_at), (
+            Action("archive_run", {"run_id": run.run_id}), Action("permit_stop"))
     if (event.payload.get('provider') in {'claude', 'codex'}
             and event.payload.get('hook_event_name') == 'Stop'
             and event.payload.get('stop_hook_active') is True):

@@ -266,10 +266,15 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
         for value in (False, 'true', 1):
             blocked = handle({**request, 'stop_hook_active': value}, self.environ)
             self.assertEqual(json.loads(blocked.stdout).get('decision'), 'block')
+        before = self.store.load(self.project)
+        # The user's own stop closes the run it cannot verify, never as completed.
         explicit = handle({**request, 'hook_event_name': 'UserPromptSubmit',
                            'prompt': '/symphony:stop', 'stop_hook_active': True}, self.environ)
-        self.assertEqual(json.loads(explicit.stdout).get('decision'), 'block')
-        before = self.store.load(self.project)
+        self.assertNotEqual(json.loads(explicit.stdout or '{}').get('decision'), 'block')
+        stopped = self.store.load(self.project)
+        self.assertIsNone(stopped.active_run)
+        self.assertEqual('stopped', stopped.recent_runs[-1].status)
+        self.store.save(self.project, before)
         released = handle({**request, 'stop_hook_active': True}, self.environ)
         self.assertEqual(set(json.loads(released.stdout)), {'systemMessage'})
         self.assertNotIn('additionalContext', released.stdout)

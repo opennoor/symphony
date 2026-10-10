@@ -2073,7 +2073,8 @@ class RuntimeTests(unittest.TestCase):
                                                choice["model"], choice["effort"]),))
         self.seed_run(run)
         with patch.object(runtime_module, "codex_completing_lead_turn",
-                          return_value=("running", None)):
+                          return_value=("running", None)), \
+                patch.object(runtime_module, "codex_lead_turn_running", return_value=True):
             blocked = handle(self.payload("$symphony:symphony stop"), self.environ)
         self.assertEqual("block", self.output(blocked)["decision"])
         self.assertIn("newer native turn still running", self.output(blocked)["reason"])

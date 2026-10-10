@@ -648,6 +648,30 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertIsNone(archived.active_run)
         self.assertEqual(archived.recent_runs[-1].status, "completed")
 
+    def test_the_users_stop_closes_a_run_held_only_by_bookkeeping(self):
+        state = running_state(status="completing", outcome={"status": "completed"},
+                              delegations=[delegation("lead-1", "completed", "lead")])
+        state = replace(state, active_run=replace(state.active_run, assessment={
+            "_pending_delegations": [{"role": "worker"}]}))
+        held, actions = reduce(state, event("stop_requested"))
+        self.assertIsNotNone(held.active_run)
+        self.assertEqual("block_stop", actions[0].kind)
+        closed, actions = reduce(state, event("stop_requested", control=True))
+        self.assertIsNone(closed.active_run)
+        self.assertEqual("stopped", closed.recent_runs[-1].status)
+        self.assertEqual(["archive_run", "permit_stop"], [action.kind for action in actions])
+        running = replace(state, active_run=replace(state.active_run, delegations=(
+            delegation("lead-1", "completed", "lead"), delegation("worker-1"))))
+        kept, actions = reduce(running, event("stop_requested", control=True))
+        self.assertIsNotNone(kept.active_run)
+        self.assertEqual("block_stop", actions[0].kind)
+        # An ambiguous callback reason must not hide a lead that is working.
+        masked = replace(state, active_run=replace(state.active_run, status="active", delegations=(
+            delegation("lead-1", "working", "lead"),), assessment={"_ambiguous_child_starts": ("old",)}))
+        kept, actions = reduce(masked, event("stop_requested", control=True))
+        self.assertIsNotNone(kept.active_run)
+        self.assertEqual("block_stop", actions[0].kind)
+
     def test_replacement_lead_cannot_archive_ambiguous_old_start(self):
         state = running_state(
             lead="new-lead",
