@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.9.8 — prepared 2026-10-13
+
+- Fix a finished run that 1.9.7 still let refuse later leads, on Claude Code and Codex. Callbacks from an archived run's agents that Symphony could not place were kept as unresolved evidence. They held a reconciliation flag on every later run, so the next prompt skipped the run and the next lead was refused with "only a stop you type closes it". Even a typed stop was refused. Now a finished run (lead reported, nothing tracked running, lead not visibly mid-turn) yields whenever new work starts: a prompt, a `start` control, an assessor spawn or a lead spawn. It is recorded as superseded, never completed.
+- A typed stop now closes a run despite retained unresolved evidence when nothing tracked is running and no lead is visibly mid-turn. This holds even after the run is archived or the retained inbox has overflowed. The evidence stays queued for its real owner and is never discarded. A native Stop still waits on it.
+
 ## 1.9.7 — prepared 2026-10-10
 
 - Fix a finished run that refused every later task, on Claude Code and Codex. When Symphony could not verify the lead's latest turn, or a child launch was never confirmed, the run stayed "completing" for good. Claude Code rewrites a resumed agent's metadata without its launch ID, which is one way the turn becomes unverifiable. Every new lead was then refused with "invoke stop to archive it", which the agent could not do itself. Now the user's next prompt, including a `start` control, closes a finished run. The new request is assessed fresh instead of inheriting the old route. The run stays open only while its lead is visibly in a newer turn: on Claude this is read from the lead's own transcript, on Codex from the native turn record.
