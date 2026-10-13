@@ -801,7 +801,16 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
         unresolved_reason = _unresolved_child_guidance(
             state, provider, session, tuple(event for event, _, _ in batch
                                            if event.event_id not in acknowledged)) if unresolved else ""
-        if source.kind == "stop_requested" and unresolved:
+        idle = _scope_state(state, f"{provider}:{session}", session, provider).active_run
+        archived_only = idle is None and any(run.provider == provider and run.session_id == session
+                                             for run in state.recent_runs)
+        if (source.kind == "stop_requested" and unresolved and explicit
+                and (archived_only or idle is not None and not _active_identities(idle)
+                     and not _turn_live(state, provider, session, project, environ))):
+            # Nothing tracked is running: retained evidence stays queued, and
+            # the user's stop closes any run as stopped, never completed.
+            unverified = True
+        elif source.kind == "stop_requested" and unresolved:
             return state, (_claude_native_stop_guard(source, unresolved_reason,
                                                      'unresolved_child_evidence'), acknowledged)
         if (not unresolved and provider == "claude"
@@ -821,9 +830,6 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, recovered)
-            if source.kind == "user_prompt":
-                scoped = _scope_state(state, f"claude:{session}", session, provider)
-                lead_turn_live = _claude_turn_live(scoped, session, project, environ)
             if source.kind == "stop_requested":
                 scoped = _scope_state(state, f"claude:{session}", session, provider)
                 try:
@@ -868,9 +874,6 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             if recovered is not None:
                 state = _hold_pending_batch(state, provider, session)
                 state, _ = dispatch(state, recovered)
-            if source.kind == "user_prompt":
-                scoped = _scope_state(state, f"codex:{session}", session, provider)
-                lead_turn_live = _codex_turn_live(scoped, session, environ)
             if source.kind == "stop_requested":
                 scoped = _scope_state(state, f"codex:{session}", session, provider)
                 try:
@@ -901,6 +904,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 if native_turn is not None:
                     state = _hold_pending_batch(state, provider, session)
                     state, _ = dispatch(state, native_turn)
+        if source.kind in {"user_prompt", "pre_tool_use"}:
+            lead_turn_live = _turn_live(state, provider, session, project, environ)
         # A new turn delivered in this same hook can supersede an earlier
         # queued completion. Include it before releasing the archive hold.
         if source.kind != "stop_requested":
@@ -1167,9 +1172,11 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     if source.kind in {"subagent_started", "subagent_stopped"}:
                         store.queue_session_event(provider, session, source)
                         return HookResult()
-                    if source.kind == 'stop_requested':
+                    if source.kind == 'stop_requested' and source.payload.get('control') is not True:
                         return render(provider, _claude_native_stop_guard(
                             source, reason, 'pending_event_overflow'), 'Stop')
+                    # The user's own stop decides in the transition: it closes
+                    # a run with nothing tracked running, and waits otherwise.
                     # Retained overflow withholds archival, not normal tools
                     # in a verified root. Its ordinary routing guards still
                     # decide which operations may run.
@@ -2217,6 +2224,28 @@ def _reconcile_session(
 _AUTOMATIC_PROMPTS = ('<hook_prompt', '<task-notification', '<subagent_notification')
 
 
+def _finished_run(run: RunState | None, source: Event) -> bool:
+    """A run whose lead reported and that has nothing left to wait for.
+
+    The root's Stop normally archives it. When that cannot happen (the lead's
+    turn is unverifiable, a launch was never confirmed, or a reconciliation
+    hold outlived its batch) the run otherwise refused every later lead until
+    the user typed stop. Only a lead visibly in a newer turn keeps it open: a
+    later result still arrives as an archived follow-up.
+    """
+    return (run is not None and run.status == "completing" and bool(run.outcome) and bool(run.lead_identity)
+            and not _active_identities(run) and not source.payload.get("lead_turn_live")
+            and not run.assessment.get("_fast_pending") and not run.assessment.get("_fast_escalated"))
+
+
+def _close_finished_run(state: ProjectState, source: Event) -> ProjectState:
+    """New work closes a finished run, recorded as superseded, never completed."""
+    if not _finished_run(state.active_run, source):
+        return state
+    archived = replace(state.active_run, status="superseded", updated_at=source.observed_at)
+    return replace(state, active_run=None, recent_runs=(*state.recent_runs, archived)[-20:])
+
+
 def _supersede_settled_run(state: ProjectState, source: Event, prompt: str) -> ProjectState:
     """A new user prompt closes a run with nothing left running.
 
@@ -2226,26 +2255,20 @@ def _supersede_settled_run(state: ProjectState, source: Event, prompt: str) -> P
     keeps the context, so continuing the same work loses nothing.
     """
     run = state.active_run
+    if not run or not prompt or prompt.lstrip().startswith(_AUTOMATIC_PROMPTS):
+        return state
+    # By the user's next prompt the root's turn has ended, so a child launch
+    # still unconfirmed never started (refused or interrupted), and a
+    # reconciliation hold belongs to the finished run, not to the new task.
+    if run.status == "completing":
+        return _close_finished_run(state, source)
     # An active run may still have a live native turn whose callback is late.
-    # A completing run whose lead reported is finished: the root's Stop
-    # normally archives it, and when Symphony cannot verify that lead's turn
-    # the run otherwise held every later task, on either host. It stays open
-    # only while its lead is visibly in a newer turn. By the user's next
-    # prompt the root's turn has ended, so a child launch still unconfirmed
-    # never started (refused or interrupted); a host reports a start within
-    # seconds, so this cannot drop live work.
     # A run between its assessment and its lead is mid-pipeline: the user's
     # "go ahead", or a hand-back delivered as a prompt, continues it.
-    finished = run is not None and run.status == "completing" and bool(run.outcome)
-    if (not run or not prompt or prompt.lstrip().startswith(_AUTOMATIC_PROMPTS)
-            or not run.lead_identity or run.status == "active"
-            or (run.status == "completing" and (not finished or source.payload.get("lead_turn_live")))
-            or _active_identities(run)
-            or (run.assessment.get("_pending_delegations") and not finished)
-            or run.assessment.get("_batch_pending")):
+    if (not run.lead_identity or run.status == "active" or _active_identities(run)
+            or run.assessment.get("_pending_delegations") or run.assessment.get("_batch_pending")):
         return state
-    status = ("superseded" if run.status == "completing"
-              else "completed" if _stop_block_reason(run) is None
+    status = ("completed" if _stop_block_reason(run) is None
               else "blocked" if run.assessment.get("_reported_nonsuccess") else "superseded")
     archived = replace(run, status=status, updated_at=source.observed_at)
     return replace(state, active_run=None, recent_runs=(*state.recent_runs, archived)[-20:])
@@ -3960,6 +3983,9 @@ def _prepare_delegation(
     if _applied_profile(state, provider) == NO_PROFILE:
         return state, ()
     fast_launch = role == "lead" and _marker_value(values, "SYMPHONY_FAST_ROUTE:") == "lead"
+    if role in {"assessor", "lead"}:
+        # Sizing or leading new work: a finished run must not capture it.
+        state = _close_finished_run(state, source)
     if not state.active_run and role != "assessor" and not fast_launch:
         if role != "lead" or _assessment_from_marker(values, "SYMPHONY_ROUTE:") is None:
             # Best effort: a child Symphony cannot place still runs, unmanaged.
@@ -5069,6 +5095,14 @@ def _claude_turn_live(state: ProjectState, session: str, project: Path,
         return claude_lead_turn_running(state, session, project, environ)
     except Exception:
         return False
+
+
+def _turn_live(state: ProjectState, provider: str, session: str, project: Path,
+               environ: Mapping[str, str]) -> bool:
+    """Whether this session's completed lead is visibly in a newer turn."""
+    scoped = _scope_state(state, f"{provider}:{session}", session, provider)
+    return (_claude_turn_live(scoped, session, project, environ) if provider == "claude"
+            else _codex_turn_live(scoped, session, environ))
 
 
 def _codex_turn_live(state: ProjectState, session: str, environ: Mapping[str, str]) -> bool:

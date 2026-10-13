@@ -332,6 +332,93 @@ class SizedTaskContinuationTests(unittest.TestCase):
                     self.assertNotIn('"decision": "block"', launched.stdout)
                     self.assertNotIn('"deny"', launched.stdout)
 
+    def finished_run(self, provider, **assessment):
+        """lexi, 2026-10-13: the lead reported, but a reconciliation hold
+        outlived its batch, so every path that closes a finished run skipped it."""
+        lead = Delegation("a2ff9fa5055697d4f", "lead", "old task", "completed", "m", "medium")
+        run = RunState("old", "old task", session_id="root", provider=provider, status="completing",
+                       lead_identity=lead.identity, delegations=(lead,), outcome={"status": "completed"},
+                       assessment={"size": "medium", "complexity": "mixed", "_batch_pending": True, **assessment})
+        self.store.save(self.project, replace(self.store.load(self.project), enabled=True, active_run=run,
+                                              active_runs={f"{provider}:root": run}))
+
+    def test_new_work_closes_a_finished_run_whatever_its_bookkeeping(self):
+        from plugins.symphony.symphony.routing import assessor_selection, snapshot_for
+        for provider in ("codex", "claude"):
+            snapshot = snapshot_for(provider, profiles_for(provider)[0]["id"])
+            for start in ("prompt", "assessor", "lead"):
+                with self.subTest(provider=provider, start=start):
+                    self.setUp()
+                    self.send(provider, "SessionStart")
+                    self.finished_run(provider, _pending_delegations=[{"role": "worker"}])
+                    if start == "prompt":
+                        result = self.send(provider, "UserPromptSubmit", prompt="Start Phase A")
+                    elif start == "assessor":
+                        result = self.spawn(provider, "assessor", assessor_selection(snapshot, "off"))
+                    else:
+                        result = self.spawn(provider, "lead", snapshot.matrix["small/simple"], self.MARKER)
+                    self.assertNotIn('"deny"', result.stdout)
+                    self.assertNotIn("already completed this run", result.stdout)
+                    state = self.store.load(self.project)
+                    self.assertEqual("superseded", state.recent_runs[-1].status)
+                    self.assertEqual("old", state.recent_runs[-1].run_id)
+                    if start != "prompt":
+                        self.assertNotEqual("old", state.active_run.run_id)  # the new work has its own run
+
+    def test_orphaned_evidence_never_pins_a_finished_run_or_the_users_stop(self):
+        # lexi, 2026-10-13: callbacks from an archived lead's agents could not
+        # be placed. Retained as unresolved, they held every later run open
+        # and refused even a typed stop. They stay queued, but hold nothing.
+        from plugins.symphony.symphony.adapters import event_from_payload
+        for provider in ("codex", "claude"):
+            for close in ("prompt", "stop", "overflow"):
+                with self.subTest(provider=provider, close=close):
+                    self.setUp()
+                    self.send(provider, "SessionStart")
+                    self.finished_run(provider)
+                    orphan = event_from_payload(provider, {
+                        "session_id": "root", "hook_event_name": "SubagentStop", "agent_id": "orphan-lead",
+                        "last_assistant_message": "Both PRs are revised and remain open."
+                                                  + ("x" * 140_000 if close == "overflow" else "")})
+                    with self.store.session_lock(provider, "root"):
+                        self.store.queue_session_event(provider, "root", orphan, ambiguous_owner=True)
+                    if close == "overflow":
+                        self.assertTrue(self.store.session_record(provider, "root")["overflow"])
+                        # No other blocker: only the overflow could make this claim completion.
+                        state = self.store.load(self.project)
+                        clean = replace(state.active_run, assessment={
+                            k: v for k, v in state.active_run.assessment.items() if k != "_batch_pending"})
+                        self.store.save(self.project, replace(state, active_run=clean,
+                                                              active_runs={f"{provider}:root": clean}))
+                    prompt = ("Start Phase A" if close == "prompt" else
+                              "/symphony:stop" if provider == "claude" else "$symphony:symphony stop")
+                    result = self.send(provider, "UserPromptSubmit", prompt=prompt)
+                    self.assertNotIn('"decision": "block"', result.stdout)
+                    state = self.store.load(self.project)
+                    self.assertIsNone(state.active_run)
+                    self.assertEqual(("old", "superseded" if close == "prompt" else "stopped"),
+                                     (state.recent_runs[-1].run_id, state.recent_runs[-1].status))
+                    retained = self.store.session_record(provider, "root")
+                    self.assertTrue(retained["pending"] or retained["overflow"])  # evidence is kept
+                    # With only archived runs left, a typed stop is never refused either.
+                    again = self.send(provider, "UserPromptSubmit", prompt=(
+                        "/symphony:stop" if provider == "claude" else "$symphony:symphony stop"))
+                    self.assertNotIn('"decision": "block"', again.stdout)
+
+    def test_a_finished_run_whose_lead_is_visibly_mid_turn_keeps_its_lead_guard(self):
+        from unittest.mock import patch
+        from plugins.symphony.symphony.routing import snapshot_for
+        for provider, target in (("codex", "codex_lead_turn_running"), ("claude", "claude_lead_turn_running")):
+            with self.subTest(provider=provider):
+                self.setUp()
+                self.send(provider, "SessionStart")
+                self.finished_run(provider)
+                lead = snapshot_for(provider, profiles_for(provider)[0]["id"]).matrix["small/simple"]
+                with patch(f"plugins.symphony.symphony.runtime.{target}", return_value=True):
+                    result = self.spawn(provider, "lead", lead, self.MARKER)
+                self.assertIn("already completed this run", result.stdout)
+                self.assertEqual("old", self.store.load(self.project).active_run.run_id)
+
     def test_a_lead_with_a_valid_route_is_never_refused_for_a_missing_run(self):
         for provider in ("codex", "claude"):
             with self.subTest(provider=provider):

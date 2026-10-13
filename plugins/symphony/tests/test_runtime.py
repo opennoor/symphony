@@ -2254,7 +2254,7 @@ class RuntimeTests(unittest.TestCase):
                                 expected += f" (high risk: `{high['lead_model']}/{high['lead_effort']}`)"
                             self.assertIn(expected, emitted)
 
-    def test_completing_run_denies_new_lead_spawn_but_preserves_other_work(self):
+    def test_a_new_lead_closes_its_finished_run_but_preserves_other_work(self):
         marker = ('SYMPHONY_ROUTE: {"size":"small","complexity":"simple",'
                   '"risk":"normal","rationale":"test","topology":"direct"}')
         for provider in ("codex", "claude"):
@@ -2297,21 +2297,14 @@ class RuntimeTests(unittest.TestCase):
                             return handle(hook, environ)
                     return handle(hook, environ)
 
-                denied = spawn(original.session_id)
-                decision = self.output(denied)
-                if provider == "claude":
-                    self.assertEqual("deny", decision["hookSpecificOutput"]["permissionDecision"])
-                    reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
-                    sibling_decision = self.output(spawn("other-session"))
-                    self.assertNotEqual("deny", sibling_decision.get("hookSpecificOutput", {})
-                                        .get("permissionDecision"))
-                else:
-                    self.assertEqual("block", decision.get("decision"))
-                    reason = decision.get("reason", "")
-                    self.assertNotEqual("block", self.output(spawn("other-session")).get("decision"))
-                self.assertIn("stop", reason.lower())
+                # The finished run yields: the new lead is never refused for it.
+                decision = self.output(spawn(original.session_id))
+                self.assertNotEqual("deny", decision.get("hookSpecificOutput", {}).get("permissionDecision"))
+                self.assertNotEqual("block", decision.get("decision"))
                 stored = StateStore(self.state_root).load(self.project)
-                self.assertEqual("completing", stored.active_runs[f"{provider}:{original.session_id}"].status)
+                self.assertNotEqual("original", stored.active_runs[f"{provider}:{original.session_id}"].run_id)
+                self.assertIn(("original", "superseded"), [(run.run_id, run.status) for run in stored.recent_runs])
+                # Another session's run is untouched.
                 self.assertEqual("assessed", stored.active_runs[f"{provider}:other-session"].status)
 
                 recovering = replace(original, status="recovering", outcome=None)
