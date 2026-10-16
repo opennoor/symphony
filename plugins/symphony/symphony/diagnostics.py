@@ -40,6 +40,20 @@ SIGNALS = {
     'codex_lead_turn_unknown': "The lead's latest native Codex turn could not be matched to its start.",
     'codex_lead_turn_running': 'Stop arrived while the lead still had a newer native turn running.',
     'unresolved_child_evidence': 'A child event is queued that the current run must reconcile before completing.',
+    'unresolved_child_unknown_alias': 'A child session alias could not be assigned to a root run.',
+    'unresolved_child_generation': 'Queued evidence belongs to another session generation or a retired agent.',
+    'unresolved_child_fast_proof': 'A fast lead callback claims credit without matching native proof.',
+    'unresolved_child_followup_start': 'A resumed Claude lead start could not be distinguished from replay.',
+    'unresolved_child_archived_child': 'A managed child callback arrived after its run was archived.',
+    'unresolved_child_terminal_conflict': 'A child callback conflicts with an earlier terminal.',
+    'unresolved_child_scope': 'A child callback does not match the owning run scope.',
+    'unresolved_child_owner_conflict': 'Queued evidence has ambiguous run ownership.',
+    'unresolved_child_event_kind': 'Queued evidence has no supported child lifecycle event kind.',
+    'unresolved_child_no_identity': 'Queued child evidence has no agent identity.',
+    'unresolved_child_no_run': 'Queued child evidence has no active run or proven fresh fast start.',
+    'unresolved_child_parent': 'The child parent does not match a tracked agent in the run.',
+    'unresolved_child_session': 'The child session does not match a tracked agent in the run.',
+    'unresolved_child_untracked': 'The child has no tracked launch or pending delegation in the run.',
     'child_owner_unresolved': 'A child result arrived whose root session could not be proven.',
     'owner_state_unavailable': "The root session's project state snapshot was unavailable during Stop.",
     'owner_state_conflict': 'One root session appeared active in more than one project state.',
@@ -408,11 +422,13 @@ def issue_body(record: dict) -> str:
         meanings.append('- `(schema 1)`: recorded by a Symphony build before 1.8.0, which kept only the '
                         'category and outcome.')
     return ('## Sanitized Symphony diagnostic report\n\n'
-            'Shared with user approval. Each row counts one kind of lifecycle event that Symphony deferred, '
+            'Shared with user approval. Counts are hook observations, not unique child events. '
+            'Each row records one kind of lifecycle event that Symphony deferred, '
             'retained, or recovered. **deferred** means Symphony released the host turn without settling the '
             'run; **retained** means evidence was kept for a later owner; **recovered** means it settled. '
             'No task text, transcripts, paths, or session IDs are included; *Site* is the Symphony '
-            'function and line that recorded the event.\n\n'
+            'function and line that recorded the event. An `unresolved_child_*` signal names the first guard '
+            'that held completion during that Stop.\n\n'
             + '\n'.join(table) + '\n\n### What the signals mean\n\n' + '\n'.join(meanings)
             + '\n\n### Triage\n\n'
               '1. Check out the reported version and open each *Site*.\n'

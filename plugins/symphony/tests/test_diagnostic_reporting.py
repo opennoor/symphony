@@ -212,6 +212,16 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.assertEqual(d.signature([row]), d.signature([later, retained]))
         self.assertNotEqual(d.signature([row]), d.signature([{**row, 'site': 'runtime.handle:9'}]))
 
+    def test_unresolved_child_reason_is_explained_without_private_evidence(self):
+        self.store.record_recovery_diagnostic({
+            'schema': 2, 'plugin_version': '1.9.8', 'provider': 'claude', 'platform': 'windows',
+            'category': 'bookkeeping', 'outcome': 'deferred', 'hook': 'Stop',
+            'signal': 'unresolved_child_owner_conflict', 'detail': '', 'site': ''})
+        body = d.issue_body({'id': 'a' * 32, 'reports': d.snapshot(self.store)})
+        self.assertIn(d.SIGNALS['unresolved_child_owner_conflict'], body)
+        self.assertIn('Counts are hook observations, not unique child events', body)
+        self.assertNotIn(str(self.project), body)
+
     def test_retained_evidence_never_starts_a_sharing_offer(self):
         (self.store.root / 'diagnostics').mkdir(exist_ok=True)
         for path in (self.store.root / 'diagnostics').glob('*.json'):

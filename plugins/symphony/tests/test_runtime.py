@@ -1425,6 +1425,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(store.session_record("claude", "claude-session")["pending"]))
         self.assertIsNotNone(store.load(self.project).active_run)
 
+        from plugins.symphony.symphony import diagnostics
+        runtime_module.handle({**self.payload("", "claude"), "hook_event_name": "Stop"},
+                              self.claude_environ)
+        self.assertIn("unresolved_child_owner_conflict",
+                      {row["signal"] for row in diagnostics.snapshot(store)})
+
     def test_claude_pre_run_marked_child_conflict_still_blocks_stop(self):
         choice = route_choice(provider="claude")
         self.seed_run(RunState(
@@ -1464,7 +1470,7 @@ class RuntimeTests(unittest.TestCase):
         )
         state = StateStore(self.state_root).load(self.project)
 
-        self.assertEqual("hold", runtime_module._pending_child_disposition(
+        self.assertEqual("hold_owner_conflict", runtime_module._pending_child_disposition(
             state, event, "claude", run.session_id))
 
     def test_child_session_inbox_is_drained_by_its_verified_root_stop(self):
