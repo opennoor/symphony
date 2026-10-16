@@ -536,6 +536,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
     ) -> tuple[ProjectState, tuple[tuple[Action, ...], set[str]]]:
         acknowledged: set[str] = set()
         unresolved = unknown_alias_pending
+        unresolved_reasons = ['unknown_alias'] if unknown_alias_pending else []
         # The user's own stop closes a run Symphony cannot verify, as stopped.
         explicit = source.kind == "stop_requested" and source.payload.get("control") is True
         unverified = False
@@ -698,6 +699,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     continue
                 if event_generation != generation or identity in retired:
                     unresolved = True
+                    unresolved_reasons.append('generation')
                     continue
             if provider == "claude" and expected_owner:
                 scoped = _scope_state(state, f"claude:{expected_owner}", expected_owner, provider)
@@ -715,6 +717,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     if current:
                         store.queue_session_event(provider, session, event)
                     unresolved = True
+                    unresolved_reasons.append('fast_proof')
                     continue
             if (provider == "claude" and expected_owner
                     and _observed_role(event.payload) in {"", "lead"}
@@ -736,6 +739,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 if current:
                     store.queue_session_event(provider, session, event, ambiguous_owner=True)
                 unresolved = True
+                unresolved_reasons.append('followup_start')
                 continue
             if (provider == "claude" and expected_owner
                     and claude_committed_native_terminal_replay(
@@ -763,11 +767,13 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     # later root task cannot silently inherit either one.
                     store.queue_session_event(provider, session, event, ambiguous_owner=True)
                     unresolved = True
+                    unresolved_reasons.append('archived_child')
                     continue
                 if (expected_owner and _prior_child_terminal_conflict(
                         state, event, provider, expected_owner)):
                     store.queue_session_event(provider, session, event, ambiguous_owner=True)
                     unresolved = True
+                    unresolved_reasons.append('terminal_conflict')
                     continue
                 if (expected_owner and _run_scope(state, event, provider)
                         != (f"{provider}:{expected_owner}", expected_owner)):
@@ -776,6 +782,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     # terminal into another active run in the same file.
                     store.queue_session_event(provider, session, event, ambiguous_owner=True)
                     unresolved = True
+                    unresolved_reasons.append('scope')
                     continue
                 # Hold actual current lifecycle work through the whole batch;
                 # unrelated retained callbacks must not impose this hold.
@@ -792,6 +799,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             else:
                 if _pending_blocks_current_run(state, event, provider, session):
                     unresolved = True
+                    unresolved_reasons.append(disposition.removeprefix('hold_'))
                 else:
                     # Evidence for a run this hook does not own is kept for
                     # its owner. That is expected and never worth a report.
@@ -811,8 +819,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             # the user's stop closes any run as stopped, never completed.
             unverified = True
         elif source.kind == "stop_requested" and unresolved:
-            return state, (_claude_native_stop_guard(source, unresolved_reason,
-                                                     'unresolved_child_evidence'), acknowledged)
+            signal = 'unresolved_child_' + (unresolved_reasons[0] if unresolved_reasons else 'evidence')
+            return state, (_claude_native_stop_guard(source, unresolved_reason, signal), acknowledged)
         if (not unresolved and provider == "claude"
                 and source.kind in {"stop_requested", "user_prompt", "session_heartbeat"}):
             scoped = _scope_state(state, f"claude:{session}", session, provider)
@@ -1554,32 +1562,32 @@ def _pending_child_disposition(
     if _pre_run_unmanaged_claude_child(state, event, provider, session):
         return "stale"
     if event.payload.get("_symphony_owner_conflict"):
-        return "hold"
+        return "hold_owner_conflict"
     if event.kind not in {"subagent_started", "subagent_stopped"}:
-        return "hold"
+        return "hold_event_kind"
     identity = str(event.payload.get("agent_id") or event.payload.get("subagent_id") or "")
     if not identity:
-        return "hold"
+        return "hold_no_identity"
     run = state.active_runs.get(f"{provider}:{session}")
     if _committed_child_terminal_replay(state, event, provider, session, allow_active=True):
         return "stale"
     if _prior_child_terminal_conflict(state, event, provider, session):
-        return "hold"
+        return "hold_terminal_conflict"
     if run is None:
-        return "apply" if _fresh_fast_start(state, event, provider, session) else "hold"
+        return "apply" if _fresh_fast_start(state, event, provider, session) else "hold_no_run"
     if run.started_at and event.observed_at < run.started_at:
         return "stale"
     if _run_scope(state, event, provider) != (f"{provider}:{session}", session):
         # One project file can contain several roots with the same child or
         # parent ID. Never ACK an event dispatch would reject or misroute.
-        return "hold"
+        return "hold_scope"
     parent = str(event.payload.get("parent_thread_id") or "")
     known = {run.session_id, run.lead_identity,
              *(item.identity for item in run.delegations)}
     if parent and parent not in known:
-        return "hold"
+        return "hold_parent"
     if not parent and str(event.payload.get("session_id") or "") not in known:
-        return "hold"
+        return "hold_session"
     if identity in known:
         return "apply"
     if event.kind == "subagent_started":
@@ -1587,7 +1595,7 @@ def _pending_child_disposition(
         pending = run.assessment.get("_pending_delegations", ())
         if any(isinstance(item, Mapping) and item.get("role") == role for item in pending):
             return "apply"
-    return "hold"
+    return "hold_untracked"
 
 
 def _pre_run_unmanaged_claude_child(

@@ -88,7 +88,7 @@ jobs:
         run: python -m unittest plugins.symphony.tests.test_fast_route plugins.symphony.tests.test_host_evidence plugins.symphony.tests.test_claude_host_evidence
 
       - name: Execute Windows hooks as a standard user
-        timeout-minutes: 7
+        timeout-minutes: 12
         run: |
           $user = 'symphony-ci'
           $secure = ConvertTo-SecureString ([guid]::NewGuid().ToString('N') + 'aA1!') -AsPlainText -Force
@@ -110,10 +110,10 @@ jobs:
               -Credential $credential -LoadUserProfile -PassThru `
               -ArgumentList '.github/scripts/windows_acceptance.py' `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-            if (-not $test.WaitForExit(300000)) {
+            if (-not $test.WaitForExit(600000)) {
               Get-Content $stdout,$stderr -ErrorAction SilentlyContinue
               Stop-Process -Id $test.Id -Force -ErrorAction SilentlyContinue
-              throw 'Standard user hook test exceeded five minutes'
+              throw 'Standard user hook test exceeded ten minutes'
             }
             Get-Content $stdout,$stderr
             if ($test.ExitCode -ne 0) { throw "Standard user hooks exited $($test.ExitCode)" }

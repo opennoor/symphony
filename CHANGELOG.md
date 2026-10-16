@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.0 — prepared 2026-10-16
+
+- Make automatically shared reports identify the first fixed guard that held unresolved child evidence. The report records a safe reason code rather than task text or agent identifiers, so a later incident can be investigated without asking someone to capture it live.
+- Clarify that diagnostic counts are hook observations; repeated checks of one queued event do not imply distinct workers. This release adds diagnosis only. It does not change child reconciliation or the separate Windows state-lock timeout path.
+
 ## 1.9.8 — prepared 2026-10-13
 
 - Fix a finished run that 1.9.7 still let refuse later leads, on Claude Code and Codex. Callbacks from an archived run's agents that Symphony could not place were kept as unresolved evidence. They held a reconciliation flag on every later run, so the next prompt skipped the run and the next lead was refused with "only a stop you type closes it". Even a typed stop was refused. Now a finished run (lead reported, nothing tracked running, lead not visibly mid-turn) yields whenever new work starts: a prompt, a `start` control, an assessor spawn or a lead spawn. It is recorded as superseded, never completed.
