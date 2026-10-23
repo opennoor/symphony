@@ -3217,8 +3217,10 @@ def _observe_delegation(
         if not token and epoch:
             source = replace(source, event_id=f"{source.event_id}:terminal-epoch:{epoch}")
     pending: Mapping[str, object] = {}
-    if current is None:
-        state, pending = _consume_pending_delegation(state, source.payload)
+    if (current is None or (source.kind == "subagent_stopped" and current
+                           and not current.objective and source.payload.get("provider") == "claude"
+                           and _claude_child_launch_hash(source.payload, environ))):
+        state, pending = _consume_pending_delegation(state, source.payload, environ)
     if (
         source.payload.get("provider") == "claude"
         and current is None
@@ -4133,7 +4135,8 @@ def _prepare_delegation(
         # Freeze the accepted launch even when boost is off; a later control
         # changes subsequent assessors, not an already queued native spawn.
         launch_selection = dict(selected, model=model, effort=effort)
-    state = _queue_pending_delegation(state, role, objective, model, effort, launch_selection)
+    state = _queue_pending_delegation(state, role, objective, model, effort, launch_selection,
+                                      str(source.payload.get('tool_use_id') or ''))
     if provider == 'claude' and fast_launch:
         launch_id = source.payload.get('tool_use_id')
         if isinstance(launch_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,160}', launch_id):
@@ -4559,6 +4562,7 @@ def _queue_pending_delegation(
     model: str,
     effort: str,
     assessor_route: Mapping | None = None,
+    launch_id: str = "",
 ) -> ProjectState:
     if not state.active_run:
         return state
@@ -4572,6 +4576,8 @@ def _queue_pending_delegation(
             "effort": effort,
         }
     )
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,160}", launch_id):
+        pending[-1]["launch_hash"] = hashlib.sha256(launch_id.encode()).hexdigest()
     if assessor_route:
         pending[-1]["assessor_selection"] = dict(assessor_route)
         if assessor_route.get("requested_effort") != "high":
@@ -4584,6 +4590,7 @@ def _queue_pending_delegation(
 def _consume_pending_delegation(
     state: ProjectState,
     payload: Mapping[str, object],
+    environ: Mapping[str, str] | None = None,
 ) -> tuple[ProjectState, Mapping[str, object]]:
     if not state.active_run:
         return state, {}
@@ -4608,6 +4615,15 @@ def _consume_pending_delegation(
             )
         )
     ]
+    if payload.get("provider") == "claude" and matching:
+        launch_hash = _claude_child_launch_hash(payload, environ)
+        if launch_hash and any(pending[index].get("launch_hash") for index in matching):
+            matching = [index for index in matching
+                        if pending[index].get("launch_hash") == launch_hash]
+        elif len(matching) > 1:
+            # Same-route starts may arrive out of order. Wait for native
+            # launch metadata instead of assigning another child's objective.
+            return state, {}
     if matching:
         item = pending.pop(matching[0])
     elif len(pending) == 1 and not observed_role and payload.get("provider") != "claude":
@@ -4622,6 +4638,36 @@ def _consume_pending_delegation(
         assessment.pop("_pending_delegations", None)
     state = replace(state, active_run=replace(state.active_run, assessment=assessment))
     return state, item if isinstance(item, Mapping) else {}
+
+
+def _claude_child_launch_hash(payload: Mapping[str, object],
+                              environ: Mapping[str, str] | None) -> str:
+    if environ is None:
+        return ""
+    session = str(payload.get("session_id") or "")
+    identity = str(payload.get("agent_id") or payload.get("subagent_id") or "")
+    if not all(re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value) for value in (session, identity)):
+        return ""
+    projects = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    if projects.is_symlink() or not projects.is_dir():
+        return ""
+    paths = tuple(projects.glob(f"*/{session}/subagents/agent-{identity}.meta.json"))
+    if len(paths) != 1:
+        return ""
+    path = paths[0]
+    try:
+        if (any(parent.is_symlink() for parent in (path, *path.parents[:3]))
+                or path.stat().st_size > 64 * 1024):
+            return ""
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return ""
+    if (not isinstance(meta, dict) or meta.get("spawnDepth") != 2
+            or meta.get("agentType") != payload.get("agent_type")):
+        return ""
+    launch_id = meta.get("toolUseId")
+    return (hashlib.sha256(launch_id.encode()).hexdigest()
+            if isinstance(launch_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", launch_id) else "")
 
 
 def _set_invalid_consultant(
@@ -4743,6 +4789,11 @@ def _render_actions(
             rendered.append(Action('inject_context', {'text': _substantive_recovery_guidance(state.active_run, provider)}))
         elif action.kind == "block_stop":
             text = _stop_block_text(action.payload, provider, scope)
+            if control_stop and action.payload.get("active"):
+                force = f"{_control_name('stop', provider)} --force"
+                text = (f"Tracked agents are still active in {scope}. Wait for their results, or ask the user "
+                        f"to type `{force}` to stop them and archive this run as interrupted. "
+                        "Do not report the work as completed.")
             if (action.payload.get('reason') == 'lead_not_started' and state.active_run
                     and isinstance(state.active_run.assessment.get('route'), Mapping)):
                 text += ' ' + _assessed_lead_guidance(state.active_run, provider)

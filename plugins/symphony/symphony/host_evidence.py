@@ -1071,7 +1071,13 @@ def _native_jsonl(path: Path) -> list[dict] | None:
             return None
         with path.open(encoding="utf-8") as stream:
             rows = [json.loads(line) for line in stream]
-        return rows if rows and all(isinstance(row, dict) for row in rows) else None
+        if not rows or not all(isinstance(row, dict) for row in rows):
+            return None
+        # Claude request diagnostics describe its API traffic, not native
+        # conversation turns, and omit child provenance fields.
+        rows = [row for row in rows if row.get("type") not in
+                {"api-request", "api-request-blob", "api-request-shape"}]
+        return rows or None
     except (OSError, TypeError, ValueError, UnicodeError):
         return None
 
