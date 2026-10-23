@@ -87,6 +87,15 @@ class ClaudeHostEvidenceTests(unittest.TestCase):
     def test_fast_report_without_a_handback_tool_completes_from_the_final_message(self):
         self.assert_fast_callback_archives(self.prepare_fast_handback_and_final(handback=False))
 
+    def test_fast_report_ignores_native_api_request_diagnostics(self):
+        callback = self.prepare_fast_handback_and_final(handback=False)
+        rows = [json.loads(line) for line in self.child.read_text().splitlines()]
+        diagnostics = [{"type": kind, "sessionId": SESSION, "agentId": LEAD}
+                       for kind in ("api-request-shape", "api-request-blob", "api-request")]
+        rows[-1:-1] = diagnostics
+        self.child.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.assert_fast_callback_archives(callback)
+
     def test_fast_report_without_a_handback_still_needs_one_decision_and_success(self):
         base = 'Merged.\nSYMPHONY_FAST_DECISION: eligible\n'
         for name, final in (('two-decisions', base + base + 'SYMPHONY_OUTCOME: {"status":"completed"}'),

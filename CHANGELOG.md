@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.10.1 — prepared 2026-10-23
+
+- Show the user the existing `stop --force` escape when a typed stop finds tracked children still active. Force stopping archives the run as interrupted, so a killed lead cannot leave the project trapped behind stale workers without a visible recovery path.
+- Bind parallel Claude children to their own queued objectives using the native Agent launch ID, including when child metadata arrives after `SubagentStart`. If the launch cannot be identified, leave the objective unassigned instead of swapping it with another child's work.
+- Ignore Claude's internal `api-request-*` transcript rows when proving a child's terminal turn. These rows omit child provenance and previously left valid Claude handbacks queued, holding runs open.
+
 ## 1.10.0 — prepared 2026-10-16
 
 - Make automatically shared reports identify the first fixed guard that held unresolved child evidence. The report records a safe reason code rather than task text or agent identifiers, so a later incident can be investigated without asking someone to capture it live.

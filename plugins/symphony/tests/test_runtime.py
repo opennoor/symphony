@@ -2095,6 +2095,78 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(archived.active_run)
         self.assertEqual("completed", archived.recent_runs[-1].status)
 
+    def test_user_stop_with_live_workers_names_the_force_escape(self):
+        choice = route_choice(provider="claude")
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="completing",
+                               outcome={"status": "completed"}, delegations=(
+                                   Delegation("lead", "lead", "task", "completed", choice["model"], choice["effort"]),
+                                   Delegation("worker", "worker", "task", "working", choice["model"], choice["effort"]),
+                               )), provider="claude")
+        blocked = handle(self.payload("/symphony:stop", "claude"), self.claude_environ)
+        self.assertIn("/symphony:stop --force", self.context(blocked))
+        self.assertIsNotNone(StateStore(self.state_root).load(self.project).active_run)
+        handle({**self.payload("/symphony:stop --force", "claude"), "prompt_id": "force"},
+               self.claude_environ)
+        self.assertEqual("force_stopped", StateStore(self.state_root).load(self.project).recent_runs[-1].status)
+
+    def test_parallel_claude_starts_keep_their_own_launch_objectives(self):
+        choice = route_choice(provider="claude")
+        self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                               assessment={"size": "small", "complexity": "simple"},
+                               delegations=(Delegation("lead", "lead", "task", "working",
+                                                       choice["model"], choice["effort"]),)),
+                      provider="claude")
+        home = self.root / "claude-home"
+        environ = {**self.claude_environ, "CLAUDE_CONFIG_DIR": str(home)}
+        agent_type = claude_agent_type("worker", choice)
+        for identity, objective in (("worker-a", "Objective A"), ("worker-b", "Objective B")):
+            handle({**self.payload("", "claude"), "hook_event_name": "PreToolUse",
+                    "tool_name": "Agent", "tool_use_id": f"toolu_{identity}",
+                    "tool_input": {"subagent_type": agent_type,
+                                   "prompt": f"SYMPHONY_ROLE: worker\n{objective}"}}, environ)
+        folder = home / "projects" / "-fixture" / "claude-session" / "subagents"
+        folder.mkdir(parents=True)
+        for identity in ("worker-a", "worker-b"):
+            (folder / f"agent-{identity}.meta.json").write_text(json.dumps({
+                "agentType": agent_type, "toolUseId": f"toolu_{identity}", "spawnDepth": 2}))
+        for identity in ("worker-b", "worker-a"):
+            handle({**self.payload("", "claude"), "hook_event_name": "SubagentStart",
+                    "agent_id": identity, "agent_type": agent_type}, environ)
+        recorded = StateStore(self.state_root).load(self.project).active_run
+        objectives = {item.identity: item.objective for item in recorded.delegations}
+        self.assertEqual("Objective A", objectives["worker-a"])
+        self.assertEqual("Objective B", objectives["worker-b"])
+
+    def test_claude_terminal_binds_objective_when_native_metadata_arrives_after_start(self):
+        choice = route_choice(provider="claude")
+        run = self.seed_run(RunState("run", "task", lead_identity="lead", status="active",
+                                     delegations=(Delegation("lead", "lead", "task", "working",
+                                                             choice["model"], choice["effort"]),)), provider="claude")
+        state = StateStore(self.state_root).load(self.project)
+        for identity in ("worker-a", "worker-b"):
+            state = runtime_module._queue_pending_delegation(
+                state, "worker", f"Objective {identity[-1].upper()}", choice["model"],
+                choice["effort"], launch_id=f"toolu_{identity}")
+        home = self.root / "claude-home"
+        environ = {**self.claude_environ, "CLAUDE_CONFIG_DIR": str(home)}
+        agent_type = claude_agent_type("worker", choice)
+        payload = {**self.payload("", "claude"), "provider": "claude", "agent_id": "worker-b",
+                   "agent_type": agent_type}
+        state, _ = runtime_module._observe_delegation(
+            state, Event("start-b", "subagent_started", "2026-10-23T00:00:00Z", payload), environ)
+        self.assertEqual("", next(item.objective for item in state.active_run.delegations
+                                  if item.identity == "worker-b"))
+        folder = home / "projects" / "-fixture" / run.session_id / "subagents"
+        folder.mkdir(parents=True)
+        (folder / "agent-worker-b.meta.json").write_text(json.dumps({
+            "agentType": agent_type, "toolUseId": "toolu_worker-b", "spawnDepth": 2}))
+        state, _ = runtime_module._observe_delegation(
+            state, Event("stop-b", "subagent_stopped", "2026-10-23T00:00:01Z",
+                         {**payload, "status": "completed"}), environ)
+        self.assertEqual("Objective B", next(item.objective for item in state.active_run.delegations
+                                              if item.identity == "worker-b"))
+        self.assertEqual(1, len(state.active_run.assessment["_pending_delegations"]))
+
     def test_assessed_stop_requires_native_child_report_order(self):
         for provider in ('codex', 'claude'):
             for order in ('valid', 'early', 'unknown'):
