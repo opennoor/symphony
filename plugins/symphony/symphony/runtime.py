@@ -508,6 +508,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
     expected_owner = ""
     unknown_alias_pending = False
     acknowledged: set[str] = set()
+    # Inbox ID -> (reason, run ID) recorded when ownership conflict queued it.
+    conflict_meta: dict[str, tuple[str, str]] = {}
 
     def dispatch(state: ProjectState, event: Event) -> tuple[ProjectState, tuple[Action, ...]]:
         # Select the owning run under the store lock so parallel hooks cannot
@@ -738,7 +740,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 # The native check above must distinguish that new call from
                 # a delayed Start before exact-payload replay is safe.
                 if current:
-                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True,
+                                              reason='followup', run_id=_queued_run(state, provider, expected_owner))
                 unresolved = True
                 unresolved_reasons.append('followup_start')
                 continue
@@ -766,13 +769,15 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     # A non-replay child turn after archive has no run to own
                     # it. Retain the Start as well as its terminal, so a
                     # later root task cannot silently inherit either one.
-                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True,
+                                              reason='archived', run_id=_queued_run(state, provider, expected_owner))
                     unresolved = True
                     unresolved_reasons.append('archived_child')
                     continue
                 if (expected_owner and _prior_child_terminal_conflict(
                         state, event, provider, expected_owner)):
-                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True,
+                                              reason='terminal', run_id=_queued_run(state, provider, expected_owner))
                     unresolved = True
                     unresolved_reasons.append('terminal_conflict')
                     continue
@@ -781,7 +786,8 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     # Retain the source before this project transaction can
                     # commit. A settled root may otherwise dispatch a child
                     # terminal into another active run in the same file.
-                    store.queue_session_event(provider, session, event, ambiguous_owner=True)
+                    store.queue_session_event(provider, session, event, ambiguous_owner=True,
+                                              reason='scope', run_id=_queued_run(state, provider, expected_owner))
                     unresolved = True
                     unresolved_reasons.append('scope')
                     continue
@@ -798,7 +804,12 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 state, _ = dispatch(state, event)
                 acknowledged.add(pending_event_id)
             else:
-                if _pending_blocks_current_run(state, event, provider, session):
+                conflict, queued_run = conflict_meta.get(pending_event_id, ('', ''))
+                if disposition == 'hold_owner_conflict' and conflict:
+                    disposition += '_' + conflict
+                if (_pending_blocks_current_run(state, event, provider, session)
+                        and not (disposition.startswith('hold_owner_conflict')
+                                 and _queued_under_archived_run(state, provider, session, queued_run))):
                     unresolved = True
                     unresolved_reasons.append(disposition.removeprefix('hold_'))
                 else:
@@ -1039,6 +1050,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                         provider, session, source,
                         ambiguous_owner=ambiguous_scope or bool(owners and (len(owners) > 1 or
                             (bound is not None and owners[0] != bound))),
+                        reason='entry',
                     )
                     return HookResult()
                 if source.kind == "pre_tool_use":
@@ -1178,6 +1190,11 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                      item["generation"] if source_record is record else record["generation"])
                     for source_record in records for item in source_record["pending"]
                 )
+                conflict_meta.update(
+                    (item["event_id"], (str(item.get("ambiguous_reason") or ""),
+                                        str(item.get("ambiguous_run") or "")))
+                    for source_record in records for item in source_record["pending"]
+                    if item.get("ambiguous_owner"))
                 if any(item["overflow"] for item in records):
                     reason = ("Symphony retained more unresolved child events than it can safely replay. "
                               "Inspect this session before completion.")
@@ -1511,6 +1528,23 @@ def _recoverable_fast_events(
                 and terminal.observed_at >= start.observed_at):
             recovered.update((start.event_id, terminal.event_id))
     return recovered
+
+
+def _queued_run(state: ProjectState, provider: str, owner: str) -> str:
+    run = state.active_runs.get(f'{provider}:{owner}')
+    return run.run_id if run else ''
+
+
+def _queued_under_archived_run(state: ProjectState, provider: str, session: str, queued_run: str) -> bool:
+    """Conflict evidence queued under a since-archived run holds only that run.
+
+    It stays queued for its owner. A continuation under the same lead keeps
+    the hold, as for any archived identity in _pending_blocks_current_run.
+    """
+    current = state.active_runs.get(f'{provider}:{session}')
+    return bool(queued_run and current and current.run_id != queued_run and any(
+        old.run_id == queued_run and old.provider == provider and old.session_id == session
+        and old.lead_identity != current.lead_identity for old in state.recent_runs))
 
 
 def _pending_blocks_current_run(state: ProjectState, event: Event, provider: str, session: str) -> bool:
