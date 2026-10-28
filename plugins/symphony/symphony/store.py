@@ -649,8 +649,13 @@ class StateStore:
 
     def queue_session_event(
         self, provider: str, session: str, event: Event, *, ambiguous_owner: bool = False,
+        reason: str = "", run_id: str = "",
     ) -> None:
-        """Retain a child hook when an old session's owner cannot be read yet."""
+        """Retain a child hook when an old session's owner cannot be read yet.
+
+        An ownership conflict also records why it was queued and which run was
+        active then, so replay can report the path and release later runs.
+        """
         record = self.session_record(provider, session)
         if record is None:
             record = {"schema": 1, "provider": provider, "session": session,
@@ -668,9 +673,11 @@ class StateStore:
         entry = {"event_id": event.event_id, "kind": event.kind,
                  "observed_at": event.observed_at, "payload": _redact(event_payload),
                  "generation": record["generation"], "ambiguous_owner": ambiguous_owner}
+        if ambiguous_owner:
+            entry.update(ambiguous_reason=reason, ambiguous_run=run_id)
         existing = next((item for item in pending if item.get("event_id") == event.event_id), None)
         if existing is not None and ambiguous_owner and not existing.get("ambiguous_owner"):
-            existing["ambiguous_owner"] = True
+            existing.update(ambiguous_owner=True, ambiguous_reason=reason, ambiguous_run=run_id)
             record["pending"] = pending
             self._write_json(self._session_path(record["provider"], record["session"]), record)
         if existing is None:

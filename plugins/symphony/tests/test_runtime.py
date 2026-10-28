@@ -1458,6 +1458,44 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(store.session_record("claude", "claude-session")["pending"]))
         self.assertIsNotNone(store.load(self.project).active_run)
 
+    def test_owner_conflict_queued_under_an_archived_run_does_not_hold_a_later_run(self):
+        # #40: a parentless Claude conflict held every later run in the session.
+        choice = route_choice(provider="claude")
+        store = StateStore(self.state_root)
+        event = Event("managed:marked-start", "subagent_started", "2026-10-01T05:05:04+00:00",
+                      {"session_id": "claude-session", "agent_id": "unknown-child",
+                       "prompt_id": "marked-prompt", "agent_type": "symphony:symphony-worker",
+                       "task": "SYMPHONY_ROLE: worker"})
+        for queued_under, lead, holds in (("old-run", "managed-lead", False),
+                                          ("managed-run", "managed-lead", True),
+                                          ("old-run", "old-lead", True)):
+            with self.subTest(queued_under=queued_under, lead=lead):
+                self.seed_run(RunState(
+                    "managed-run", "task", status="completing", lead_identity=lead,
+                    assessment={"size": "small", "complexity": "simple"},
+                    delegations=(Delegation(lead, "lead", "task", "completed",
+                                            choice["model"], choice["effort"]),),
+                    outcome={"status": "completed"}, started_at="2026-10-01T05:05:20+00:00",
+                ), provider="claude")
+                state = store.load(self.project)
+                archived = RunState("old-run", "old", status="completed", session_id="claude-session",
+                                    provider="claude", lead_identity="old-lead")
+                store.save(self.project, replace(state, recent_runs=(archived,)))
+                pending_path = store._session_path("claude", "claude-session")
+                pending_path.unlink(missing_ok=True)
+                with store.session_lock("claude", "claude-session"):
+                    store.queue_session_event("claude", "claude-session", event, ambiguous_owner=True,
+                                              reason="archived", run_id=queued_under)
+
+                stop = handle({**self.payload("", "claude"), "hook_event_name": "Stop"},
+                              self.claude_environ)
+
+                self.assertEqual(holds, self.output(stop).get("decision") == "block")
+                if holds:
+                    self.assertEqual("unresolved_child_owner_conflict_archived", stop.recovery_signal)
+                # The evidence stays queued for its real owner either way.
+                self.assertEqual(1, len(store.session_record("claude", "claude-session")["pending"]))
+
     def test_claude_pre_run_malformed_agent_type_is_not_discarded(self):
         run = self.seed_run(RunState(
             "managed-run", "task", started_at="2026-10-01T05:05:20+00:00",
@@ -1843,6 +1881,7 @@ class RuntimeTests(unittest.TestCase):
         pending = store.session_record("codex", "settled-root")["pending"]
         self.assertEqual(1, len(pending))
         self.assertTrue(pending[0]["ambiguous_owner"])
+        self.assertEqual(("scope", ""), (pending[0]["ambiguous_reason"], pending[0]["ambiguous_run"]))
 
         stop = handle({**self.payload(""), "session_id": "settled-root",
                        "hook_event_name": "Stop"}, self.environ)
@@ -2670,6 +2709,7 @@ class RuntimeTests(unittest.TestCase):
         pending = store.session_record("codex", session)["pending"]
         self.assertEqual(1, len(pending))
         self.assertTrue(pending[0]["ambiguous_owner"])
+        self.assertEqual(("archived", ""), (pending[0]["ambiguous_reason"], pending[0]["ambiguous_run"]))
         self.assertEqual("block", self.output(handle({**self.payload(""),
             "hook_event_name": "Stop"}, self.environ)).get("decision"))
 

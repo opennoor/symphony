@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.3 — prepared 2026-10-28
+
+- A child callback queued with ambiguous ownership while one run was active no longer holds later runs in the same session (#40). Claude child callbacks carry no parent ID, so a single such callback previously held every later run open as `unresolved_child_owner_conflict`. Once its run is archived and a run with a different lead is active, the callback stops holding the new run. It stays queued for its real owner and is never acknowledged or credited. A continuation under the same lead, and callbacks queued while no run was active, keep the previous hold.
+- Ownership-conflict reports now name the path that queued the evidence: `unresolved_child_owner_conflict_followup`, `_archived`, `_terminal`, `_scope` or `_entry`. Evidence queued by an older version still reports the plain signal.
+
 ## 1.10.2 — prepared 2026-10-28
 
 - Fix the Windows state-lock timeouts reported on every hook (`store._locked`). Each state write re-normalized every key of the whole project state with regular expressions while holding the lock; on a 2 MB state that took about 0.4 s per write on Linux and longer on Windows, so parallel subagent hooks waited past the 5-second deadline. Key classification is now cached (about 3× faster), and a transaction that changes nothing no longer rewrites the file at all, which is most tool hooks.
