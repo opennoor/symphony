@@ -535,6 +535,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
         retired: frozenset[str] = frozenset(),
     ) -> tuple[ProjectState, tuple[tuple[Action, ...], set[str]]]:
         acknowledged: set[str] = set()
+        retained_for_other = False
         unresolved = unknown_alias_pending
         unresolved_reasons = ['unknown_alias'] if unknown_alias_pending else []
         # The user's own stop closes a run Symphony cannot verify, as stopped.
@@ -803,9 +804,12 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 else:
                     # Evidence for a run this hook does not own is kept for
                     # its owner. That is expected and never worth a report.
-                    _recovery_diagnostic(store, provider, 'bookkeeping', 'retained',
-                                         'pending_child_for_other_run', hook=str(
-                                             source.payload.get('hook_event_name') or ''))
+                    retained_for_other = True
+        if retained_for_other:
+            # Once per hook: a write per retained event held the state lock.
+            _recovery_diagnostic(store, provider, 'bookkeeping', 'retained',
+                                 'pending_child_for_other_run', hook=str(
+                                     source.payload.get('hook_event_name') or ''))
         unresolved_reason = _unresolved_child_guidance(
             state, provider, session, tuple(event for event, _, _ in batch
                                            if event.event_id not in acknowledged)) if unresolved else ""
