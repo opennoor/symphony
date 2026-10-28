@@ -107,6 +107,36 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.load(self.project), state)
         self.assertEqual(json.loads(self.state_path().read_text())["schema_version"], 2)
 
+    def test_unchanged_transaction_does_not_rewrite_state(self):
+        # Rewriting a large unchanged state on every hook timed out Windows locks.
+        self.store.save(self.project, ProjectState(enabled=True))
+        with patch.object(StateStore, "_write") as write:
+            self.store.update(self.project, lambda state: (state, None))
+            self.store.update_path(self.state_path(), lambda state: (state, None))
+            write.assert_not_called()
+            self.store.update(self.project, lambda state: (ProjectState(enabled=False), None))
+            write.assert_called_once()
+        self.state_path().unlink()
+        self.store.update(self.project, lambda state: (state, None))
+        self.assertTrue(self.state_path().is_file())
+
+    def test_windows_replace_retries_a_briefly_held_target(self):
+        from plugins.symphony.symphony import store as store_module
+        real = os.replace
+        calls = []
+
+        def held_once(source, target):
+            calls.append(target)
+            if len(calls) == 1:
+                raise PermissionError("held by another process")
+            real(source, target)
+
+        with patch.object(store_module, "msvcrt", object()), \
+                patch.object(store_module.os, "replace", held_once):
+            StateStore._write_json(self.root / "value.json", {"ok": True})
+        self.assertEqual(2, len(calls))
+        self.assertEqual({"ok": True}, json.loads((self.root / "value.json").read_text()))
+
     def test_project_key_uses_the_canonical_project_path(self):
         alias = self.project / ".." / self.project.name
         other = self.root / "other"

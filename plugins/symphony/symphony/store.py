@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
@@ -395,20 +396,29 @@ def _text(value: Any, name: str) -> str:
     return value
 
 
-def _redact(value: Any, key: str = "") -> Any:
+@lru_cache(maxsize=4096)
+def _key_class(key: str) -> tuple[bool, bool]:
+    """Return (count key, secret key). A large state repeats few key names,
+    and re-normalizing each one held the state lock for most of a write."""
     normalized = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', key)
     normalized = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', normalized)
     normalized = re.sub(r'[^a-z0-9]+', '_', normalized.lower()).strip('_')
     words = set(normalized.split('_'))
-    # A numeric count is metadata, never a credential container or value.
-    if normalized.endswith(('_count', '_counts')) and type(value) is int and value >= 0:
-        return value
     phrased = '_' + normalized + '_'
-    if (any('_' + secret + '_' in phrased for secret in _SECRET_KEYS)
-            or words & {'password', 'passwords', 'passwd', 'secret', 'secrets', 'authorization',
-                        'credential', 'credentials', 'cookie', 'cookies', 'passphrase', 'passphrases',
-                        'apikey', 'apikeys', 'pwd', 'token', 'tokens', 'auth', 'authentication'}
-            or (words & {'key', 'keys'} and bool(words & {'api', 'private', 'encryption'}))):
+    return (normalized.endswith(('_count', '_counts')),
+            any('_' + secret + '_' in phrased for secret in _SECRET_KEYS)
+            or bool(words & {'password', 'passwords', 'passwd', 'secret', 'secrets', 'authorization',
+                             'credential', 'credentials', 'cookie', 'cookies', 'passphrase', 'passphrases',
+                             'apikey', 'apikeys', 'pwd', 'token', 'tokens', 'auth', 'authentication'})
+            or bool(words & {'key', 'keys'} and words & {'api', 'private', 'encryption'}))
+
+
+def _redact(value: Any, key: str = "") -> Any:
+    count_key, secret_key = _key_class(key)
+    # A numeric count is metadata, never a credential container or value.
+    if count_key and type(value) is int and value >= 0:
+        return value
+    if secret_key:
         return "[REDACTED]"
     if isinstance(value, str):
         return redact_secrets(value)
@@ -870,7 +880,7 @@ class StateStore:
             if not run or run.session_id != session or run.provider not in {"", provider}:
                 return None
             next_state, result = transition(state)
-            self._write(path, replace(next_state, recent_runs=next_state.recent_runs[-20:]))
+            self._commit(path, state, next_state)
             return result
 
     def update_path(
@@ -883,7 +893,7 @@ class StateStore:
                 return None
             state = _state_from_dict(json.loads(path.read_text(encoding="utf-8")))
             next_state, result = transition(state)
-            self._write(path, replace(next_state, recent_runs=next_state.recent_runs[-20:]))
+            self._commit(path, state, next_state)
             return result
 
     def read_path(self, path: Path) -> ProjectState | None:
@@ -912,7 +922,7 @@ class StateStore:
         with _locked(path):
             state = self._load_unlocked(project, path)
             next_state, result = transition(state)
-            self._write(path, replace(next_state, recent_runs=next_state.recent_runs[-20:]))
+            self._commit(path, state, next_state)
             return result
 
     def _load_unlocked(self, project: Path, path: Path) -> ProjectState:
@@ -1000,6 +1010,13 @@ class StateStore:
         path.unlink()
 
     @staticmethod
+    def _commit(path: Path, state: ProjectState, next_state: ProjectState) -> None:
+        # Most hooks change nothing. Rewriting a large state anyway held the
+        # lock long enough for parallel Windows hooks to time out.
+        if next_state != state or not path.is_file():
+            StateStore._write(path, replace(next_state, recent_runs=next_state.recent_runs[-20:]))
+
+    @staticmethod
     def _write(path: Path, state: ProjectState) -> None:
         StateStore._write_json(path, _state_to_dict(state))
 
@@ -1014,7 +1031,16 @@ class StateStore:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            for attempt in range(25):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    # Windows refuses to replace a file another process (an
+                    # unlocked reader or a virus scanner) briefly holds open.
+                    if msvcrt is None or attempt == 24:
+                        raise
+                    time.sleep(0.02)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise

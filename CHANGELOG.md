@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.10.2 — prepared 2026-10-28
+
+- Fix the Windows state-lock timeouts reported on every hook (`store._locked`). Each state write re-normalized every key of the whole project state with regular expressions while holding the lock; on a 2 MB state that took about 0.4 s per write on Linux and longer on Windows, so parallel subagent hooks waited past the 5-second deadline. Key classification is now cached (about 3× faster), and a transaction that changes nothing no longer rewrites the file at all, which is most tool hooks.
+- Record the expected `pending_child_for_other_run` count once per hook instead of once per retained event. Each record was a separate file write inside the project transaction, which multiplied lock hold time by the number of retained events.
+- Retry a Windows state replace for up to half a second when another process briefly holds the target open, instead of failing the hook with `PermissionError`.
+
 ## 1.10.1 — prepared 2026-10-23
 
 - Show the user the existing `stop --force` escape when a typed stop finds tracked children still active. Force stopping archives the run as interrupted, so a killed lead cannot leave the project trapped behind stale workers without a visible recovery path.
