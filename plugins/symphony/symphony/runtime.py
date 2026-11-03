@@ -31,6 +31,7 @@ from .host_evidence import (
     _CLAUDE_FAST_ACK,
     codex_substantive_launch,
     codex_child_followup_start,
+    codex_completed_active_turns,
     codex_deferred_child_turns,
     codex_archived_followup_sequence,
     codex_completing_lead_turn, codex_lead_turn_running, codex_recovered_lead_event,
@@ -821,6 +822,23 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
             _recovery_diagnostic(store, provider, 'bookkeeping', 'retained',
                                  'pending_child_for_other_run', hook=str(
                                      source.payload.get('hook_event_name') or ''))
+        if (provider == 'codex' and source.kind in {'stop_requested', 'user_prompt', 'session_heartbeat'}):
+            scoped = _scope_state(state, f'codex:{session}', session, provider)
+            run = scoped.active_run
+            ended = codex_completed_active_turns(run, source, project, environ) if run else {}
+            if ended:
+                # Liveness proof neither consumes pending conflicts nor grants
+                # outcome, ownership, substantive work, or review credit.
+                assessment = dict(run.assessment)
+                assessment['_active_turns'] = {identity: token for identity, token in
+                    assessment.get('_active_turns', {}).items() if identity not in ended}
+                for field in ('_ambiguous_child_starts', '_ambiguous_child_stops'):
+                    assessment[field] = tuple(identity for identity in assessment.get(field, ()) if identity not in ended)
+                reconciled = replace(run, assessment=assessment, delegations=tuple(
+                    replace(item, state='completed', updated_at=source.observed_at)
+                    if item.identity in ended else item for item in run.delegations))
+                state = _merge_scope(state, scoped, replace(scoped, active_run=reconciled),
+                                     f'codex:{session}', provider, session)
         unresolved_reason = _unresolved_child_guidance(
             state, provider, session, tuple(event for event, _, _ in batch
                                            if event.event_id not in acknowledged)) if unresolved else ""
@@ -1947,7 +1965,8 @@ def _transition(
         actions += heartbeat_actions
         retained = environ.get("SYMPHONY_PINNED_RUNTIME")
         original = str(heartbeat.payload["plugin_root"])
-        if retained and (source.kind == "session_heartbeat" or not Path(original).is_dir()):
+        if (retained and (state.enabled or state.active_run)
+                and (source.kind == "session_heartbeat" or not Path(original).is_dir())):
             text = (
                 f"Symphony hooks are active in this session. It retained the reviewed runtime at {retained}. "
                 "If the loaded plugin cache disappears, use this retained root for Symphony references. "

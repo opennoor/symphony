@@ -15,16 +15,71 @@ from uuid import NAMESPACE_URL, uuid5
 
 from plugins.symphony.scripts.generate_hooks import bootstrap, generated
 from plugins.symphony.scripts.package_smoke import _payload, _role_model, _write_claude_child_launch
+from plugins.symphony.symphony.store import StateStore
 
 
 PLUGIN = Path(__file__).resolve().parents[1]
 
 
 class RuntimeRetentionTests(unittest.TestCase):
+    def test_installed_hooks_keep_disabled_projects_silent(self):
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                root = self.materialize(directory, 'Reviewed Plugin')
+                first, second = directory / 'enabled project', directory / 'fresh project'
+                first.mkdir()
+                second.mkdir()
+                store = StateStore(directory / 'state')
+                turn = 0
+
+                def send(project, event, prompt=''):
+                    nonlocal turn
+                    turn += 1
+                    payload = {'hook_event_name': event, 'cwd': str(project),
+                               'session_id': project.name, 'turn_id': f'turn-{turn}',
+                               'prompt_id': f'prompt-{turn}', 'prompt': prompt}
+                    result, _ = self.run_hook(self.command(root, provider, event), root,
+                                              provider, directory, payload)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    return result.stdout
+
+                control = '$symphony:symphony ' if provider == 'codex' else '/symphony:'
+                self.assertIn('enabled', send(first, 'UserPromptSubmit', control + 'enable'))
+                self.assertIn('Symphony hooks are active', send(first, 'SessionStart'))
+                self.assertTrue(store.load(first).enabled)
+
+                for disabled in (False, True):
+                    with self.subTest(disabled=disabled):
+                        if disabled:
+                            send(second, 'UserPromptSubmit', control + 'enable')
+                            self.assertIn('disabled', send(second, 'UserPromptSubmit', control + 'disable'))
+                        self.assertEqual('', send(second, 'SessionStart'))
+                        self.assertEqual('', send(second, 'UserPromptSubmit', 'Implement the greeting feature'))
+                        state = store.load(second)
+                        self.assertFalse(state.enabled)
+                        self.assertFalse(state.active_runs)
+                        self.assertIsNone(state.active_run)
+                        self.assertFalse(state.recent_runs)
+                        self.assertFalse(state.configuration.get('root_admission_intents'))
+                        self.assertEqual('guarded', state.activation[provider]['state'])
+                        self.assertTrue(store.load(first).enabled)
+                        self.assertIn('SYMPHONY', send(first, 'UserPromptSubmit', 'Implement the greeting feature'))
+
+                send(second, 'UserPromptSubmit', control + 'enable')
+                self.assertIn('SYMPHONY', send(second, 'UserPromptSubmit', 'Implement the greeting feature'))
+                self.assertTrue(store.load(second).enabled)
+                self.assertTrue(store.load(first).enabled)
+
     def test_compact_activation_command_verifies_retained_tree_and_session(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             root = self.materialize(directory, "Reviewed 'Old' Plugin With Spaces")
+            enabled, _ = self.run_hook(self.command(root, "codex", "UserPromptSubmit"), root,
+                                       "codex", directory,
+                                       {"hook_event_name": "UserPromptSubmit", "prompt": "$symphony:symphony enable",
+                                        "session_id": "original-session", "cwd": str(directory)})
+            self.assertEqual(0, enabled.returncode, enabled.stderr)
             result, env = self.run_hook(self.command(root, "codex", "SessionStart"), root,
                                         "codex", directory,
                                         {"hook_event_name": "SessionStart",

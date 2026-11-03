@@ -1,6 +1,6 @@
 {
   "name": "symphony",
-  "version": "1.10.3",
+  "version": "1.10.4",
   "description": "Capability-aware, recoverable orchestration with a thin root and task-sized leads.",
   "author": {
     "name": "OpenNoor",
