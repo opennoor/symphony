@@ -450,6 +450,78 @@ def codex_child_followup_start(run: RunState, source: Event,
         return None
 
 
+def codex_completed_active_turns(run: RunState, source: Event, project: Path,
+                                 environ: Mapping[str, str]) -> dict[str, str]:
+    """Prove stale tracked turns ended, without crediting their reports as work.
+
+    Missing callbacks outlive owner changes and substantive epochs. A newer
+    terminal cannot match the old Start, but native completion of that exact
+    turn and of the latest turn can independently retire its liveness.
+    """
+    if (run.provider != 'codex' or source.payload.get('provider') != 'codex'
+            or source.payload.get('session_id') != run.session_id):
+        return {}
+    completed = {}
+    home = Path(environ.get('CODEX_HOME') or Path.home() / '.codex')
+    boundary = _instant(source.observed_at)
+    began = _instant(run.started_at)
+    for child in run.delegations:
+        token = run.assessment.get('_active_turns', {}).get(child.identity)
+        proof = run.assessment.get('_substantive_children', {}).get(child.identity)
+        contract = run.assessment.get('substantive_contract', {})
+        current_proof = isinstance(proof, Mapping) and all(proof.get(key) == value for key, value in {
+            'run_id': run.run_id, 'lead': run.lead_identity, 'owner_generation': run.owner_generation,
+            'epoch': contract.get('epoch')}.items())
+        if (child.identity == run.lead_identity or current_proof
+                or child.state not in {'active', 'created', 'pending', 'running', 'waiting', 'working', 'interrupted'}
+                or not isinstance(token, str)):
+            continue
+        try:
+            rows = _chronology_codex_file(home, child.identity, '', project)
+            if rows is None:
+                continue
+            spawn = rows[0]['payload'].get('source', {})
+            for key in ('subagent', 'thread_spawn'):
+                spawn = spawn.get(key, {}) if isinstance(spawn, dict) else {}
+            parent = spawn.get('parent_thread_id') if isinstance(spawn, dict) else None
+            # An old owner's children remain this run's work. A native parent
+            # from another run or session cannot retire a tracked identity.
+            owners = {run.session_id, *(item.identity for item in run.delegations if item.role == 'lead')}
+            if (parent not in owners or rows[0]['payload'].get('parent_thread_id') not in {None, parent}
+                    or not isinstance(rows[0]['payload'].get('agent_path'), str)
+                    or not rows[0]['payload']['agent_path'].startswith('/root/')
+                    or spawn.get('agent_path') not in {None, rows[0]['payload']['agent_path']}):
+                continue
+            starts = [index for index, row in enumerate(rows) if row.get('type') == 'event_msg'
+                      and row['payload'].get('type') == 'task_started']
+            matching = [index for index in starts if f"turn_id:{rows[index]['payload'].get('turn_id')}" == token]
+            if len(matching) != 1:
+                continue
+            index = matching[0]
+            next_start = next((later for later in starts if later > index), len(rows))
+            ends = [offset for offset in range(index + 1, next_start)
+                    if rows[offset].get('type') == 'event_msg'
+                    and rows[offset]['payload'].get('type') == 'task_complete'
+                    and f"turn_id:{rows[offset]['payload'].get('turn_id')}" == token]
+            if len(ends) != 1:
+                continue
+            if any(row.get('type') == 'turn_context' or row.get('type') == 'event_msg'
+                   and row['payload'].get('type') in {
+                       'task_complete', 'task_failed', 'turn_aborted', 'task_interrupted', 'error'}
+                   for row in rows[ends[0] + 1:next_start]):
+                continue
+            original = _chronology_codex_turn(rows[:ends[0] + 1], child, allow_blocked=True)
+            latest = _chronology_codex_turn(rows, child, allow_blocked=True)
+            if (original is None or latest is None or boundary is None or began is None or original[1] < began
+                    or latest[2] > boundary or original[2] > latest[2]
+                    or next_start < len(rows) and original[2] >= _instant(rows[next_start].get('timestamp'))):
+                continue
+            completed[child.identity] = token
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            continue
+    return completed
+
+
 def codex_deferred_child_turns(state: ProjectState, source: Event, project: Path,
                                environ: Mapping[str, str]) -> tuple[tuple[Event, Event], ...]:
     """Reconcile observed child callbacks after native task_complete is durable.

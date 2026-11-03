@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.4 — prepared 2026-11-03
+
+- Keep installed hooks silent in fresh or disabled projects. Hook activation alone no longer injects Symphony startup guidance, and the skill requires an explicit request or routing/recovery guidance from the current project's hook before governing work. Enabling another project grants no authority here.
+- Retire stale Codex child turns only when their native transcript proves that the tracked turn and the latest turn both completed. Older owners' finished children can then stop blocking later leads, while missing or ambiguous evidence stays active. This clears liveness only and never grants work, review, ownership, or outcome credit.
+
 ## 1.10.3 — prepared 2026-10-28
 
 - A child callback queued with ambiguous ownership while one run was active no longer holds later runs in the same session (#40). Claude child callbacks carry no parent ID, so a single such callback previously held every later run open as `unresolved_child_owner_conflict`. Once its run is archived and a run with a different lead is active, the callback stops holding the new run. It stays queued for its real owner and is never acknowledged or credited. A continuation under the same lead, and callbacks queued while no run was active, keep the previous hold.

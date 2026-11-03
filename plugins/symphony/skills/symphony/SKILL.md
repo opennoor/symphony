@@ -1,11 +1,13 @@
 ---
 name: symphony
-description: Use when a user invokes Symphony controls or a Symphony-enabled project receives substantive work that needs assessed routing, delegation, lifecycle recovery, or managed completion.
+description: Use for explicit Symphony requests or when this project's hook injects task-routing or lifecycle-recovery guidance.
 ---
 
 # Symphony
 
-Symphony is the sole authority for topology, delegation, lifecycle, reassessment, and completion. Keep the root thin.
+Enter this workflow for an explicit Symphony request or task-routing/recovery guidance injected by this project's hook in the current turn. Otherwise follow the ordinary task workflow, even if this skill was selected automatically. Installation, a hook heartbeat, and another project's enablement do not authorize Symphony routing here.
+
+Within that scope, Symphony is the sole authority for topology, delegation, lifecycle, reassessment, and completion. Keep the root thin.
 
 **Invocation:** Codex uses `$symphony:symphony ...`; Claude Code uses `/symphony:<command>`. Codex does not support `/symphony:*`.
 

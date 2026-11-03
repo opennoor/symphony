@@ -811,6 +811,154 @@ class HostEvidenceTests(unittest.TestCase):
 class CompletionChronologyTests(unittest.TestCase):
     """File-backed native evidence, independent of callback arrival times."""
 
+    def test_missing_child_terminal_retires_liveness_without_current_epoch_credit(self):
+        self.fixture('codex')
+        # The original callback was lost; a later continuation has also ended.
+        self.rows[self.child].extend([
+            {'timestamp': self.stamp(14), 'type': 'event_msg', 'payload': {
+                'type': 'user_message', 'message': 'Continue the same task.'}},
+            {'timestamp': self.stamp(15), 'type': 'event_msg', 'payload': {
+                'type': 'task_started', 'turn_id': 'later-turn'}},
+            {'timestamp': self.stamp(15), 'type': 'turn_context', 'payload': {
+                'turn_id': 'later-turn', 'model': self.model, 'effort': 'low'}},
+            {'timestamp': self.stamp(16), 'type': 'event_msg', 'payload': {
+                'type': 'task_complete', 'turn_id': 'later-turn', 'last_agent_message': 'Done.'}}])
+        self.write()
+        proof = {**self.run.assessment['_substantive_children'][self.child],
+                 'owner_generation': 0, 'successful': False}
+        run = replace(self.run, owner_generation=2,
+            delegations=tuple(replace(item, state='working') if item.identity == self.child else item
+                              for item in self.run.delegations),
+            assessment={**self.run.assessment, '_active_turns': {self.child: 'turn_id:child-turn'},
+                '_ambiguous_child_stops': [self.child],
+                '_substantive_children': {self.child: proof}})
+        store = StateStore(self.base / 'state')
+        store.save(self.project, replace(self.state, active_run=run,
+                                         active_runs={f'codex:{self.session}': run}))
+        handle({'session_id': self.session, 'cwd': str(self.project),
+                'hook_event_name': 'UserPromptSubmit', 'prompt': '$symphony:symphony status'},
+               {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROFILE': 'full',
+                'SYMPHONY_PROVIDER': 'codex'})
+        updated = store.load(self.project).active_run
+        self.assertEqual('completed', next(item.state for item in updated.delegations
+                                           if item.identity == self.child))
+        self.assertNotIn(self.child, updated.assessment.get('_active_turns', {}))
+        self.assertNotIn(self.child, updated.assessment.get('_ambiguous_child_stops', ()))
+        self.assertEqual(proof, updated.assessment['_substantive_children'][self.child])
+        self.assertEqual(self.run.lead_identity, updated.lead_identity)
+        self.assertEqual(2, updated.owner_generation)
+        self.assertEqual(self.run.outcome, updated.outcome)
+        env = {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROFILE': 'full',
+               'SYMPHONY_PROVIDER': 'codex'}
+        handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'UserPromptSubmit',
+                'prompt': 'A new independent task.'}, env)
+        settled = store.load(self.project)
+        self.assertIsNone(settled.active_run)
+        self.assertEqual('superseded', settled.recent_runs[-1].status)
+        handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'SubagentStart',
+                'agent_id': 'new-lead', 'task_name': 'symphony_lead_fast_gpt_6_1_sol_medium',
+                'parent_thread_id': self.session,
+                'task': 'SYMPHONY_FAST_ROUTE: lead\nA new independent task.',
+                'turn_id': 'new-task-turn'}, env)
+        self.assertEqual('new-lead', store.load(self.project).active_run.lead_identity)
+        self.assertNotEqual(self.run.run_id, store.load(self.project).active_run.run_id)
+
+    def test_liveness_reconciliation_leaves_current_owner_and_current_child_contracts_alone(self):
+        from plugins.symphony.symphony.host_evidence import codex_completed_active_turns
+        self.fixture('codex')
+        run = replace(self.run, assessment={**self.run.assessment, '_active_turns': {
+            self.lead: 'turn_id:lead-turn', self.child: 'turn_id:child-turn'}},
+            delegations=tuple(replace(item, state='working') for item in self.run.delegations))
+        source = Event('root', 'user_prompt', self.stamp(30), {
+            'provider': 'codex', 'session_id': self.session})
+        self.assertEqual({}, codex_completed_active_turns(run, source, self.project, self.env))
+
+    def test_original_turn_conflicts_before_followup_keep_stale_child_active(self):
+        from plugins.symphony.symphony.host_evidence import codex_completed_active_turns
+        for conflict in ('task_failed', 'turn_aborted', 'task_interrupted', 'error', 'task_complete', 'turn_context'):
+            with self.subTest(conflict=conflict):
+                self.fixture('codex')
+                run = replace(self.run, assessment={**self.run.assessment,
+                    '_substantive_children': {}, '_active_turns': {self.child: 'turn_id:child-turn'}},
+                    delegations=tuple(replace(item, state='working') if item.identity == self.child else item
+                                      for item in self.run.delegations))
+                self.rows[self.child].extend([
+                    {'timestamp': self.stamp(12), 'type': 'turn_context' if conflict == 'turn_context' else 'event_msg',
+                     'payload': {'type': conflict, 'turn_id': 'child-turn'}},
+                    {'timestamp': self.stamp(15), 'type': 'event_msg',
+                     'payload': {'type': 'task_started', 'turn_id': 'later-turn'}},
+                    {'timestamp': self.stamp(15), 'type': 'turn_context',
+                     'payload': {'turn_id': 'later-turn', 'model': self.model, 'effort': 'low'}},
+                    {'timestamp': self.stamp(16), 'type': 'event_msg', 'payload': {
+                        'type': 'task_complete', 'turn_id': 'later-turn', 'last_agent_message': 'Done.'}}])
+                self.write()
+                source = Event('root', 'user_prompt', self.stamp(30), {
+                    'provider': 'codex', 'session_id': self.session})
+                self.assertEqual({}, codex_completed_active_turns(run, source, self.project, self.env))
+
+    def test_native_liveness_reconciliation_keeps_incomplete_or_foreign_evidence_active(self):
+        from plugins.symphony.symphony.host_evidence import codex_completed_active_turns
+        for case in ('running', 'missing-original-end', 'duplicate-end', 'wrong-parent',
+                     'wrong-project', 'wrong-turn', 'wrong-model', 'partial-file', 'foreign-session'):
+            with self.subTest(case=case):
+                self.fixture('codex')
+                run = replace(self.run, assessment={**self.run.assessment,
+                    '_active_turns': {self.child: 'turn_id:child-turn'},
+                    '_substantive_children': {}}, delegations=tuple(
+                    replace(item, state='working') if item.identity == self.child else item
+                    for item in self.run.delegations))
+                source = Event('root', 'user_prompt', self.stamp(30), {
+                    'provider': 'codex', 'session_id': self.session})
+                self.assertEqual({self.child: 'turn_id:child-turn'},
+                                 codex_completed_active_turns(run, source, self.project, self.env))
+                rows = self.rows[self.child]
+                if case == 'running':
+                    rows.append({'timestamp': self.stamp(15), 'type': 'event_msg',
+                                 'payload': {'type': 'task_started', 'turn_id': 'running'}})
+                elif case == 'missing-original-end':
+                    rows.pop()
+                elif case == 'duplicate-end':
+                    rows.append(rows[-1])
+                elif case == 'wrong-parent':
+                    rows[0]['payload']['source']['subagent']['thread_spawn']['parent_thread_id'] = 'foreign'
+                elif case == 'wrong-project':
+                    rows[0]['payload']['cwd'] = str(self.project.parent)
+                elif case == 'wrong-turn':
+                    run = replace(run, assessment={**run.assessment, '_active_turns': {self.child: 'turn_id:other'}})
+                elif case == 'wrong-model':
+                    rows[2]['payload']['model'] = 'other-model'
+                self.write()
+                if case == 'partial-file':
+                    self.paths[self.child].write_text(self.paths[self.child].read_text()[:-1])
+                source = Event('root', 'user_prompt', self.stamp(30), {
+                    'provider': 'codex', 'session_id': 'foreign' if case == 'foreign-session' else self.session})
+                self.assertEqual({}, codex_completed_active_turns(run, source, self.project, self.env))
+
+    def test_native_liveness_reconciliation_does_not_consume_pending_owner_conflicts(self):
+        self.fixture('codex')
+        run = replace(self.run, assessment={**self.run.assessment,
+            '_active_turns': {self.child: 'turn_id:child-turn'},
+            '_substantive_children': {}}, delegations=tuple(
+            replace(item, state='working') if item.identity == self.child else item
+            for item in self.run.delegations))
+        store = StateStore(self.base / 'state')
+        store.save(self.project, replace(self.state, active_run=run,
+                                         active_runs={f'codex:{self.session}': run}))
+        store.bind_session('codex', self.session, store._path(self.project), False, self.project)
+        pending = Event('foreign-owner', 'subagent_stopped', self.stamp(20), {
+            'provider': 'codex', 'session_id': self.session, 'agent_id': self.child,
+            'parent_thread_id': 'foreign-owner', 'turn_id': 'unproven', 'status': 'completed'})
+        store.queue_session_event('codex', self.session, pending, ambiguous_owner=True,
+                                  reason='terminal', run_id=run.run_id)
+        result = handle({'session_id': self.session, 'cwd': str(self.project), 'hook_event_name': 'Stop'},
+                        {**self.env, 'SYMPHONY_STATE_DIR': str(store.root), 'SYMPHONY_PROFILE': 'full',
+                         'SYMPHONY_PROVIDER': 'codex'})
+        self.assertEqual('block', json.loads(result.stdout).get('decision'))
+        self.assertIsNotNone(store.load(self.project).active_run)
+        self.assertNotIn(self.child, store.load(self.project).active_run.assessment.get('_active_turns', {}))
+        self.assertTrue(store.session_record('codex', self.session)['pending'])
+
+
     def fixture(self, provider, *, role='worker', early=False, handback=False, lead_handback=False):
         import hashlib
         from plugins.symphony.symphony.host_evidence import assessed_completion_chronology
