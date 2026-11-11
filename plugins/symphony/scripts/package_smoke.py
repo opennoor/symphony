@@ -65,6 +65,26 @@ def _plugin_source(candidate: Path) -> Path:
     return source
 
 
+def _version(root: Path, provider: str) -> tuple[int, ...]:
+    return tuple(map(int, _manifest(root, provider)['version'].split('.')))
+
+
+def _owner_retained(documents: list[dict[str, Any]], version: tuple[int, ...],
+                    provider: str, session: str) -> bool:
+    """An unproved fake lead keeps its run open and is never archived as completed.
+
+    Before 1.10.5 an unreadable Claude completion order sent the lead back as
+    retryable; from 1.10.5 the run stays completing without that retry.
+    """
+    runs = [document.get('active_runs', {}).get(f'{provider}:{session}') for document in documents]
+    if provider == 'claude' and version >= (1, 10, 5):
+        return any(run and run['status'] == 'completing' for run in runs) and not any(
+            item.get('status') == 'completed' for document in documents
+            for item in document.get('recent_runs', ()))
+    return any(run and run['status'] == 'recovering' and run['outcome'] is None
+               and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in runs)
+
+
 def _manifest(root: Path, provider: str) -> dict[str, Any]:
     path = root / f".{provider}-plugin" / "plugin.json"
     try:
@@ -497,10 +517,7 @@ def _exercise(
         if captured:
             # Fake agent IDs have no native transcript. The reviewed runtime
             # must retain the owner instead of archiving a fabricated result.
-            recovering = [document.get('active_runs', {}).get(f'{provider}:fake-session')
-                          for document in _state_documents(state_dir)]
-            if not any(run and run['status'] == 'recovering' and run['outcome'] is None
-                    and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in recovering):
+            if not _owner_retained(_state_documents(state_dir), _version(root, provider), provider, 'fake-session'):
                 raise SmokeFailure("unproved native lead was not retained for same-owner recovery")
         elif blocked or any(_has_active_run(document) for document in _state_documents(state_dir)):
             raise SmokeFailure("the synthetic lead was not reconciled")
@@ -582,6 +599,7 @@ def _exercise(
         stale_payload = _payload(old_root, provider, "SubagentStop", project, "old-session")
         stale_stop = _command_argv(_event_command(_hook_config(old_root, provider), "Stop"), old_root, provider)
         before = _state_documents(state_dir)
+        old_root_version = _version(old_root, provider)
         shutil.rmtree(old_root)
         stale_env = os.environ.copy()
         stale_env.update({"SYMPHONY_STATE_DIR": str(state_dir), "SYMPHONY_RUNTIME_DIR": str(home / "runtimes"),
@@ -599,10 +617,7 @@ def _exercise(
                                      "cwd": str(project)}), capture_output=True, text=True, env=stale_env, timeout=15)
             if stopped.returncode:
                 raise SmokeFailure("retained Stop failed after cache removal")
-            recovering = [doc.get('active_runs', {}).get(f'{provider}:old-session')
-                          for doc in _state_documents(state_dir)]
-            if not any(run and run['status'] == 'recovering' and run['outcome'] is None
-                       and run['assessment'].get('_retryable_lead') == 'fake-lead' for run in recovering):
+            if not _owner_retained(_state_documents(state_dir), old_root_version, provider, 'old-session'):
                 raise SmokeFailure("old session lost its recoverable owner after cache removal")
         else:
             # Pre-retention captured commands cannot be repaired retroactively.
