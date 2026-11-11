@@ -12,6 +12,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import replace
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping
@@ -1138,20 +1139,30 @@ def _archived_fast_owner(run: RunState) -> bool:
 def _native_jsonl(path: Path) -> list[dict] | None:
     """Read one complete, bounded native transcript without following aliases."""
     try:
-        if (path.is_symlink() or not path.is_file()
-                or path.stat().st_size > _MAX_TRANSCRIPT_BYTES):
+        if path.is_symlink() or not path.is_file():
             return None
-        with path.open(encoding="utf-8") as stream:
-            rows = [json.loads(line) for line in stream]
-        if not rows or not all(isinstance(row, dict) for row in rows):
+        stat = path.stat()
+        if stat.st_size > _MAX_TRANSCRIPT_BYTES:
             return None
-        # Claude request diagnostics describe its API traffic, not native
-        # conversation turns, and omit child provenance fields.
-        rows = [row for row in rows if row.get("type") not in
-                {"api-request", "api-request-blob", "api-request-shape"}]
-        return rows or None
+        # One hook checks every retained callback against the same transcripts;
+        # re-parsing a large root transcript per callback timed hooks out.
+        rows = _parsed_jsonl(str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        return list(rows) if rows else None
     except (OSError, TypeError, ValueError, UnicodeError):
         return None
+
+
+@lru_cache(maxsize=4)
+def _parsed_jsonl(path: str, inode: int, size: int, mtime_ns: int) -> tuple[dict, ...] | None:
+    """Parse one transcript version; the stat fields key the cache, not the read."""
+    with open(path, encoding="utf-8") as stream:
+        rows = [json.loads(line) for line in stream]
+    if not rows or not all(isinstance(row, dict) for row in rows):
+        return None
+    # Claude request diagnostics describe its API traffic, not native
+    # conversation turns, and omit child provenance fields.
+    return tuple(row for row in rows if row.get("type") not in
+                 {"api-request", "api-request-blob", "api-request-shape"}) or None
 
 
 def _complete_native_jsonl(path: Path) -> list[dict] | None:
@@ -1955,13 +1966,20 @@ def claude_lead_turn_running(
     run = state.active_run
     lead_id = run.lead_identity if run else None
     if (not run or run.provider != "claude" or run.status != "completing" or run.session_id != session
-            or not isinstance(lead_id, str) or not _CLAUDE_ID.fullmatch(lead_id)):
+            or not isinstance(lead_id, str)):
         return False
+    return claude_agent_turn_state(session, lead_id, environ) == "running"
+
+
+def claude_agent_turn_state(session: str, agent_id: str, environ: Mapping[str, str]) -> str:
+    """"running", "ended" or "unknown" for an agent's latest native Claude turn."""
+    if not _CLAUDE_ID.fullmatch(agent_id):
+        return "unknown"
     projects = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
     try:
-        paths = tuple(projects.glob(f"*/{session}/subagents/agent-{lead_id}.jsonl"))
+        paths = tuple(projects.glob(f"*/{session}/subagents/agent-{agent_id}.jsonl"))
         if len(paths) != 1 or paths[0].is_symlink():
-            return False
+            return "unknown"
         with paths[0].open("rb") as stream:
             stream.seek(0, 2)
             size = stream.tell()
@@ -1970,18 +1988,18 @@ def claude_lead_turn_running(
                 stream.seek(max(0, size - window))
                 data = stream.read()
                 if data and not data.endswith(b"\n"):
-                    return True  # the host is still writing this turn
+                    return "running"  # the host is still writing this turn
                 ended = _claude_tail_turn_ended(
                     data.decode("utf-8", "replace").splitlines()[1 if size > len(data) else 0:])
                 # Widen until a deciding row is in view: one tool result can
                 # outgrow the window, with reminders or attachments after it.
                 if ended is not None:
-                    return not ended
+                    return "ended" if ended else "running"
                 if len(data) >= size or window >= _MAX_TRANSCRIPT_BYTES:
-                    return False
+                    return "unknown"
                 window *= 4
     except OSError:
-        return False
+        return "unknown"
 
 
 def _claude_tail_turn_ended(lines: list[str]) -> bool | None:
@@ -2673,6 +2691,16 @@ def codex_lead_turn_running(state: ProjectState, session: str, environ: Mapping[
     turn = turns.get(latest_started or "", {})
     # An aborted turn ends without a completion; it is not live.
     return bool(turn.get("started")) and turn.get("completed_at") is None and not turn.get("failed")
+
+
+def codex_lead_turn_ended(state: ProjectState, session: str, environ: Mapping[str, str]) -> bool:
+    """The lead's newest native Codex turn has completed, failed or aborted."""
+    observed = _native_lead_turns(state, session, environ)
+    if observed is None:
+        return False
+    _, turns, _, latest_started, _ = observed
+    turn = turns.get(latest_started or "", {})
+    return bool(turn.get("started")) and (turn.get("completed_at") is not None or bool(turn.get("failed")))
 
 
 def codex_completing_lead_turn(

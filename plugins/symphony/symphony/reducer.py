@@ -478,7 +478,8 @@ def _lead_completed(state: ProjectState, event: Event):
     if (active or unresolved or run.assessment.get("_batch_pending")
             or run.assessment.get("_ambiguous_child_starts")
             or run.assessment.get("_pending_delegations")
-            or run.assessment.get("_invalid_consultants") or run.assessment.get("_lead_route_mismatch")):
+            or (run.assessment.get("_invalid_consultants") and not run.assessment.get("_consultant_retry_asked"))
+            or run.assessment.get("_lead_route_mismatch")):
         completed = replace(completed, status="completing")
         return replace(state, active_run=completed), (Action("wait_for_delegations", {"active": active}),)
     # A completed child may receive a later native follow-up before the root
@@ -604,7 +605,8 @@ def _stop_block_reason(run: RunState) -> dict | None:
         return {"reason": "waiting for host launch confirmation: " + ", ".join(roles),
                 "code": "launch_unconfirmed"}
     invalid_consultants = run.assessment.get("_invalid_consultants", ())
-    if invalid_consultants:
+    # Asked once, then trusted: a missing marker line is not unfinished work.
+    if invalid_consultants and not run.assessment.get("_consultant_retry_asked"):
         return {
             "reason": "consultant results still require size/complexity classification: "
             + ", ".join(map(str, invalid_consultants)),
@@ -650,6 +652,9 @@ def _stop_requested(state: ProjectState, event: Event):
         return state, (Action("permit_stop"),)
     explicit = event.payload.get("control") is True
     reason = _stop_block_reason(run)
+    if reason and reason.get("code") == "consultant_unclassified" and not explicit:
+        run = replace(run, assessment={**run.assessment, "_consultant_retry_asked": True})
+        state = replace(state, active_run=run)
     if reason is None and not event.payload.get("native_unverified"):
         return _archive(state, run, "completed", event.observed_at), (
             Action("archive_run", {"run_id": run.run_id}),

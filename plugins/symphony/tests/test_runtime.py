@@ -2238,6 +2238,14 @@ class RuntimeTests(unittest.TestCase):
                     if order == 'valid':
                         self.assertIsNone(stored.active_run)
                         self.assertEqual('completed', stored.recent_runs[-1].status)
+                    elif order == 'unknown':
+                        # Bookkeeping: the hook wrapper releases the turn silently,
+                        # and the lead is never sent back to redo its work.
+                        self.assertEqual(('bookkeeping', 'completion_order_unknown'),
+                                         (result.recovery_kind, result.recovery_signal))
+                        self.assertEqual('completing', stored.active_run.status)
+                        self.assertEqual({'status': 'completed'}, stored.active_run.outcome)
+                        self.assertNotIn('_retryable_lead', stored.active_run.assessment)
                     else:
                         self.assertEqual('block', self.output(result).get('decision'))
                         self.assertEqual('recovering', stored.active_run.status)
