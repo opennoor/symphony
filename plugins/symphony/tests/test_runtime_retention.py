@@ -317,9 +317,17 @@ class RuntimeRetentionTests(unittest.TestCase):
                 # runtime must keep each owner recoverable instead of archiving it.
                 self.assertEqual({f"{provider}:old-a", f"{provider}:old-b"},
                                  set(document["active_runs"]))
-                self.assertTrue(all(run["status"] == "recovering" and run["outcome"] is None
-                                    and run["assessment"]["_retryable_lead"] == "fake-lead"
-                                    for run in document["active_runs"].values()))
+                if provider == "codex":
+                    self.assertTrue(all(run["status"] == "recovering" and run["outcome"] is None
+                                        and run["assessment"]["_retryable_lead"] == "fake-lead"
+                                        for run in document["active_runs"].values()))
+                else:
+                    # Unreadable Claude completion order never archives success,
+                    # nor does it send the lead back to redo finished work.
+                    self.assertTrue(all(run["status"] == "completing"
+                                        and "_retryable_lead" not in run["assessment"]
+                                        for run in document["active_runs"].values()))
+                self.assertFalse(document["recent_runs"])
 
     def exercise_removed_cache(self, providers=("codex", "claude")):
         for provider in providers:
@@ -421,18 +429,16 @@ class RuntimeRetentionTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 document = json.loads(state_file.read_text())
                 pending = document["active_runs"][f"{provider}:{session}"]
-                if provider == "codex":
-                    # The native parent launch proves the worker's purpose but
-                    # contains no lead turn/result. The earlier freshness guard
-                    # must withhold completion before chronology recovery.
-                    # The public hook quietly ends the host turn, retaining
-                    # this completing run without success credit.
-                    self.assertEqual('', result.stdout)
-                    self.assertEqual("completing", pending["status"])
-                    self.assertFalse(any(run["run_id"] == pending["run_id"] for run in document["recent_runs"]))
-                else:
-                    self.assertEqual("recovering", pending["status"])
-                    self.assertEqual("fake-lead", pending["assessment"]["_retryable_lead"])
+                # Codex: the native parent launch proves the worker's purpose
+                # but contains no lead turn/result, so the freshness guard
+                # withholds completion. Claude: the completion order cannot be
+                # read for fake IDs, which is bookkeeping, not an early report.
+                # Either way the public hook quietly ends the host turn,
+                # retaining this completing run without success credit.
+                self.assertEqual('', result.stdout)
+                self.assertEqual("completing", pending["status"])
+                self.assertNotIn("_retryable_lead", pending["assessment"])
+                self.assertFalse(any(run["run_id"] == pending["run_id"] for run in document["recent_runs"]))
 
     def test_retained_or_source_tampering_fails_closed(self):
         for changed_path in ("symphony/runtime.py", "json.py", "scripts/check_activation.py"):

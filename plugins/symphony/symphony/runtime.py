@@ -26,7 +26,8 @@ from .host_evidence import (
     claude_archived_sendmessage_sequence, claude_archived_mixed_sendmessage_sequence, claude_sendmessage_source_hash,
     _claude_sendmessage_late_callback,
     claude_committed_native_start_replay, claude_committed_native_terminal_replay, claude_completing_lead_turn,
-    claude_current_native_lead_event, claude_lead_turn_running, claude_recovered_lead_event,
+    claude_agent_turn_state, claude_current_native_lead_event, claude_lead_turn_running,
+    claude_recovered_lead_event,
     claude_substantive_launch,
     _CLAUDE_FAST_ACK,
     codex_substantive_launch,
@@ -34,7 +35,8 @@ from .host_evidence import (
     codex_completed_active_turns,
     codex_deferred_child_turns,
     codex_archived_followup_sequence,
-    codex_completing_lead_turn, codex_lead_turn_running, codex_recovered_lead_event,
+    codex_completing_lead_turn, codex_lead_turn_ended, codex_lead_turn_running,
+    codex_recovered_lead_event,
     codex_unavailable_lead_proof,
     codex_unmanaged_pre_run_terminal,
     retained_fast_escalation_receipt,
@@ -808,7 +810,7 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                 conflict, queued_run = conflict_meta.get(pending_event_id, ('', ''))
                 if disposition == 'hold_owner_conflict' and conflict:
                     disposition += '_' + conflict
-                if (_pending_blocks_current_run(state, event, provider, session)
+                if (_pending_blocks_current_run(state, event, provider, session, environ)
                         and not (disposition.startswith('hold_owner_conflict')
                                  and _queued_under_archived_run(state, provider, session, queued_run))):
                     unresolved = True
@@ -947,18 +949,23 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     state, _ = dispatch(state, native_turn)
         if source.kind in {"user_prompt", "pre_tool_use"}:
             lead_turn_live = _turn_live(state, provider, session, project, environ)
+        fast_lead_ended = source.kind == "pre_tool_use" and _fast_lead_ended(
+            state, provider, session, environ)
         # A new turn delivered in this same hook can supersede an earlier
         # queued completion. Include it before releasing the archive hold.
         if source.kind != "stop_requested":
             if pending and not lifecycle_source and any(
-                    _pending_blocks_current_run(state, event, provider, session)
+                    _pending_blocks_current_run(state, event, provider, session, environ)
                     for event, _ in pending):
                 state = _hold_pending_batch(state, provider, session)
             if lifecycle_source:
                 actions = source_actions
             else:
                 state, actions = dispatch(state, replace(source, payload={
-                    **source.payload, "lead_turn_live": True}) if lead_turn_live else source)
+                    **source.payload,
+                    **({"lead_turn_live": True} if lead_turn_live else {}),
+                    **({"fast_lead_ended": True} if fast_lead_ended else {}),
+                }) if lead_turn_live or fast_lead_ended else source)
             if not unresolved:
                 before_finish = state
                 state = _finish_pending_batch(state, provider, session, source)
@@ -981,6 +988,14 @@ def _handle_core(payload: dict, environ: Mapping[str, str] = os.environ) -> Hook
                     order = assessed_completion_chronology(evidence, session, project, environ)
                     if order != "valid" and explicit:
                         unverified = True
+                    elif order == "unknown":
+                        # Unreadable order is not proof of an early report. Never
+                        # claim completion or send the lead back to redo work: the
+                        # run stays completing and the next new task closes it.
+                        return state, ((Action("block_stop", {
+                            "reason": "Symphony could not verify the lead's native completion order.",
+                            'recovery_kind': 'bookkeeping',
+                            'recovery_signal': 'completion_order_unknown'}),), acknowledged)
                     elif order != "valid":
                         turns = run.assessment.get("_terminal_turns", {}).get(run.lead_identity, ())
                         token = turns[-1] if turns else ""
@@ -1565,13 +1580,18 @@ def _queued_under_archived_run(state: ProjectState, provider: str, session: str,
         and old.lead_identity != current.lead_identity for old in state.recent_runs))
 
 
-def _pending_blocks_current_run(state: ProjectState, event: Event, provider: str, session: str) -> bool:
+def _pending_blocks_current_run(state: ProjectState, event: Event, provider: str, session: str,
+                                environ: Mapping[str, str] | None = None) -> bool:
     """A proven different parent/archived identity cannot hold today's run."""
     run = state.active_runs.get(f'{provider}:{session}')
     if run is None:
         return True
     identity = event.payload.get('agent_id') or event.payload.get('subagent_id')
     parent = event.payload.get('parent_thread_id')
+    if not parent and provider == 'claude':
+        # Claude callbacks carry no parent; its native metadata names a nested
+        # agent's parent, which proves another lead's worker is not ours.
+        parent = _claude_child_meta(event.payload, environ).get('parentAgentId') or None
     known = {run.session_id, run.lead_identity, *(item.identity for item in run.delegations)} - {None, ''}
     if identity in known or parent in known - {session}:
         return True
@@ -2303,9 +2323,20 @@ def _finished_run(run: RunState | None, source: Event) -> bool:
             and not run.assessment.get("_fast_pending") and not run.assessment.get("_fast_escalated"))
 
 
+def _stalled_fast_run(run: RunState | None, source: Event) -> bool:
+    """A fast run whose lead is not visibly mid-turn but never settled its decision.
+
+    Its decision can stay unrecorded for good: the report may be unprovable,
+    or the root may have resumed the lead outside a tracked turn. Refusing
+    every later assessor and lead until then stopped unrelated work.
+    """
+    return (run is not None and bool(run.assessment.get("_fast_pending"))
+            and source.payload.get("fast_lead_ended") is True)
+
+
 def _close_finished_run(state: ProjectState, source: Event) -> ProjectState:
     """New work closes a finished run, recorded as superseded, never completed."""
-    if not _finished_run(state.active_run, source):
+    if not (_finished_run(state.active_run, source) or _stalled_fast_run(state.active_run, source)):
         return state
     archived = replace(state.active_run, status="superseded", updated_at=source.observed_at)
     return replace(state, active_run=None, recent_runs=(*state.recent_runs, archived)[-20:])
@@ -3282,7 +3313,8 @@ def _observe_delegation(
         source.payload.get("provider") == "claude"
         and current is None
         and not pending
-        and not _observed_role(source.payload)
+        and (not _observed_role(source.payload)
+             or _claude_foreign_child(state, source.payload, environ))
     ):
         # Every Symphony spawn on Claude passes PreToolUse with a role marker,
         # so an agent that arrives with neither is the host's or another
@@ -3855,8 +3887,11 @@ def _observe_delegation(
             )
             actions += recovery_actions
         invalid_consultants = state.active_run.assessment.get("_invalid_consultants", ())
-        if successful and invalid_consultants:
+        if (successful and invalid_consultants
+                and not state.active_run.assessment.get("_consultant_retry_asked")):
+            # Asked once: the lead's next completion is trusted without them.
             assessment = dict(state.active_run.assessment)
+            assessment["_consultant_retry_asked"] = True
             assessment["_pending_lead_completion"] = {
                 "identity": str(identity),
                 "owner_generation": state.active_run.owner_generation,
@@ -3869,6 +3904,7 @@ def _observe_delegation(
                     {
                         "text": "Lead completion is waiting for classified consultant results: "
                         + ", ".join(map(str, invalid_consultants))
+                        + ". Retry them, or report completion again to finish without them."
                     },
                 ),
             )
@@ -4051,7 +4087,7 @@ def _prepare_delegation(
         return state, ()
     fast_launch = role == "lead" and _marker_value(values, "SYMPHONY_FAST_ROUTE:") == "lead"
     if role in {"assessor", "lead"}:
-        # Sizing or leading new work: a finished run must not capture it.
+        # Sizing or leading new work: a finished or stalled run must not capture it.
         state = _close_finished_run(state, source)
     if not state.active_run and role != "assessor" and not fast_launch:
         if role != "lead" or _assessment_from_marker(values, "SYMPHONY_ROUTE:") is None:
@@ -4697,28 +4733,57 @@ def _consume_pending_delegation(
     return state, item if isinstance(item, Mapping) else {}
 
 
-def _claude_child_launch_hash(payload: Mapping[str, object],
-                              environ: Mapping[str, str] | None) -> str:
+def _claude_child_meta(payload: Mapping[str, object],
+                       environ: Mapping[str, str] | None) -> dict:
+    """The child's native Claude metadata, or {} when it cannot be read safely."""
     if environ is None:
-        return ""
+        return {}
     session = str(payload.get("session_id") or "")
     identity = str(payload.get("agent_id") or payload.get("subagent_id") or "")
     if not all(re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value) for value in (session, identity)):
-        return ""
+        return {}
     projects = Path(environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
     if projects.is_symlink() or not projects.is_dir():
-        return ""
+        return {}
     paths = tuple(projects.glob(f"*/{session}/subagents/agent-{identity}.meta.json"))
     if len(paths) != 1:
-        return ""
+        return {}
     path = paths[0]
     try:
         if (any(parent.is_symlink() for parent in (path, *path.parents[:3]))
                 or path.stat().st_size > 64 * 1024):
-            return ""
+            return {}
         meta = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, UnicodeError):
-        return ""
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _claude_foreign_child(state: ProjectState, payload: Mapping[str, object],
+                          environ: Mapping[str, str] | None) -> bool:
+    """A Claude agent this run never launched that evidently has another owner.
+
+    The root may resume an archived run's lead with SendMessage while a newer
+    run is open, and that lead may resume its own workers. Adopting them made
+    the newer run wait on another task's agents; a fast run could then never
+    finish, and every later lead was refused.
+    """
+    run = state.active_run
+    identity = str(payload.get("agent_id") or payload.get("subagent_id") or "")
+    if not run or not identity:
+        return False
+    if any(run_.provider == run.provider and run_.session_id == run.session_id
+           and identity in {run_.lead_identity, *(item.identity for item in run_.delegations)}
+           for run_ in state.recent_runs):
+        return True
+    parent = _claude_child_meta(payload, environ).get("parentAgentId")
+    return (isinstance(parent, str) and bool(parent)
+            and parent not in {run.lead_identity, *(item.identity for item in run.delegations)})
+
+
+def _claude_child_launch_hash(payload: Mapping[str, object],
+                              environ: Mapping[str, str] | None) -> str:
+    meta = _claude_child_meta(payload, environ)
     if (not isinstance(meta, dict) or meta.get("spawnDepth") != 2
             or meta.get("agentType") != payload.get("agent_type")):
         return ""
@@ -5219,6 +5284,21 @@ def _turn_live(state: ProjectState, provider: str, session: str, project: Path,
     scoped = _scope_state(state, f"{provider}:{session}", session, provider)
     return (_claude_turn_live(scoped, session, project, environ) if provider == "claude"
             else _codex_turn_live(scoped, session, environ))
+
+
+def _fast_lead_ended(state: ProjectState, provider: str, session: str,
+                     environ: Mapping[str, str]) -> bool:
+    """Native proof that a pending fast run's lead is not in a turn."""
+    run = _scope_state(state, f"{provider}:{session}", session, provider).active_run
+    if not run or not run.assessment.get("_fast_pending") or not run.lead_identity:
+        return False
+    try:
+        if provider == "claude":
+            return claude_agent_turn_state(session, run.lead_identity, environ) == "ended"
+        return codex_lead_turn_ended(
+            _scope_state(state, f"{provider}:{session}", session, provider), session, environ)
+    except Exception:
+        return False
 
 
 def _codex_turn_live(state: ProjectState, session: str, environ: Mapping[str, str]) -> bool:

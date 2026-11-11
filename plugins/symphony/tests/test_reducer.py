@@ -388,6 +388,21 @@ class LifecycleReducerTests(unittest.TestCase):
         self.assertEqual(original.active_run, state.active_run)
         self.assertEqual("block_completion", actions[0].kind)
 
+    def test_unclassified_consultant_holds_stop_only_once(self):
+        """#50: a consultant missing its decision line held every Stop."""
+        original = running_state(delegations=[delegation("consultant-1", "completed", role="consultant")])
+        original = replace(original, active_run=replace(original.active_run, assessment={
+            "_invalid_consultants": ["consultant-1"]}))
+        state, actions = reduce(original, event("lead_completed", identity="lead-1",
+                                                outcome={"status": "completed"}))
+        self.assertEqual("wait_for_delegations", actions[0].kind)
+        state, actions = reduce(state, event("stop_requested", event_id="stop-1"))
+        self.assertEqual("block_stop", actions[0].kind)
+        self.assertEqual("consultant_unclassified", actions[0].payload["code"])
+        state, actions = reduce(state, event("stop_requested", event_id="stop-2"))
+        self.assertIsNone(state.active_run)
+        self.assertEqual("completed", state.recent_runs[-1].status)
+
     def test_replayed_event_is_idempotent(self):
         enable = event("enable", event_id="stable-event")
         state, _ = reduce(ProjectState(), enable)

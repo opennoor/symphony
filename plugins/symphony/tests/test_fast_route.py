@@ -557,6 +557,73 @@ class FastRouteTests(unittest.TestCase):
                 self.assertEqual(2, len(self.store.session_record("codex", "codex-session")["pending"]))
                 self.assertIn("block", self.hook("codex", "Stop").stdout)
 
+    def assessed_lead_input(self, provider):
+        choice = resolve_tier(route_for(Assessment("medium", "mixed")), snapshot_for(provider, profiles_for(provider)[0]["id"]))
+        lead_type = (f"symphony:symphony-lead-{choice['lead_model']}-{choice['lead_effort']}"
+                     if provider == "claude" else
+                     f"symphony_lead_{choice['lead_model'].replace('-', '_').replace('.', '_')}_{choice['lead_effort']}")
+        route = '{"size":"medium","complexity":"mixed","risk":"normal","rationale":"other task","topology":"mixed"}'
+        packet = f"SYMPHONY_ROLE: lead\nSYMPHONY_ROUTE: {route}\nFix the metrics scraping"
+        return ({"subagent_type": lead_type, "prompt": packet} if provider == "claude"
+                else {"model": choice["lead_model"], "reasoning_effort": choice["lead_effort"], "message": packet})
+
+    def test_stalled_fast_run_yields_to_new_assessed_lead_only_after_its_lead_ended(self):
+        """lexi 2026-11-11: an unsettled fast decision refused every later lead."""
+        for provider in ('claude', 'codex'):
+            for turn in ('ended', 'running', 'unknown'):
+                with self.subTest(provider=provider, turn=turn):
+                    self.tearDown()
+                    self.setUp()
+                    self.start_fast(provider)
+                    with patch('plugins.symphony.symphony.runtime.claude_agent_turn_state', return_value=turn), \
+                         patch('plugins.symphony.symphony.runtime.codex_lead_turn_ended', return_value=turn == 'ended'):
+                        prepared = self.hook(provider, "PreToolUse",
+                                             tool_name="Agent" if provider == "claude" else "spawn_agent",
+                                             tool_input=self.assessed_lead_input(provider), tool_use_id="lead-spawn")
+                    if turn == 'ended':
+                        self.assertNotIn("deny", prepared.stdout)
+                        archived = self.store.load(self.project).recent_runs[-1]
+                        self.assertEqual(('superseded', 'fast-1', None),
+                                         (archived.status, archived.lead_identity, archived.outcome))
+                        self.assertNotIn('_fast_pending', self.run_state().assessment)
+                        self.assertIn('Fix the metrics scraping', self.run_state().task)
+                    else:
+                        self.assertIn("Recover the fast lead's decision", prepared.stdout)
+                        self.assertEqual('fast-1', self.run_state().lead_identity)
+
+    def test_archived_runs_resumed_agents_never_join_a_newer_run(self):
+        """lexi 2026-11-11: a resumed archived lead and its workers joined a fast run."""
+        config = Path(self.temp.name) / "claude"
+        subagents = config / "projects" / "project" / "claude-session" / "subagents"
+        subagents.mkdir(parents=True)
+        blocked = 'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"blocked"}'
+        _, old = self.start_fast('claude', identity='old-lead')
+        with patch('plugins.symphony.symphony.runtime.claude_current_native_lead_event', return_value=None):
+            self.hook('claude', "SubagentStop", **old, status="completed", last_assistant_message=blocked)
+        self.hook('claude', "UserPromptSubmit", prompt='/symphony:stop')
+        self.assertEqual('old-lead', self.store.load(self.project).recent_runs[-1].lead_identity)
+        self.start_fast('claude', identity='fast-2')
+        worker_type = old['agent_type'].replace('-lead-', '-worker-')
+        (subagents / "agent-old-worker.meta.json").write_text(json.dumps(
+            {"agentType": worker_type, "parentAgentId": "old-lead", "spawnDepth": 2}))
+        env = {"SYMPHONY_STATE_DIR": str(self.store.root), "SYMPHONY_PROFILE": profiles_for('claude')[0]["id"],
+               "SYMPHONY_PROVIDER": 'claude', "CLAUDE_CONFIG_DIR": str(config)}
+        for event, fields in (("SubagentStart", {**old, "prompt_id": "resume-1"}),
+                              ("SubagentStart", {"agent_id": "old-worker", "agent_type": worker_type}),
+                              ("SubagentStop", {"agent_id": "old-worker", "agent_type": worker_type,
+                                                "status": "completed", "last_assistant_message": "done"}),
+                              ("SubagentStop", {**old, "prompt_id": "resume-1", "status": "completed",
+                                                "last_assistant_message": "Babylon progress"})):
+            result = handle({"cwd": str(self.project), "session_id": "claude-session",
+                             "hook_event_name": event, **fields}, env)
+            self.assertNotIn('"decision": "block"', result.stdout)
+        run = self.run_state()
+        self.assertEqual('fast-2', run.lead_identity)
+        self.assertEqual(['fast-2'], [item.identity for item in run.delegations])
+        self.stop_fast('claude', {"agent_id": "fast-2", "agent_type": old['agent_type']},
+                       'SYMPHONY_FAST_DECISION: eligible\nSYMPHONY_OUTCOME: {"status":"completed"}')
+        self.assertEqual({'status': 'completed'}, self.run_state().outcome)
+
     def load_retained_fast_fixture(self):
         fixture = json.loads((Path(__file__).parent / "fixtures/retained-fast-v1.6.0.json").read_text())
         self.store.root.mkdir(parents=True, exist_ok=True)

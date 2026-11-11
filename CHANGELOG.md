@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.10.5 — prepared 2026-11-11
+
+- Fix a fast run that refused every later lead with "Recover the fast lead's decision before another lead can start", on Claude Code and Codex. When the root resumed an earlier run's lead with SendMessage while a fast run was open, Symphony adopted that lead and the workers it resumed into the fast run. The fast lead could then never finish, because a fast run may not have descendants, so its decision was never recorded. Symphony now leaves another run's agents out of the open run. On Claude it recognises them by their archived run or by the parent agent named in their native metadata. A fast run whose lead has provably ended its turn also yields to the next assessor or lead. It is recorded as superseded, never completed.
+- Make every hook fast again on large Claude sessions. A hook checked each retained callback against the session's native transcripts and re-parsed the whole root transcript for every one. On a 17 MB session with 78 retained callbacks, a plain tool hook took 13 seconds while holding the state lock. Claude cancelled hooks at their 20-second limit, so agent launches went ungoverned, and Windows hooks waited past the lock deadline (`store._locked` TimeoutError). Each transcript version is now parsed once per hook: the same hook takes 1.3 seconds.
+- Retained Claude callbacks from another lead's worker no longer hold the current run as `unresolved_child_owner_conflict` (#43–#54). Claude callbacks carry no parent ID, so Symphony now reads the parent from the worker's native metadata.
+- A consultant result missing its `SYMPHONY_DECISION` line now holds the lead's completion or the root's Stop at most once (`consultant_unclassified`, #50). Previously it held every Stop until the consultant was retried. The lead is asked once to retry it; its next completion report is trusted, and the unclassified consultant earns no credit.
+- When Symphony cannot read a Claude lead's native completion order (`completion_order_unknown`, #43, #53, #54), it no longer marks the lead failed and sends it back to redo finished work. The run stays open without success credit, and the next task closes it as superseded. A proven early report still sends the lead back.
+
 ## 1.10.4 — prepared 2026-11-03
 
 - Keep installed hooks silent in fresh or disabled projects. Hook activation alone no longer injects Symphony startup guidance, and the skill requires an explicit request or routing/recovery guidance from the current project's hook before governing work. Enabling another project grants no authority here.
