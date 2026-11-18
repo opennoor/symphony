@@ -130,12 +130,16 @@ class EntitlementProbeTests(unittest.TestCase):
     def test_a_complete_roster_selects_the_full_profile(self):
         required = profiles_for("codex")[0].get("requires_all", [])
         environ = self.codex_home(roster(*required))
-        self.assertEqual(self.heartbeat(environ).get("profile"), "latest")
+        self.assertEqual(self.heartbeat(environ).get("profile"), "latest-6-2")
 
     def test_new_models_route_without_losing_legacy_entitlements(self):
         for index, (provider, models, expected) in enumerate((
+            ("codex", ("gpt-6.2-astra", "gpt-6-luna", "gpt-6.2-sol"), "latest-6-2"),
+            ("codex", ("gpt-6-luna", "gpt-6.2-sol"), "luna-sol-6-2"),
+            ("codex", ("gpt-6.2-sol",), "sol-6-2"),
             ("codex", ("gpt-6-astra", "gpt-6-luna", "gpt-6.1-sol"), "latest"),
             ("codex", ("gpt-6-astra", "gpt-6-luna", "gpt-6-sol"), "full"),
+            ("claude", ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5"), "fable-5-2"),
             ("claude", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"), "fable-5-5"),
             ("claude", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5"), "fable"),
         )):
@@ -242,7 +246,7 @@ class EntitlementProbeTests(unittest.TestCase):
         # Remove the roster: a second heartbeat in the same session must not
         # re-probe, so the recorded answer survives.
         (Path(environ["CODEX_HOME"]) / "models_cache.json").unlink()
-        self.assertEqual(self.heartbeat(environ).get("profile"), "latest")
+        self.assertEqual(self.heartbeat(environ).get("profile"), "latest-6-2")
 
     def test_an_old_claude_profile_is_not_reused_after_upgrade(self):
         store = StateStore(self.state_root)
@@ -689,7 +693,7 @@ class ClampGateTests(unittest.TestCase):
         )
 
     def test_proceed_without_a_clamped_route_says_so(self):
-        environ = self.environ("latest")
+        environ = self.environ(profiles_for("codex")[0]["id"])
         result = self.send(
             environ, hook_event_name="UserPromptSubmit", prompt="$symphony:symphony proceed"
         )

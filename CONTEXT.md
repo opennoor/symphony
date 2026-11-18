@@ -1,6 +1,6 @@
 # Symphony
 
-Symphony gives a thin root agent a reliable way to complete project work through the right model, effort, and delegation topology, on both Codex and Claude Code. This glossary fixes the terms that have caused ambiguity; it is not a spec.
+Symphony gives a thin root agent a reliable way to complete project work through the right model, effort, and delegation topology, on both Codex and Claude Code, and from Hermes in orchestrator mode. This glossary fixes the terms that have caused ambiguity; it is not a spec.
 
 ## Language
 
@@ -35,6 +35,26 @@ _Avoid_: unarmed, unverified
 **Abandoned**:
 A run permitted to complete while tracked work was never reconciled, because the host reported no terminal event for it. Distinct from degraded, which is about activation rather than tracked work.
 _Avoid_: stale, orphaned, stuck
+
+**Host**:
+The program the root session runs in: Codex, Claude Code or Hermes. Distinct from provider: Hermes is a host but supplies no agents.
+_Avoid_: platform, client, frontend
+
+**Provider**:
+A source of agents with its own CLI, models and entitlement: Codex or Claude Code.
+_Avoid_: vendor, backend, host
+
+**Orchestrator mode**:
+The route in which a root delegates through the launcher instead of its host's own subagents: an assessor, then a lead, then full agents on either provider.
+_Avoid_: cross-provider mode, headless mode, multi-agent mode
+
+**Full agent**:
+A headless provider session started by the launcher, pinned to one model and effort, that may use its own host's subagents. Distinct from a delegation, which is a host-observed child of a native run.
+_Avoid_: external agent, remote agent, sub-session
+
+**Launcher**:
+The command that starts, tracks and reports full agents, and chooses their provider, model and effort by one rule for both providers.
+_Avoid_: runner, dispatcher, spawner
 
 **Safe boundary**:
 A lifecycle point at which lead ownership may transfer: completion of a worker wave, an explicit request, a new task, an approved plan, resume or compaction, interruption, or reported scope drift.

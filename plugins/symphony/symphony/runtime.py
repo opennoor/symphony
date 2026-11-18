@@ -19,6 +19,7 @@ from typing import Mapping
 from . import HOOK_SCHEMA_VERSION, PLUGIN_VERSION
 from .adapters import HookResult, detect_provider, event_from_payload, render
 from . import diagnostics
+from . import orchestrator
 from .host_evidence import (
     _archived_fast_owner, _instant, _packet_purpose, _reported_status,
     archived_lead_followup,
@@ -67,6 +68,7 @@ CONTROLS = {
     "disable",
     "enable",
     "help",
+    "orchestrate",
     "proceed",
     "report",
     "reassess",
@@ -328,7 +330,13 @@ def _launched_by_another_agent(payload: Mapping, environ: Mapping[str, str], pro
     already orchestrated by that agent; routing it again only adds agents and
     delay. Each host scrubs its own markers for its hooks, so only the outer
     shell's survive. Set SYMPHONY_AGENT_SESSIONS=1 to route such sessions.
+
+    An agent the orchestrator launched says so itself. It is one packet of a
+    lead's run on whatever host started it, and routing it again would nest
+    runs without bound, so no setting turns that back on.
     """
+    if environ.get('SYMPHONY_ORCHESTRATED') == '1':
+        return True
     if environ.get('SYMPHONY_AGENT_SESSIONS') == '1':
         return False
     try:
@@ -2409,6 +2417,16 @@ def _handle_prompt(
         configuration["assessor_boosts"] = preferences
         state = replace(state, configuration=configuration)
         return state, (Action("inject_context", {"text": _boost_status(state, provider, session_id)}),)
+    if name == "orchestrate":
+        if argument in {"on", "off"}:
+            state = replace(state, configuration=orchestrator.with_mode(state.configuration, argument == "on"))
+        if argument in {"", "on", "off", "status"}:
+            return state, (Action("inject_context", {"text": _orchestrator_status(state, provider)}),)
+        if state.active_run:
+            return state, (Action("inject_context", {"text": _recovery_guidance(state, provider)}),)
+        # One task through the launcher, whatever the standing mode is.
+        return state, (Action("inject_context", {"text": orchestrator.root_guidance(
+            orchestrator.launcher_command(environ), argument)}),)
     if name == "help":
         return state, (Action("inject_context", {"text": _help(provider)}),)
     if name == "version":
@@ -2478,12 +2496,37 @@ def _handle_prompt(
 
 def _task_guidance(state: ProjectState, task: str, provider: str, session_id: str = "") -> str:
     """Guidance for substantive work: recover an active run, or open a new one."""
+    if _orchestrator_mode(state) and not state.active_run:
+        # The launcher ranks both providers, so this host's own roster does not gate it.
+        return orchestrator.root_guidance(orchestrator.launcher_command(), task)
     if _applied_profile(state, provider) == NO_PROFILE:
         return ("Symphony has no launchable route in this account's available model roster; "
                 "do the task without Symphony at full quality.")
     if state.active_run:
         return _recovery_guidance(state, provider)
     return _assessment_guidance(task, provider, state, session_id)
+
+
+def _orchestrator_mode(state: ProjectState) -> bool:
+    setting = state.configuration.get("orchestrator")
+    return isinstance(setting, Mapping) and setting.get("enabled") is True
+
+
+def _orchestrator_status(state: ProjectState, provider: str) -> str:
+    """The orchestrate control's own result; it opens no task."""
+    control = _control_name("orchestrate", provider)
+    if not _orchestrator_mode(state):
+        return (f"Symphony orchestrator mode is off for this project. `{control} on` routes tasks through "
+                f"headless full agents on Codex and Claude Code; `{control} <task>` does that for one task. "
+                "This control-only invocation creates no managed task.")
+    scope = ("Every task prompt in this project is orchestrated." if state.enabled else
+             f"Symphony is not enabled here, so only `{control} <task>` and "
+             f"`{_control_name('start', provider)} <task>` are orchestrated; "
+             f"`{_control_name('enable', provider)}` covers every prompt.")
+    return ("Symphony orchestrator mode is on for this project. The root stays shallow at the model and "
+            "effort this session runs on; the strongest available assessor sizes each task and a lead "
+            "delegates it to full agents on both providers. " + scope
+            + f" `{control} off` returns to native agents. This control-only invocation creates no managed task.")
 
 
 def _parse_control(prompt: str) -> tuple[str, str] | None:
@@ -5109,13 +5152,13 @@ def _lead_guidance(state: ProjectState, provider: str) -> str:
     return (
         _ASSESSED_LEAD_CONTRACT
         + 'Only spawn workers/consultants; routing assessors belong to the root. '
-        + 'Parallel independent children (max 6), dependents in order; if refused, wait, retry. '
+        + 'Parallel independent children (max 6), dependents in order; refused: wait, retry. '
         + protocol + "Symphony worker routes by the packet's own size/complexity: "
         + "; ".join(_provider_cells(snapshot, "worker"))
         + (f". Consultants use `symphony:symphony-consultant-{snapshot.tiers['strongest']}-high`."
            if provider == "claude" else
            f". Consultants: model={snapshot.tiers['strongest']}, reasoning_effort=high, "
-           'fork_turns="none", name `symphony_consultant_<model>_<effort>__<purpose>`, '
+           'fork_turns="none", name symphony_consultant_<model>_<effort>__<purpose>, '
            'SYMPHONY_ROLE: consultant; SYMPHONY_DECISION JSON in packet and own final report.')
         + "\n\nTask reminder (full assigned packet governs if clipped):\n" + state.active_run.task
     )
@@ -5589,6 +5632,8 @@ def _status(
     ]
     if provider:
         lines.append(_boost_status(state, provider, session_id))
+    if _orchestrator_mode(state):
+        lines.append("Orchestrator mode: on (tasks run through headless full agents on both providers)")
     if provider == "claude" and activation.get("claude_probe_attempted"):
         lines.append(f"Claude model check: {activation.get('profile') or 'unverified (Sonnet fallback)'}")
     if not state.active_run:
@@ -5677,8 +5722,8 @@ def _native_help(provider: str) -> str:
 
 def _help(provider: str) -> str:
     if provider == "claude":
-        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:boost [xhigh|max|off], /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:report on|off|submit|decline <approval-code>, /symphony:help."
-    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|boost [xhigh|max|ultra|off]|reassess|proceed|stop|version|report on|off|submit|decline <approval-code>|help."
+        return "Symphony controls: /symphony:enable, /symphony:start, /symphony:bypass, /symphony:disable, /symphony:status, /symphony:agents, /symphony:boost [xhigh|max|off], /symphony:orchestrate [on|off|<task>], /symphony:reassess, /symphony:proceed, /symphony:stop, /symphony:version, /symphony:report on|off|submit|decline <approval-code>, /symphony:help."
+    return "Symphony controls: $symphony:symphony enable|start|bypass|disable|status|agents|boost [xhigh|max|ultra|off]|orchestrate [on|off|<task>]|reassess|proceed|stop|version|report on|off|submit|decline <approval-code>|help."
 
 
 def _fault_log(environ: Mapping[str, str]) -> Path:

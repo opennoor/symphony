@@ -33,6 +33,10 @@ class DiagnosticReportingTests(unittest.TestCase):
             side_effect=lambda environ: {**environ, 'GH_TOKEN': 'test-only-token'})
         self.credential_patch.start()
         self.addCleanup(self.credential_patch.stop)
+        # Existing fixtures use historical versions; treat them as current.
+        self.release_patch = patch.object(d, '_latest_release', return_value=(0, 0, 0))
+        self.release = self.release_patch.start()
+        self.addCleanup(self.release_patch.stop)
 
     def offered(self, provider='codex', session='root'):
         self.assertEqual('', d.notice(self.store, provider, session, self.env))
@@ -221,6 +225,111 @@ class DiagnosticReportingTests(unittest.TestCase):
         self.assertIn(d.SIGNALS['unresolved_child_owner_conflict'], body)
         self.assertIn('Counts are hook observations, not unique child events', body)
         self.assertNotIn(str(self.project), body)
+
+    def test_released_and_repeated_stop_signals_name_the_guard_that_held(self):
+        for signal in ('released_active_work', 'repeat_active_work', 'repeat_block',
+                       'released_unclassified_block', 'repeat_substantive_child_missing'):
+            self.assertNotIn('Not described', d.describe(signal), signal)
+        self.assertIn(d.SIGNALS['active_work'], d.describe('released_active_work'))
+        self.assertIn(d.SIGNALS['active_work'], d.describe('repeat_active_work'))
+        self.assertNotEqual(d.describe('released_active_work'), d.describe('repeat_active_work'))
+        self.assertIn('Not described', d.describe('released_never_recorded'))
+        self.store.record_recovery_diagnostic({
+            'schema': 2, 'plugin_version': '1.10.1', 'provider': 'claude', 'platform': 'macos',
+            'category': 'incomplete_work', 'outcome': 'deferred', 'hook': 'Stop',
+            'signal': 'repeat_active_work', 'detail': '', 'site': ''})
+        body = d.issue_body({'id': 'a' * 32, 'reports': d.snapshot(self.store)})
+        self.assertIn('- `repeat_active_work`: ' + d.describe('repeat_active_work'), body)
+        self.assertNotIn('Not described', body)
+
+    def test_release_lookup_accepts_only_a_plain_version_tag(self):
+        self.release_patch.stop()
+        try:
+            with patch.object(d, '_gh', return_value='v1.10.5') as gh:
+                self.assertEqual((1, 10, 5), d._latest_release({}))
+            self.assertIn('repos/opennoor/symphony/releases/latest', gh.call_args.args[0])
+            for tag in ('', 'latest', 'v1.10', '1.10.5-rc1', 'v1.10.5\nv9.9.9'):
+                with patch.object(d, '_gh', return_value=tag):
+                    with self.assertRaises(ValueError):
+                        d._latest_release({})
+        finally:
+            self.release_patch.start()
+
+    def test_install_older_than_the_latest_release_is_told_to_update_and_never_asked_to_share(self):
+        self.release.return_value = (1, 10, 5)
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))
+        with patch.object(d, '_gh', side_effect=['User', 'true']) as gh:
+            d.worker(str(self.store.root), 'probe')
+        self.assertEqual(2, gh.call_count)
+        record = d._read(self.store)
+        self.assertEqual(('outdated', '1.10.5'), (record['phase'], record['latest_release']))
+        text = d.notice(self.store, 'codex', 'root', self.env)
+        self.assertIn('1.10.5', text)
+        self.assertIn('codex plugin marketplace upgrade symphony', text)
+        self.assertNotIn('Approval code', text)
+        # Once per release, in any session, and the reports stay local.
+        self.assertEqual('', d.notice(self.store, 'claude', 'other-root', self.env))
+        self.assertEqual(1, len(d.snapshot(self.store)))
+        self.assertFalse((self.store.root / 'diagnostic-issue.md').exists())
+
+    def test_outdated_install_is_rechecked_daily_without_repeating_the_notice(self):
+        self.release.return_value = (1, 10, 5)
+        d.notice(self.store, 'codex', 'root', self.env)
+        with patch.object(d, '_gh', side_effect=['User', 'true']):
+            d.worker(str(self.store.root), 'probe')
+        self.assertIn('1.10.5', d.notice(self.store, 'codex', 'root', self.env))
+        record = d._read(self.store)
+        self.store._write_json(d._path(self.store), {**record, 'cycle_at': 0})
+        self.launch.reset_mock()
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))
+        self.launch.assert_called_once()
+        self.assertEqual('checking', d._read(self.store)['phase'])
+        with patch.object(d, '_gh', side_effect=['User', 'true']):
+            d.worker(str(self.store.root), 'probe')
+        self.assertEqual('outdated', d._read(self.store)['phase'])
+        self.assertEqual('', d.notice(self.store, 'codex', 'root', self.env))
+        # A newer release is worth one more line.
+        self.store._write_json(d._path(self.store), {**d._read(self.store), 'cycle_at': 0})
+        d.notice(self.store, 'codex', 'root', self.env)
+        self.release.return_value = (1, 11, 0)
+        with patch.object(d, '_gh', side_effect=['User', 'true']):
+            d.worker(str(self.store.root), 'probe')
+        self.assertIn('1.11.0', d.notice(self.store, 'codex', 'root', self.env))
+
+    def test_updated_install_shares_only_reports_from_the_current_release(self):
+        self.store.record_recovery_diagnostic({
+            'schema': 2, 'plugin_version': '1.10.5', 'provider': 'codex', 'platform': 'linux',
+            'category': 'runtime_fault', 'outcome': 'deferred', 'hook': 'Stop',
+            'signal': 'stop_hook_exception', 'detail': 'KeyError', 'site': 'runtime._stop_requested:42'})
+        self.release.return_value = (1, 10, 5)
+        self.approved()
+        with patch.object(d, '_gh', side_effect=['User', '[]', '[]',
+                                                 'https://github.com/opennoor/symphony/issues/123']) as gh:
+            d.worker(str(self.store.root), 'publish')
+        args = gh.call_args_list[-1].args[0]
+        self.assertEqual('Symphony 1.10.5 diagnostics: stop_hook_exception (codex, linux)',
+                         args[args.index('--title') + 1])
+        body = (self.store.root / 'diagnostic-issue.md').read_text()
+        self.assertNotIn('1.7.5', body)
+        self.assertEqual('published', d._read(self.store)['phase'])
+
+    def test_release_published_after_approval_keeps_the_approved_snapshot_local(self):
+        self.approved()
+        self.release.return_value = (1, 10, 5)
+        with patch.object(d, '_gh', side_effect=['User']) as gh:
+            d.worker(str(self.store.root), 'publish')
+        self.assertEqual(1, gh.call_count)
+        self.assertEqual('outdated', d._read(self.store)['phase'])
+        self.assertIn('claude plugin update symphony', d.notice(self.store, 'claude', 'other', self.env))
+
+    def test_failed_release_lookup_keeps_reports_local(self):
+        self.approved()
+        self.release.side_effect = OSError('offline')
+        with patch.object(d, '_gh', side_effect=['User']) as gh:
+            d.worker(str(self.store.root), 'publish')
+        self.assertEqual(1, gh.call_count)
+        self.assertEqual('approved', d._read(self.store)['phase'])
+        self.assertFalse((self.store.root / 'diagnostic-issue.md').exists())
 
     def test_retained_evidence_never_starts_a_sharing_offer(self):
         (self.store.root / 'diagnostics').mkdir(exist_ok=True)

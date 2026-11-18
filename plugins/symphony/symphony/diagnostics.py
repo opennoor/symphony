@@ -81,7 +81,42 @@ SIGNALS = {
     'stop_notice_suppressed': 'A Stop notice was withheld from the user because the turn was released.',
     'pending_child_for_other_run': 'Evidence for a run another hook owns was kept for that owner. Expected.',
     'native_events_replayed': 'Queued native events were replayed and the run recovered.',
+    'unclassified_block': 'A Stop block carried no reason code.',
+    'block': 'A Stop block carried no recovery signal.',
 }
+
+# Stop is held at most once per turn. These prefixes mark the second Stop of
+# that turn, which Symphony released with the named guard still holding.
+_RELEASED = {
+    'released_': 'The run reducer released a repeated Stop and kept the unfinished work in durable status. '
+                 'The guard that still held: ',
+    'repeat_': 'Stop was held once this turn and asked again; the second Stop was released unsettled. '
+               'The guard that still held: ',
+}
+
+
+def describe(name: str) -> str:
+    """Meaning of one recorded signal, including the composed release forms."""
+    if name in SIGNALS:
+        return SIGNALS[name]
+    for prefix, lead in _RELEASED.items():
+        if name.startswith(prefix) and name[len(prefix):] in SIGNALS:
+            return lead + SIGNALS[name[len(prefix):]]
+    return 'Not described by this Symphony version; start at its site.'
+
+
+def _version(text: object) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r'v?([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})', str(text))
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
+
+def _supported(reports: list[dict], latest: tuple[int, int, int]) -> list[dict]:
+    """Reports recorded by the latest release or a newer build.
+
+    An older install reports faults that later releases may already fix, so
+    its records stay local and the user is told to update instead.
+    """
+    return [item for item in reports if (_version(item.get('plugin_version')) or (0, 0, 0)) >= latest]
 
 
 def _valid_report(item: object) -> bool:
@@ -203,7 +238,12 @@ def _fault_count(reports: list[dict]) -> int:
 
 
 def _command(provider: str) -> str:
-    return '$symphony:symphony report' if provider == 'codex' else '/symphony:report'
+    return {'codex': '$symphony:symphony report', 'hermes': '/symphony report'}.get(provider, '/symphony:report')
+
+
+def _upgrade_command(provider: str) -> str:
+    return {'codex': 'codex plugin marketplace upgrade symphony',
+            'hermes': 'hermes plugins update symphony'}.get(provider, 'claude plugin update symphony')
 
 
 def _rotate(store: StateStore, through: float) -> None:
@@ -254,13 +294,29 @@ def notice(store: StateStore, provider: str, session: str, environ: Mapping[str,
     publish = False
     with _locked(_path(store), timeout=0.05):
         record = _read(store)
+        carried = {}
         if (standing == 'on' and faults and record.get('phase') in {'published', 'idle'}
                 and time.time() - float(record.get('cycle_at') or record.get('publish_scheduled') or 0) > _CYCLE_SECONDS):
             record = {}
+        elif (record.get('phase') == 'outdated' and record.get('notified') and faults
+              and time.time() - float(record.get('cycle_at') or 0) > _CYCLE_SECONDS):
+            # Look again daily: the user may have updated. One notice per release.
+            carried = {'upgrade_notified': record.get('latest_release')}
+            record = {}
         if not record or (record.get('phase') == 'checking' and time.time() - record.get('started', 0) > 60):
-            record = {'id': secrets.token_hex(16), 'phase': 'checking', 'started': time.time()}
+            record = {'id': secrets.token_hex(16), 'phase': 'checking', 'started': time.time(),
+                      **{key: value for key, value in (carried or record).items() if key == 'upgrade_notified'}}
             store._write_json(_path(store), record)
             probe = True
+        elif record.get('phase') == 'outdated':
+            if not record.get('notified'):
+                record['notified'] = True
+                store._write_json(_path(store), record)
+                if record.get('upgrade_notified') != record.get('latest_release'):
+                    return (f"This Symphony install is older than the released {record.get('latest_release')}, so "
+                            'its diagnostic reports stay on this machine: newer releases may already fix them. '
+                            f'Mention once, in one short line, that `{_upgrade_command(provider)}` updates '
+                            'Symphony; then continue the user task.')
         elif (record.get('phase') == 'available' and standing == 'on'
               and preference(store).get('account', record.get('account')) == record.get('account')):
             # Opted in: share silently with the account the user approved.
@@ -399,6 +455,15 @@ def _credential_environ(environ: Mapping[str, str]) -> dict[str, str]:
     return {**environ, 'GH_TOKEN': token}
 
 
+def _latest_release(environ: Mapping[str, str]) -> tuple[int, int, int]:
+    """The newest published Symphony version; a failed lookup keeps reports local."""
+    version = _version(_gh(['api', '--hostname', 'github.com', f'repos/{REPOSITORY}/releases/latest',
+                            '--jq', '.tag_name'], environ))
+    if version is None:
+        raise ValueError('invalid release tag')
+    return version
+
+
 def _validated_reports(record: dict) -> list[dict]:
     # Revalidate persisted approved data too: edits cannot smuggle private text.
     reports = record['reports']
@@ -422,7 +487,7 @@ def issue_body(record: dict) -> str:
                      f"{row['provider']}/{row['platform']} |")
     meanings = []
     for name in dict.fromkeys(row['signal'] for row in rows if row['signal']):
-        meanings.append(f"- `{name}`: {SIGNALS.get(name, 'Not described by this Symphony version; start at its site.')}")
+        meanings.append(f"- `{name}`: {describe(name)}")
     if any(not row['signal'] for row in rows):
         meanings.append('- `(schema 1)`: recorded by a Symphony build before 1.8.0, which kept only the '
                         'category and outcome.')
@@ -459,10 +524,18 @@ def worker(root: str, mode: str) -> None:
                 account = _account(environ)
                 available = _gh(['api', '--hostname', 'github.com', f'repos/{REPOSITORY}',
                                  '--jq', '.has_issues'], environ)
+                phase = 'available' if available == 'true' else 'unavailable'
+                extra = {}
+                if phase == 'available':
+                    released = _latest_release(environ)
+                    if not _fault_count(_supported(snapshot(store), released)):
+                        # Every fault here predates the latest release.
+                        phase = 'outdated'
+                        extra = {'latest_release': '.'.join(map(str, released)), 'cycle_at': time.time()}
                 with _locked(_path(store), timeout=0.05):
                     latest = _read(store)
                     if latest.get('id') == record['id'] and latest.get('phase') == 'checking':
-                        latest.update(phase='available' if available == 'true' else 'unavailable', account=account)
+                        latest.update(phase=phase, account=account, **extra)
                         store._write_json(_path(store), latest)
                 return
             if mode != 'publish' or record.get('phase') != 'approved' or record.get('repository') != REPOSITORY:
@@ -475,6 +548,22 @@ def worker(root: str, mode: str) -> None:
                 with _locked(_path(store), timeout=0.05):
                     store._write_json(_path(store), {'id': secrets.token_hex(16), 'phase': 'checking', 'started': 0})
                 return
+            if not record.get('create_attempted'):
+                # Nothing is public yet: an install older than the latest
+                # release keeps its reports local and is told to update.
+                released = _latest_release(environ)
+                current = _supported(_validated_reports(record), released)
+                if not current:
+                    with _locked(_path(store), timeout=0.05):
+                        latest = _read(store)
+                        if latest.get('id') == record.get('id') and latest.get('phase') == 'approved':
+                            store._write_json(_path(store), {
+                                'id': record['id'], 'phase': 'outdated', 'account': record.get('account'),
+                                'latest_release': '.'.join(map(str, released)), 'cycle_at': time.time(),
+                                **({'upgrade_notified': record['upgrade_notified']}
+                                   if record.get('upgrade_notified') else {})})
+                    return
+                record['reports'] = current
             body = issue_body(record)
             marker = f"symphony-diagnostic:{record['id']}"
             # Recover a successful create whose response or local receipt was
