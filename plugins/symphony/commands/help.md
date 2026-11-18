@@ -13,6 +13,7 @@ description: Show Claude Code commands for Symphony
 - `/symphony:reassess` — reassess subsequent work at the current evidence boundary.
 - `/symphony:proceed` — accept a route your plan clamps to a weaker model, for this session.
 - `/symphony:boost [xhigh|max|off]` — boost subsequent assessors in this session; status shows requested and effective effort.
+- `/symphony:orchestrate [on|off|<task>]` — run tasks through headless full agents on Codex and Claude Code; `on`/`off` sets the mode for this project, a task runs once.
 - `/symphony:stop [--force]` — request a safe stop; `--force` acknowledges interruption of active work.
 - `/symphony:version` — show which Symphony build is running this session, and whether a newer one is installed.
 - `/symphony:report on|off` — share anonymous error reports automatically (at most daily), or keep them local.

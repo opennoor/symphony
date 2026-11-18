@@ -1,0 +1,246 @@
+{
+  "reviewed_at": "2026-11-18",
+  "sources": [
+    "https://learn.chatgpt.com/docs/pricing",
+    "https://learn.chatgpt.com/codex/models",
+    "https://developers.openai.com/api/docs/models/gpt-6-luna",
+    "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "https://developers.openai.com/api/docs/models/gpt-6-astra",
+    "https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.6",
+    "https://www.anthropic.com/news/claude-sonnet-5",
+    "https://www.anthropic.com/claude-opus-5-5",
+    "https://www.anthropic.com/claude/fable",
+    "https://www.anthropic.com/claude-fable-and-mythos-5-1",
+    "https://docs.anthropic.com/en/docs/about-claude/model-deprecations",
+    "https://docs.anthropic.com/en/docs/about-claude/pricing",
+    "https://learn.chatgpt.com/docs/agent-configuration/subagents",
+    "https://learn.chatgpt.com/docs/models",
+    "https://code.claude.com/docs/en/sub-agents",
+    "https://code.claude.com/docs/en/model-config",
+    "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+    "https://platform.claude.com/docs/en/models/sonnet-5-5/overview",
+    "https://platform.claude.com/docs/en/build-with-claude/effort",
+    "https://openai.com/index/introducing-gpt-6-2-astra-sol/",
+    "https://learn.chatgpt.com/docs/whats-new/gpt-62-astra-sol",
+    "https://platform.claude.com/docs/en/models/overview",
+    "https://platform.claude.com/docs/en/models/fable-5-2/overview",
+    "https://platform.claude.com/docs/en/models/haiku-5-5/overview",
+    "https://platform.claude.com/docs/en/about-claude/pricing",
+    "https://www.anthropic.com/claude-fable-and-mythos-5-2"
+  ],
+  "note": "Reviewed selection policy: prefer newer models when the entitlement profile can select them; retain older models in legacy profiles for accounts without access to their replacement, and otherwise use an older model only when verified token rates justify it. Capability bands express Symphony's routing judgment from provider positioning, not prices or benchmark scores. Generation is comparable only within a family. Codex rates are Standard subscription credits per million tokens; Claude rates are standard API USD per million tokens, including 5-minute/1-hour cache writes (1.25x/2x uncached input); Claude Haiku 5.5 lists its base rates for prompts up to 100,000 tokens and its higher long-prompt rates separately. These billing contexts are not interchangeable and do not estimate ChatGPT or Claude plan allowances. Unknown models need a source-backed policy update; legacy, deprecated, retiring and retired models are ineligible. Actual task cost requires measured input/cache/output (including reasoning), retries and tools; effort labels have no fixed token multiplier. Price comparisons assume the same token mix and service tier, not equal task consumption.",
+  "cross_provider_cost": {
+    "codex_credit_usd": 0.04,
+    "basis": "OpenAI lists gpt-6.2-astra at $8/$40 per million tokens and 200/1000 Codex credits, and gpt-6.2-sol at $2/$10 and 50/250: one credit is $0.04. Used only to rank orchestrated agents across providers on one price scale."
+  },
+  "models": {
+    "gpt-6-luna": {
+      "capability_rank": 0,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 2.5,
+        "cached_input": 0.25,
+        "output": 12.5
+      },
+      "family": "gpt",
+      "generation": 6
+    },
+    "gpt-6-sol": {
+      "capability_rank": 2,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 50,
+        "cached_input": 5,
+        "output": 250
+      },
+      "family": "gpt",
+      "generation": 6
+    },
+    "gpt-6-astra": {
+      "capability_rank": 4,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 250,
+        "cached_input": 25,
+        "output": 1250
+      },
+      "family": "gpt",
+      "generation": 6
+    },
+    "gpt-5.6-luna": {
+      "capability_rank": 0,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 5,
+        "cached_input": 0.5,
+        "output": 30
+      },
+      "family": "gpt",
+      "generation": 5.6
+    },
+    "gpt-5.6-terra": {
+      "capability_rank": 1,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 50,
+        "cached_input": 5,
+        "output": 300
+      },
+      "family": "gpt",
+      "generation": 5.6
+    },
+    "gpt-5.6-sol": {
+      "capability_rank": 2,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 100,
+        "cached_input": 10,
+        "output": 500
+      },
+      "family": "gpt",
+      "generation": 5.6
+    },
+    "claude-sonnet-5": {
+      "capability_rank": 1,
+      "lifecycle": "current",
+      "api_usd_per_million_tokens": {
+        "input": 2,
+        "cached_input": 0.2,
+        "output": 10,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 4
+      },
+      "family": "sonnet",
+      "generation": 5
+    },
+    "claude-opus-5-5": {
+      "capability_rank": 3,
+      "lifecycle": "current",
+      "api_usd_per_million_tokens": {
+        "input": 4,
+        "cached_input": 0.2,
+        "output": 20,
+        "cache_write_5m": 5,
+        "cache_write_1h": 8
+      },
+      "family": "opus",
+      "generation": 5.5
+    },
+    "claude-fable-5-1": {
+      "capability_rank": 4,
+      "lifecycle": "current",
+      "api_usd_per_million_tokens": {
+        "input": 10,
+        "cached_input": 0.25,
+        "output": 50,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20
+      },
+      "family": "fable",
+      "generation": 5.1
+    },
+    "gpt-5.5": {
+      "capability_rank": 1,
+      "lifecycle": "retired",
+      "retirement_date": "2026-10-14",
+      "codex_credits_per_million_tokens": {
+        "input": 125,
+        "cached_input": 12.5,
+        "output": 750
+      },
+      "family": "gpt",
+      "generation": 5.5
+    },
+    "gpt-6.1-sol": {
+      "capability_rank": 3,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 50,
+        "cached_input": 2.5,
+        "output": 250
+      },
+      "family": "gpt",
+      "generation": 6.1
+    },
+    "claude-sonnet-5-5": {
+      "capability_rank": 2,
+      "lifecycle": "current",
+      "api_usd_per_million_tokens": {
+        "input": 2,
+        "cached_input": 0.1,
+        "output": 10,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 4
+      },
+      "family": "sonnet",
+      "generation": 5.5
+    },
+    "gpt-6.2-astra": {
+      "capability_rank": 4,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 200,
+        "cached_input": 10,
+        "output": 1000
+      },
+      "family": "gpt",
+      "generation": 6.2
+    },
+    "gpt-6.2-sol": {
+      "capability_rank": 3,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 50,
+        "cached_input": 2.5,
+        "output": 250
+      },
+      "family": "gpt",
+      "generation": 6.2
+    },
+    "gpt-6.1-terra": {
+      "capability_rank": 1,
+      "lifecycle": "current",
+      "codex_credits_per_million_tokens": {
+        "input": 25,
+        "cached_input": 1.25,
+        "output": 125
+      },
+      "family": "gpt",
+      "generation": 6.1
+    },
+    "claude-fable-5-2": {
+      "capability_rank": 4,
+      "lifecycle": "current",
+      "api_usd_per_million_tokens": {
+        "input": 8,
+        "cached_input": 0.2,
+        "output": 40,
+        "cache_write_5m": 10,
+        "cache_write_1h": 16
+      },
+      "family": "fable",
+      "generation": 5.2
+    },
+    "claude-haiku-5-5": {
+      "capability_rank": 0,
+      "lifecycle": "current",
+      "api_usd_per_million_tokens": {
+        "input": 0.1,
+        "cached_input": 0.01,
+        "output": 0.5,
+        "cache_write_5m": 0.125,
+        "cache_write_1h": 0.2
+      },
+      "long_prompt_threshold_tokens": 100000,
+      "long_prompt_api_usd_per_million_tokens": {
+        "input": 0.5,
+        "cached_input": 0.05,
+        "output": 2.5,
+        "cache_write_5m": 0.625,
+        "cache_write_1h": 1
+      },
+      "family": "haiku",
+      "generation": 5.5
+    }
+  }
+}

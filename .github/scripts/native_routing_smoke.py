@@ -27,7 +27,11 @@ PLUGIN = Path(__file__).resolve().parents[2] / "plugins" / "symphony"
 sys.path.insert(0, str(PLUGIN))
 from symphony.host_evidence import _complete_native_jsonl, _native_jsonl  # noqa: E402
 from symphony import host_evidence  # noqa: E402
-from symphony.routing import Assessment, fast_lead_selection, route_for, snapshot_for  # noqa: E402
+from symphony.routing import Assessment, fast_lead_selection, profiles_for, route_for, snapshot_for  # noqa: E402
+
+# Every shipped profile can be probed; a hand-kept list fell behind each model update.
+SHIPPED_PROFILES = tuple(sorted({profile["id"] for provider in ("codex", "claude")
+                                 for profile in profiles_for(provider)}))
 from symphony.store import StateStore, _state_from_dict, _run_from_dict  # noqa: E402
 from symphony.model import Event, ProjectState  # noqa: E402
 from symphony.adapters import event_from_payload  # noqa: E402
@@ -197,7 +201,7 @@ def failure_diagnostics(provider, root, document):
                     root / 'primary', {'CLAUDE_CONFIG_DIR': str(home)}, host_evidence, mixed=True))
     return {"enabled": document.get("enabled") is True,
             "activation_guarded": activation.get("state") == "guarded",
-            "profile": activation.get("profile") if activation.get("profile") in {"latest", "full", "opus-5-5"} else "unknown",
+            "profile": activation.get("profile") if activation.get("profile") in SHIPPED_PROFILES else "unknown",
             "loaded_version": activation.get("plugin_version") if re.fullmatch(r"\d+\.\d+\.\d+", str(activation.get("plugin_version"))) else "unknown",
             "boost_levels": sorted({value for value in boosts if isinstance(value, str) and value in {"off", "xhigh", "max", "ultra"}}),
             "callbacks": counts, "native_signals": native_signals,
@@ -2690,8 +2694,8 @@ def verify_case_run(provider, case, document, run_state, home, project, greeting
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", choices=("codex", "claude"), required=True)
-    parser.add_argument("--profile", choices=("latest", "full", "opus-5-5"),
-                        help="Explicit shipped profile; Codex latest requires an observed compatible spawn roster")
+    parser.add_argument("--profile", choices=SHIPPED_PROFILES,
+                        help="Explicit shipped profile; a Codex profile requires an observed compatible spawn roster")
     parser.add_argument("--candidate-plugin-root", type=Path, default=PLUGIN)
     parser.add_argument("--timeout", type=int, default=600, help="Seconds per plain objective")
     parser.add_argument("--budget", type=float, default=6)

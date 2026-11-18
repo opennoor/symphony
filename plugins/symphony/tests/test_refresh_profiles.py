@@ -123,7 +123,8 @@ class RosterTests(unittest.TestCase):
         current = json.loads(self.refresh.PROFILES.read_text())["providers"]["claude"]["profiles"]
         profiles = [{"id": item["id"], "matrix": json.loads(json.dumps(item["matrix"]))} for item in current]
         next(item for item in profiles if item["id"] == "opus")["matrix"] = json.loads(json.dumps(profiles[-1]["matrix"]))
-        models = ("claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1")
+        models = ("claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1",
+                  "claude-fable-5-2")
         decision = {
             "profiles": profiles,
             "model_order": list(models),
@@ -152,12 +153,31 @@ class ShippedProfileTests(unittest.TestCase):
         refresh = load()
         policy = refresh._policy()
         profiles = json.loads(refresh.PROFILES.read_text())["providers"]
-        self.assertEqual(policy["reviewed_at"], "2026-09-29")
+        self.assertEqual(policy["reviewed_at"], "2026-11-18")
         self.assertEqual(policy["models"]["gpt-6.1-sol"]["codex_credits_per_million_tokens"],
                          {"input": 50, "cached_input": 2.5, "output": 250})
+        self.assertEqual(policy["models"]["gpt-6.2-sol"]["codex_credits_per_million_tokens"],
+                         {"input": 50, "cached_input": 2.5, "output": 250})
+        self.assertEqual(policy["models"]["gpt-6.2-astra"]["codex_credits_per_million_tokens"],
+                         {"input": 200, "cached_input": 10, "output": 1000})
+        self.assertEqual(policy["models"]["gpt-6.1-terra"]["codex_credits_per_million_tokens"],
+                         {"input": 25, "cached_input": 1.25, "output": 125})
         self.assertEqual(policy["models"]["claude-sonnet-5-5"]["api_usd_per_million_tokens"],
-                         {"input": 2, "cached_input": 0.2, "output": 10,
+                         {"input": 2, "cached_input": 0.1, "output": 10,
                           "cache_write_5m": 2.5, "cache_write_1h": 4})
+        self.assertEqual(policy["models"]["claude-fable-5-2"]["api_usd_per_million_tokens"],
+                         {"input": 8, "cached_input": 0.2, "output": 40,
+                          "cache_write_5m": 10, "cache_write_1h": 16})
+        self.assertEqual(policy["models"]["claude-haiku-5-5"]["api_usd_per_million_tokens"],
+                         {"input": 0.1, "cached_input": 0.01, "output": 0.5,
+                          "cache_write_5m": 0.125, "cache_write_1h": 0.2})
+        # The newest strongest model leads each provider's primary profile.
+        self.assertEqual(profiles["codex"]["profiles"][0]["tiers"]["strongest"], "gpt-6.2-astra")
+        self.assertEqual(profiles["claude"]["profiles"][0]["tiers"]["strongest"], "claude-fable-5-2")
+        self.assertEqual(profiles["codex"]["profiles"][0]["efforts"]["gpt-6.2-astra"],
+                         ["low", "medium", "high", "xhigh", "max", "ultra"])
+        self.assertEqual(profiles["claude"]["profiles"][0]["efforts"]["claude-fable-5-2"],
+                         ["low", "medium", "high", "xhigh", "max"])
         self.assertEqual(profiles["codex"]["profiles"][0]["efforts"]["gpt-6.1-sol"],
                          ["low", "medium", "high", "xhigh", "max", "ultra"])
         self.assertEqual(profiles["claude"]["profiles"][0]["efforts"]["claude-sonnet-5-5"],
@@ -336,11 +356,13 @@ class SemanticMatrixTests(unittest.TestCase):
     def test_sol_only_profile_cannot_gain_a_luna_requirement(self):
         current = json.loads(self.refresh.PROFILES.read_text())["providers"]["codex"]["profiles"]
         result = {"profiles": json.loads(json.dumps(current)),
-                  "model_order": ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"]}
+                  "model_order": ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol",
+                                  "gpt-6-astra", "gpt-6.2-astra"]}
         next(profile for profile in result["profiles"] if profile["id"] == "sol")["matrix"]["large/simple"]["model"] = "gpt-6-luna"
         with self.assertRaisesRegex(SystemExit, "preserve its gated model coverage"):
             self.refresh.validate_matrix("codex", result, current,
-                                         roster("gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"))
+                                         roster("gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol",
+                                                "gpt-6-astra", "gpt-6.2-astra"))
 
     def test_noncurrent_model_rejected_even_in_raw_roster(self):
         result = self.result()
@@ -531,7 +553,7 @@ class PolicyCheckTests(unittest.TestCase):
             self.refresh.validate_matrix("codex", result, codex, available)
 
     def test_policy_age_blocks_live_probe_only(self):
-        with patch.object(self.refresh, "_today", return_value="2026-11-15"):
+        with patch.object(self.refresh, "_today", return_value="2027-01-03"):
             self.assertEqual(self.refresh.check_policy(), 0)
             self.assertEqual(self.refresh.check_policy(require_fresh=True), 1)
 

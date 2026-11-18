@@ -4,13 +4,13 @@
 
 # Symphony
 
-Symphony is a Codex and Claude Code plugin that keeps the root agent thin, selects a task-sized execution lead, and preserves lifecycle state across long-running work.
+Symphony is a Codex and Claude Code plugin that keeps the root agent thin, selects a task-sized execution lead, and preserves lifecycle state across long-running work. In orchestrator mode the same root, or a Hermes session, delegates through headless full agents on both providers.
 
 ## Install
 
 ### Codex
 
-Native routing with the `latest` profile (`gpt-6.1-sol`) is tested on Codex CLI 0.160.0. CLI 0.158.0 rejects `gpt-6.1-sol` in `spawn_agent`; the `latest` profile requires a host that can spawn that model. On CLI 0.158.0, set `SYMPHONY_PROFILE=full` in the environment of the Codex process to select `gpt-6-sol`, which that host supports. Verify the available spawn models before using another CLI version.
+The primary `latest-6-2` profile uses `gpt-6.2-astra` and `gpt-6.2-sol` and applies when the account's Codex roster lists both; `codex exec` accepts them on Codex CLI 0.170.0. Accounts without them keep the `latest` profile. Native routing with the `latest` profile (`gpt-6.1-sol`) is tested on Codex CLI 0.160.0. CLI 0.158.0 rejects `gpt-6.1-sol` in `spawn_agent`; the `latest` profile requires a host that can spawn that model. On CLI 0.158.0, set `SYMPHONY_PROFILE=full` in the environment of the Codex process to select `gpt-6-sol`, which that host supports. Verify the available spawn models before using another CLI version.
 
 ```bash
 codex plugin marketplace add opennoor/symphony
@@ -29,6 +29,15 @@ Open `/hooks`, review and trust Symphony's hooks, then send another prompt. An i
 
 If normal reload is declined, use `/reload-plugins --force` or restart Claude Code. Send another prompt after reload so Symphony can record the current-session heartbeat. `/hooks` shows whether workspace or managed policy blocks hook execution.
 
+### Hermes
+
+```bash
+hermes plugins install opennoor/symphony#plugins/symphony-hermes
+hermes plugins enable symphony
+```
+
+Start a new Hermes session afterwards. Hermes is a host, not a third agent provider: the session stays the root and every Symphony agent runs as a headless Codex or Claude Code session, so at least one of those CLIs must be installed and signed in. The Hermes package is its own small directory with the launcher only; it carries no hooks and does not need the Codex or Claude Code plugin.
+
 ## Use
 
 Codex exposes one skill entry point:
@@ -42,6 +51,7 @@ $symphony:symphony agents [--all]
 $symphony:symphony reassess
 $symphony:symphony proceed
 $symphony:symphony boost [xhigh|max|ultra|off]
+$symphony:symphony orchestrate [on|off|<task>]
 $symphony:symphony stop [--force]
 $symphony:symphony disable
 $symphony:symphony version
@@ -61,6 +71,7 @@ Claude Code exposes native slash commands:
 /symphony:reassess
 /symphony:proceed
 /symphony:boost [xhigh|max|off]
+/symphony:orchestrate [on|off|<task>]
 /symphony:stop [--force]
 /symphony:disable
 /symphony:version
@@ -78,6 +89,24 @@ Native Stop bookkeeping faults end the host turn quietly while preserving unreso
 Optional diagnostic sharing collects only version/provider/OS, hook name, recovery category/outcome/signal, the Symphony code location (`module.function:line`) and exception type of a fault, UTC day and counts locally. Reports with the same versions, signals and sites are added to one open issue as comments instead of new issues. When `gh` has access, the plugin offers one nonblocking confirmation to open a **public issue in `opennoor/symphony` using your named GitHub account**. Counters accumulate while you decide. Only actual approval submits the sanitized snapshot as JSON in the issue body; raw logs, task text, paths and project/session IDs stay private. Missing access, silence, decline and submission failure do not pause work. See [diagnostic sharing](plugins/symphony/skills/symphony/references/diagnostic-sharing.md).
 
 Symphony assumes the session root runs at the economy tier: it exists to route work to a right-sized lead, so a root that is already the strongest model pays for an assessor and a lead on top of itself. Set the root model to the cheapest capable option before enabling.
+
+## Orchestrator mode
+
+Orchestrator mode runs a task through headless full agents on Codex and Claude Code instead of the host's own subagents. The root stays shallow at whatever model and effort you set for the session. The strongest available assessor on either provider sizes the task, then one lead owns it and delegates bounded packets to full agents on both providers. Each agent is an ordinary `codex exec` or `claude -p` session pinned to an exact model and effort, and it may use its own host's subagents.
+
+| Host | Standing mode | One task |
+|---|---|---|
+| Codex | `$symphony:symphony orchestrate on` / `off` | `$symphony:symphony orchestrate <task>` |
+| Claude Code | `/symphony:orchestrate on` / `off` | `/symphony:orchestrate <task>` |
+| Hermes | `/symphony on` / `off` | type the task while the mode is on |
+
+On Codex and Claude Code, the standing mode applies to governed tasks: every task prompt in an enabled project, and `start <task>` in any project. A native run that is already active finishes natively. On Hermes, `/symphony status`, `/symphony agents` and `/symphony catalog` show the mode, the latest run and what each provider can launch.
+
+Each provider proposes its own reviewed route for an agent: the strongest tier at high effort for the assessor, and the matrix cell of the packet's size and complexity for a lead, worker or consultant, from the profile the account is entitled to. One rule then ranks the two proposals. An independent review runs on the other provider than the work it reviews. An account limited to a weaker model than the policy intends loses to one that is not, and for the assessor the stronger model wins. Equal candidates are spread across providers: fewer of the run's agents running, then fewer given so far, then a rotation derived from the run. `--prefer price` or `SYMPHONY_ORCHESTRATION_PREFER=price` puts price before spreading. A provider whose CLI is missing or whose login answers for no model is left out and named. `--provider`, `--model` and `--effort` override the choice and require `--why`.
+
+Agents run with full permissions by default (`danger-full-access` on Codex, `bypassPermissions` on Claude Code) so none stalls on a prompt nobody can answer; they can read, change and run anything your account can, in the project directory and beyond. `--permission workspace-write` or `read-only` narrows one agent. At most 8 agents run at once in a run, and agents started by a lead cannot start further Symphony agents. An orchestrated session carries `SYMPHONY_ORCHESTRATED=1` and its own Symphony hooks stay inert.
+
+Runs are recorded under `~/.symphony/state/orchestration/`, readable only by you: each agent's route, the reason it was chosen, its state, its final report and the provider CLI's output. Finished runs are removed after 14 days. The [orchestrator mode reference](plugins/symphony/skills/symphony/references/orchestrator-mode.md) lists the launcher commands and exit codes.
 
 ## Persistent enablement
 
@@ -131,7 +160,7 @@ Symphony ships several profiles per provider and routes through the best one you
 | Medium | balanced/medium, mixed | balanced/high, mixed with optional consultation | capable/high, mixed with reserved consultation |
 | Large | economy/low, delegated | economy/medium, delegated with reserved consultation | economy/medium, delegated with strongest consultation |
 
-On Claude Code, the first substantive Symphony task checks Sonnet 5 and Opus 5.5 using the current Claude Code login, then selects the Opus profile only when both models actually served a minimal request. Each check has a 15-second timeout and asks Claude Code for a $0.25 budget; loaded session context can make actual usage exceed that budget before the CLI stops. The result is cached for that session. An unverified check uses the Sonnet fallback. Fable can require usage credits, so it is selected only when `SYMPHONY_CLAUDE_AVAILABLE_MODELS` explicitly lists Fable, Opus, and Sonnet model IDs, or when you pin `SYMPHONY_PROFILE=fable`. An explicit model list or profile pin skips the checks. Symphony names the exact packaged agent type for each role, and agents run in the background: the root ends its turn after a spawn and Claude Code wakes it with the result, so the Stop guard no longer holds a turn open while background agents run.
+On Claude Code, the first substantive Symphony task checks Sonnet 5 and Opus 5.5 using the current Claude Code login, then selects the Opus profile only when both models actually served a minimal request. Each check has a 15-second timeout and asks Claude Code for a $0.25 budget; loaded session context can make actual usage exceed that budget before the CLI stops. The result is cached for that session. An unverified check uses the Sonnet fallback. Fable can require usage credits, so it is selected only when `SYMPHONY_CLAUDE_AVAILABLE_MODELS` explicitly lists Fable, Opus, and Sonnet model IDs, or when you pin `SYMPHONY_PROFILE=fable-5-2` (Fable 5.2) or one of the Fable 5.1 profiles `fable-5-5` and `fable`. An explicit model list or profile pin skips the checks. Symphony names the exact packaged agent type for each role, and agents run in the background: the root ends its turn after a spawn and Claude Code wakes it with the result, so the Stop guard no longer holds a turn open while background agents run.
 
 Claude Code's Agent hook can reject an invalid spawn before launch. On Symphony's currently supported Codex collaboration path, a mis-routed spawn is detected after the child starts. Codex documents `PreToolUse` for ordinary `spawn_agent`, but Symphony has not verified pre-spawn enforcement on its exact collaboration path. Claude's packaged hooks match Agent calls, not Skill calls, so optional-capability practice is reported and checked by agents rather than host-enforced.
 
@@ -184,6 +213,8 @@ Managed run records store lifecycle facts: identities, roles, requested tier and
 ```bash
 python3 -m unittest discover -s plugins/symphony/tests -v
 claude plugin validate ./plugins/symphony
+hermes plugins validate ./plugins/symphony-hermes
+python3 plugins/symphony/scripts/generate_hermes.py --check
 python3 plugins/symphony/scripts/package_smoke.py --provider codex --candidate . --scenario activation
 python3 plugins/symphony/scripts/package_smoke.py --provider claude --candidate . --scenario activation
 git diff --check

@@ -146,6 +146,9 @@ jobs:
       - name: Check captured launchers match the reviewed runtime
         run: python3 plugins/symphony/scripts/generate_hooks.py --check
 
+      - name: Check the Hermes package carries the current launcher
+        run: python3 plugins/symphony/scripts/generate_hermes.py --check
+
       - name: Run installed-package smokes
         run: |
           for provider in codex claude; do

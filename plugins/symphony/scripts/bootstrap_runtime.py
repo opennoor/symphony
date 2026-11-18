@@ -1,6 +1,10 @@
 """Embedded in reviewed hook commands; retain that exact runtime across updates.
 
-EXPECTED and DIGEST are embedded by generate_hooks.py, never read from disk.
+DIGEST is embedded by generate_hooks.py, never read from disk. It covers the
+name and content of every file the fixed patterns below select, so a file
+added, removed, renamed or edited after review changes the digest. Embedding
+the names themselves grew every launcher with each packaged agent until the
+Windows command limit left no room for a release.
 """
 
 import hashlib
@@ -12,17 +16,31 @@ import sys
 import tempfile
 
 
+GLOBS = ("symphony/*.py", "agents/*.md", "commands/*.md", "skills/**/*.md")
+FILES = ("profiles.json", "model-policy.json", "scripts/symphony_hook.py",
+         "scripts/check_activation.py", "scripts/symphony_agent.py")
+
+
+def expected(root):
+    found = {path.relative_to(root).as_posix() for pattern in GLOBS for path in root.glob(pattern)}
+    return sorted(found | set(FILES))
+
+
 def verified(root, snapshot=False):
     if root.is_symlink():
+        return False
+    try:
+        names = expected(root)
+    except (OSError, ValueError):
         return False
     if snapshot and root.exists():
         entries = list(root.rglob("*"))
         if any(path.is_symlink() for path in entries):
             return False
-        if {path.relative_to(root).as_posix() for path in entries if path.is_file()} != set(EXPECTED):
+        if {path.relative_to(root).as_posix() for path in entries if path.is_file()} != set(names):
             return False
     aggregate = hashlib.sha256()
-    for relative in EXPECTED:
+    for relative in names:
         path = root / relative
         try:
             path.resolve().relative_to(root.resolve())
@@ -48,7 +66,7 @@ def main():
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = Path(tempfile.mkdtemp(prefix=".pin-", dir=base))
         try:
-            for relative in EXPECTED:
+            for relative in expected(source):
                 destination = temporary / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source / relative, destination)

@@ -16,18 +16,24 @@ import zlib
 PLUGIN = Path(__file__).resolve().parents[1]
 
 
+def pinned(root=PLUGIN):
+    """The reviewed file set, selected by the launcher's own fixed patterns."""
+    tree = ast.parse((root / "scripts/bootstrap_runtime.py").read_text())
+    constants = {node.targets[0].id: ast.literal_eval(node.value) for node in tree.body
+                 if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                 and node.targets[0].id in {"GLOBS", "FILES"}}
+    found = {path.relative_to(root).as_posix() for pattern in constants["GLOBS"] for path in root.glob(pattern)}
+    return sorted(found | set(constants["FILES"]))
+
+
 def bootstrap(root=PLUGIN):
-    paths = [*root.glob("symphony/*.py"), *root.glob("agents/*.md"),
-             *root.glob("commands/*.md"), *root.glob("skills/**/*.md"),
-             root / "profiles.json", root / "model-policy.json",
-             root / "scripts/symphony_hook.py", root / "scripts/check_activation.py"]
-    expected = sorted(path.relative_to(root).as_posix() for path in paths)
+    expected = pinned(root)
     aggregate = hashlib.sha256()
     for relative in expected:
         aggregate.update(relative.encode() + b"\0" + hashlib.sha256((root / relative).read_bytes()).digest())
     tree = ast.parse((root / "scripts/bootstrap_runtime.py").read_text())
     tree.body = [node for node in tree.body if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))]
-    source = "EXPECTED = " + repr(expected) + "\nDIGEST = " + repr(aggregate.hexdigest()) + "\n" + ast.unparse(tree)
+    source = "DIGEST = " + repr(aggregate.hexdigest()) + "\n" + ast.unparse(tree)
     encoded = base64.b64encode(zlib.compress(source.encode(), level=9)).decode()
     return "import base64,zlib;exec(zlib.decompress(base64.b64decode('" + encoded + "')))"
 

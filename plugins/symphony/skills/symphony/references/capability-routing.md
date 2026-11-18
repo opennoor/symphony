@@ -31,6 +31,20 @@ If no suitable assessor is available, disclose and use the conservative shipped 
 <!-- generated routes: start -->
 The tables below are generated from `profiles.json` with the runtime resolver. The last profile for each provider is the fallback when entitlement is unknown.
 
+### Codex: `latest-6-2`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| small / mixed | `gpt-6.2-sol/medium` | `gpt-6.2-sol/high` |
+| small / complex | `gpt-6.2-astra/high` | `gpt-6.2-astra/high` |
+| medium / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| medium / mixed | `gpt-6-luna/medium` | `gpt-6-luna/high` |
+| medium / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
+| large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
+| large / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
+
 ### Codex: `latest`
 
 | Size / complexity | Normal risk | High risk |
@@ -59,6 +73,20 @@ The tables below are generated from `profiles.json` with the runtime resolver. T
 | large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
 | large / complex | `gpt-6-sol/high` | `gpt-6-sol/high` |
 
+### Codex: `luna-sol-6-2`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| small / mixed | `gpt-6.2-sol/medium` | `gpt-6.2-sol/high` |
+| small / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
+| medium / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| medium / mixed | `gpt-6-luna/medium` | `gpt-6-luna/high` |
+| medium / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
+| large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
+| large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
+| large / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
+
 ### Codex: `luna-sol-6-1`
 
 | Size / complexity | Normal risk | High risk |
@@ -72,6 +100,20 @@ The tables below are generated from `profiles.json` with the runtime resolver. T
 | large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
 | large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
 | large / complex | `gpt-6.1-sol/high` | `gpt-6.1-sol/high` |
+
+### Codex: `sol-6-2`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `gpt-6.2-sol/low` | `gpt-6.2-sol/medium` |
+| small / mixed | `gpt-6.2-sol/medium` | `gpt-6.2-sol/high` |
+| small / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
+| medium / simple | `gpt-6.2-sol/low` | `gpt-6.2-sol/medium` |
+| medium / mixed | `gpt-6.2-sol/medium` | `gpt-6.2-sol/high` |
+| medium / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
+| large / simple | `gpt-6.2-sol/low` | `gpt-6.2-sol/medium` |
+| large / mixed | `gpt-6.2-sol/medium` | `gpt-6.2-sol/medium` |
+| large / complex | `gpt-6.2-sol/high` | `gpt-6.2-sol/high` |
 
 ### Codex: `sol-6-1`
 
@@ -128,6 +170,20 @@ The tables below are generated from `profiles.json` with the runtime resolver. T
 | large / simple | `gpt-6-luna/low` | `gpt-6-luna/medium` |
 | large / mixed | `gpt-6-luna/medium` | `gpt-6-luna/medium` |
 | large / complex | `gpt-6-luna/high` | `gpt-6-luna/high` |
+
+### Claude Code: `fable-5-2`
+
+| Size / complexity | Normal risk | High risk |
+|---|---|---|
+| small / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| small / mixed | `claude-opus-5-5/medium` | `claude-opus-5-5/high` |
+| small / complex | `claude-fable-5-2/high` | `claude-fable-5-2/high` |
+| medium / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| medium / mixed | `claude-opus-5-5/medium` | `claude-opus-5-5/high` |
+| medium / complex | `claude-opus-5-5/high` | `claude-opus-5-5/high` |
+| large / simple | `claude-sonnet-5-5/low` | `claude-sonnet-5-5/medium` |
+| large / mixed | `claude-sonnet-5-5/medium` | `claude-sonnet-5-5/medium` |
+| large / complex | `claude-opus-5-5/medium` | `claude-opus-5-5/medium` |
 
 ### Claude Code: `fable-5-5`
 

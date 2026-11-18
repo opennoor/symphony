@@ -1,0 +1,7 @@
+name: symphony
+version: "1.11.0"
+description: "Symphony orchestrator mode for Hermes: the session stays a shallow root while the strongest available assessor sizes each task and a lead delegates it to headless full agents on Codex and Claude Code, each pinned to an exact model and effort."
+author: OpenNoor
+requires_hermes: ">=0.23.0"
+provides_hooks:
+  - pre_llm_call
