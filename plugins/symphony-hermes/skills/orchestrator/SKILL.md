@@ -11,7 +11,7 @@ Hermes is the root. It stays shallow at the model and effort the user chose for 
 
 ## Steps
 
-The per-turn guidance prints the exact launcher command. It is `python3 "<plugin>/scripts/symphony_agent.py"`; below it is written `AGENT`.
+The per-turn guidance prints the exact launcher command. It is `python3 "<this plugin>/scripts/symphony_agent.py"`; below it is written `AGENT`.
 
 1. Keep low-token work yourself: a question, one command, a quick lookup. Clarify unclear intent with the user before starting; agents cannot ask.
 2. Write the full request and its acceptance checks to a file, then run `AGENT assess --task-file <file> --wait 540`. It opens a run, starts the strongest available assessor across both providers, and prints the run id and the assessment.

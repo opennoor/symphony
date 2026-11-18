@@ -3,6 +3,7 @@ Hermes plugin, and the launcher's place in the pinned runtime."""
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
-import plugins.symphony as hermes_plugin
+from plugins.symphony.scripts import generate_hermes
 from plugins.symphony.scripts.generate_hooks import bootstrap, generated, pinned
 from plugins.symphony.symphony import PLUGIN_VERSION
 from plugins.symphony.symphony import orchestrator as orch
@@ -24,6 +25,20 @@ from plugins.symphony.symphony.store import StateStore
 
 
 PLUGIN = Path(__file__).resolve().parents[1]
+HERMES = PLUGIN.parent / "symphony-hermes"
+
+
+def load_hermes_package():
+    """Import the Hermes package the way Hermes does: a directory with relative imports."""
+    name = "symphony_hermes_under_test"
+    for loaded in [key for key in sys.modules if key == name or key.startswith(name + ".")]:
+        del sys.modules[loaded]
+    spec = importlib.util.spec_from_file_location(name, HERMES / "__init__.py",
+                                                  submodule_search_locations=[str(HERMES)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class HookControlTests(unittest.TestCase):
@@ -155,9 +170,11 @@ class HermesHostTests(unittest.TestCase):
                       ("SYMPHONY_STATE_DIR", "SYMPHONY_ORCHESTRATOR_NO_PROBE", "CODEX_HOME")}
         os.environ.update({"SYMPHONY_STATE_DIR": str(self.root / "state"),
                            "SYMPHONY_ORCHESTRATOR_NO_PROBE": "1", "CODEX_HOME": str(self.root / "no-codex-home")})
-        hermes_plugin._briefed.clear()
+        self.package = load_hermes_package()
         self.context = FakeHermesContext()
-        hermes_plugin.register(self.context)
+        self.package.register(self.context)
+        from symphony_hermes_under_test.symphony import orchestrator
+        self.launcher = orchestrator
 
     def tearDown(self):
         for key, value in self.saved.items():
@@ -176,30 +193,69 @@ class HermesHostTests(unittest.TestCase):
             model="any", platform="cli", cwd=str(self.project))
 
     def test_the_manifest_matches_what_register_provides(self):
-        manifest = (PLUGIN / "plugin.yaml").read_text()
+        manifest = (HERMES / "plugin.yaml").read_text()
         self.assertRegex(manifest, r"(?m)^name: symphony$")
         self.assertEqual(re.search(r'(?m)^version: "([^"]+)"$', manifest).group(1), PLUGIN_VERSION)
         self.assertEqual(re.findall(r"(?m)^  - (\w+)$", manifest), sorted(self.context.hooks))
         self.assertEqual(set(self.context.commands), {"symphony"})
         skill = self.context.skills["orchestrator"]
-        self.assertEqual(skill, PLUGIN / "hermes" / "SKILL.md")
+        self.assertEqual(skill, HERMES / "skills" / "orchestrator" / "SKILL.md")
         self.assertRegex(skill.read_text(), r"(?s)\A---\nname: orchestrator\ndescription: .+?\n---\n")
 
-    def test_the_hermes_skill_is_not_a_codex_or_claude_skill(self):
-        # Everything under skills/ is loaded by the other two hosts and pinned by their hooks.
+    def test_the_package_is_the_launcher_and_nothing_hermes_would_refuse(self):
+        self.assertEqual(generate_hermes.stale(), [])
+        shipped = sorted(path.relative_to(HERMES).as_posix() for path in HERMES.rglob("*")
+                         if path.is_file() and "__pycache__" not in path.parts)
+        self.assertEqual(shipped, sorted({*generate_hermes.COPIED, *generate_hermes.OWN}))
+        # Hermes scans what it installs and blocks an encoded command such as the
+        # Codex Windows hook launcher. No hook launcher or hook runtime ships here.
+        self.assertFalse((HERMES / "hooks").exists())
+        for name in shipped:
+            self.assertNotRegex((HERMES / name).read_text(encoding="utf-8"), r"(?i)base64[^\n]*env")
+        # The Codex and Claude Code plugin stays free of Hermes files.
         self.assertEqual(sorted(path.parent.name for path in PLUGIN.glob("skills/*/SKILL.md")), ["symphony"])
-        self.assertNotIn("hermes/SKILL.md", pinned(PLUGIN))
+        for name in ("plugin.yaml", "__init__.py", "hermes"):
+            self.assertFalse((PLUGIN / name).exists())
+
+    def test_a_changed_launcher_makes_the_package_stale(self):
+        with TemporaryDirectory() as temporary:
+            target = Path(temporary) / "symphony-hermes"
+            shutil.copytree(HERMES, target, ignore=shutil.ignore_patterns("__pycache__"))
+            self.assertEqual(generate_hermes.stale(PLUGIN, target), [])
+            (target / "symphony" / "orchestrator.py").write_text("# edited in place\n")
+            (target / "symphony" / "runtime.py").write_text("# not part of the package\n")
+            (target / "profiles.json").unlink()
+            self.assertEqual(generate_hermes.stale(PLUGIN, target),
+                             ["profiles.json", "symphony/orchestrator.py", "symphony/runtime.py"])
+            generate_hermes.write(PLUGIN, target)
+            self.assertEqual(generate_hermes.stale(PLUGIN, target), ["symphony/runtime.py"])
+
+    @unittest.skipIf(os.name == "nt", "runs the packaged script through a POSIX interpreter path")
+    def test_the_packaged_launcher_runs_on_its_own(self):
+        with TemporaryDirectory() as temporary:
+            target = Path(temporary) / "installed"
+            shutil.copytree(HERMES, target, ignore=shutil.ignore_patterns("__pycache__"))
+            environ = {"PATH": os.environ.get("PATH", ""), "SYMPHONY_STATE_DIR": str(Path(temporary) / "state"),
+                       "SYMPHONY_ORCHESTRATOR_NO_PROBE": "1", "CODEX_HOME": str(Path(temporary) / "codex"),
+                       "SYMPHONY_CODEX_CLI": "/fake/codex", "SYMPHONY_CLAUDE_CLI": "/fake/claude"}
+            done = subprocess.run([sys.executable, "-I", str(target / "scripts" / "symphony_agent.py"),
+                                   "select", "--role", "assessor", "--json"],
+                                  capture_output=True, text=True, env=environ, cwd=temporary, timeout=60)
+            self.assertEqual((done.returncode, done.stderr), (0, ""))
+            self.assertEqual({item["provider"] for item in json.loads(done.stdout)["candidates"]},
+                             {"codex", "claude"})
 
     def test_guidance_is_silent_until_the_mode_is_on_for_this_project(self):
         self.assertIsNone(self.guidance())
         self.assertIn("Symphony orchestrator mode: off", self.command("status"))
         on = self.command("on")
         self.assertIn("orchestrator mode is on for this project", on)
-        self.assertTrue(orch.mode(self.project, os.environ, "hermes"))
-        # Hermes has its own switch; it does not change what Codex or Claude Code do here.
-        self.assertFalse(orch.mode(self.project, os.environ, "enabled"))
+        self.assertTrue(self.launcher.hermes_mode(self.project, os.environ))
+        # Hermes has its own switch; it does not touch the hook hosts' project state.
+        self.assertEqual(list((self.root / "state").glob("*.json")), [])
         first = self.guidance()["context"]
-        self.assertIn(f'"{orch.launcher_script()}" assess --task-file', first)
+        self.assertEqual(self.launcher.launcher_script(), HERMES / "scripts" / "symphony_agent.py")
+        self.assertIn(f'"{self.launcher.launcher_script()}" assess --task-file', first)
         self.assertIn("lead --run <run>", first)
         again = self.guidance()["context"]
         self.assertLess(len(again), len(first))
@@ -215,8 +271,7 @@ class HermesHostTests(unittest.TestCase):
         self.assertIn("/symphony on", self.command("unknown words"))
         self.assertIn("no orchestrated run found", self.command("agents"))
         self.assertIn("codex", self.command("catalog"))
-        state_file = self.root / "state"
-        state_file.write_text("not a directory")
+        (self.root / "state").write_text("not a directory")
         self.assertIn("Symphony could not do that", self.command("on"))
         self.assertIsNone(self.guidance())
 
@@ -229,7 +284,7 @@ class PinnedRuntimeTests(unittest.TestCase):
                          "skills/symphony/references/orchestrator-mode.md", "profiles.json", "model-policy.json"):
             self.assertIn(required, names)
         self.assertEqual(names, sorted(set(names)))
-        for outside in ("__init__.py", "plugin.yaml", "hermes/SKILL.md", "scripts/generate_hooks.py"):
+        for outside in ("scripts/generate_hooks.py", "scripts/generate_hermes.py"):
             self.assertNotIn(outside, names)
 
     def test_file_names_no_longer_grow_the_launchers(self):

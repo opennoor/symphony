@@ -104,9 +104,8 @@ def _parser() -> argparse.ArgumentParser:
     stop.add_argument("--all", action="store_true")
     stop.add_argument("--run", default="")
 
-    mode = commands.add_parser("mode", help="orchestrator mode for this project")
+    mode = commands.add_parser("hermes-mode", help="orchestrator mode for Hermes sessions in this project")
     mode.add_argument("state", nargs="?", default="status", choices=("on", "off", "status"))
-    mode.add_argument("--host", default="enabled", choices=("enabled", "hermes"))
 
     supervise = commands.add_parser("_supervise")
     supervise.add_argument("directory")
@@ -411,13 +410,13 @@ def _select(args: argparse.Namespace, environ: Mapping[str, str], out: TextIO) -
 def _mode(args: argparse.Namespace, environ: Mapping[str, str], out: TextIO) -> int:
     project = _project(args, environ)
     if args.state != "status":
-        orch.set_mode(project, environ, args.state == "on", args.host)
-    out.write("Symphony orchestrator mode: " + ("on" if orch.mode(project, environ, args.host) else "off") + "\n")
+        orch.set_hermes_mode(project, environ, args.state == "on")
+    out.write("Symphony orchestrator mode: " + ("on" if orch.hermes_mode(project, environ) else "off") + "\n")
     return DONE
 
 
 _COMMANDS = {"assess": _assess, "lead": _lead, "agent": _agent, "wait": _wait, "status": _status,
-             "result": _result, "stop": _stop, "catalog": _catalog, "select": _select, "mode": _mode}
+             "result": _result, "stop": _stop, "catalog": _catalog, "select": _select, "hermes-mode": _mode}
 
 
 def main(argv: list[str] | None = None, environ: Mapping[str, str] = os.environ,

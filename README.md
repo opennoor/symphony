@@ -32,11 +32,11 @@ If normal reload is declined, use `/reload-plugins --force` or restart Claude Co
 ### Hermes
 
 ```bash
-hermes plugins install opennoor/symphony#plugins/symphony
+hermes plugins install opennoor/symphony#plugins/symphony-hermes
 hermes plugins enable symphony
 ```
 
-Start a new Hermes session afterwards. Hermes is a host, not a third agent provider: the session stays the root and every Symphony agent runs as a headless Codex or Claude Code session, so at least one of those CLIs must be installed and signed in. `hermes plugins validate` reports a caution for `hooks/codex.json`; that file holds the Codex hook launcher, which Hermes does not run.
+Start a new Hermes session afterwards. Hermes is a host, not a third agent provider: the session stays the root and every Symphony agent runs as a headless Codex or Claude Code session, so at least one of those CLIs must be installed and signed in. The Hermes package is its own small directory with the launcher only; it carries no hooks and does not need the Codex or Claude Code plugin.
 
 ## Use
 
@@ -213,7 +213,8 @@ Managed run records store lifecycle facts: identities, roles, requested tier and
 ```bash
 python3 -m unittest discover -s plugins/symphony/tests -v
 claude plugin validate ./plugins/symphony
-hermes plugins validate ./plugins/symphony
+hermes plugins validate ./plugins/symphony-hermes
+python3 plugins/symphony/scripts/generate_hermes.py --check
 python3 plugins/symphony/scripts/package_smoke.py --provider codex --candidate . --scenario activation
 python3 plugins/symphony/scripts/package_smoke.py --provider claude --candidate . --scenario activation
 git diff --check

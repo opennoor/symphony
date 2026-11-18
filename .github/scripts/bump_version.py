@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Advance the plugin's patch version across every file that states it.
 
-Five files repeat the version and all five must agree: the two provider
-manifests, the Hermes manifest, the package constant the heartbeat reports,
-and the marketplace entry. Keeping this in a script rather than inline in a workflow means it can
+Six files repeat the version and all six must agree: the two provider
+manifests, the Hermes manifest, the package constant the heartbeat reports
+with its copy in the Hermes package, and the marketplace entry. Keeping this in a script rather than inline in a workflow means it can
 be run and tested like anything else.
 """
 
@@ -20,7 +20,8 @@ MANIFESTS = (
     PLUGIN / ".codex-plugin" / "plugin.json",
 )
 INIT = PLUGIN / "symphony" / "__init__.py"
-HERMES = PLUGIN / "plugin.yaml"
+HERMES = pathlib.Path("plugins/symphony-hermes") / "plugin.yaml"
+HERMES_INIT = pathlib.Path("plugins/symphony-hermes") / "symphony" / "__init__.py"
 MARKETPLACE = pathlib.Path(".claude-plugin/marketplace.json")
 
 
@@ -50,6 +51,8 @@ def apply(version: str) -> None:
     HERMES.write_text(
         re.sub(r'(?m)^version: "[^"]+"$', f'version: "{version}"', HERMES.read_text())
     )
+    # The Hermes package carries a copy of the package constant.
+    HERMES_INIT.write_text(INIT.read_text())
     entry = json.loads(MARKETPLACE.read_text())
     entry["plugins"][0]["version"] = version
     MARKETPLACE.write_text(json.dumps(entry, indent=2) + "\n")

@@ -4,6 +4,10 @@ Hermes cannot pin a model and effort on its own subagents, so here Symphony
 always works through the launcher: the session stays a shallow root and the
 assessor, the lead and every agent run as headless Codex or Claude Code
 sessions. Nothing below imports Hermes until Hermes calls `register`.
+
+`symphony/`, `scripts/symphony_agent.py`, `profiles.json` and
+`model-policy.json` beside this file are copies written by
+`plugins/symphony/scripts/generate_hermes.py`; edit the originals.
 """
 
 from __future__ import annotations
@@ -57,7 +61,7 @@ def command(raw_args: str = "", **context: Any) -> str:
     project = _project(**context)
     try:
         if action in {"on", "off"}:
-            orchestrator.set_mode(project, os.environ, action == "on", "hermes")
+            orchestrator.set_hermes_mode(project, os.environ, action == "on")
             _briefed.clear()
             if action == "off":
                 return "Symphony orchestrator mode is off for this project."
@@ -65,7 +69,7 @@ def command(raw_args: str = "", **context: Any) -> str:
                     "shallow root at its own model and effort, and the work runs through headless full "
                     "agents on Codex and Claude Code.\n" + _run(["catalog"], project))
         if action in {"", "status"}:
-            state = "on" if orchestrator.mode(project, os.environ, "hermes") else "off"
+            state = "on" if orchestrator.hermes_mode(project, os.environ) else "off"
             latest = _run(["status"], project)
             return f"Symphony orchestrator mode: {state}\n{latest}"
         if action == "agents":
@@ -83,7 +87,7 @@ def guidance(session_id: str = "", **context: Any) -> dict[str, str] | None:
         from .symphony import orchestrator
 
         project = _project(**context)
-        if not orchestrator.mode(project, os.environ, "hermes"):
+        if not orchestrator.hermes_mode(project, os.environ):
             return None
         launcher = orchestrator.launcher_command(os.environ)
         if session_id and session_id in _briefed:
@@ -100,7 +104,7 @@ def guidance(session_id: str = "", **context: Any) -> dict[str, str] | None:
 
 def register(ctx: Any) -> None:
     root = Path(__file__).resolve().parent
-    ctx.register_skill("orchestrator", root / "hermes" / "SKILL.md")
+    ctx.register_skill("orchestrator", root / "skills" / "orchestrator" / "SKILL.md")
     ctx.register_command(
         "symphony", command,
         description="Symphony orchestrator mode: on, off, status, agents, catalog",

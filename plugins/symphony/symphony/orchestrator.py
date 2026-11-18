@@ -189,13 +189,47 @@ def _claude_probe_cache(environ: Mapping[str, str]) -> Path:
     return state_root(environ) / "orchestration" / "claude-entitlement.json"
 
 
+# The launcher reads entitlement the way the hook runtime does, from the same
+# sources. It keeps its own copy of these few lines so that it runs without the
+# hook runtime, which the Hermes package does not ship.
+_CLAUDE_PROBE_MODELS = ("claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5")
+
+
+def _codex_roster(environ: Mapping[str, str]) -> set[str] | None:
+    home = Path(environ.get("CODEX_HOME") or Path.home() / ".codex")
+    roster = _read_json(home / "models_cache.json")
+    if not roster:
+        return None
+    return {str(item.get("slug")) for item in roster.get("models", ())
+            if isinstance(item, Mapping) and item.get("visibility") == "list" and item.get("slug")}
+
+
+def _claude_accepts(model: str, environ: Mapping[str, str]) -> bool:
+    """Ask this Claude Code login, then verify the model that actually served."""
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed arguments, the user's own CLI
+            [cli_path("claude", environ), "--settings", '{"disableAllHooks":true}', "--print",
+             "--no-session-persistence", "--tools", "", "--disallowedTools", "mcp__*",
+             "--system-prompt", "Reply ok.", "--model", model, "--max-budget-usd", "0.25",
+             "--output-format", "json", "Reply ok."],
+            capture_output=True, text=True, timeout=30,
+            env={**environ, "SYMPHONY_CLAUDE_PROBE": "1", "SYMPHONY_ORCHESTRATED": "1"},
+        )
+        if completed.returncode:
+            return False
+        result = json.loads(completed.stdout)
+        return (isinstance(result, dict) and not result.get("is_error")
+                and set(result.get("modelUsage", {})) == {model})
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return False
+
+
 def entitlement(provider: str, environ: Mapping[str, str], *, probe: bool = False) -> set[str] | None:
     """The models this account grants, or None when nothing can tell."""
-    from . import runtime  # deferred: the hook runtime is large and rarely needed here
-
     if provider == "codex":
-        return runtime._codex_entitlement(environ)
-    explicit = runtime._claude_entitlement(environ)
+        return _codex_roster(environ)
+    explicit = {model.strip() for model in environ.get("SYMPHONY_CLAUDE_AVAILABLE_MODELS", "").split(",")
+                if model.strip()}
     if explicit:
         return explicit
     cached = _read_json(_claude_probe_cache(environ))
@@ -209,7 +243,7 @@ def entitlement(provider: str, environ: Mapping[str, str], *, probe: bool = Fals
         return None
     # One short call per model, with this login; Fable stays opt-in through
     # SYMPHONY_CLAUDE_AVAILABLE_MODELS exactly as on the native route.
-    found = runtime._claude_entitlement(environ, probe=True) or set()
+    found = {model for model in _CLAUDE_PROBE_MODELS if _claude_accepts(model, environ)}
     try:
         _private_dir(_claude_probe_cache(environ).parent)
         _write_json(_claude_probe_cache(environ), {"checked_at": time.time(), "models": sorted(found)})
@@ -991,41 +1025,40 @@ def describe(meta: Mapping[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------
-# Mode, shared with the hook runtime through the project's state
+# Mode
 
 
-def mode(project: Path, environ: Mapping[str, str], host: str = "enabled") -> bool:
-    from .store import StateStore
-
-    try:
-        configuration = StateStore(state_root(environ)).load(Path(project).resolve()).configuration
-    except (OSError, ValueError, TypeError, KeyError):
-        return False
-    setting = configuration.get("orchestrator")
-    return isinstance(setting, Mapping) and setting.get(host) is True
+def _hermes_flag(project: Path, environ: Mapping[str, str]) -> Path:
+    return ledger_root(project, environ) / "hermes.json"
 
 
-def set_mode(project: Path, environ: Mapping[str, str], enabled: bool, host: str = "enabled") -> bool:
-    from dataclasses import replace
+def hermes_mode(project: Path, environ: Mapping[str, str]) -> bool:
+    """Whether Hermes sessions in this project are orchestrated.
 
-    from .store import StateStore
-
-    def transition(state):
-        return replace(state, configuration=with_mode(state.configuration, enabled, host)), enabled
-
-    return bool(StateStore(state_root(environ)).update(Path(project).resolve(), transition))
+    Codex and Claude Code keep their switch in the project's hook state. Hermes
+    runs no Symphony hooks, so its switch lives beside the runs it produces.
+    """
+    return _read_json(_hermes_flag(project, environ)).get("enabled") is True
 
 
-def with_mode(configuration: Mapping[str, Any], enabled: bool, host: str = "enabled") -> dict[str, Any]:
-    updated = dict(configuration)
-    recorded = updated.get("orchestrator")
-    setting = dict(recorded) if isinstance(recorded, Mapping) else {}
+def set_hermes_mode(project: Path, environ: Mapping[str, str], enabled: bool) -> bool:
+    flag = _hermes_flag(project, environ)
     if enabled:
-        setting[host] = True
+        _private_dir(flag.parent)
+        _write_json(flag, {"enabled": True, "project": str(Path(project).resolve()), "since": now()})
     else:
-        setting.pop(host, None)
-    if setting:
-        updated["orchestrator"] = setting
+        try:
+            flag.unlink()
+        except FileNotFoundError:
+            pass
+    return enabled
+
+
+def with_mode(configuration: Mapping[str, Any], enabled: bool) -> dict[str, Any]:
+    """A hook host's project configuration with the standing mode set or cleared."""
+    updated = dict(configuration)
+    if enabled:
+        updated["orchestrator"] = {"enabled": True}
     else:
         updated.pop("orchestrator", None)
     return updated

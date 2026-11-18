@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 import textwrap
 import time
 import unittest
+import unittest.mock
 
 from plugins.symphony.symphony import orchestrator as orch
 from plugins.symphony.symphony import orchestrator_cli
@@ -550,24 +551,85 @@ class LauncherTests(unittest.TestCase):
 
 
 class ModeTests(unittest.TestCase):
-    def test_each_host_has_its_own_switch_in_the_projects_state(self):
+    def test_the_hermes_switch_is_a_private_file_per_project(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             environ = {"SYMPHONY_STATE_DIR": str(root / "state")}
-            project = root / "project"
+            project, other = root / "project", root / "other"
             project.mkdir()
-            self.assertFalse(orch.mode(project, environ))
-            orch.set_mode(project, environ, True, "hermes")
-            self.assertTrue(orch.mode(project, environ, "hermes"))
-            self.assertFalse(orch.mode(project, environ, "enabled"))
-            orch.set_mode(project, environ, True)
-            orch.set_mode(project, environ, False, "hermes")
-            self.assertTrue(orch.mode(project, environ))
-            self.assertFalse(orch.mode(project, environ, "hermes"))
+            other.mkdir()
+            self.assertFalse(orch.hermes_mode(project, environ))
+            orch.set_hermes_mode(project, environ, True)
+            self.assertTrue(orch.hermes_mode(project, environ))
+            self.assertFalse(orch.hermes_mode(other, environ))
+            flag = orch.ledger_root(project, environ) / "hermes.json"
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(flag.stat().st_mode), 0o600)
             out = io.StringIO()
-            self.assertEqual(orchestrator_cli.main(["--cwd", str(project), "mode", "off"], environ, out), 0)
-            self.assertEqual(out.getvalue(), "Symphony orchestrator mode: off\n")
-            self.assertEqual(orch.with_mode({"orchestrator": {"enabled": True}, "kept": 1}, False), {"kept": 1})
+            self.assertEqual(orchestrator_cli.main(["--cwd", str(project), "hermes-mode"], environ, out), 0)
+            self.assertEqual(out.getvalue(), "Symphony orchestrator mode: on\n")
+            self.assertEqual(orchestrator_cli.main(["--cwd", str(project), "hermes-mode", "off"], environ, out), 0)
+            self.assertFalse(flag.exists())
+            orch.set_hermes_mode(project, environ, False)  # already off is not an error
+
+    def test_the_hook_hosts_switch_is_one_key_in_project_configuration(self):
+        self.assertEqual(orch.with_mode({"kept": 1}, True), {"kept": 1, "orchestrator": {"enabled": True}})
+        self.assertEqual(orch.with_mode({"orchestrator": {"enabled": True}, "kept": 1}, False), {"kept": 1})
+
+
+class EntitlementTests(unittest.TestCase):
+    """The launcher reads entitlement without the hook runtime, and must agree with it."""
+
+    def test_the_codex_roster_is_read_as_the_hook_reads_it(self):
+        from plugins.symphony.symphony import runtime
+
+        with TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            environ = {"CODEX_HOME": str(home)}
+            self.assertIsNone(orch.entitlement("codex", environ))
+            self.assertEqual(orch.entitlement("codex", environ), runtime._codex_entitlement(environ))
+            (home / "models_cache.json").write_text(json.dumps({"models": [
+                {"slug": "gpt-6.2-sol", "visibility": "list"}, {"slug": "gpt-reserve", "visibility": "hide"},
+                {"slug": "", "visibility": "list"}, "not a model"]}))
+            self.assertEqual(orch.entitlement("codex", environ), {"gpt-6.2-sol"})
+            self.assertEqual(orch.entitlement("codex", environ), runtime._codex_entitlement(environ))
+
+    def test_declared_claude_models_are_used_without_a_probe(self):
+        from plugins.symphony.symphony import runtime
+
+        with TemporaryDirectory() as temporary:
+            environ = {"SYMPHONY_STATE_DIR": temporary, "SYMPHONY_CLAUDE_CLI": "/fake/claude",
+                       "SYMPHONY_CLAUDE_AVAILABLE_MODELS": " claude-fable-5-2, claude-opus-5-5 ,claude-sonnet-5-5,"}
+            declared = orch.entitlement("claude", environ, probe=True)
+            self.assertEqual(declared, {"claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5"})
+            self.assertEqual(declared, runtime._claude_entitlement(environ))
+            self.assertEqual(orch.applied_profile("claude", environ), "fable-5-2")
+            self.assertFalse(orch._claude_probe_cache(environ).exists())
+
+    def test_a_probe_asks_each_model_once_and_is_remembered(self):
+        asked = []
+
+        def accepts(model, environ):
+            asked.append(model)
+            return model != "claude-opus-5-5"
+
+        with TemporaryDirectory() as temporary:
+            environ = {"SYMPHONY_STATE_DIR": temporary, "SYMPHONY_CLAUDE_CLI": "/fake/claude"}
+            self.assertIsNone(orch.entitlement("claude", environ))
+            with unittest.mock.patch.object(orch, "_claude_accepts", accepts):
+                first = orch.entitlement("claude", environ, probe=True)
+                second = orch.entitlement("claude", environ, probe=True)
+            self.assertEqual(first, {"claude-sonnet-5", "claude-sonnet-5-5"})
+            self.assertEqual(second, first)
+            self.assertEqual(asked, list(orch._CLAUDE_PROBE_MODELS))
+            self.assertEqual(orch.applied_profile("claude", environ), "sonnet-5-5")
+            self.assertIsNone(orch.entitlement("claude", {**environ, "SYMPHONY_STATE_DIR": temporary + "-other",
+                                                          "SYMPHONY_ORCHESTRATOR_NO_PROBE": "1"}, probe=True))
+
+    def test_the_launcher_does_not_need_the_hook_runtime(self):
+        source = Path(orch.__file__).read_text() + Path(orchestrator_cli.__file__).read_text()
+        for module in ("runtime", "store", "reducer", "host_evidence", "diagnostics", "adapters"):
+            self.assertNotRegex(source, rf"(?m)^\s*from \.{module} import|^\s*from \. import .*\b{module}\b")
 
 
 if __name__ == "__main__":

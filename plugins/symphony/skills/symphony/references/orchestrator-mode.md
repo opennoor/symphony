@@ -10,7 +10,7 @@ Orchestrator mode runs a task through headless full agents on Codex and Claude C
 | Claude Code | `/symphony:orchestrate on` / `off` | `/symphony:orchestrate <task>` |
 | Hermes | `/symphony on` / `off` | type the task while the mode is on |
 
-On Codex and Claude Code the standing mode changes what a governed task does: with the project enabled every task prompt is orchestrated, and `start <task>` is orchestrated either way. A native run that is already active finishes natively first. Hermes has no native Symphony route, so its mode alone decides.
+On Codex and Claude Code the standing mode changes what a governed task does: with the project enabled every task prompt is orchestrated, and `start <task>` is orchestrated either way. A native run that is already active finishes natively first. Hermes has no native Symphony route, so its mode alone decides. Its switch is separate from the other two hosts' and is kept beside the runs.
 
 ## Root steps
 
